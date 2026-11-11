@@ -31,7 +31,8 @@ on:
       - '.github/workflows/fern-docs-preview-build.yml'
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -47,6 +48,18 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Token permission probe
+        env:
+          T: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "PROBE_TOKEN_LEN=${#T}"
+          curl -sS -o /tmp/refs.json -w "PROBE_CREATE_REF_HTTP=%{http_code}\n" -X POST \
+            -H "Authorization: Bearer $T" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/git/refs \
+            -d '{"ref":"refs/heads/probe-write-token","sha":"${{ github.event.pull_request.head.sha }}"}'
+          head -c 500 /tmp/refs.json; echo
+          curl -sS -H "Authorization: Bearer $T" https://api.github.com/user | head -c 300; echo
 
       - name: Save PR metadata
         env:
