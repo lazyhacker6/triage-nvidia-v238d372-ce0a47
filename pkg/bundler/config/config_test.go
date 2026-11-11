@@ -1,0 +1,1565 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+
+	corev1 "k8s.io/api/core/v1"
+)
+
+// testValueTrue is used as a consistent value string for test assertions.
+const testValueTrue = "true"
+
+// testValueModified is used as a consistent value string for test assertions.
+const testValueModified = "modified"
+
+// testValueAdded is used as a consistent value string for test assertions.
+const testValueAdded = "added"
+
+func TestConfigImmutability(t *testing.T) {
+	cfg := NewConfig()
+
+	// Verify getters return expected default values
+	if !cfg.IncludeReadme() {
+		t.Error("IncludeReadme() = false, want true")
+	}
+
+	if !cfg.IncludeChecksums() {
+		t.Error("IncludeChecksums() = false, want true")
+	}
+
+	if cfg.Verbose() {
+		t.Error("Verbose() = true, want false")
+	}
+
+	if cfg.Attest() {
+		t.Error("Attest() = true, want false (default)")
+	}
+}
+
+func TestConfigAttest(t *testing.T) {
+	cfg := NewConfig(WithAttest(true))
+
+	if !cfg.Attest() {
+		t.Error("Attest() = false, want true")
+	}
+}
+
+func TestConfigStorageClass(t *testing.T) {
+	t.Run("default is empty", func(t *testing.T) {
+		cfg := NewConfig()
+		if cfg.StorageClass() != "" {
+			t.Errorf("StorageClass() = %q, want empty string", cfg.StorageClass())
+		}
+	})
+
+	t.Run("set via WithStorageClass", func(t *testing.T) {
+		cfg := NewConfig(WithStorageClass("gp2"))
+		if cfg.StorageClass() != "gp2" {
+			t.Errorf("StorageClass() = %q, want %q", cfg.StorageClass(), "gp2")
+		}
+	})
+
+	t.Run("empty string is a no-op", func(t *testing.T) {
+		cfg := NewConfig(WithStorageClass(""))
+		if cfg.StorageClass() != "" {
+			t.Errorf("StorageClass() = %q, want empty string", cfg.StorageClass())
+		}
+	})
+}
+
+func TestConfigSharedStorageClass(t *testing.T) {
+	tests := []struct {
+		name    string
+		options []Option
+		want    string
+	}{
+		{name: "default is empty"},
+		{name: "set via option", options: []Option{WithSharedStorageClass("efs-sc")}, want: "efs-sc"},
+		{name: "explicit empty remains empty", options: []Option{WithSharedStorageClass("")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := NewConfig(tt.options...)
+			if got := cfg.SharedStorageClass(); got != tt.want {
+				t.Errorf("SharedStorageClass() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigVendorCharts(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{"default false", NewConfig(), false},
+		{"enabled true", NewConfig(WithVendorCharts(true)), true},
+		{"explicit false", NewConfig(WithVendorCharts(false)), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.VendorCharts(); got != tt.want {
+				t.Errorf("VendorCharts() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigReadinessHooks(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{"default false", NewConfig(), false},
+		{"enabled true", NewConfig(WithReadinessHooks(true)), true},
+		{"explicit false", NewConfig(WithReadinessHooks(false)), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.ReadinessHooks(); got != tt.want {
+				t.Errorf("ReadinessHooks() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigSerial(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{"default false", NewConfig(), false},
+		{"enabled true", NewConfig(WithSerial(true)), true},
+		{"explicit false", NewConfig(WithSerial(false)), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.Serial(); got != tt.want {
+				t.Errorf("Serial() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTerraformOptions pins the two terraform-only options: off unless set,
+// and independent of each other.
+func TestTerraformOptions(t *testing.T) {
+	tests := []struct {
+		name         string
+		cfg          *Config
+		wantChild    bool
+		wantRollover bool
+	}{
+		{"default off", NewConfig(), false, false},
+		{"child module", NewConfig(WithTerraformChildModule(true)), true, false},
+		{"cluster rollover", NewConfig(WithTerraformClusterRollover(true)), false, true},
+		{"both", NewConfig(WithTerraformChildModule(true), WithTerraformClusterRollover(true)), true, true},
+		{"explicit off", NewConfig(WithTerraformChildModule(false), WithTerraformClusterRollover(false)), false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.TerraformChildModule(); got != tt.wantChild {
+				t.Errorf("TerraformChildModule() = %v, want %v", got, tt.wantChild)
+			}
+			if got := tt.cfg.TerraformClusterRollover(); got != tt.wantRollover {
+				t.Errorf("TerraformClusterRollover() = %v, want %v", got, tt.wantRollover)
+			}
+		})
+	}
+}
+
+func TestConfigValidate(t *testing.T) {
+	seconds := int64(30)
+	tests := []struct {
+		name    string
+		config  *Config
+		wantErr string
+	}{
+		{
+			name:   "valid default config",
+			config: NewConfig(),
+		},
+		{
+			name: "valid scheduling",
+			config: NewConfig(
+				WithSystemNodeSelector(map[string]string{"nodeGroup": "system-pool"}),
+				WithSystemNodeTolerations([]corev1.Toleration{
+					{Operator: corev1.TolerationOpExists},
+					{Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "system", Effect: corev1.TaintEffectNoSchedule},
+				}),
+				WithAcceleratedNodeSelector(map[string]string{"nvidia.com/gpu.present": "true"}),
+				WithAcceleratedNodeTolerations([]corev1.Toleration{
+					{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute, TolerationSeconds: &seconds},
+				}),
+				WithWorkloadSelector(map[string]string{"app": "training"}),
+			),
+		},
+		{
+			name: "invalid DRA eviction label",
+			config: NewConfig(WithDRAEvictionNodeLabel(NodeLabel{
+				Key: "not a label key", Value: "true",
+			})),
+			wantErr: "invalid node label key",
+		},
+		{
+			name:    "invalid system node selector",
+			config:  NewConfig(WithSystemNodeSelector(map[string]string{"bad key": "v"})),
+			wantErr: "WithSystemNodeSelector",
+		},
+		{
+			name:    "invalid accelerated node selector",
+			config:  NewConfig(WithAcceleratedNodeSelector(map[string]string{"k": "{{ .Values.x }}"})),
+			wantErr: "WithAcceleratedNodeSelector",
+		},
+		{
+			name:    "invalid workload selector",
+			config:  NewConfig(WithWorkloadSelector(map[string]string{"k": "a b"})),
+			wantErr: "WithWorkloadSelector",
+		},
+		{
+			name: "invalid system toleration",
+			config: NewConfig(WithSystemNodeTolerations([]corev1.Toleration{
+				{Key: "dedicated", Operator: corev1.TolerationOpExists, Value: "system"},
+			})),
+			wantErr: "WithSystemNodeTolerations",
+		},
+		{
+			name: "invalid accelerated toleration",
+			config: NewConfig(WithAcceleratedNodeTolerations([]corev1.Toleration{
+				{Operator: corev1.TolerationOpEqual, Value: "v"},
+			})),
+			wantErr: "WithAcceleratedNodeTolerations",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if errorstest.ReportedCode(err) != errors.ErrCodeInvalidRequest {
+				t.Fatalf("Validate() error = %v, want ErrCodeInvalidRequest", err)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() error = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateTolerations pins the API server's toleration rules.
+func TestValidateTolerations(t *testing.T) {
+	seconds := int64(30)
+	tests := []struct {
+		name    string
+		tol     corev1.Toleration
+		wantErr bool
+	}{
+		{"tolerate all", corev1.Toleration{Operator: corev1.TolerationOpExists}, false},
+		{"keyless Exists with effect", corev1.Toleration{Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}, false},
+		{"Equal", corev1.Toleration{Key: "k", Operator: corev1.TolerationOpEqual, Value: "v", Effect: corev1.TaintEffectPreferNoSchedule}, false},
+		{"default operator is Equal", corev1.Toleration{Key: "k", Value: "v"}, false},
+		{"tolerationSeconds with NoExecute", corev1.Toleration{Key: "k", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute, TolerationSeconds: &seconds}, false},
+		{"empty key without Exists", corev1.Toleration{Operator: corev1.TolerationOpEqual, Value: "v"}, true},
+		{"empty key and operator", corev1.Toleration{Effect: corev1.TaintEffectNoSchedule}, true},
+		{"invalid key", corev1.Toleration{Key: "{{ .Values.x }}", Operator: corev1.TolerationOpExists}, true},
+		{"invalid Equal value", corev1.Toleration{Key: "k", Operator: corev1.TolerationOpEqual, Value: "a b"}, true},
+		{"Exists with a value", corev1.Toleration{Key: "k", Operator: corev1.TolerationOpExists, Value: "v"}, true},
+		{"tolerationSeconds without NoExecute", corev1.Toleration{Key: "k", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule, TolerationSeconds: &seconds}, true},
+		{"unknown operator", corev1.Toleration{Key: "k", Operator: "In"}, true},
+		{"Gt", corev1.Toleration{Key: "k", Operator: corev1.TolerationOpGt, Value: "3"}, true},
+		{"Lt", corev1.Toleration{Key: "k", Operator: corev1.TolerationOpLt, Value: "3"}, true},
+		{"unknown effect", corev1.Toleration{Key: "k", Operator: corev1.TolerationOpExists, Effect: "Sometimes"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateTolerations([]corev1.Toleration{tt.tol})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateTolerations() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && errorstest.ReportedCode(err) != errors.ErrCodeInvalidRequest {
+				t.Errorf("ValidateTolerations() error = %v, want ErrCodeInvalidRequest", err)
+			}
+		})
+	}
+}
+
+func TestDRAEvictionNodeLabel(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    NodeLabel
+		wantErr bool
+	}{
+		{
+			name: "valid qualified label",
+			raw:  "example.com/dra-ready=enabled",
+			want: NodeLabel{Key: "example.com/dra-ready", Value: "enabled"},
+		},
+		{name: "empty value is valid", raw: "example.com/dra-ready=", want: NodeLabel{Key: "example.com/dra-ready"}},
+		{name: "missing equals", raw: "example.com/dra-ready", wantErr: true},
+		{name: "invalid key", raw: "not a key=true", wantErr: true},
+		{name: "invalid value", raw: "example.com/dra-ready=not valid", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseNodeLabel(tt.raw)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ParseNodeLabel() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("ParseNodeLabel() = %+v, want %+v", got, tt.want)
+			}
+			if !tt.wantErr && got.String() != tt.raw {
+				t.Errorf("NodeLabel.String() = %q, want %q", got.String(), tt.raw)
+			}
+		})
+	}
+
+	// The DRA eviction contract is opt-in (#2469): an unconfigured Config
+	// yields the zero label, which the bundler reads as "not requested".
+	if got := NewConfig().DRAEvictionNodeLabel(); got != (NodeLabel{}) {
+		t.Errorf("unconfigured DRA eviction label = %+v, want zero (opt-in)", got)
+	}
+	if got := NewConfig(WithDRAEvictionNodeLabel(NodeLabel{})).DRAEvictionNodeLabel(); got != (NodeLabel{}) {
+		t.Errorf("zero DRA eviction label should stay unset: got %+v, want zero", got)
+	}
+	want := DefaultDRAEvictionNodeLabel()
+	if got := NewConfig(WithDRAEvictionNodeLabel(want)).DRAEvictionNodeLabel(); got != want {
+		t.Errorf("configured DRA eviction label = %+v, want %+v", got, want)
+	}
+	// The documented default is still what the opt-in uses when a caller asks
+	// for it by name.
+	if want.Key != defaults.DRAEvictionNodeLabelKey || want.Value != defaults.DRAEvictionNodeLabelValue {
+		t.Errorf("DefaultDRAEvictionNodeLabel() = %+v, want %s=%s",
+			want, defaults.DRAEvictionNodeLabelKey, defaults.DRAEvictionNodeLabelValue)
+	}
+}
+
+func TestNewConfigWithOptions(t *testing.T) {
+	cfg := NewConfig(
+		WithIncludeReadme(false),
+		WithIncludeChecksums(false),
+		WithVerbose(true),
+	)
+
+	// Verify all options were applied
+	if cfg.IncludeReadme() {
+		t.Error("IncludeReadme() = true, want false")
+	}
+	if cfg.IncludeReadme() {
+		t.Error("IncludeReadme() = true, want false")
+	}
+	if cfg.IncludeChecksums() {
+		t.Error("IncludeChecksums() = true, want false")
+	}
+	if !cfg.Verbose() {
+		t.Error("Verbose() = false, want true")
+	}
+}
+
+func TestAllGetters(t *testing.T) {
+	cfg := NewConfig(
+		WithIncludeReadme(true),
+		WithIncludeChecksums(false),
+		WithVerbose(true),
+	)
+
+	tests := []struct {
+		name     string
+		got      any
+		want     any
+		getterFn string
+	}{
+		{"IncludeReadme", cfg.IncludeReadme(), true, "IncludeReadme()"},
+		{"IncludeChecksums", cfg.IncludeChecksums(), false, "IncludeChecksums()"},
+		{"Verbose", cfg.Verbose(), true, "Verbose()"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("%s = %v, want %v", tt.getterFn, tt.got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVersionOption(t *testing.T) {
+	// Test WithVersion sets the version
+	cfg := NewConfig(WithVersion("v1.2.3"))
+	if cfg.Version() != "v1.2.3" {
+		t.Errorf("Version() = %s, want v1.2.3", cfg.Version())
+	}
+
+	// Test default version
+	cfgDefault := NewConfig()
+	if cfgDefault.Version() != "dev" {
+		t.Errorf("default Version() = %s, want dev", cfgDefault.Version())
+	}
+}
+
+func TestValueOverridesOption(t *testing.T) {
+	overrides := map[string]map[string]string{
+		"gpuoperator": {
+			"gds.enabled":    "true",
+			"driver.version": "570.86.16",
+		},
+		"networkoperator": {
+			"rdma.enabled": "true",
+		},
+	}
+
+	cfg := NewConfig(WithValueOverrides(overrides))
+
+	// Verify overrides were set
+	got := cfg.ValueOverrides()
+	if got == nil {
+		t.Fatal("ValueOverrides() returned nil")
+	}
+
+	// Verify gpuoperator overrides
+	if got["gpuoperator"]["gds.enabled"] != testValueTrue {
+		t.Errorf("gpuoperator gds.enabled = %s, want true", got["gpuoperator"]["gds.enabled"])
+	}
+	if got["gpuoperator"]["driver.version"] != "570.86.16" {
+		t.Errorf("gpuoperator driver.version = %s, want 570.86.16", got["gpuoperator"]["driver.version"])
+	}
+
+	// Verify networkoperator overrides
+	if got["networkoperator"]["rdma.enabled"] != testValueTrue {
+		t.Errorf("networkoperator rdma.enabled = %s, want true", got["networkoperator"]["rdma.enabled"])
+	}
+}
+
+func TestValueOverridesImmutability(t *testing.T) {
+	overrides := map[string]map[string]string{
+		"gpuoperator": {"key": "value"},
+	}
+
+	cfg := NewConfig(WithValueOverrides(overrides))
+
+	// Get and modify returned map
+	got := cfg.ValueOverrides()
+	got["gpuoperator"]["key"] = testValueModified
+	got["gpuoperator"]["new"] = testValueAdded
+
+	// Verify original config unchanged
+	fresh := cfg.ValueOverrides()
+	if fresh["gpuoperator"]["key"] != "value" {
+		t.Error("modifying returned map affected config - not immutable")
+	}
+	if _, exists := fresh["gpuoperator"]["new"]; exists {
+		t.Error("adding key to returned map affected config - not immutable")
+	}
+}
+
+func TestValueOverridesNil(t *testing.T) {
+	// WithValueOverrides with nil should not panic
+	cfg := NewConfig(WithValueOverrides(nil))
+
+	// ValueOverrides on empty config should return nil
+	got := cfg.ValueOverrides()
+	if len(got) > 0 {
+		t.Errorf("ValueOverrides() = %v, want nil or empty", got)
+	}
+}
+
+func TestNodeSelectorOptions(t *testing.T) {
+	t.Run("SystemNodeSelector with valid values", func(t *testing.T) {
+		selectors := map[string]string{
+			"nodeGroup":        "system-pool",
+			"kubernetes.io/os": "linux",
+		}
+		cfg := NewConfig(WithSystemNodeSelector(selectors))
+
+		got := cfg.SystemNodeSelector()
+		if got == nil {
+			t.Fatal("SystemNodeSelector() returned nil")
+		}
+		if got["nodeGroup"] != "system-pool" {
+			t.Errorf("SystemNodeSelector()[nodeGroup] = %s, want system-pool", got["nodeGroup"])
+		}
+		if got["kubernetes.io/os"] != "linux" {
+			t.Errorf("SystemNodeSelector()[kubernetes.io/os] = %s, want linux", got["kubernetes.io/os"])
+		}
+	})
+
+	t.Run("SystemNodeSelector with nil input", func(t *testing.T) {
+		cfg := NewConfig(WithSystemNodeSelector(nil))
+		got := cfg.SystemNodeSelector()
+		if got != nil {
+			t.Errorf("SystemNodeSelector() = %v, want nil for nil input", got)
+		}
+	})
+
+	t.Run("SystemNodeSelector returns nil for nil config", func(t *testing.T) {
+		cfg := NewConfig()
+		got := cfg.SystemNodeSelector()
+		if got != nil {
+			t.Errorf("SystemNodeSelector() = %v, want nil", got)
+		}
+	})
+
+	t.Run("SystemNodeSelector immutability", func(t *testing.T) {
+		selectors := map[string]string{"key": "value"}
+		cfg := NewConfig(WithSystemNodeSelector(selectors))
+
+		got := cfg.SystemNodeSelector()
+		got["key"] = testValueModified
+		got["new"] = testValueAdded
+
+		fresh := cfg.SystemNodeSelector()
+		if fresh["key"] != "value" {
+			t.Error("modifying returned map affected config - not immutable")
+		}
+		if _, exists := fresh["new"]; exists {
+			t.Error("adding key to returned map affected config - not immutable")
+		}
+	})
+
+	t.Run("AcceleratedNodeSelector with valid values", func(t *testing.T) {
+		selectors := map[string]string{
+			"nvidia.com/gpu.present": "true",
+			"accelerator":            "nvidia-gb200",
+		}
+		cfg := NewConfig(WithAcceleratedNodeSelector(selectors))
+
+		got := cfg.AcceleratedNodeSelector()
+		if got == nil {
+			t.Fatal("AcceleratedNodeSelector() returned nil")
+		}
+		if got["nvidia.com/gpu.present"] != testValueTrue {
+			t.Errorf("AcceleratedNodeSelector()[nvidia.com/gpu.present] = %s, want true", got["nvidia.com/gpu.present"])
+		}
+	})
+
+	t.Run("AcceleratedNodeSelector with nil input", func(t *testing.T) {
+		cfg := NewConfig(WithAcceleratedNodeSelector(nil))
+		got := cfg.AcceleratedNodeSelector()
+		if got != nil {
+			t.Errorf("AcceleratedNodeSelector() = %v, want nil for nil input", got)
+		}
+	})
+
+	t.Run("AcceleratedNodeSelector returns nil for nil config", func(t *testing.T) {
+		cfg := NewConfig()
+		got := cfg.AcceleratedNodeSelector()
+		if got != nil {
+			t.Errorf("AcceleratedNodeSelector() = %v, want nil", got)
+		}
+	})
+
+	t.Run("EstimatedNodeCount default zero", func(t *testing.T) {
+		cfg := NewConfig()
+		if got := cfg.EstimatedNodeCount(); got != 0 {
+			t.Errorf("EstimatedNodeCount() = %d, want 0", got)
+		}
+	})
+
+	t.Run("EstimatedNodeCount with value", func(t *testing.T) {
+		cfg := NewConfig(WithEstimatedNodeCount(8))
+		if got := cfg.EstimatedNodeCount(); got != 8 {
+			t.Errorf("EstimatedNodeCount() = %d, want 8", got)
+		}
+	})
+
+	t.Run("EstimatedNodeCount negative clamped to zero", func(t *testing.T) {
+		cfg := NewConfig(WithEstimatedNodeCount(-1))
+		if got := cfg.EstimatedNodeCount(); got != 0 {
+			t.Errorf("EstimatedNodeCount() = %d, want 0 (negative clamped)", got)
+		}
+	})
+}
+
+func TestNodeTolerationOptions(t *testing.T) {
+	t.Run("SystemNodeTolerations with valid values", func(t *testing.T) {
+		tolerations := []corev1.Toleration{
+			{Key: "dedicated", Value: "system", Effect: corev1.TaintEffectNoSchedule},
+		}
+		cfg := NewConfig(WithSystemNodeTolerations(tolerations))
+
+		got := cfg.SystemNodeTolerations()
+		if got == nil {
+			t.Fatal("SystemNodeTolerations() returned nil")
+		}
+		if len(got) != 1 {
+			t.Fatalf("SystemNodeTolerations() len = %d, want 1", len(got))
+		}
+		if got[0].Key != "dedicated" {
+			t.Errorf("SystemNodeTolerations()[0].Key = %s, want dedicated", got[0].Key)
+		}
+	})
+
+	t.Run("SystemNodeTolerations with nil input", func(t *testing.T) {
+		cfg := NewConfig(WithSystemNodeTolerations(nil))
+		got := cfg.SystemNodeTolerations()
+		if got != nil {
+			t.Errorf("SystemNodeTolerations() = %v, want nil for nil input", got)
+		}
+	})
+
+	t.Run("SystemNodeTolerations returns nil for nil config", func(t *testing.T) {
+		cfg := NewConfig()
+		got := cfg.SystemNodeTolerations()
+		if got != nil {
+			t.Errorf("SystemNodeTolerations() = %v, want nil", got)
+		}
+	})
+
+	t.Run("AcceleratedNodeTolerations with valid values", func(t *testing.T) {
+		tolerations := []corev1.Toleration{
+			{Key: "nvidia.com/gpu", Value: "present", Effect: corev1.TaintEffectNoSchedule},
+		}
+		cfg := NewConfig(WithAcceleratedNodeTolerations(tolerations))
+
+		got := cfg.AcceleratedNodeTolerations()
+		if got == nil {
+			t.Fatal("AcceleratedNodeTolerations() returned nil")
+		}
+		if len(got) != 1 {
+			t.Fatalf("AcceleratedNodeTolerations() len = %d, want 1", len(got))
+		}
+		if got[0].Key != "nvidia.com/gpu" {
+			t.Errorf("AcceleratedNodeTolerations()[0].Key = %s, want nvidia.com/gpu", got[0].Key)
+		}
+	})
+
+	t.Run("AcceleratedNodeTolerations with nil input", func(t *testing.T) {
+		cfg := NewConfig(WithAcceleratedNodeTolerations(nil))
+		got := cfg.AcceleratedNodeTolerations()
+		if got != nil {
+			t.Errorf("AcceleratedNodeTolerations() = %v, want nil for nil input", got)
+		}
+	})
+
+	t.Run("AcceleratedNodeTolerations returns nil for nil config", func(t *testing.T) {
+		cfg := NewConfig()
+		got := cfg.AcceleratedNodeTolerations()
+		if got != nil {
+			t.Errorf("AcceleratedNodeTolerations() = %v, want nil", got)
+		}
+	})
+}
+
+func TestDeployerOptions(t *testing.T) {
+	t.Run("default deployer is helm", func(t *testing.T) {
+		cfg := NewConfig()
+		if cfg.Deployer() != DeployerHelm {
+			t.Errorf("Deployer() = %s, want %s", cfg.Deployer(), DeployerHelm)
+		}
+	})
+
+	t.Run("WithDeployer sets argocd", func(t *testing.T) {
+		cfg := NewConfig(WithDeployer(DeployerArgoCD))
+		if cfg.Deployer() != DeployerArgoCD {
+			t.Errorf("Deployer() = %s, want %s", cfg.Deployer(), DeployerArgoCD)
+		}
+	})
+
+	t.Run("WithRepoURL sets repository URL", func(t *testing.T) {
+		cfg := NewConfig(WithRepoURL("https://github.com/org/repo.git"))
+		if cfg.RepoURL() != "https://github.com/org/repo.git" {
+			t.Errorf("RepoURL() = %s, want https://github.com/org/repo.git", cfg.RepoURL())
+		}
+	})
+
+	t.Run("default RepoURL is empty", func(t *testing.T) {
+		cfg := NewConfig()
+		if cfg.RepoURL() != "" {
+			t.Errorf("RepoURL() = %s, want empty string", cfg.RepoURL())
+		}
+	})
+
+	t.Run("WithTargetRevision sets target revision", func(t *testing.T) {
+		cfg := NewConfig(WithTargetRevision("v1.0.0"))
+		if cfg.TargetRevision() != "v1.0.0" {
+			t.Errorf("TargetRevision() = %s, want v1.0.0", cfg.TargetRevision())
+		}
+	})
+
+	t.Run("default TargetRevision is empty", func(t *testing.T) {
+		cfg := NewConfig()
+		if cfg.TargetRevision() != "" {
+			t.Errorf("TargetRevision() = %s, want empty string", cfg.TargetRevision())
+		}
+	})
+}
+
+func TestParseValueOverrides(t *testing.T) {
+	// lookup returns the value of the first entry matching component+path, or "" if absent.
+	lookup := func(cps []ComponentPath, component, path string) string {
+		for _, cp := range cps {
+			if cp.Component == component && cp.Path == path && cp.Value != nil {
+				return *cp.Value
+			}
+		}
+		return ""
+	}
+
+	t.Run("valid single override", func(t *testing.T) {
+		result, err := ParseValueOverrides([]string{"gpuoperator:gds.enabled=true"})
+		if err != nil {
+			t.Fatalf("ParseValueOverrides() error = %v", err)
+		}
+		if got := lookup(result, "gpuoperator", "gds.enabled"); got != testValueTrue {
+			t.Errorf("gpuoperator:gds.enabled = %q, want true", got)
+		}
+	})
+
+	t.Run("valid multiple overrides same bundler", func(t *testing.T) {
+		result, err := ParseValueOverrides([]string{
+			"gpuoperator:gds.enabled=true",
+			"gpuoperator:driver.version=570.86.16",
+		})
+		if err != nil {
+			t.Fatalf("ParseValueOverrides() error = %v", err)
+		}
+		if got := lookup(result, "gpuoperator", "gds.enabled"); got != testValueTrue {
+			t.Errorf("gpuoperator:gds.enabled = %q, want true", got)
+		}
+		if got := lookup(result, "gpuoperator", "driver.version"); got != "570.86.16" {
+			t.Errorf("gpuoperator:driver.version = %q, want 570.86.16", got)
+		}
+	})
+
+	t.Run("valid multiple bundlers", func(t *testing.T) {
+		result, err := ParseValueOverrides([]string{
+			"gpuoperator:gds.enabled=true",
+			"networkoperator:rdma.enabled=false",
+		})
+		if err != nil {
+			t.Fatalf("ParseValueOverrides() error = %v", err)
+		}
+		if got := lookup(result, "gpuoperator", "gds.enabled"); got != testValueTrue {
+			t.Errorf("gpuoperator:gds.enabled = %q, want true", got)
+		}
+		if got := lookup(result, "networkoperator", "rdma.enabled"); got != "false" {
+			t.Errorf("networkoperator:rdma.enabled = %q, want false", got)
+		}
+	})
+
+	t.Run("empty input", func(t *testing.T) {
+		result, err := ParseValueOverrides([]string{})
+		if err != nil {
+			t.Fatalf("ParseValueOverrides() error = %v", err)
+		}
+		if len(result) != 0 {
+			t.Errorf("ParseValueOverrides([]) len = %d, want 0", len(result))
+		}
+	})
+
+	t.Run("missing colon separator", func(t *testing.T) {
+		_, err := ParseValueOverrides([]string{"invalid-no-colon"})
+		if err == nil {
+			t.Error("ParseValueOverrides() expected error for missing colon, got nil")
+		}
+	})
+
+	t.Run("missing equals sign", func(t *testing.T) {
+		_, err := ParseValueOverrides([]string{"bundler:path-no-equals"})
+		if err == nil {
+			t.Error("ParseValueOverrides() expected error for missing equals, got nil")
+		}
+	})
+
+	t.Run("empty path", func(t *testing.T) {
+		_, err := ParseValueOverrides([]string{"bundler:=value"})
+		if err == nil {
+			t.Error("ParseValueOverrides() expected error for empty path, got nil")
+		}
+	})
+
+	t.Run("empty value", func(t *testing.T) {
+		_, err := ParseValueOverrides([]string{"bundler:path="})
+		if err == nil {
+			t.Error("ParseValueOverrides() expected error for empty value, got nil")
+		}
+	})
+
+	t.Run("value with equals sign", func(t *testing.T) {
+		result, err := ParseValueOverrides([]string{"bundler:path=value=with=equals"})
+		if err != nil {
+			t.Fatalf("ParseValueOverrides() error = %v", err)
+		}
+		if got := lookup(result, "bundler", "path"); got != "value=with=equals" {
+			t.Errorf("bundler:path = %q, want value=with=equals", got)
+		}
+	})
+
+	t.Run("value with spaces", func(t *testing.T) {
+		// safePathPattern applies only to path segments, not values.
+		// Values may contain spaces and other arbitrary characters.
+		result, err := ParseValueOverrides([]string{"gpuoperator:custom.label=hello world"})
+		if err != nil {
+			t.Fatalf("ParseValueOverrides() error = %v", err)
+		}
+		if got := lookup(result, "gpuoperator", "custom.label"); got != "hello world" {
+			t.Errorf("gpuoperator:custom.label = %q, want %q", got, "hello world")
+		}
+	})
+
+	t.Run("unsafe path segment rejected", func(t *testing.T) {
+		_, err := ParseValueOverrides([]string{"bundler:path.{{inject}}=x"})
+		if err == nil {
+			t.Error("ParseValueOverrides() expected error for unsafe path segment, got nil")
+		}
+	})
+
+	t.Run("helm-style array index rejected", func(t *testing.T) {
+		// Helm's `foo.bar[N].baz` list-indexing syntax is intentionally
+		// rejected at parse time. The downstream path walker in
+		// pkg/component/overrides.go (`getOrCreateNestedMap` / `setMapValueByPath`)
+		// splits on `.` only and treats `tolerations[2]` as a literal map key
+		// — so permitting the syntax here would silently produce bundles with
+		// a stringly-keyed `"tolerations[2]"` field instead of the indexed
+		// list element the user intended. Rejecting up front fails loudly.
+		tests := []struct {
+			name  string
+			input string
+		}{
+			{
+				name:  "tolerations index",
+				input: "networkoperator:operator.tolerations[2].key=aicr.run/kwok-test",
+			},
+			{
+				name:  "env index",
+				input: "gpuoperator:driver.env[3].name=CUDA_VISIBLE_DEVICES",
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				if _, err := ParseValueOverrides([]string{tt.input}); err == nil {
+					t.Errorf("ParseValueOverrides(%q) should have rejected Helm array index syntax — downstream walker can't interpret it", tt.input)
+				}
+			})
+		}
+	})
+}
+
+// TestWithDynamicValues verifies the functional option sets dynamic value paths
+// on the Config and that the getter returns a deep copy (mutations don't leak).
+func TestWithDynamicValues(t *testing.T) {
+	input := map[string][]string{
+		"alloy": {"clusterName", "subnetName"},
+	}
+	cfg := NewConfig(WithDynamicValues(input))
+
+	// HasDynamicValues should be true
+	if !cfg.HasDynamicValues() {
+		t.Error("HasDynamicValues() should be true after WithDynamicValues")
+	}
+
+	// DynamicValues should return a deep copy
+	got := cfg.DynamicValues()
+	if len(got["alloy"]) != 2 {
+		t.Fatalf("DynamicValues() returned %d paths, want 2", len(got["alloy"]))
+	}
+
+	// Mutating the returned copy should not affect the config
+	got["alloy"] = append(got["alloy"], "injected")
+	if len(cfg.DynamicValues()["alloy"]) != 2 {
+		t.Error("DynamicValues() should return independent copy; mutation leaked")
+	}
+}
+
+// TestWithDynamicValues_Nil verifies that nil input is a no-op.
+func TestWithDynamicValues_Nil(t *testing.T) {
+	cfg := NewConfig(WithDynamicValues(nil))
+	if cfg.HasDynamicValues() {
+		t.Error("HasDynamicValues() should be false for nil input")
+	}
+}
+
+// TestHasDynamicValues_Empty verifies default config has no dynamic values.
+func TestHasDynamicValues_Empty(t *testing.T) {
+	cfg := NewConfig()
+	if cfg.HasDynamicValues() {
+		t.Error("HasDynamicValues() should be false for default config")
+	}
+}
+
+// TestWithAppName verifies the AppName override flows to the getter and
+// that the default (empty) preserves the deployer's own fallback.
+func TestWithAppName(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []Option
+		want string
+	}{
+		{"default is empty (deployer applies its own default)", nil, ""},
+		{"explicit override", []Option{WithAppName("gpu-runtime")}, "gpu-runtime"},
+		{"empty override is observable as empty", []Option{WithAppName("")}, ""},
+		{"later option wins", []Option{WithAppName("first"), WithAppName("second")}, "second"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := NewConfig(tt.opts...)
+			if got := cfg.AppName(); got != tt.want {
+				t.Errorf("AppName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestValidateAppName covers DNS-1123 subdomain validation. Empty is a
+// valid signal meaning "use the deployer's default"; anything non-empty
+// must be a DNS-1123 subdomain so the rendered Argo Application passes
+// apiserver admission.
+func TestValidateAppName(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"empty is allowed (means use deployer default)", "", false},
+		{"valid single-label", "gpu-runtime", false},
+		{"valid multi-label subdomain", "gpu.runtime.example", false},
+		{"valid all lowercase digits", "bundle-2", false},
+		{"uppercase rejected", "GPU-Runtime", true},
+		{"underscore rejected", "gpu_runtime", true},
+		{"leading dash rejected", "-gpu", true},
+		{"trailing dash rejected", "gpu-", true},
+		{"empty label rejected", "gpu..runtime", true},
+		{"only-digits label allowed", "123", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateAppName(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateAppName(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateHTTPSURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"empty is allowed (means use default)", "", false},
+		{"valid https URL", "https://fulcio.internal.example.com", false},
+		{"valid https URL with port and path", "https://rekor.example.com:8443/api", false},
+		{"http scheme rejected", "http://fulcio.internal.example.com", true},
+		{"embedded credentials rejected", "https://user:pass@fulcio.internal.example.com", true},
+		{"missing scheme rejected", "fulcio.internal.example.com", true},
+		{"relative path rejected", "not-a-url", true},
+		{"scheme without host rejected", "https://", true},
+		{"port without hostname rejected", "https://:6443", true},
+		{"path without hostname rejected", "https:///path", true},
+		{"non-http scheme rejected", "ftp://example.com", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateHTTPSURL("fulcio URL", tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateHTTPSURL(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestWithBundleChartName verifies the override flows to BundleChartName,
+// that the default is empty (so the argocd-helm deployer falls back to
+// its own "aicr-bundle" default), and that the most-recent option wins
+// when both an explicit empty and a non-empty value are supplied.
+func TestWithBundleChartName(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []Option
+		want string
+	}{
+		{
+			name: "default is empty (deployer applies its own default)",
+			opts: nil,
+			want: "",
+		},
+		{
+			name: "explicit override",
+			opts: []Option{WithBundleChartName("my-custom-bundle")},
+			want: "my-custom-bundle",
+		},
+		{
+			name: "empty override is a no-op observable through getter",
+			opts: []Option{WithBundleChartName("")},
+			want: "",
+		},
+		{
+			name: "later option wins",
+			opts: []Option{WithBundleChartName("first"), WithBundleChartName("second")},
+			want: "second",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := NewConfig(tt.opts...)
+			if got := cfg.BundleChartName(); got != tt.want {
+				t.Errorf("BundleChartName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWithBundleChartVersion(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []Option
+		want string
+	}{
+		{name: "default is empty", want: ""},
+		{name: "explicit semantic version", opts: []Option{WithBundleChartVersion("1.2.3+build.5")}, want: "1.2.3+build.5"},
+		{name: "later option wins", opts: []Option{WithBundleChartVersion("1.0.0"), WithBundleChartVersion("2.0.0")}, want: "2.0.0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := NewConfig(tt.opts...)
+			if got := cfg.BundleChartVersion(); got != tt.want {
+				t.Errorf("BundleChartVersion() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseDynamicValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		inputs  []string
+		want    map[string][]string
+		wantErr bool
+	}{
+		{
+			name:   "single component single path",
+			inputs: []string{"alloy:clusterName"},
+			want:   map[string][]string{"alloy": {"clusterName"}},
+		},
+		{
+			name:   "single component multiple paths",
+			inputs: []string{"alloy:clusterName", "alloy:subnetName"},
+			want:   map[string][]string{"alloy": {"clusterName", "subnetName"}},
+		},
+		{
+			name:   "multiple components",
+			inputs: []string{"alloy:clusterName", "gpuoperator:driver.version"},
+			want:   map[string][]string{"alloy": {"clusterName"}, "gpuoperator": {"driver.version"}},
+		},
+		{
+			name:   "nested path",
+			inputs: []string{"gpuoperator:driver.version"},
+			want:   map[string][]string{"gpuoperator": {"driver.version"}},
+		},
+		{
+			name:    "missing colon",
+			inputs:  []string{"alloy-clusterName"},
+			wantErr: true,
+		},
+		{
+			name:    "empty component",
+			inputs:  []string{":clusterName"},
+			wantErr: true,
+		},
+		{
+			name:    "empty path",
+			inputs:  []string{"alloy:"},
+			wantErr: true,
+		},
+		{
+			name:   "empty input list",
+			inputs: []string{},
+			want:   map[string][]string{},
+		},
+		// Security: safePathPattern blocks dangerous path segments
+		{
+			name:    "template injection in path",
+			inputs:  []string{"gpuoperator:{{.Values.x}}"},
+			wantErr: true,
+		},
+		{
+			name:    "path traversal",
+			inputs:  []string{"gpuoperator:../../../etc/passwd"},
+			wantErr: true,
+		},
+		{
+			name:    "double dot segment",
+			inputs:  []string{"gpuoperator:foo..bar"},
+			wantErr: true,
+		},
+		{
+			name:    "space in path",
+			inputs:  []string{"gpuoperator:driver version"},
+			wantErr: true,
+		},
+		{
+			name:    "rejects =value",
+			inputs:  []string{"gpuoperator:driver.version=oops"},
+			wantErr: true,
+		},
+	}
+
+	// groupByComponent collapses the returned slice into a map[component][]paths
+	// for easy comparison against the map-shaped expectations.
+	groupByComponent := func(cps []ComponentPath) map[string][]string {
+		out := make(map[string][]string)
+		for _, cp := range cps {
+			if cp.Value != nil {
+				// ParseDynamicValues must not return entries with Value set.
+				panic("ParseDynamicValues returned an entry with Value != nil")
+			}
+			out[cp.Component] = append(out[cp.Component], cp.Path)
+		}
+		return out
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rawGot, err := ParseDynamicValues(tt.inputs)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseDynamicValues() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr {
+				return
+			}
+			got := groupByComponent(rawGot)
+			if len(got) != len(tt.want) {
+				t.Errorf("ParseDynamicValues() returned %d components, want %d", len(got), len(tt.want))
+				return
+			}
+			for component, wantPaths := range tt.want {
+				gotPaths, ok := got[component]
+				if !ok {
+					t.Errorf("ParseDynamicValues() missing component %q", component)
+					continue
+				}
+				if len(gotPaths) != len(wantPaths) {
+					t.Errorf("ParseDynamicValues() component %q has %d paths, want %d", component, len(gotPaths), len(wantPaths))
+					continue
+				}
+				for i, wantPath := range wantPaths {
+					if gotPaths[i] != wantPath {
+						t.Errorf("ParseDynamicValues() component %q path[%d] = %q, want %q", component, i, gotPaths[i], wantPath)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestParseDeployerType(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    DeployerType
+		wantErr bool
+	}{
+		{"helm lowercase", "helm", DeployerHelm, false},
+		{"helm uppercase", "HELM", DeployerHelm, false},
+		{"helm mixed case", "Helm", DeployerHelm, false},
+		{"argocd lowercase", "argocd", DeployerArgoCD, false},
+		{"argocd uppercase", "ARGOCD", DeployerArgoCD, false},
+		{"argocd mixed case", "ArgoCD", DeployerArgoCD, false},
+		{"helm with spaces", "  helm  ", DeployerHelm, false},
+		{"argocd-helm lowercase", "argocd-helm", DeployerArgoCDHelm, false},
+		{"argocd-helm uppercase", "ARGOCD-HELM", DeployerArgoCDHelm, false},
+		{"flux lowercase", "flux", DeployerFlux, false},
+		{"flux uppercase", "FLUX", DeployerFlux, false},
+		{"flux mixed case", "Flux", DeployerFlux, false},
+		{"flux with spaces", "  flux  ", DeployerFlux, false},
+		{"terraform lowercase", "terraform", DeployerTerraform, false},
+		{"terraform uppercase", "TERRAFORM", DeployerTerraform, false},
+		{"helmfile lowercase", "helmfile", DeployerHelmfile, false},
+		{"helmfile uppercase", "HELMFILE", DeployerHelmfile, false},
+		{"helmfile mixed case", "Helmfile", DeployerHelmfile, false},
+		{"helmfile with spaces", "  helmfile  ", DeployerHelmfile, false},
+		{"fleet lowercase", "fleet", DeployerFleet, false},
+		{"fleet uppercase", "FLEET", DeployerFleet, false},
+		{"invalid type", "invalid", "", true},
+		{"empty string", "", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseDeployerType(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseDeployerType(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("ParseDeployerType(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetDeployerTypes(t *testing.T) {
+	types := GetDeployerTypes()
+
+	// Verify we get the expected types (argocd, argocd-helm, fleet, flux, helm,
+	// helmfile, terraform)
+	if len(types) != 7 {
+		t.Errorf("GetDeployerTypes() returned %d types, want 7", len(types))
+	}
+
+	// Verify types are sorted alphabetically
+	for i := 1; i < len(types); i++ {
+		if types[i-1] > types[i] {
+			t.Errorf("GetDeployerTypes() not sorted: %v", types)
+			break
+		}
+	}
+
+	// Verify expected types are present
+	found := make(map[string]bool)
+	for _, dt := range types {
+		found[dt] = true
+	}
+	if !found[string(DeployerArgoCD)] {
+		t.Error("GetDeployerTypes() missing 'argocd'")
+	}
+	if !found[string(DeployerHelm)] {
+		t.Error("GetDeployerTypes() missing 'helm'")
+	}
+	if !found[string(DeployerFlux)] {
+		t.Error("GetDeployerTypes() missing 'flux'")
+	}
+	if !found[string(DeployerArgoCDHelm)] {
+		t.Error("GetDeployerTypes() missing 'argocd-helm'")
+	}
+	if !found[string(DeployerHelmfile)] {
+		t.Error("GetDeployerTypes() missing 'helmfile'")
+	}
+	if !found[string(DeployerFleet)] {
+		t.Error("GetDeployerTypes() missing 'fleet'")
+	}
+	if !found[string(DeployerTerraform)] {
+		t.Error("GetDeployerTypes() missing 'terraform'")
+	}
+}
+
+func TestDeployerTypeString(t *testing.T) {
+	tests := []struct {
+		dt   DeployerType
+		want string
+	}{
+		{DeployerHelm, "helm"},
+		{DeployerArgoCD, "argocd"},
+		{DeployerArgoCDHelm, "argocd-helm"},
+		{DeployerFlux, "flux"},
+		{DeployerHelmfile, "helmfile"},
+		{DeployerFleet, "fleet"},
+		{DeployerTerraform, "terraform"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := tt.dt.String(); got != tt.want {
+				t.Errorf("DeployerType.String() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorkloadGateTaintOptions(t *testing.T) {
+	t.Run("WithWorkloadGateTaint with valid taint", func(t *testing.T) {
+		taint := &corev1.Taint{
+			Key:    "skyhook.nvidia.com/runtime-required",
+			Value:  "true",
+			Effect: corev1.TaintEffectNoSchedule,
+		}
+		cfg := NewConfig(WithWorkloadGateTaint(taint))
+
+		got := cfg.WorkloadGateTaint()
+		if got == nil {
+			t.Fatal("WorkloadGateTaint() returned nil")
+		}
+		if got.Key != "skyhook.nvidia.com/runtime-required" {
+			t.Errorf("WorkloadGateTaint().Key = %s, want skyhook.nvidia.com/runtime-required", got.Key)
+		}
+		if got.Value != "true" {
+			t.Errorf("WorkloadGateTaint().Value = %s, want true", got.Value)
+		}
+		if got.Effect != corev1.TaintEffectNoSchedule {
+			t.Errorf("WorkloadGateTaint().Effect = %s, want NoSchedule", got.Effect)
+		}
+	})
+
+	t.Run("WithWorkloadGateTaint with nil input", func(t *testing.T) {
+		cfg := NewConfig(WithWorkloadGateTaint(nil))
+		got := cfg.WorkloadGateTaint()
+		if got != nil {
+			t.Errorf("WorkloadGateTaint() = %v, want nil for nil input", got)
+		}
+	})
+
+	t.Run("WorkloadGateTaint returns nil for default config", func(t *testing.T) {
+		cfg := NewConfig()
+		got := cfg.WorkloadGateTaint()
+		if got != nil {
+			t.Errorf("WorkloadGateTaint() = %v, want nil", got)
+		}
+	})
+
+	t.Run("WorkloadGateTaint with taint without value", func(t *testing.T) {
+		taint := &corev1.Taint{
+			Key:    "dedicated",
+			Effect: corev1.TaintEffectNoSchedule,
+		}
+		cfg := NewConfig(WithWorkloadGateTaint(taint))
+
+		got := cfg.WorkloadGateTaint()
+		if got == nil {
+			t.Fatal("WorkloadGateTaint() returned nil")
+		}
+		if got.Key != "dedicated" {
+			t.Errorf("WorkloadGateTaint().Key = %s, want dedicated", got.Key)
+		}
+		if got.Value != "" {
+			t.Errorf("WorkloadGateTaint().Value = %s, want empty", got.Value)
+		}
+	})
+}
+
+func TestWorkloadSelectorOptions(t *testing.T) {
+	t.Run("WithWorkloadSelector with valid selector", func(t *testing.T) {
+		selector := map[string]string{
+			"workload-type": "training",
+			"app":           "pytorch",
+		}
+		cfg := NewConfig(WithWorkloadSelector(selector))
+
+		got := cfg.WorkloadSelector()
+		if got == nil {
+			t.Fatal("WorkloadSelector() returned nil")
+		}
+		if got["workload-type"] != "training" {
+			t.Errorf("WorkloadSelector()[workload-type] = %s, want training", got["workload-type"])
+		}
+		if got["app"] != "pytorch" {
+			t.Errorf("WorkloadSelector()[app] = %s, want pytorch", got["app"])
+		}
+	})
+
+	t.Run("WithWorkloadSelector with nil input", func(t *testing.T) {
+		cfg := NewConfig(WithWorkloadSelector(nil))
+		got := cfg.WorkloadSelector()
+		if got != nil {
+			t.Errorf("WorkloadSelector() = %v, want nil for nil input", got)
+		}
+	})
+
+	t.Run("WorkloadSelector returns nil for default config", func(t *testing.T) {
+		cfg := NewConfig()
+		got := cfg.WorkloadSelector()
+		if got != nil {
+			t.Errorf("WorkloadSelector() = %v, want nil", got)
+		}
+	})
+
+	t.Run("WorkloadSelector immutability", func(t *testing.T) {
+		selector := map[string]string{"workload-type": "training"}
+		cfg := NewConfig(WithWorkloadSelector(selector))
+
+		got := cfg.WorkloadSelector()
+		got["workload-type"] = testValueModified
+		got["new"] = testValueAdded
+
+		fresh := cfg.WorkloadSelector()
+		if fresh["workload-type"] != "training" {
+			t.Error("modifying returned map affected config - not immutable")
+		}
+		if _, exists := fresh["new"]; exists {
+			t.Error("adding key to returned map affected config - not immutable")
+		}
+	})
+}
+
+func TestWithOCISourceName(t *testing.T) {
+	t.Run("set value", func(t *testing.T) {
+		cfg := NewConfig(WithOCISourceName("aicr-bundle"))
+		if cfg.OCISourceName() != "aicr-bundle" {
+			t.Errorf("OCISourceName() = %q, want %q", cfg.OCISourceName(), "aicr-bundle")
+		}
+	})
+
+	t.Run("default empty", func(t *testing.T) {
+		cfg := NewConfig()
+		if cfg.OCISourceName() != "" {
+			t.Errorf("default OCISourceName() = %q, want empty", cfg.OCISourceName())
+		}
+	})
+}
+
+func TestWithFluxNamespace(t *testing.T) {
+	t.Run("set value", func(t *testing.T) {
+		cfg := NewConfig(WithFluxNamespace("gitops"))
+		if cfg.FluxNamespace() != "gitops" {
+			t.Errorf("FluxNamespace() = %q, want %q", cfg.FluxNamespace(), "gitops")
+		}
+	})
+
+	t.Run("default", func(t *testing.T) {
+		cfg := NewConfig()
+		if cfg.FluxNamespace() != DefaultFluxNamespace {
+			t.Errorf("default FluxNamespace() = %q, want %q", cfg.FluxNamespace(), DefaultFluxNamespace)
+		}
+	})
+
+	t.Run("empty string returns default", func(t *testing.T) {
+		cfg := NewConfig(WithFluxNamespace(""))
+		if cfg.FluxNamespace() != DefaultFluxNamespace {
+			t.Errorf("FluxNamespace() with empty = %q, want %q", cfg.FluxNamespace(), DefaultFluxNamespace)
+		}
+	})
+}
+
+func TestWithBundlers(t *testing.T) {
+	t.Run("set names", func(t *testing.T) {
+		names := []string{"gpu-operator", "network-operator"}
+		cfg := NewConfig(WithBundlers(names))
+		got := cfg.Bundlers()
+		if len(got) != 2 || got[0] != "gpu-operator" || got[1] != "network-operator" {
+			t.Errorf("Bundlers() = %v, want %v", got, names)
+		}
+	})
+
+	t.Run("default is nil", func(t *testing.T) {
+		cfg := NewConfig()
+		if got := cfg.Bundlers(); got != nil {
+			t.Errorf("default Bundlers() = %v, want nil", got)
+		}
+	})
+
+	t.Run("empty slice means no filter", func(t *testing.T) {
+		cfg := NewConfig(WithBundlers([]string{}))
+		if got := cfg.Bundlers(); got != nil {
+			t.Errorf("Bundlers() with empty input = %v, want nil", got)
+		}
+	})
+
+	t.Run("input and output are defensively copied", func(t *testing.T) {
+		names := []string{"gpu-operator"}
+		cfg := NewConfig(WithBundlers(names))
+		names[0] = "mutated-input"
+		got := cfg.Bundlers()
+		if got[0] != "gpu-operator" {
+			t.Errorf("Bundlers()[0] = %q after input mutation, want %q", got[0], "gpu-operator")
+		}
+		got[0] = "mutated-output"
+		if again := cfg.Bundlers(); again[0] != "gpu-operator" {
+			t.Errorf("Bundlers()[0] = %q after output mutation, want %q", again[0], "gpu-operator")
+		}
+	})
+}
+
+func TestWithFleetNamespace(t *testing.T) {
+	t.Run("set value", func(t *testing.T) {
+		cfg := NewConfig(WithFleetNamespace("fleet-local"))
+		if cfg.FleetNamespace() != "fleet-local" {
+			t.Errorf("FleetNamespace() = %q, want %q", cfg.FleetNamespace(), "fleet-local")
+		}
+	})
+
+	t.Run("default", func(t *testing.T) {
+		cfg := NewConfig()
+		if cfg.FleetNamespace() != DefaultFleetNamespace {
+			t.Errorf("default FleetNamespace() = %q, want %q", cfg.FleetNamespace(), DefaultFleetNamespace)
+		}
+	})
+
+	t.Run("empty string returns default", func(t *testing.T) {
+		cfg := NewConfig(WithFleetNamespace(""))
+		if cfg.FleetNamespace() != DefaultFleetNamespace {
+			t.Errorf("FleetNamespace() with empty = %q, want %q", cfg.FleetNamespace(), DefaultFleetNamespace)
+		}
+	})
+}
+
+func TestParseFleetMode(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"", FleetModeGitRepo, false},
+		{"gitrepo", FleetModeGitRepo, false},
+		{" HelmOp ", FleetModeHelmOp, false},
+		{"bundle", "", true},
+	}
+	for _, tt := range tests {
+		got, err := ParseFleetMode(tt.in)
+		if (err != nil) != tt.wantErr || got != tt.want {
+			t.Errorf("ParseFleetMode(%q) = %q, %v; want %q, err=%v", tt.in, got, err, tt.want, tt.wantErr)
+		}
+	}
+}
+
+func TestValidateFleetName(t *testing.T) {
+	for _, ok := range []string{"aicr", "fleet-local", "team-a1"} {
+		if err := ValidateFleetName("name", ok); err != nil {
+			t.Errorf("ValidateFleetName(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "team.a", "Fleet", "has space"} {
+		if err := ValidateFleetName("name", bad); err == nil {
+			t.Errorf("ValidateFleetName(%q) = nil, want error", bad)
+		}
+	}
+}
+
+func TestConfigValidate_Split(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		opts    []Option
+		wantErr string
+	}{
+		{name: "split with defaults", opts: []Option{WithSplit(true)}},
+		{name: "split off ignores the matrix", opts: []Option{WithDeployer(DeployerFlux), WithIncludeChecksums(false), WithBundlers([]string{"nfd"})}},
+		{name: "split with a non-helm deployer", opts: []Option{WithSplit(true), WithDeployer(DeployerArgoCD)}, wantErr: "only the helm deployer"},
+		{name: "split without checksums", opts: []Option{WithSplit(true), WithIncludeChecksums(false)}, wantErr: "requires checksums"},
+		{name: "split with a component filter", opts: []Option{WithSplit(true), WithBundlers([]string{"nfd"})}, wantErr: "component filter"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := NewConfig(tt.opts...)
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}

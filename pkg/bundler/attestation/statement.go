@@ -1,0 +1,215 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package attestation
+
+import (
+	"fmt"
+	"time"
+
+	intoto "github.com/in-toto/attestation/go/v1"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/header"
+	"github.com/google/uuid"
+)
+
+// SLSA and in-toto constants.
+const (
+	SLSAProvenanceType = "https://slsa.dev/provenance/v1"
+	BundleBuildType    = "https://" + header.Domain + "/bundle/v1"
+
+	// CatalogBuildType is the SLSA buildType for recipe-catalog attestations.
+	CatalogBuildType = "https://" + header.Domain + "/recipe-catalog/v1"
+)
+
+// StatementMetadata provides build context for the SLSA predicate.
+type StatementMetadata struct {
+	// Recipe name that produced this bundle.
+	Recipe string
+
+	// RecipeSource indicates where the recipe came from ("embedded" or "external").
+	RecipeSource string
+
+	// Components lists the component names in the bundle.
+	Components []string
+
+	// OutputDir is the bundle output directory.
+	OutputDir string
+
+	// BuilderID identifies who created this bundle (e.g., OIDC email or workflow URI).
+	BuilderID string
+
+	// ToolVersion is the aicr version that produced this bundle (e.g., "v1.0.0").
+	ToolVersion string
+
+	// InvocationID overrides the auto-generated runDetails.metadata.invocationId.
+	// Leave empty for non-deterministic auto-generation.
+	InvocationID string
+
+	// StartedOn overrides the auto-generated runDetails.metadata.startedOn.
+	// Zero value means "use time.Now()" unless Deterministic is true.
+	StartedOn time.Time
+
+	// Deterministic, when true, derives invocationId via UUIDv5 from
+	// (Recipe, ToolVersion, BuilderID, subject digest) and omits startedOn.
+	// Required for SLSA-reproducible builds where two runs against
+	// identical inputs must produce byte-identical attestations.
+	Deterministic bool
+
+	// BuildType overrides the SLSA buildDefinition.buildType URI.
+	// Empty falls back to BundleBuildType ("https://aicr.run/bundle/v1").
+	BuildType string
+}
+
+// aicrBundleNamespace is the UUIDv5 namespace for deterministic
+// invocationId derivation, seeded from BundleBuildType so it tracks the
+// AICR domain. Deterministic IDs are stable for a given domain/inputs, but
+// the namespace ROTATED at the aicr.run migration: IDs minted before vs.
+// after differ for identical inputs.
+var aicrBundleNamespace = uuid.NewSHA1(uuid.NameSpaceURL, []byte(BundleBuildType))
+
+// BuildStatement constructs an in-toto Statement v1 with a SLSA Build Provenance v1
+// predicate. Returns the statement as serialized JSON.
+func BuildStatement(subject AttestSubject, metadata StatementMetadata) ([]byte, error) {
+	if subject.Name == "" || len(subject.Digest) == 0 {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "subject name and digest are required")
+	}
+	for algo, value := range subject.Digest {
+		if value == "" {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"empty digest value for algorithm "+algo)
+		}
+		if algo == "sha256" && len(value) != 64 {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("sha256 digest must be 64 hex characters, got %d", len(value)))
+		}
+	}
+
+	// Build SLSA predicate as a structpb.Struct
+	predicate, err := buildPredicate(subject, metadata)
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to build SLSA predicate", err)
+	}
+
+	// Construct the in-toto Statement using the official types
+	stmt := &intoto.Statement{
+		Type: intoto.StatementTypeUri,
+		Subject: []*intoto.ResourceDescriptor{
+			{
+				Name:   subject.Name,
+				Digest: subject.Digest,
+			},
+		},
+		PredicateType: SLSAProvenanceType,
+		Predicate:     predicate,
+	}
+
+	// Validate the statement against the in-toto spec
+	if err := stmt.Validate(); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "invalid in-toto statement", err)
+	}
+
+	return protojson.Marshal(stmt)
+}
+
+// buildPredicate constructs the SLSA Build Provenance v1 predicate.
+func buildPredicate(subject AttestSubject, metadata StatementMetadata) (*structpb.Struct, error) {
+	// Build resolvedDependencies as a list of maps
+	// Convert map[string]string to map[string]any for structpb compatibility
+	deps := make([]any, 0, len(subject.ResolvedDependencies))
+	for _, dep := range subject.ResolvedDependencies {
+		digestAny := make(map[string]any, len(dep.Digest))
+		for k, v := range dep.Digest {
+			digestAny[k] = v
+		}
+		deps = append(deps, map[string]any{
+			"uri":    dep.URI,
+			"digest": digestAny,
+		})
+	}
+
+	// Build components list as []any for structpb compatibility
+	components := make([]any, 0, len(metadata.Components))
+	for _, c := range metadata.Components {
+		components = append(components, c)
+	}
+
+	buildType := BundleBuildType
+	if metadata.BuildType != "" {
+		buildType = metadata.BuildType
+	}
+
+	predicateMap := map[string]any{
+		"buildDefinition": map[string]any{
+			"buildType": buildType,
+			"externalParameters": map[string]any{
+				"recipe":       metadata.Recipe,
+				"recipeSource": metadata.RecipeSource,
+			},
+			"internalParameters": map[string]any{
+				"components":  components,
+				"outputDir":   metadata.OutputDir,
+				"toolVersion": metadata.ToolVersion,
+			},
+			"resolvedDependencies": deps,
+		},
+		"runDetails": map[string]any{
+			"builder": map[string]any{
+				"id": metadata.BuilderID,
+			},
+			"metadata": runDetailsMetadata(subject, metadata),
+		},
+	}
+
+	return structpb.NewStruct(predicateMap)
+}
+
+// runDetailsMetadata builds the runDetails.metadata block. In deterministic
+// mode the invocationId is derived via UUIDv5 from stable identity inputs
+// (subject digest + recipe + tool version + builder) and startedOn is
+// omitted. Otherwise an explicit override is honored, falling back to a
+// random UUID and time.Now() for back-compat with non-reproducible builds.
+func runDetailsMetadata(subject AttestSubject, metadata StatementMetadata) map[string]any {
+	out := map[string]any{}
+
+	switch {
+	case metadata.Deterministic:
+		// Stable identity: subject sha256 digest dominates. Recipe, tool
+		// version, and builder discriminate parallel builds.
+		identity := fmt.Sprintf("%s|%s|%s|%s",
+			subject.Digest["sha256"],
+			metadata.Recipe,
+			metadata.ToolVersion,
+			metadata.BuilderID,
+		)
+		out["invocationId"] = uuid.NewSHA1(aicrBundleNamespace, []byte(identity)).String()
+		// Omit startedOn in deterministic mode.
+	default:
+		if metadata.InvocationID != "" {
+			out["invocationId"] = metadata.InvocationID
+		} else {
+			out["invocationId"] = uuid.New().String()
+		}
+		if !metadata.StartedOn.IsZero() {
+			out["startedOn"] = metadata.StartedOn.UTC().Format(time.RFC3339)
+		} else {
+			out["startedOn"] = time.Now().UTC().Format(time.RFC3339)
+		}
+	}
+
+	return out
+}

@@ -1,0 +1,544 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: UAT Nightly Batch
+
+# The night side of the day/night cycle (#1274, DC1 + DC5): on a nightly cron,
+# run the version matrix per reservation. For each reservation the controller
+# expands an ordered, time-boxed schedule — main first, then the previous N
+# stable releases in descending semver order (uat-broker schedule) — and runs
+# the cells SEQUENTIALLY, dispatching the shared uat-run.yaml per cell and
+# waiting for it before the next. Different reservations run in parallel
+# (independent hardware); uat-run.yaml's per-reservation lease serializes runs
+# that share a reservation. When the time-box closes, remaining cells are
+# dropped oldest-release-first (they are ordered oldest-last, so the controller
+# simply stops). Dispatch (not workflow_call) keeps uat-run.yaml top-level, so
+# its own lease + superseded observer apply and the reusable-nesting depth stays
+# at 3 (uat-run -> uat-{aws,gcp} -> evidence-ingest).
+#
+# aicr_version is threaded per cell; the release cells install the released
+# aicr + validator/agent images at that version (DC5), main builds from source.
+on:
+  schedule:
+    - cron: '0 4 * * *' # 04:00 UTC daily (evening in US Pacific); default branch only
+  workflow_dispatch:
+    inputs:
+      previous_n:
+        description: 'Previous stable releases below main to run per reservation (0 = main only).'
+        type: string
+        default: '1'
+      deadline_offset_hours:
+        description: 'Time-box: hours after batch start to stop dispatching cells. Secondary cap — the drive also refuses any cell that cannot finish before its own timeout (see max_cell_minutes).'
+        type: string
+        default: '5'
+      max_cell_minutes:
+        description: 'Wall-clock a dispatched cell may need. The drive stops dispatching once fewer minutes than this remain before its timeout, so the last cell finishes cleanly.'
+        type: string
+        default: '150'
+
+permissions:
+  contents: read
+
+# Serialize batch runs: a manual dispatch should not fan out a second batch
+# alongside the cron one. (The per-reservation leases in uat-run.yaml would
+# queue the duplicates anyway, but there is no reason to start them.)
+concurrency:
+  group: uat-nightly-batch
+  cancel-in-progress: false
+
+jobs:
+  # Enumerate reservation names from the registry into a JSON array for the
+  # matrix below — keeps the batch data-driven (no per-reservation YAML).
+  enumerate:
+    if: github.repository == 'nvidia/aicr'
+    runs-on: ubuntu-24.04
+    outputs:
+      reservations: ${{ steps.list.outputs.reservations }}
+      # Single batch-start timestamp shared by every matrix leg, so the time-box
+      # deadline is identical regardless of when each leg's runner starts.
+      batch_start: ${{ steps.list.outputs.batch_start }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Load versions
+        id: versions
+        uses: ./.github/actions/load-versions
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '${{ steps.versions.outputs.go }}'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+      - name: Enumerate reservations
+        id: list
+        run: |
+          set -euo pipefail
+          go build -o ./bin/uat-broker ./tools/uat-broker
+          mapfile -t names < <(./bin/uat-broker reservations --list)
+          if [ "${#names[@]}" -eq 0 ]; then
+            echo "::error::no reservations found in infra/uat/reservations.yaml"
+            exit 1
+          fi
+          json=$(printf '%s\n' "${names[@]}" | jq -R . | jq -cs .)
+          echo "reservations=${json}" >> "$GITHUB_OUTPUT"
+          echo "Reservations: ${json}"
+          # Capture the batch start once; every leg derives its deadline from this.
+          echo "batch_start=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+  # One matrix leg per reservation (parallel). Each leg drives its own version
+  # matrix sequentially. It only DISPATCHES uat-run.yaml (workflow_dispatch is
+  # exempt from the GITHUB_TOKEN recursion rule and always creates a run), so
+  # this job needs actions:write to dispatch + read to watch; the dispatched
+  # uat-run.yaml runs top-level with its own permissions.
+  drive:
+    needs: enumerate
+    runs-on: ubuntu-24.04
+    # The controller blocks on `gh run watch` per cell sequentially, so this job
+    # runs as long as the batch. GitHub hard-caps a hosted job at 6h; set an
+    # explicit timeout just under that so the job ends cleanly. The dispatch loop
+    # is budget-aware: it stops dispatching once fewer than `max_cell_minutes`
+    # remain before this timeout, so the last cell always finishes and the leg
+    # drops-oldest gracefully instead of being killed mid-cell (issue #1778).
+    # DRIVE_JOB_TIMEOUT_MINUTES in the run step below MUST equal this literal.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        reservation: ${{ fromJSON(needs.enumerate.outputs.reservations) }}
+    permissions:
+      contents: read  # checkout + build uat-broker
+      actions: write  # dispatch uat-run.yaml and watch the dispatched runs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # full tag history for `git tag` -> uat-broker schedule
+      - name: Load versions
+        id: versions
+        uses: ./.github/actions/load-versions
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '${{ steps.versions.outputs.go }}'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+      # Over-high floor check for tests/uat/compat.yaml (#2860). An over-high
+      # floor silently skips a good release cell, so it is the dangerous
+      # direction: prove each floor for THIS reservation's lane is at most the
+      # first release containing the commit that set it. git lives here, not in
+      # pkg/uatbroker (no git/network I/O): the blame + tag-contains results are
+      # handed to `uat-broker compat check` as data. A rejected or inconclusive
+      # floor is NOT honored — its min-release line goes to --ignore-floor-lines
+      # so the cell runs and shows its real color — and the drive step fails the
+      # leg at the end, after every cell has run. Never skips silently: a git or
+      # broker failure is inconclusive, not "no problem".
+      - name: Check harness-compat floors
+        id: compat
+        env:
+          RESERVATION: ${{ matrix.reservation }}
+          PREVIOUS_N: ${{ inputs.previous_n || '1' }}
+          COMPAT_FILE: tests/uat/compat.yaml
+        run: |
+          set -euo pipefail
+          if [[ ! "$PREVIOUS_N" =~ ^[0-9]+$ ]]; then
+            echo "::error::previous_n must be a non-negative integer; got '${PREVIOUS_N}'." >&2
+            exit 1
+          fi
+          go build -o ./bin/uat-broker ./tools/uat-broker
+          rejections="${RUNNER_TEMP}/compat-rejections.txt"
+          containing="${RUNNER_TEMP}/compat-containing.tsv"
+          : > "$rejections"
+          : > "$containing"
+          echo "rejections_file=${rejections}" >> "$GITHUB_OUTPUT"
+
+          ROW=$(./bin/uat-broker reservations --name "$RESERVATION")
+          CLOUD=$(sed -n 's/^cloud=//p' <<<"$ROW")
+          if [[ -z "$CLOUD" ]]; then
+            echo "::error::could not resolve cloud for ${RESERVATION} (key missing from broker output)" >&2
+            exit 1
+          fi
+
+          # Floor rows for this lane only: other lanes' floors are checked (and
+          # reported) by their own legs. TSV: line lane intent floor.
+          list=$(./bin/uat-broker compat list --file "$COMPAT_FILE")
+          mapfile -t lane_lines < <(awk -F'\t' -v l="$CLOUD" '$2 == l { print $1 }' <<<"$list" | sort -un)
+          if (( ${#lane_lines[@]} == 0 )); then
+            echo "No harness-compat floors for lane ${CLOUD}."
+            echo "ignore_lines=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Fail-closed git reads. A line whose blame or tag lookup fails is
+          # OMITTED from the containing file, which the broker reports as
+          # inconclusive; a line present with no tags means "no tag contains
+          # it" (a legitimate result, not an error).
+          declare -A git_failed=()
+          for n in "${lane_lines[@]}"; do
+            if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+              echo "::error::uat-broker compat list returned a non-numeric line '${n}'." >&2
+              exit 1
+            fi
+            if ! blame=$(git blame --porcelain -L "${n},${n}" -- "$COMPAT_FILE"); then
+              git_failed[$n]=1; continue
+            fi
+            sha=${blame%% *}
+            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ || "$sha" =~ ^0+$ ]]; then
+              git_failed[$n]=1; continue
+            fi
+            if ! tags=$(git tag -l --contains "$sha" 'v*'); then
+              git_failed[$n]=1; continue
+            fi
+            printf '%s' "$n" >> "$containing"
+            while IFS= read -r t; do
+              [[ -n "$t" ]] && printf '\t%s' "$t" >> "$containing"
+            done <<<"$tags"
+            printf '\n' >> "$containing"
+          done
+          for n in "${!git_failed[@]}"; do
+            echo "::warning::git blame/tag lookup failed for ${COMPAT_FILE}:${n}; treating that floor as inconclusive."
+          done
+
+          all_tags=$(git tag -l 'v*')
+          rc=0
+          problems=$(./bin/uat-broker compat check --file "$COMPAT_FILE" \
+            --containing "$containing" --previous-n "$PREVIOUS_N" <<<"$all_tags") || rc=$?
+          if (( rc != 0 )) || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$problems"; then
+            # The check itself failed: nothing about this lane's floors is
+            # proven, so honor none of them.
+            echo "::warning::uat-broker compat check failed (rc=${rc}); no ${CLOUD} floor is honored this run."
+            problems=$(printf '%s\n' "${lane_lines[@]}" | jq -R 'tonumber | {line: ., kind: "inconclusive", severity: "error",
+              message: "uat-broker compat check did not run to completion"}' | jq -cs .)
+          fi
+
+          declare -A in_lane=()
+          for n in "${lane_lines[@]}"; do in_lane[$n]=1; done
+          declare -A ignore=()
+          for n in "${!git_failed[@]}"; do ignore[$n]=1; done
+          # Inert rows are informational; every other kind (including any kind
+          # this workflow does not know) rejects the floor.
+          while IFS=$'\t' read -r line kind msg; do
+            [[ -n "${in_lane[$line]:-}" ]] || continue
+            msg=${msg//'%'/'%25'}
+            if [[ "$kind" == "inert" ]]; then
+              echo "::notice title=UAT compat floor inert::${COMPAT_FILE}:${line} (lane ${CLOUD}) ${msg}"
+              continue
+            fi
+            ignore[$line]=1
+            printf '%s:%s (lane %s) [%s] %s; cell NOT skipped.\n' "$COMPAT_FILE" "$line" "$CLOUD" "$kind" "$msg" >> "$rejections"
+          done < <(jq -r '.[] | [(.line | tostring), (.kind // "unknown"),
+              ((.message // "") | gsub("[\r\n\t]+"; " "))] | @tsv' <<<"$problems")
+          for n in "${!git_failed[@]}"; do
+            if ! grep -q "^${COMPAT_FILE}:${n} " "$rejections"; then
+              printf '%s:%s (lane %s) [inconclusive] git blame/tag lookup failed; cell NOT skipped.\n' "$COMPAT_FILE" "$n" "$CLOUD" >> "$rejections"
+            fi
+          done
+
+          ignore_lines=$(printf '%s\n' "${!ignore[@]}" | sed '/^$/d' | sort -n | paste -sd, -)
+          echo "ignore_lines=${ignore_lines}" >> "$GITHUB_OUTPUT"
+          if [[ -n "$ignore_lines" ]]; then
+            echo "Floor lines NOT honored for ${CLOUD}: ${ignore_lines}"
+          else
+            echo "All ${CLOUD} harness-compat floors verified."
+          fi
+      - name: Run version-matrix cells (sequential, time-boxed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          RESERVATION: ${{ matrix.reservation }}
+          PREVIOUS_N: ${{ inputs.previous_n || '1' }}
+          DEADLINE_OFFSET_HOURS: ${{ inputs.deadline_offset_hours || '5' }}
+          MAX_CELL_MINUTES: ${{ inputs.max_cell_minutes || '150' }}
+          # MUST equal the drive job's timeout-minutes literal above. Used to
+          # derive the budget-aware dispatch cutoff so the last cell finishes
+          # before GitHub kills this job (issue #1778).
+          DRIVE_JOB_TIMEOUT_MINUTES: '350'
+          BATCH_START: ${{ needs.enumerate.outputs.batch_start }}
+          COMPAT_FILE: tests/uat/compat.yaml
+          # From the compat step: min-release lines NOT honored (rejected or
+          # inconclusive floors) and the file of their ::error messages.
+          IGNORE_FLOOR_LINES: ${{ steps.compat.outputs.ignore_lines }}
+          COMPAT_REJECTIONS_FILE: ${{ steps.compat.outputs.rejections_file }}
+        run: |
+          set -euo pipefail
+          # Approximate this drive job's start (its timeout-minutes clock anchor).
+          # Captured at the top of the first substantive step; the checkout/setup
+          # steps before it already consumed a few minutes of the timeout budget,
+          # so the real GitHub kill is slightly EARLIER than DRIVE_START + timeout.
+          # SETUP_SLACK_MINUTES absorbs that skew (plus gh dispatch/watch latency)
+          # so the budget-aware cutoff holds even for a full-length cell. It must
+          # exceed this job's pre-`run` setup — a heavier-than-usual `fetch-depth:
+          # 0` checkout + setup-go — or the mid-cell kill this guards against
+          # returns; 10m gives ample margin over that few-minute setup. If setup
+          # ever grows past it, switch DRIVE_START to the job's exact start_at:
+          #   gh api "repos/${REPO}/actions/runs/${GITHUB_RUN_ID}/jobs" \
+          #     --jq '.jobs[] | select(.name|endswith("('"${RESERVATION}"')")) | .started_at'
+          # (leaving the slack to cover only dispatch/watch latency).
+          DRIVE_START=$(date +%s)
+          SETUP_SLACK_MINUTES=10
+          # Poll budget for finding a dispatched run (gh workflow run returns no
+          # run id): POLL_MAX_ATTEMPTS x POLL_INTERVAL_SECONDS seconds.
+          POLL_MAX_ATTEMPTS=24
+          POLL_INTERVAL_SECONDS=5
+          go build -o ./bin/uat-broker ./tools/uat-broker
+
+          # Nightly intents for this reservation (#1276, DC3). The batch runs
+          # EACH listed intent (training and/or inference) as its own full CUJ
+          # cell per version, dispatched SEQUENTIALLY through the shared
+          # per-reservation lease — so both intents run nightly with no
+          # contention and no second cron. The broker resolves an ABSENT
+          # nightly-intents to the training default; an EXPLICIT empty list is
+          # a bring-up opt-out (manual dispatch only) and resolves to an empty
+          # value. Distinguish the two failure shapes: a MISSING key is a
+          # broker/registry regression (fail closed); a present-but-EMPTY
+          # value is the opt-out (skip this leg gracefully).
+          ROW=$(./bin/uat-broker reservations --name "$RESERVATION")
+          if ! grep -q '^nightly-intents=' <<<"$ROW"; then
+            echo "::error::could not resolve nightly-intents for ${RESERVATION} (key missing from broker output)" >&2
+            exit 1
+          fi
+          NIGHTLY_INTENTS_CSV=$(sed -n 's/^nightly-intents=//p' <<<"$ROW")
+          if [[ -z "$NIGHTLY_INTENTS_CSV" ]]; then
+            echo "::notice::Reservation ${RESERVATION} opts out of the nightly batch (nightly-intents: []); skipping this leg."
+            exit 0
+          fi
+          # The actual per-cell intents come from the schedule below, which
+          # applies the lane's tests/uat/compat.yaml floors per version; this
+          # line is just the leg-level summary of what's enrolled.
+          echo "Nightly intents for ${RESERVATION}: ${NIGHTLY_INTENTS_CSV} (release cells further gated by ${COMPAT_FILE})"
+
+          # Validate previous_n before the broker consumes it. `--previous-n` is
+          # an int flag so it rejects non-integers, but it would accept a
+          # negative and mis-shape the schedule; reject non-integer or negative
+          # values here too, symmetric with the deadline_offset_hours guard.
+          if [[ ! "$PREVIOUS_N" =~ ^[0-9]+$ ]]; then
+            echo "::error::previous_n must be a non-negative integer; got '${PREVIOUS_N}'." >&2
+            exit 1
+          fi
+
+          if [[ -n "$IGNORE_FLOOR_LINES" && ! "$IGNORE_FLOOR_LINES" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+            echo "::error::malformed ignore_lines from the compat step: '${IGNORE_FLOOR_LINES}'." >&2
+            exit 1
+          fi
+
+          # Ordered cells for this reservation: main first, then the previous-N
+          # stable releases in descending semver order (oldest last). Release
+          # cells carry only the intents at or above the lane's compat floor;
+          # each gated (version x intent) is reported in the cell's .skipped[].
+          schedule_args=(--reservations "$RESERVATION" --previous-n "$PREVIOUS_N" --compat "$COMPAT_FILE")
+          if [[ -n "$IGNORE_FLOOR_LINES" ]]; then
+            schedule_args+=(--ignore-floor-lines "$IGNORE_FLOOR_LINES")
+          fi
+          schedule=$(git tag -l 'v*' | ./bin/uat-broker schedule "${schedule_args[@]}")
+          mapfile -t versions < <(jq -r --arg r "$RESERVATION" '.[$r][].aicr_version' <<<"$schedule")
+          echo "Cells for ${RESERVATION}: ${versions[*]:-<none>}"
+
+          # One notice per skipped (version x intent), emitted up front so a
+          # time-box cutoff cannot hide one. Fields come from the repo, not
+          # untrusted input, but are single-lined, truncated, and %-escaped so
+          # the workflow command stays intact.
+          mapfile -t skipped_rows < <(jq -r --arg r "$RESERVATION" '
+            def clean: tostring | gsub("[\r\n\t]+"; " ");
+            .[$r][] | .aicr_version as $v | (.skipped // [])[]
+            | [($v | clean), (.intent | clean), (.floor | clean), (.lane | clean), (.reason | clean | .[0:200])]
+            | @tsv' <<<"$schedule")
+          if (( ${#skipped_rows[@]} > 0 )); then
+            {
+              echo "### Release cells skipped by harness-compat floor"
+              echo
+              echo "| Reservation | Version | Intent | Floor | Reason |"
+              echo "|---|---|---|---|---|"
+            } >> "$GITHUB_STEP_SUMMARY"
+            for row in "${skipped_rows[@]}"; do
+              IFS=$'\t' read -r s_ver s_intent s_floor s_lane s_reason <<<"$row"
+              reason_cmd=${s_reason//'%'/'%25'}
+              skip_msg="${RESERVATION} ${s_intent} @ ${s_ver} skipped: ${COMPAT_FILE} requires >= ${s_floor} for lane ${s_lane} (${reason_cmd})."
+              echo "::notice title=UAT release cell skipped (compat floor)::${skip_msg} main still runs this intent."
+              echo "| ${RESERVATION} | ${s_ver} | ${s_intent} | ${s_floor} | ${s_reason//|/\\|} |" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+
+          # Reject a non-integer / negative deadline_offset_hours before the
+          # arithmetic below — workflow_dispatch passes it as a free-form string
+          # and Bash would silently accept e.g. -1, moving the cutoff before
+          # batch start and dropping every cell immediately.
+          if [[ ! "$DEADLINE_OFFSET_HOURS" =~ ^[0-9]+$ ]]; then
+            echo "::error::deadline_offset_hours must be a non-negative integer; got '${DEADLINE_OFFSET_HOURS}'." >&2
+            exit 1
+          fi
+          # Same guard for max_cell_minutes (free-form workflow_dispatch string):
+          # a non-integer or 0 would mis-shape the budget-aware cutoff below.
+          if [[ ! "$MAX_CELL_MINUTES" =~ ^[0-9]+$ || "$MAX_CELL_MINUTES" -eq 0 ]]; then
+            echo "::error::max_cell_minutes must be a positive integer; got '${MAX_CELL_MINUTES}'." >&2
+            exit 1
+          fi
+          # A cell reserve that leaves no room before the drive-job timeout would
+          # drop every cell immediately (an empty, silently-green batch). Reject
+          # it: the operator must lower max_cell_minutes or the job needs a longer
+          # timeout-minutes (bounded by GitHub's 6h hosted-job cap).
+          if (( MAX_CELL_MINUTES + SETUP_SLACK_MINUTES >= DRIVE_JOB_TIMEOUT_MINUTES )); then
+            echo "::error::max_cell_minutes+slack (${MAX_CELL_MINUTES}+${SETUP_SLACK_MINUTES}) must be < drive-job timeout (${DRIVE_JOB_TIMEOUT_MINUTES}m); no cell could dispatch." >&2
+            exit 1
+          fi
+
+          # Effective dispatch cutoff = the EARLIER of two deadlines:
+          #   (1) the user time-box, anchored to the single batch-start timestamp
+          #       (captured once in enumerate) so every reservation leg shares one
+          #       cutoff regardless of when its runner started; and
+          #   (2) the budget-aware cutoff: stop dispatching once fewer than
+          #       MAX_CELL_MINUTES remain before THIS drive job's own
+          #       timeout-minutes kill (anchored to DRIVE_START). This guarantees
+          #       the last cell dispatched has a full cell budget to finish before
+          #       GitHub cancels the job, so an overrun sheds the oldest remaining
+          #       cell gracefully instead of hard-failing the leg mid-cell (#1778).
+          # (2) is per-leg (DRIVE_START differs across matrix legs); (1) is shared.
+          offset_deadline=$(( BATCH_START + DEADLINE_OFFSET_HOURS * 3600 ))
+          budget_deadline=$(( DRIVE_START + (DRIVE_JOB_TIMEOUT_MINUTES - MAX_CELL_MINUTES - SETUP_SLACK_MINUTES) * 60 ))
+          deadline=$(( offset_deadline < budget_deadline ? offset_deadline : budget_deadline ))
+          if (( budget_deadline < offset_deadline )); then
+            echo "Dispatch cutoff: budget-aware (${MAX_CELL_MINUTES}m cell reserve before the ${DRIVE_JOB_TIMEOUT_MINUTES}m drive-job timeout), $(( (deadline - DRIVE_START) / 60 ))m into this leg."
+          else
+            echo "Dispatch cutoff: user time-box (deadline_offset_hours=${DEADLINE_OFFSET_HOURS}), $(( (deadline - BATCH_START) / 60 ))m after batch start."
+          fi
+          cell=0
+          leg_failed=""
+          # Version outer-loop, intent inner-loop: `main` runs every intent
+          # before any release cell, so a time-box drop always sheds the OLDEST
+          # release cells first — never main's inference. Each (version × intent)
+          # is a full provision→CUJ→teardown dispatched through the shared lease,
+          # so the intents serialize automatically (no contention).
+          #
+          # Intents are per-CELL: the schedule already applied the lane's
+          # tests/uat/compat.yaml floors, so a release below an intent's floor
+          # carries a shorter (or empty) .intents list and that (version ×
+          # intent) never dispatches (its .skipped[] notice is printed above);
+          # `main` always carries every listed intent.
+          for ver in "${versions[@]}"; do
+            mapfile -t cell_intents < <(jq -r --arg r "$RESERVATION" --arg v "$ver" \
+              '.[$r][] | select(.aicr_version == $v) | .intents[]' <<<"$schedule")
+            # A fully-gated release cell (no eligible intents) contributes
+            # nothing — skip it without consuming the time-box or cell counter,
+            # but say so: the per-intent skip notices above name the floors.
+            if (( ${#cell_intents[@]} == 0 )); then
+              gated_msg="${RESERVATION} @ ${ver:-main}: no nightly intent is at or above its ${COMPAT_FILE} floor"
+              echo "::notice title=UAT release cell fully gated (compat floor)::${gated_msg}; nothing dispatched for this release."
+              continue
+            fi
+            for intent in "${cell_intents[@]}"; do
+              if (( $(date +%s) >= deadline )); then
+                echo "::notice::Dispatch cutoff reached (time-box or drive-job budget) — dropping remaining cells for ${RESERVATION} (oldest release first)."
+                break 2
+              fi
+              cell=$((cell + 1))
+              label="${ver:-main}"
+              # Unique per-dispatch key (controller run id + attempt + reservation
+              # + cell index) so the resolver below watches THIS run and never a
+              # concurrent manual dispatch of the same reservation/version. The
+              # cell index increments per (version × intent), so the two intents
+              # of one version get distinct keys and distinct run titles.
+              dispatch_key="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RESERVATION}-${cell}"
+              # MUST match uat-run.yaml's run-name exactly (now includes intent).
+              title="UAT ${RESERVATION} ${intent} @ ${label} #${dispatch_key}"
+              echo "::group::${title} [intent=${intent}]"
+
+              dispatch_args=(-f reservation="$RESERVATION" -f aicr_version="$ver"
+                -f intent="$intent" -f dispatch_key="$dispatch_key")
+              # A rejected floor was deliberately not honored, so its cells are
+              # in the schedule; uat-run's own compat gate would still refuse
+              # them. Override it only then, keeping that gate as a backstop
+              # for every run where all floors are honored.
+              if [[ -n "$IGNORE_FLOOR_LINES" ]]; then
+                dispatch_args+=(-f allow_below_compat_floor=true)
+              fi
+              gh workflow run uat-run.yaml --repo "$REPO" --ref "$REF" "${dispatch_args[@]}"
+
+              # Resolve the dispatched run by its run-name — this title MUST match
+              # uat-run.yaml's `run-name:` (which appends the same dispatch_key).
+              # dispatch_key makes the title globally unique, so an exact title
+              # match is unambiguous; no createdAt filter (a runner clock running
+              # ahead of GitHub's API clock would falsely reject this dispatch).
+              run_id=""
+              for _ in $(seq 1 "$POLL_MAX_ATTEMPTS"); do
+                sleep "$POLL_INTERVAL_SECONDS"
+                run_id=$(gh run list --repo "$REPO" --workflow uat-run.yaml \
+                  --event workflow_dispatch --limit 50 \
+                  --json databaseId,displayTitle,createdAt 2>/dev/null \
+                  | jq -r --arg t "$title" \
+                      'map(select(.displayTitle == $t))
+                       | sort_by(.createdAt) | .[-1].databaseId // empty' || true)
+                [[ -n "$run_id" ]] && break
+              done
+              if [[ -z "$run_id" ]]; then
+                # Fail the leg rather than continue: an unwatched run can still
+                # hold the reservation's pending slot and let a later (lower-
+                # priority) cell supersede it, breaking version ordering.
+                echo "::error::Dispatched ${title} but could not resolve its run id; stopping this reservation leg to preserve version ordering."
+                echo "::endgroup::"
+                exit 1
+              fi
+
+              echo "Waiting on run ${run_id} ..."
+              # --exit-status is intentionally not fatal here; classify the run's
+              # conclusion below so we can distinguish a benign superseded run from
+              # a real failure without aborting mid-loop.
+              # Output is discarded: in a non-TTY log `gh run watch` APPENDS a full
+              # status render every refresh (no in-place redraw), which flooded the
+              # drive log with tens of thousands of duplicate lines per multi-hour
+              # cell. We only need it to BLOCK until the run finishes; the
+              # conclusion is read from `gh run view` below, so the live render is
+              # redundant. --interval 60 keeps the polling gentle on the API.
+              gh run watch "$run_id" --repo "$REPO" --interval 60 --exit-status >/dev/null 2>&1 || true
+
+              conclusion=$(gh run view "$run_id" --repo "$REPO" --json conclusion --jq '.conclusion' 2>/dev/null || echo "")
+              njobs=$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs" --jq '.total_count' 2>/dev/null || echo "")
+              if [[ "$conclusion" == "cancelled" && "$njobs" == "0" ]]; then
+                # Benign: the single-slot reservation lease dropped a pending run.
+                # Surface it (must not be silent) but do not fail the leg — the
+                # superseded-run observer complements this (DC1 superseded surfacing).
+                echo "::warning::${title} [intent=${intent}] was superseded while pending (dropped by the reservation lease); re-dispatch when the reservation frees."
+              elif [[ "$conclusion" != "success" ]]; then
+                # Real cell failure/timeout — record it so the leg (and thus the
+                # nightly batch) fails, but keep testing the remaining cells.
+                echo "::error::${title} [intent=${intent}] finished with conclusion '${conclusion:-unknown}'."
+                leg_failed=1
+              fi
+              echo "::endgroup::"
+            done
+          done
+
+          # Rejected/inconclusive compat floors were NOT honored (their cells
+          # ran above); fail the leg now that every cell has had its turn.
+          compat_rejected=""
+          if [[ -n "$COMPAT_REJECTIONS_FILE" && -s "$COMPAT_REJECTIONS_FILE" ]]; then
+            while IFS= read -r rej; do
+              [[ -n "$rej" ]] || continue
+              echo "::error title=UAT compat floor rejected::${rej}"
+              compat_rejected=1
+            done < "$COMPAT_REJECTIONS_FILE"
+          fi
+
+          if [[ -n "$leg_failed" ]]; then
+            echo "::error::One or more version cells failed for ${RESERVATION}."
+          fi
+          if [[ -n "$compat_rejected" ]]; then
+            echo "::error::One or more ${COMPAT_FILE} floors for ${RESERVATION} were rejected; fix the floor (see above)."
+          fi
+          if [[ -n "$leg_failed" || -n "$compat_rejected" ]]; then
+            exit 1
+          fi

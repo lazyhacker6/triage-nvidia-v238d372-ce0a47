@@ -1,0 +1,1392 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package recipe
+
+import (
+	"context"
+	stderrors "errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+	"github.com/NVIDIA/aicr/pkg/recipe/providertest"
+	"gopkg.in/yaml.v3"
+)
+
+// TestEmbeddedDataProvider tests the embedded data provider.
+func TestEmbeddedDataProvider(t *testing.T) {
+	provider := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+
+	t.Run("read existing file", func(t *testing.T) {
+		data, err := provider.ReadFile(context.Background(), "registry.yaml")
+		if err != nil {
+			t.Fatalf("failed to read registry.yaml: %v", err)
+		}
+		if len(data) == 0 {
+			t.Error("registry.yaml is empty")
+		}
+	})
+
+	t.Run("read non-existent file", func(t *testing.T) {
+		_, err := provider.ReadFile(context.Background(), "non-existent.yaml")
+		if err == nil {
+			t.Error("expected error for non-existent file")
+		}
+	})
+
+	t.Run("read host-native nested path", func(t *testing.T) {
+		data, err := provider.ReadFile(context.Background(), filepath.Join("overlays", "base.yaml"))
+		if err != nil {
+			t.Fatalf("failed to read nested overlays/base.yaml: %v", err)
+		}
+		if len(data) == 0 {
+			t.Error("overlays/base.yaml is empty")
+		}
+	})
+
+	t.Run("walk embedded directory with host-native root", func(t *testing.T) {
+		foundBase := false
+		err := provider.WalkDir(context.Background(), "overlays", func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if strings.HasSuffix(path, "base.yaml") {
+				foundBase = true
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("WalkDir failed: %v", err)
+		}
+		if !foundBase {
+			t.Error("expected to find base.yaml in overlays")
+		}
+	})
+
+	t.Run("source returns embedded", func(t *testing.T) {
+		source := provider.Source("registry.yaml")
+		if source != sourceEmbedded {
+			t.Errorf("expected source %q, got %q", sourceEmbedded, source)
+		}
+	})
+}
+
+// TestLayeredDataProvider_RequiresRegistry tests that external dir must have registry.yaml.
+func TestLayeredDataProvider_RequiresRegistry(t *testing.T) {
+	// Create temp directory without registry.yaml
+	tmpDir := t.TempDir()
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	_, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+
+	if err == nil {
+		t.Error("expected error when registry.yaml is missing")
+	}
+}
+
+// TestLayeredDataProvider_MergesRegistry tests registry merging.
+func TestLayeredDataProvider_MergesRegistry(t *testing.T) {
+	registryContent := `apiVersion: aicr.run/v1beta1
+kind: ComponentRegistry
+components:
+  - name: custom-component
+    displayName: Custom Component
+    helm:
+      defaultRepository: https://example.com/charts
+      defaultChart: custom/custom-component
+`
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml": []byte(registryContent),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Read merged registry
+	data, err := provider.ReadFile(context.Background(), "registry.yaml")
+	if err != nil {
+		t.Fatalf("failed to read registry.yaml: %v", err)
+	}
+
+	// Should contain both embedded and custom components
+	content := string(data)
+	if !strings.Contains(content, "custom-component") {
+		t.Error("merged registry should contain custom-component from external")
+	}
+	if !strings.Contains(content, "gpu-operator") {
+		t.Error("merged registry should contain gpu-operator from embedded")
+	}
+}
+
+func TestLayeredDataProvider_ValidatesRawExternalRegistryBeforeMerge(t *testing.T) {
+	tests := []struct {
+		name       string
+		apiVersion string
+		wantErr    bool
+	}{
+		{name: "target accepted", apiVersion: "aicr.run/v1beta1"},
+		{name: "unknown rejected", apiVersion: "aicr.run/v9", wantErr: true},
+		{name: "empty rejected", apiVersion: "", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := "apiVersion: " + tt.apiVersion + "\nkind: ComponentRegistry\ncomponents:\n" +
+				"  - name: external-only\n    displayName: External Only\n"
+			tmpDir := providertest.WriteDir(t, map[string][]byte{
+				registryFileName: []byte(registry),
+			})
+			provider, err := NewLayeredDataProvider(
+				NewEmbeddedDataProvider(GetEmbeddedFS(), "."),
+				LayeredProviderConfig{ExternalDir: tmpDir},
+			)
+			if err != nil {
+				t.Fatalf("NewLayeredDataProvider() error = %v", err)
+			}
+
+			data, err := provider.ReadFile(t.Context(), registryFileName)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("ReadFile() error = nil, want raw external header rejection")
+				}
+				if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
+					t.Fatalf("error = %v, want ErrCodeInvalidRequest", err)
+				}
+				if observed := fmt.Sprintf("apiVersion %q", tt.apiVersion); !strings.Contains(err.Error(), observed) {
+					t.Errorf("error %q does not name observed header %q", err, observed)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ReadFile() error = %v", err)
+			}
+			if !strings.Contains(string(data), "external-only") {
+				t.Fatal("merged registry omitted accepted target-version component")
+			}
+			var merged ComponentRegistry
+			if err := yaml.Unmarshal(data, &merged); err != nil {
+				t.Fatalf("unmarshal merged registry: %v", err)
+			}
+			if merged.APIVersion != ComponentRegistryAPIVersion {
+				t.Errorf("merged registry apiVersion = %q, want current emitter %q",
+					merged.APIVersion, ComponentRegistryAPIVersion)
+			}
+		})
+	}
+}
+
+// TestLayeredDataProvider_OverridesFile tests file replacement.
+func TestLayeredDataProvider_OverridesFile(t *testing.T) {
+	baseContent := `apiVersion: aicr.run/v1beta1
+kind: RecipeMetadata
+metadata:
+  name: custom-base
+spec:
+  components: []
+`
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml":      []byte(providertest.EmptyRegistryYAML),
+		"overlays/base.yaml": []byte(baseContent),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Read overlays/base.yaml - should get external version
+	data, err := provider.ReadFile(context.Background(), "overlays/base.yaml")
+	if err != nil {
+		t.Fatalf("failed to read overlays/base.yaml: %v", err)
+	}
+
+	content := string(data)
+	if !strings.Contains(content, "custom-base") {
+		t.Error("overlays/base.yaml should be from external directory")
+	}
+
+	// Check source
+	source := provider.Source("overlays/base.yaml")
+	if source != "external" {
+		t.Errorf("expected source 'external', got %q", source)
+	}
+}
+
+// TestLayeredDataProvider_AddsNewFile tests adding new files.
+func TestLayeredDataProvider_AddsNewFile(t *testing.T) {
+	overlayContent := `apiVersion: aicr.run/v1beta1
+kind: RecipeMetadata
+metadata:
+  name: custom-overlay
+spec:
+  criteria:
+    service: custom
+  components: []
+`
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml":                []byte(providertest.EmptyRegistryYAML),
+		"overlays/custom-overlay.yaml": []byte(overlayContent),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Read new overlay
+	data, err := provider.ReadFile(context.Background(), "overlays/custom-overlay.yaml")
+	if err != nil {
+		t.Fatalf("failed to read custom-overlay.yaml: %v", err)
+	}
+
+	content := string(data)
+	if !strings.Contains(content, "custom-overlay") {
+		t.Error("should be able to read custom overlay from external")
+	}
+}
+
+// TestLayeredDataProvider_SecurityChecks tests security validations.
+func TestLayeredDataProvider_SecurityChecks(t *testing.T) {
+	t.Run("rejects symlinks", func(t *testing.T) {
+		tmpDir := providertest.WriteDir(t, map[string][]byte{
+			"registry.yaml": []byte(providertest.EmptyRegistryYAML),
+		})
+
+		// Create a symlink
+		symlinkPath := filepath.Join(tmpDir, "symlink.yaml")
+		targetPath := filepath.Join(tmpDir, "registry.yaml")
+		if err := os.Symlink(targetPath, symlinkPath); err != nil {
+			t.Skipf("cannot create symlinks: %v", err)
+		}
+
+		embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+		_, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+			ExternalDir:   tmpDir,
+			AllowSymlinks: false,
+		})
+
+		if err == nil {
+			t.Error("expected error for symlink")
+		}
+	})
+
+	t.Run("rejects large files", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Create registry.yaml that exceeds size limit
+		largeContent := make([]byte, 100) // Small for test, but we'll set a tiny limit
+		if err := os.WriteFile(filepath.Join(tmpDir, "registry.yaml"), largeContent, 0600); err != nil {
+			t.Fatalf("failed to write registry.yaml: %v", err)
+		}
+
+		embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+		_, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+			ExternalDir: tmpDir,
+			MaxFileSize: 10, // Very small limit
+		})
+
+		if err == nil {
+			t.Error("expected error for file exceeding size limit")
+		}
+	})
+
+	t.Run("rejects missing directory", func(t *testing.T) {
+		embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+		_, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+			ExternalDir: "/non/existent/path",
+		})
+
+		if err == nil {
+			t.Error("expected error for non-existent directory")
+		}
+	})
+}
+
+// TestReadExternalFile pins the path-injection and size-bound guards on the
+// read-time helper. The walk-time check in NewLayeredDataProvider is
+// best-effort; this helper is the authoritative bound and must reject
+// non-local paths and oversized files so a TOCTOU swap can't bypass either.
+func TestReadExternalFile(t *testing.T) {
+	t.Run("rejects non-local relative path", func(t *testing.T) {
+		_, err := readExternalFile(t.TempDir(), "../escape", 1024, false)
+		if err == nil {
+			t.Fatal("expected error for non-local relative path")
+		}
+		var se *aicrerrors.StructuredError
+		if !stderrors.As(err, &se) {
+			t.Fatalf("expected StructuredError, got %T", err)
+		}
+		if se.Code != aicrerrors.ErrCodeInvalidRequest {
+			t.Errorf("code = %v, want %v", se.Code, aicrerrors.ErrCodeInvalidRequest)
+		}
+	})
+
+	t.Run("enforces caller-supplied max size", func(t *testing.T) {
+		dir := t.TempDir()
+		// Write a 64-byte file then require maxBytes=32 — the helper must
+		// reject it even though the walk-time check used a larger limit.
+		if err := os.WriteFile(filepath.Join(dir, "big.yaml"), make([]byte, 64), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		_, err := readExternalFile(dir, "big.yaml", 32, false)
+		if err == nil {
+			t.Fatal("expected error for oversized file")
+		}
+		var se *aicrerrors.StructuredError
+		if !stderrors.As(err, &se) {
+			t.Fatalf("expected StructuredError, got %T", err)
+		}
+		if se.Code != aicrerrors.ErrCodeInvalidRequest {
+			t.Errorf("code = %v, want %v", se.Code, aicrerrors.ErrCodeInvalidRequest)
+		}
+	})
+
+	t.Run("reads a small file successfully", func(t *testing.T) {
+		dir := t.TempDir()
+		want := []byte("hello\n")
+		if err := os.WriteFile(filepath.Join(dir, "small.yaml"), want, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		got, err := readExternalFile(dir, "small.yaml", 1024, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("rejects post-validation symlink escape", func(t *testing.T) {
+		// Simulate a TOCTOU swap: a legitimate file is replaced with a
+		// symlink that points outside the base directory between
+		// walk-time validation and the read. os.OpenRoot must refuse
+		// to follow it. This is the failure mode plain os.Open
+		// silently honored.
+		dir := t.TempDir()
+		secrets := t.TempDir()
+		secretPath := filepath.Join(secrets, "leak")
+		if err := os.WriteFile(secretPath, []byte("secret"), 0o600); err != nil {
+			t.Fatalf("write secret: %v", err)
+		}
+		swap := filepath.Join(dir, "swap.yaml")
+		if err := os.Symlink(secretPath, swap); err != nil {
+			t.Skipf("cannot create symlinks on this platform: %v", err)
+		}
+		if _, err := readExternalFile(dir, "swap.yaml", 1024, false); err == nil {
+			t.Fatal("expected error from symlink escape, got nil")
+		}
+	})
+
+	t.Run("allowSymlinks=true rejects symlink escaping baseDir", func(t *testing.T) {
+		// Even when symlinks are allowed at the provider level, the resolved
+		// target must stay inside baseDir. A symlink whose target leaks to
+		// an unrelated directory is rejected.
+		dir := t.TempDir()
+		outside := t.TempDir()
+		outsideFile := filepath.Join(outside, "leak")
+		if err := os.WriteFile(outsideFile, []byte("secret"), 0o600); err != nil {
+			t.Fatalf("write outside file: %v", err)
+		}
+		link := filepath.Join(dir, "leak.yaml")
+		if err := os.Symlink(outsideFile, link); err != nil {
+			t.Skipf("cannot create symlinks on this platform: %v", err)
+		}
+		_, err := readExternalFile(dir, "leak.yaml", 1024, true)
+		if err == nil {
+			t.Fatal("expected error from symlink target outside baseDir, got nil")
+		}
+		var se *aicrerrors.StructuredError
+		if !stderrors.As(err, &se) {
+			t.Fatalf("expected StructuredError, got %T", err)
+		}
+		if se.Code != aicrerrors.ErrCodeInvalidRequest {
+			t.Errorf("code = %v, want %v", se.Code, aicrerrors.ErrCodeInvalidRequest)
+		}
+	})
+}
+
+// TestLayeredDataProvider_FallsBackToEmbedded tests fallback behavior.
+func TestLayeredDataProvider_FallsBackToEmbedded(t *testing.T) {
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml": []byte(providertest.EmptyRegistryYAML),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Read overlays/base.yaml - should fall back to embedded since we didn't override it
+	data, err := provider.ReadFile(context.Background(), "overlays/base.yaml")
+	if err != nil {
+		t.Fatalf("failed to read overlays/base.yaml: %v", err)
+	}
+
+	if len(data) == 0 {
+		t.Error("overlays/base.yaml should not be empty")
+	}
+
+	// Source should be embedded
+	source := provider.Source("overlays/base.yaml")
+	if source != "embedded" {
+		t.Errorf("expected source 'embedded', got %q", source)
+	}
+}
+
+// TestLayeredDataProvider_IntegrationWithRegistry tests that the layered provider
+// correctly merges registry files by testing the merged content directly.
+func TestLayeredDataProvider_IntegrationWithRegistry(t *testing.T) {
+	registryContent := `apiVersion: aicr.run/v1beta1
+kind: ComponentRegistry
+components:
+  - name: custom-operator
+    displayName: Custom Operator
+    helm:
+      defaultRepository: https://custom.example.com/charts
+      defaultChart: custom/custom-operator
+      defaultVersion: v1.0.0
+`
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml": []byte(registryContent),
+	})
+
+	// Create layered provider
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	layered, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Read the merged registry directly from the provider
+	mergedData, err := layered.ReadFile(context.Background(), "registry.yaml")
+	if err != nil {
+		t.Fatalf("failed to read merged registry: %v", err)
+	}
+
+	// Parse the merged registry
+	var registry ComponentRegistry
+	if err := yaml.Unmarshal(mergedData, &registry); err != nil {
+		t.Fatalf("failed to parse merged registry: %v", err)
+	}
+
+	// Build index for lookup
+	registry.byName = make(map[string]*ComponentConfig, len(registry.Components))
+	for i := range registry.Components {
+		comp := &registry.Components[i]
+		registry.byName[comp.Name] = comp
+	}
+
+	// Verify custom component exists
+	customComp := registry.Get("custom-operator")
+	if customComp == nil {
+		t.Error("custom-operator should exist in merged registry")
+	} else if customComp.DisplayName != "Custom Operator" {
+		t.Errorf("custom-operator displayName = %q, want 'Custom Operator'", customComp.DisplayName)
+	}
+
+	// Verify embedded components still exist
+	gpuOp := registry.Get("gpu-operator")
+	if gpuOp == nil {
+		t.Error("gpu-operator should still exist from embedded registry")
+	}
+
+	certManager := registry.Get("cert-manager")
+	if certManager == nil {
+		t.Error("cert-manager should still exist from embedded registry")
+	}
+}
+
+// TestLayeredDataProvider_OverrideComponentValues tests overriding component values files.
+func TestLayeredDataProvider_OverrideComponentValues(t *testing.T) {
+	customValues := `# Custom values for testing
+installCRDs: false
+customField: customValue
+`
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml":                       []byte(providertest.EmptyRegistryYAML),
+		"components/cert-manager/values.yaml": []byte(customValues),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Read the custom values
+	data, err := provider.ReadFile(context.Background(), "components/cert-manager/values.yaml")
+	if err != nil {
+		t.Fatalf("failed to read custom values: %v", err)
+	}
+
+	content := string(data)
+	if !strings.Contains(content, "customField") {
+		t.Error("custom values should contain customField")
+	}
+	if !strings.Contains(content, "customValue") {
+		t.Error("custom values should contain customValue")
+	}
+
+	// Verify source is external
+	source := provider.Source("components/cert-manager/values.yaml")
+	if source != "external" {
+		t.Errorf("expected source 'external', got %q", source)
+	}
+}
+
+// TestLayeredDataProvider_WalkDir tests walking directories with layered provider.
+func TestLayeredDataProvider_WalkDir(t *testing.T) {
+	customOverlay := `apiVersion: aicr.run/v1beta1
+kind: RecipeMetadata
+metadata:
+  name: walk-test-overlay
+spec:
+  criteria:
+    service: walktest
+  componentRefs: []
+`
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml":           []byte(providertest.EmptyRegistryYAML),
+		"overlays/walk-test.yaml": []byte(customOverlay),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	t.Run("walks overlays directory", func(t *testing.T) {
+		var files []string
+		err := provider.WalkDir(context.Background(), "overlays", func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() {
+				files = append(files, path)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("WalkDir failed: %v", err)
+		}
+
+		// Should find both external and embedded overlay files
+		if len(files) == 0 {
+			t.Error("expected to find overlay files")
+		}
+
+		// Check that external file is included
+		foundExternal := false
+		for _, f := range files {
+			if strings.Contains(f, "walk-test.yaml") {
+				foundExternal = true
+				break
+			}
+		}
+		if !foundExternal {
+			t.Error("expected to find external walk-test.yaml in walk results")
+		}
+	})
+
+	t.Run("walks root directory", func(t *testing.T) {
+		var files []string
+		err := provider.WalkDir(context.Background(), "", func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() {
+				files = append(files, path)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("WalkDir failed: %v", err)
+		}
+
+		if len(files) == 0 {
+			t.Error("expected to find files in root walk")
+		}
+	})
+}
+
+// TestLayeredDataProvider_WalkDirWithOverride tests walking when external overrides embedded files.
+func TestLayeredDataProvider_WalkDirWithOverride(t *testing.T) {
+	externalOverlay := `apiVersion: aicr.run/v1beta1
+kind: RecipeMetadata
+metadata:
+  name: external-only-overlay
+spec:
+  criteria:
+    service: external-test
+  componentRefs: []
+`
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml":               []byte(providertest.EmptyRegistryYAML),
+		"overlays/external-test.yaml": []byte(externalOverlay),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Walk overlays - should include both external and embedded files
+	var files []string
+	err = provider.WalkDir(context.Background(), "overlays", func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WalkDir failed: %v", err)
+	}
+
+	// Should have multiple files (external + embedded)
+	if len(files) < 2 {
+		t.Errorf("expected at least 2 files (external + embedded), got %d", len(files))
+	}
+
+	// Check external file is present
+	foundExternal := false
+	for _, f := range files {
+		if strings.Contains(f, "external-test.yaml") {
+			foundExternal = true
+			break
+		}
+	}
+	if !foundExternal {
+		t.Error("expected to find external-test.yaml in walk results")
+	}
+}
+
+// TestLayeredDataProvider_SourceForRegistry tests source reporting for registry file.
+func TestLayeredDataProvider_SourceForRegistry(t *testing.T) {
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml": []byte(providertest.EmptyRegistryYAML),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	source := provider.Source("registry.yaml")
+	if !strings.Contains(source, "merged") {
+		t.Errorf("expected source to contain 'merged', got %q", source)
+	}
+	if !strings.Contains(source, "embedded") {
+		t.Errorf("expected source to contain 'embedded', got %q", source)
+	}
+	if !strings.Contains(source, "external") {
+		t.Errorf("expected source to contain 'external', got %q", source)
+	}
+}
+
+// TestLayeredDataProvider_SourceHostNativeNestedPath tests that Source resolves nested catalog paths
+// when formatted using the host-native path separator.
+func TestLayeredDataProvider_SourceHostNativeNestedPath(t *testing.T) {
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml":           []byte(providertest.EmptyRegistryYAML),
+		"validators/catalog.yaml": []byte("validators: []\n"),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Test host-native nested path
+	source := provider.Source(filepath.Join("validators", "catalog.yaml"))
+	if source != sourceMerged {
+		t.Errorf("expected source %q, got %q", sourceMerged, source)
+	}
+}
+
+// TestLayeredDataProvider_WalkDirDeduplication verifies that external overrides retain root prefix
+// and properly suppress embedded counterparts without emitting duplicate entries.
+func TestLayeredDataProvider_WalkDirDeduplication(t *testing.T) {
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml":      []byte(providertest.EmptyRegistryYAML),
+		"overlays/base.yaml": []byte("metadata:\n  name: base-override\n"),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	var seen []string
+	err = provider.WalkDir(context.Background(), "overlays", func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && filepath.Base(path) == "base.yaml" {
+			seen = append(seen, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WalkDir failed: %v", err)
+	}
+
+	if len(seen) != 1 || seen[0] != "overlays/base.yaml" {
+		t.Errorf("expected exactly [overlays/base.yaml], got %v", seen)
+	}
+}
+
+// TestLayeredDataProvider_CachedRegistry tests that merged registry is cached.
+func TestLayeredDataProvider_CachedRegistry(t *testing.T) {
+	registryContent := `apiVersion: aicr.run/v1beta1
+kind: ComponentRegistry
+components:
+  - name: cache-test-component
+    displayName: Cache Test
+    helm:
+      defaultRepository: https://example.com/charts
+      defaultChart: cache-test
+`
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml": []byte(registryContent),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// First read
+	data1, err := provider.ReadFile(context.Background(), "registry.yaml")
+	if err != nil {
+		t.Fatalf("first read failed: %v", err)
+	}
+
+	// Second read should return cached result
+	data2, err := provider.ReadFile(context.Background(), "registry.yaml")
+	if err != nil {
+		t.Fatalf("second read failed: %v", err)
+	}
+
+	if string(data1) != string(data2) {
+		t.Error("cached registry should return same content")
+	}
+}
+
+// TestEmbeddedDataProvider_WalkDir tests walking embedded filesystem.
+func TestEmbeddedDataProvider_WalkDir(t *testing.T) {
+	provider := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+
+	var files []string
+	err := provider.WalkDir(context.Background(), "overlays", func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WalkDir failed: %v", err)
+	}
+
+	if len(files) == 0 {
+		t.Error("expected to find overlay files in embedded data")
+	}
+}
+
+// TestLayeredDataProvider_NotDirectory tests error when path is not a directory.
+func TestLayeredDataProvider_NotDirectory(t *testing.T) {
+	// Create a file instead of directory
+	tmpFile, err := os.CreateTemp("", "notadir-*.txt")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	_, err = NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpFile.Name(),
+	})
+
+	if err == nil {
+		t.Error("expected error when external path is not a directory")
+	}
+}
+
+// TestLayeredDataProvider_InvalidExternalRegistry tests error handling for invalid registry.
+func TestLayeredDataProvider_InvalidExternalRegistry(t *testing.T) {
+	invalidRegistry := `apiVersion: aicr.run/v1beta1
+kind: ComponentRegistry
+components:
+  - name: [invalid yaml structure
+`
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml": []byte(invalidRegistry),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Reading registry should fail due to invalid YAML
+	_, err = provider.ReadFile(context.Background(), "registry.yaml")
+	if err == nil {
+		t.Error("expected error for invalid external registry YAML")
+	}
+}
+
+// TestLayeredDataProvider_ReadExternalFileError tests error when external file can't be read.
+func TestLayeredDataProvider_ReadExternalFileError(t *testing.T) {
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml":  []byte(providertest.EmptyRegistryYAML),
+		"test-file.yaml": []byte("content"),
+	})
+	testFile := filepath.Join(tmpDir, "test-file.yaml")
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Delete the file after provider creation
+	if removeErr := os.Remove(testFile); removeErr != nil {
+		t.Fatalf("failed to remove test file: %v", removeErr)
+	}
+
+	// Reading should fail
+	_, err = provider.ReadFile(context.Background(), "test-file.yaml")
+	if err == nil {
+		t.Error("expected error when external file can't be read")
+	}
+}
+
+// TestLayeredDataProvider_AllowSymlinks tests that symlinks work when allowed.
+func TestLayeredDataProvider_AllowSymlinks(t *testing.T) {
+	const targetContent = "target content"
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml": []byte(providertest.EmptyRegistryYAML),
+		"target.yaml":   []byte(targetContent),
+	})
+	targetPath := filepath.Join(tmpDir, "target.yaml")
+
+	// Create a symlink
+	symlinkPath := filepath.Join(tmpDir, "symlink.yaml")
+	if err := os.Symlink(targetPath, symlinkPath); err != nil {
+		t.Skipf("cannot create symlinks: %v", err)
+	}
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir:   tmpDir,
+		AllowSymlinks: true, // Allow symlinks
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider with AllowSymlinks=true: %v", err)
+	}
+
+	// Should be able to read via symlink
+	data, err := provider.ReadFile(context.Background(), "symlink.yaml")
+	if err != nil {
+		t.Fatalf("failed to read symlink file: %v", err)
+	}
+
+	if string(data) != targetContent {
+		t.Errorf("expected content %q, got %q", targetContent, string(data))
+	}
+}
+
+func TestLayeredDataProvider_ExternalFiles(t *testing.T) {
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml":               []byte(providertest.EmptyRegistryYAML),
+		"components/test/values.yaml": []byte("key: value"),
+		"overrides.yaml":              []byte("override: true"),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	files := provider.ExternalFiles()
+	if len(files) == 0 {
+		t.Fatal("ExternalFiles() returned empty, expected at least 3 files")
+	}
+
+	// Should be sorted
+	for i := 1; i < len(files); i++ {
+		if files[i] < files[i-1] {
+			t.Errorf("ExternalFiles() not sorted: %q before %q", files[i-1], files[i])
+		}
+	}
+}
+
+func TestLayeredDataProvider_ExternalDir(t *testing.T) {
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml": []byte(providertest.EmptyRegistryYAML),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if provider.ExternalDir() != tmpDir {
+		t.Errorf("ExternalDir() = %q, want %q", provider.ExternalDir(), tmpDir)
+	}
+}
+
+// testExternalCatalogContent is a minimal catalog.yaml for testing.
+const testExternalCatalogContent = `apiVersion: validator.nvidia.com/v1alpha1
+kind: ValidatorCatalog
+metadata:
+  name: custom-validators
+  version: "1.0.0"
+validators:
+  - name: custom-check
+    phase: deployment
+    description: "Custom deployment check"
+    image: example.com/custom/validator:v1.0.0
+    timeout: 3m
+    args: ["custom-check"]
+    env: []
+`
+
+// setupCatalogTestDir creates a temp directory with registry.yaml and optionally
+// validators/catalog.yaml for catalog merge tests.
+func setupCatalogTestDir(t *testing.T, catalogContent string) string {
+	t.Helper()
+	files := map[string][]byte{
+		"registry.yaml": []byte(providertest.EmptyRegistryYAML),
+	}
+	if catalogContent != "" {
+		files["validators/catalog.yaml"] = []byte(catalogContent)
+	}
+	return providertest.WriteDir(t, files)
+}
+
+func TestLayeredDataProvider_ValidatorCatalogRemainsOutsideADR022Gate(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{
+			name:   "headerless catalog remains readable",
+			header: "",
+		},
+		{
+			name: "different version remains readable",
+			header: "apiVersion: validator.nvidia.com/v9\n" +
+				"kind: ValidatorCatalog\n",
+		},
+		{
+			name: "different kind remains readable",
+			header: "apiVersion: validator.nvidia.com/v1alpha1\n" +
+				"kind: OtherCatalog\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			catalogContent := tt.header + "validators:\n  - name: adr-022-scope-boundary\n"
+			tmpDir := setupCatalogTestDir(t, catalogContent)
+			provider, err := NewLayeredDataProvider(
+				NewEmbeddedDataProvider(GetEmbeddedFS(), "."),
+				LayeredProviderConfig{ExternalDir: tmpDir},
+			)
+			if err != nil {
+				t.Fatalf("NewLayeredDataProvider() error = %v", err)
+			}
+
+			data, err := provider.ReadFile(t.Context(), catalogFileName)
+			if err != nil {
+				t.Fatalf("ReadFile() error = %v", err)
+			}
+			if !strings.Contains(string(data), "adr-022-scope-boundary") {
+				t.Fatal("merged catalog omitted external validator")
+			}
+		})
+	}
+}
+
+// TestLayeredDataProvider_MergesCatalog tests catalog merging with external data.
+func TestLayeredDataProvider_MergesCatalog(t *testing.T) {
+	tmpDir := setupCatalogTestDir(t, testExternalCatalogContent)
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Read merged catalog
+	data, err := provider.ReadFile(context.Background(), "validators/catalog.yaml")
+	if err != nil {
+		t.Fatalf("failed to read catalog: %v", err)
+	}
+
+	content := string(data)
+
+	// Should contain custom validator from external
+	if !strings.Contains(content, "custom-check") {
+		t.Error("merged catalog should contain custom-check from external")
+	}
+
+	// Should contain embedded validators
+	if !strings.Contains(content, "operator-health") {
+		t.Error("merged catalog should contain operator-health from embedded")
+	}
+	if !strings.Contains(content, "nccl-all-reduce-bw") {
+		t.Error("merged catalog should contain nccl-all-reduce-bw from embedded")
+	}
+}
+
+// TestLayeredDataProvider_CatalogOverrideByName tests that external validators
+// override embedded validators with the same name.
+func TestLayeredDataProvider_CatalogOverrideByName(t *testing.T) {
+	// Override operator-health with a custom image and timeout
+	overrideCatalog := `apiVersion: validator.nvidia.com/v1alpha1
+kind: ValidatorCatalog
+metadata:
+  name: custom-validators
+  version: "1.0.0"
+validators:
+  - name: operator-health
+    phase: deployment
+    description: "Custom operator health check"
+    image: example.com/custom/deployment:v2.0.0
+    timeout: 5m
+    args: ["operator-health", "--custom"]
+    env: []
+`
+	tmpDir := setupCatalogTestDir(t, overrideCatalog)
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	data, err := provider.ReadFile(context.Background(), "validators/catalog.yaml")
+	if err != nil {
+		t.Fatalf("failed to read catalog: %v", err)
+	}
+
+	// Parse the merged result
+	var cat catalogForMerge
+	if err := yaml.Unmarshal(data, &cat); err != nil {
+		t.Fatalf("failed to parse merged catalog: %v", err)
+	}
+
+	// Find operator-health — should have the external image
+	for _, v := range cat.Validators {
+		name, _ := v["name"].(string)
+		if name == "operator-health" {
+			image, _ := v["image"].(string)
+			if image != "example.com/custom/deployment:v2.0.0" {
+				t.Errorf("operator-health image = %q, want %q", image, "example.com/custom/deployment:v2.0.0")
+			}
+			desc, _ := v["description"].(string)
+			if desc != "Custom operator health check" {
+				t.Errorf("operator-health description = %q, want %q", desc, "Custom operator health check")
+			}
+			return
+		}
+	}
+	t.Error("operator-health not found in merged catalog")
+}
+
+// TestLayeredDataProvider_CatalogNoCatalogInExternal tests fallback when external
+// directory does not contain validators/catalog.yaml.
+func TestLayeredDataProvider_CatalogNoCatalogInExternal(t *testing.T) {
+	tmpDir := setupCatalogTestDir(t, "") // No catalog in external
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Should fall back to embedded catalog
+	data, err := provider.ReadFile(context.Background(), "validators/catalog.yaml")
+	if err != nil {
+		t.Fatalf("failed to read catalog: %v", err)
+	}
+
+	content := string(data)
+	if !strings.Contains(content, "operator-health") {
+		t.Error("catalog should fall back to embedded when external has no catalog")
+	}
+
+	// Source should be embedded
+	source := provider.Source("validators/catalog.yaml")
+	if source != sourceEmbedded {
+		t.Errorf("expected source %q, got %q", sourceEmbedded, source)
+	}
+}
+
+// TestLayeredDataProvider_CatalogSourceMerged tests Source() for catalog when external exists.
+func TestLayeredDataProvider_CatalogSourceMerged(t *testing.T) {
+	tmpDir := setupCatalogTestDir(t, testExternalCatalogContent)
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	source := provider.Source("validators/catalog.yaml")
+	if !strings.Contains(source, "merged") {
+		t.Errorf("expected source to contain 'merged', got %q", source)
+	}
+	if !strings.Contains(source, "embedded") {
+		t.Errorf("expected source to contain 'embedded', got %q", source)
+	}
+	if !strings.Contains(source, "external") {
+		t.Errorf("expected source to contain 'external', got %q", source)
+	}
+}
+
+// TestLayeredDataProvider_CachedCatalog tests that merged catalog is cached.
+func TestLayeredDataProvider_CachedCatalog(t *testing.T) {
+	tmpDir := setupCatalogTestDir(t, testExternalCatalogContent)
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// First read
+	data1, err := provider.ReadFile(context.Background(), "validators/catalog.yaml")
+	if err != nil {
+		t.Fatalf("first read failed: %v", err)
+	}
+
+	// Second read should return cached result
+	data2, err := provider.ReadFile(context.Background(), "validators/catalog.yaml")
+	if err != nil {
+		t.Fatalf("second read failed: %v", err)
+	}
+
+	if string(data1) != string(data2) {
+		t.Error("cached catalog should return same content")
+	}
+}
+
+// TestLayeredDataProvider_InvalidExternalCatalog tests error handling for invalid catalog YAML.
+func TestLayeredDataProvider_InvalidExternalCatalog(t *testing.T) {
+	invalidCatalog := `apiVersion: validator.nvidia.com/v1alpha1
+kind: ValidatorCatalog
+validators:
+  - name: [invalid yaml structure
+`
+	tmpDir := setupCatalogTestDir(t, invalidCatalog)
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	_, err = provider.ReadFile(context.Background(), "validators/catalog.yaml")
+	if err == nil {
+		t.Error("expected error for invalid external catalog YAML")
+	}
+}
+
+// TestLayeredDataProvider_CatalogMergePreservesOrder tests that embedded validator
+// order is preserved and new external validators are appended.
+func TestLayeredDataProvider_CatalogMergePreservesOrder(t *testing.T) {
+	// Add a new validator and override an existing one
+	externalCatalog := `apiVersion: validator.nvidia.com/v1alpha1
+kind: ValidatorCatalog
+metadata:
+  name: custom-validators
+  version: "1.0.0"
+validators:
+  - name: operator-health
+    phase: deployment
+    description: "Overridden operator health"
+    image: example.com/custom/deployment:v2.0.0
+    timeout: 5m
+    args: ["operator-health"]
+    env: []
+  - name: new-custom-validator
+    phase: conformance
+    description: "Brand new validator"
+    image: example.com/custom/conformance:v1.0.0
+    timeout: 3m
+    args: ["custom"]
+    env: []
+`
+	tmpDir := setupCatalogTestDir(t, externalCatalog)
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	data, err := provider.ReadFile(context.Background(), "validators/catalog.yaml")
+	if err != nil {
+		t.Fatalf("failed to read catalog: %v", err)
+	}
+
+	var cat catalogForMerge
+	if err := yaml.Unmarshal(data, &cat); err != nil {
+		t.Fatalf("failed to parse merged catalog: %v", err)
+	}
+
+	// First validator should still be operator-health (embedded order preserved)
+	if len(cat.Validators) == 0 {
+		t.Fatal("expected validators in merged catalog")
+	}
+	firstName, _ := cat.Validators[0]["name"].(string)
+	if firstName != "operator-health" {
+		t.Errorf("first validator = %q, want %q", firstName, "operator-health")
+	}
+
+	// Last validator should be the new external one (appended)
+	lastName, _ := cat.Validators[len(cat.Validators)-1]["name"].(string)
+	if lastName != "new-custom-validator" {
+		t.Errorf("last validator = %q, want %q", lastName, "new-custom-validator")
+	}
+
+	// Overridden operator-health should have external image
+	firstImage, _ := cat.Validators[0]["image"].(string)
+	if firstImage != "example.com/custom/deployment:v2.0.0" {
+		t.Errorf("operator-health image = %q, want %q", firstImage, "example.com/custom/deployment:v2.0.0")
+	}
+}
+
+// TestDataProvider_HonorsContextCancellation pins acceptance criterion #6 of
+// issue #1109: a caller that cancels its context mid-read sees
+// context.Canceled propagate back rather than blocking until the read
+// completes. Run separately for each in-tree implementation so a future
+// refactor that drops the guard on one but not the other gets caught.
+func TestDataProvider_HonorsContextCancellation(t *testing.T) {
+	tmpDir := providertest.WriteDir(t, map[string][]byte{
+		"registry.yaml": []byte(providertest.EmptyRegistryYAML),
+	})
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	layered, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{ExternalDir: tmpDir})
+	if err != nil {
+		t.Fatalf("NewLayeredDataProvider: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		dp   DataProvider
+	}{
+		{"embedded", embedded},
+		{"layered", layered},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name+"/ReadFile", func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, err := tc.dp.ReadFile(ctx, "registry.yaml")
+			if !stderrors.Is(err, context.Canceled) {
+				t.Errorf("ReadFile with canceled ctx returned %v, want context.Canceled", err)
+			}
+		})
+
+		t.Run(tc.name+"/WalkDir", func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			err := tc.dp.WalkDir(ctx, ".", func(string, fs.DirEntry, error) error { return nil })
+			if !stderrors.Is(err, context.Canceled) {
+				t.Errorf("WalkDir with canceled ctx returned %v, want context.Canceled", err)
+			}
+		})
+	}
+}

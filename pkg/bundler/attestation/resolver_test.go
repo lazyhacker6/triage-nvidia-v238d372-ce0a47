@@ -1,0 +1,485 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package attestation
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/errors"
+
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+)
+
+// TestSelectOIDCSource pins the source-precedence classifier that both
+// ResolveOIDCToken and the CLI disclosure gate consume, so the two cannot
+// drift: identity-token > ambient (both values) > device-flow > browser.
+func TestSelectOIDCSource(t *testing.T) {
+	tests := []struct {
+		name            string
+		opts            ResolveOptions
+		want            OIDCSourceKind
+		wantInteractive bool
+	}{
+		{
+			name:            "identity token wins over everything",
+			opts:            ResolveOptions{IdentityToken: "tok", AmbientURL: "u", AmbientToken: "t", DeviceFlow: true},
+			want:            OIDCSourceIdentityToken,
+			wantInteractive: false,
+		},
+		{
+			name:            "ambient requires both url and token",
+			opts:            ResolveOptions{AmbientURL: "u", AmbientToken: "t", DeviceFlow: true},
+			want:            OIDCSourceAmbient,
+			wantInteractive: false,
+		},
+		{
+			name:            "ambient url alone falls through to device-flow",
+			opts:            ResolveOptions{AmbientURL: "u", DeviceFlow: true},
+			want:            OIDCSourceDeviceFlow,
+			wantInteractive: true,
+		},
+		{
+			name:            "device-flow when no non-interactive source",
+			opts:            ResolveOptions{DeviceFlow: true},
+			want:            OIDCSourceDeviceFlow,
+			wantInteractive: true,
+		},
+		{
+			name:            "empty options default to browser",
+			opts:            ResolveOptions{},
+			want:            OIDCSourceBrowser,
+			wantInteractive: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SelectOIDCSource(tt.opts)
+			if got != tt.want {
+				t.Errorf("SelectOIDCSource() = %v, want %v", got, tt.want)
+			}
+			if got.Interactive() != tt.wantInteractive {
+				t.Errorf("%v.Interactive() = %v, want %v", got, got.Interactive(), tt.wantInteractive)
+			}
+		})
+	}
+}
+
+// TestResolveAttester exercises the four-tier OIDC source precedence
+// (identity-token > ambient > device-flow > interactive browser) plus the
+// disabled short-circuit. The ambient case uses an httptest server so the
+// suite stays fully offline; the device-flow case relies on a pre-canceled
+// context so the helper returns immediately without hitting Sigstore.
+func TestResolveAttester(t *testing.T) {
+	type wantKind int
+	const (
+		wantNoOp wantKind = iota
+		wantKeyless
+		wantErr
+	)
+
+	// ambient OIDC test server — returns the bearer token echoed back.
+	ambientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer ambient-test-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Query().Get("audience") != "sigstore" {
+			http.Error(w, "bad audience", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"value":"ambient-oidc-token"}`)
+	}))
+	t.Cleanup(ambientServer.Close)
+
+	tests := []struct {
+		name           string
+		opts           ResolveOptions
+		preCanceledCtx bool
+		want           wantKind
+	}{
+		{
+			name: "attest disabled short-circuits regardless of token sources",
+			opts: ResolveOptions{
+				Attest:        false,
+				IdentityToken: "ignored",
+				AmbientURL:    ambientServer.URL,
+				AmbientToken:  "ambient-test-token",
+				DeviceFlow:    true,
+			},
+			want: wantNoOp,
+		},
+		{
+			name: "explicit identity-token wins over ambient and device-flow",
+			opts: ResolveOptions{
+				Attest:        true,
+				IdentityToken: "pre-fetched-token",
+				AmbientURL:    ambientServer.URL,
+				AmbientToken:  "ambient-test-token",
+				DeviceFlow:    true,
+			},
+			want: wantKeyless,
+		},
+		{
+			name: "ambient OIDC produces keyless attester when both env values present",
+			opts: ResolveOptions{
+				Attest:       true,
+				AmbientURL:   ambientServer.URL,
+				AmbientToken: "ambient-test-token",
+				DeviceFlow:   true, // must be ignored — ambient wins
+			},
+			want: wantKeyless,
+		},
+		{
+			name: "ambient URL alone (without token) does not activate ambient branch",
+			opts: ResolveOptions{
+				Attest:       true,
+				AmbientURL:   ambientServer.URL,
+				DeviceFlow:   true,
+				PromptWriter: io.Discard,
+			},
+			preCanceledCtx: true, // forces device-flow path to fail fast
+			want:           wantErr,
+		},
+		{
+			name: "device-flow is selected when no other source is available",
+			opts: ResolveOptions{
+				Attest:       true,
+				DeviceFlow:   true,
+				PromptWriter: io.Discard,
+			},
+			preCanceledCtx: true,
+			want:           wantErr,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tt.preCanceledCtx {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+
+			att, err := ResolveAttester(ctx, tt.opts)
+			switch tt.want {
+			case wantNoOp:
+				if err != nil {
+					t.Fatalf("ResolveAttester returned error: %v", err)
+				}
+				if _, ok := att.(*NoOpAttester); !ok {
+					t.Errorf("expected *NoOpAttester, got %T", att)
+				}
+			case wantKeyless:
+				if err != nil {
+					t.Fatalf("ResolveAttester returned error: %v", err)
+				}
+				if _, ok := att.(*KeylessAttester); !ok {
+					t.Errorf("expected *KeylessAttester, got %T", att)
+				}
+			case wantErr:
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+			}
+		})
+	}
+}
+
+// TestResolveAttesterKMS verifies the eager resolver returns a KMSAttester
+// when SigningKey is set, without resolving an OIDC token. A non-empty
+// SigningKey takes precedence over an ambient identity token. See #407.
+func TestResolveAttesterKMS(t *testing.T) {
+	// Precedence still holds for IdentityToken, which a CI environment can
+	// populate without the caller asking for keyless signing (see the
+	// ResolveOptions field doc). DeviceFlow is the one keyless field that is
+	// rejected rather than overridden — see TestResolveAttesterSigningModeConflict.
+	att, err := ResolveAttester(context.Background(), ResolveOptions{
+		Attest:        true,
+		SigningKey:    "awskms://arn:aws:kms:us-east-1:111:key/abc",
+		IdentityToken: "should-be-ignored",
+	})
+	if err != nil {
+		t.Fatalf("ResolveAttester: %v", err)
+	}
+	if _, ok := att.(*KMSAttester); !ok {
+		t.Errorf("got %T, want *KMSAttester", att)
+	}
+}
+
+// TestResolveAttesterLazyKMS verifies the lazy resolver returns a KMSAttester
+// when SigningKey is set, taking precedence over an ambient identity token.
+// See #407.
+func TestResolveAttesterLazyKMS(t *testing.T) {
+	att, err := ResolveAttesterLazy(context.Background(), ResolveOptions{
+		Attest:        true,
+		SigningKey:    "awskms://arn:aws:kms:us-east-1:111:key/abc",
+		IdentityToken: "should-be-ignored",
+	})
+	if err != nil {
+		t.Fatalf("ResolveAttesterLazy: %v", err)
+	}
+	if _, ok := att.(*KMSAttester); !ok {
+		t.Errorf("got %T, want *KMSAttester", att)
+	}
+}
+
+// TestResolveAttesterSigningModeConflict pins the one keyless field the
+// resolver rejects instead of overriding. Both entry points decide KMS-vs-
+// keyless on a non-empty SigningKey, so a caller asking for device flow
+// alongside a key used to receive a key signature and never see the
+// verification prompt it was waiting for. The CLI has always rejected the pair
+// on its merged options; an SDK caller deriving straight from a document never
+// merges anything, which is the path this closes (#2537).
+//
+// Attest=false keeps its short-circuit: nothing signs, so there is no mode to
+// conflict over.
+func TestResolveAttesterSigningModeConflict(t *testing.T) {
+	const key = "awskms://arn:aws:kms:us-east-1:111:key/abc"
+
+	tests := []struct {
+		name     string
+		opts     ResolveOptions
+		wantErr  bool
+		lazyOnly bool
+	}{
+		{
+			name:    "key with device flow is rejected",
+			opts:    ResolveOptions{Attest: true, SigningKey: key, DeviceFlow: true},
+			wantErr: true,
+		},
+		{
+			name:    "key alone is fine",
+			opts:    ResolveOptions{Attest: true, SigningKey: key},
+			wantErr: false,
+		},
+		{
+			// Lazy only: the eager resolver would run a real device-flow token
+			// exchange against the network before returning.
+			name:     "device flow alone is fine",
+			opts:     ResolveOptions{Attest: true, DeviceFlow: true},
+			wantErr:  false,
+			lazyOnly: true,
+		},
+		{
+			name:    "attestation disabled short-circuits before the check",
+			opts:    ResolveOptions{Attest: false, SigningKey: key, DeviceFlow: true},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		for _, entry := range []struct {
+			name    string
+			resolve func(context.Context, ResolveOptions) (Attester, error)
+		}{
+			{"eager", ResolveAttester},
+			{"lazy", ResolveAttesterLazy},
+		} {
+			if tt.lazyOnly && entry.name == "eager" {
+				continue
+			}
+			t.Run(tt.name+"/"+entry.name, func(t *testing.T) {
+				att, err := entry.resolve(context.Background(), tt.opts)
+				if (err != nil) != tt.wantErr {
+					t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
+				}
+				if tt.wantErr {
+					if errorstest.ReportedCode(err) != errors.ErrCodeInvalidRequest {
+						t.Errorf("error = %v, want code %v", err, errors.ErrCodeInvalidRequest)
+					}
+					if att != nil {
+						t.Errorf("got attester %T alongside the error, want nil", att)
+					}
+					return
+				}
+				if att == nil {
+					t.Error("got nil attester without an error")
+				}
+			})
+		}
+	}
+}
+
+// TestResolveAttesterDisableTLogUpload verifies DisableTLogUpload wires the
+// no-tlog override onto the KMS attester (offline / air-gapped signing) for
+// both the eager and lazy resolvers, and only when SigningKey is set. Keyless
+// signing (SigningKey empty) ignores the flag and always uploads. See #409.
+func TestResolveAttesterDisableTLogUpload(t *testing.T) {
+	const keyURI = "awskms://arn:aws:kms:us-east-1:111:key/abc"
+
+	resolvers := []struct {
+		name    string
+		resolve func(ResolveOptions) (Attester, error)
+	}{
+		{"eager", func(o ResolveOptions) (Attester, error) {
+			return ResolveAttester(context.Background(), o)
+		}},
+		{"lazy", func(o ResolveOptions) (Attester, error) {
+			return ResolveAttesterLazy(context.Background(), o)
+		}},
+	}
+
+	cases := []struct {
+		name      string
+		opts      ResolveOptions
+		wantKMS   bool // attester must (KMS) / must not (keyless) be a *KMSAttester
+		wantRekor bool // expected HasRekorEntry()
+	}{
+		{
+			// KMS + DisableTLogUpload:true → no Rekor entry.
+			name:      "kms uploads disabled",
+			opts:      ResolveOptions{Attest: true, SigningKey: keyURI, DisableTLogUpload: true},
+			wantKMS:   true,
+			wantRekor: false,
+		},
+		{
+			// KMS + DisableTLogUpload:false (default) → Rekor entry.
+			name:      "kms default uploads",
+			opts:      ResolveOptions{Attest: true, SigningKey: keyURI},
+			wantKMS:   true,
+			wantRekor: true,
+		},
+		{
+			// Keyless (no SigningKey) + DisableTLogUpload:true → still a keyless
+			// attester that always uploads; the flag is ignored on this path.
+			name:      "keyless ignores disable and uploads",
+			opts:      ResolveOptions{Attest: true, IdentityToken: "tok", DisableTLogUpload: true},
+			wantKMS:   false,
+			wantRekor: true,
+		},
+	}
+
+	for _, r := range resolvers {
+		t.Run(r.name, func(t *testing.T) {
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					att, err := r.resolve(tc.opts)
+					if err != nil {
+						t.Fatalf("resolve: %v", err)
+					}
+					if _, ok := att.(*KMSAttester); ok != tc.wantKMS {
+						t.Fatalf("attester type = %T, want *KMSAttester: %v", att, tc.wantKMS)
+					}
+					if att.HasRekorEntry() != tc.wantRekor {
+						t.Errorf("HasRekorEntry() = %v, want %v", att.HasRekorEntry(), tc.wantRekor)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestResolveAttesterLazy_DefersTokenResolution verifies the lazy entry
+// point does not touch the OIDC chain at construction time. Constructing
+// a lazy attester with a pre-canceled context plus a forced device-flow
+// path (which would error immediately if invoked) must succeed; the
+// error surfaces only when Attest is called.
+func TestResolveAttesterLazy_DefersTokenResolution(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	att, err := ResolveAttesterLazy(ctx, ResolveOptions{
+		Attest:       true,
+		DeviceFlow:   true,
+		PromptWriter: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("ResolveAttesterLazy must not resolve at construction; got error %v", err)
+	}
+	if _, ok := att.(*LazyKeylessAttester); !ok {
+		t.Fatalf("expected *LazyKeylessAttester, got %T", att)
+	}
+	if att.Identity() != "" {
+		t.Errorf("Identity must be empty before first Attest; got %q", att.Identity())
+	}
+
+	// Now exercise the deferred resolve — the pre-canceled context forces
+	// the device-flow helper to fail, surfacing the error at Attest time.
+	if _, err := att.Attest(ctx, AttestSubject{}); err == nil {
+		t.Error("expected Attest to surface resolver error from canceled context")
+	}
+}
+
+// TestResolveAttesterLazy_DisabledShortCircuits mirrors the eager
+// resolver's Attest=false short-circuit so callers can swap entry points.
+func TestResolveAttesterLazy_DisabledShortCircuits(t *testing.T) {
+	att, err := ResolveAttesterLazy(context.Background(), ResolveOptions{Attest: false})
+	if err != nil {
+		t.Fatalf("disabled short-circuit returned error: %v", err)
+	}
+	if _, ok := att.(*NoOpAttester); !ok {
+		t.Errorf("expected *NoOpAttester, got %T", att)
+	}
+}
+
+// TestResolveAttester_ThreadsSigstoreURLs verifies the eager resolver carries
+// private Fulcio/Rekor endpoints from ResolveOptions onto the constructed
+// KeylessAttester. The identity-token branch resolves synchronously (no
+// network), so the returned attester can be inspected directly. See #408.
+func TestResolveAttester_ThreadsSigstoreURLs(t *testing.T) {
+	const (
+		privFulcio = "https://fulcio.internal.example.com"
+		privRekor  = "https://rekor.internal.example.com"
+	)
+	att, err := ResolveAttester(context.Background(), ResolveOptions{
+		Attest:        true,
+		IdentityToken: "pre-fetched-token",
+		FulcioURL:     privFulcio,
+		RekorURL:      privRekor,
+	})
+	if err != nil {
+		t.Fatalf("ResolveAttester returned error: %v", err)
+	}
+	keyless, ok := att.(*KeylessAttester)
+	if !ok {
+		t.Fatalf("expected *KeylessAttester, got %T", att)
+	}
+	if keyless.fulcioURL != privFulcio {
+		t.Errorf("fulcioURL = %q, want %q", keyless.fulcioURL, privFulcio)
+	}
+	if keyless.rekorURL != privRekor {
+		t.Errorf("rekorURL = %q, want %q", keyless.rekorURL, privRekor)
+	}
+}
+
+// TestNewLazyKeylessAttester_RetainsSigstoreURLs verifies the lazy attester
+// retains the private-Sigstore endpoints in its deferred options so the
+// KeylessAttester it builds on first Attest() targets the same infrastructure
+// as the eager path. See #408.
+func TestNewLazyKeylessAttester_RetainsSigstoreURLs(t *testing.T) {
+	const (
+		privFulcio = "https://fulcio.internal.example.com"
+		privRekor  = "https://rekor.internal.example.com"
+	)
+	lazy := NewLazyKeylessAttester(ResolveOptions{
+		Attest:    true,
+		FulcioURL: privFulcio,
+		RekorURL:  privRekor,
+	})
+	if lazy.opts.FulcioURL != privFulcio {
+		t.Errorf("opts.FulcioURL = %q, want %q", lazy.opts.FulcioURL, privFulcio)
+	}
+	if lazy.opts.RekorURL != privRekor {
+		t.Errorf("opts.RekorURL = %q, want %q", lazy.opts.RekorURL, privRekor)
+	}
+}

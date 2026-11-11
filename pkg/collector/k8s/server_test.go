@@ -1,0 +1,262 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package k8s
+
+import (
+	"context"
+	stderrors "errors"
+	"os"
+	"testing"
+	"time"
+
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/measurement"
+	"github.com/stretchr/testify/assert"
+)
+
+// expiredCtxTimeout is short enough that the context is guaranteed already
+// expired by the time Collect is called — the test using it asserts the
+// deadline-exceeded path, so any non-trivial value would defeat the point.
+const expiredCtxTimeout = 1 * time.Nanosecond
+
+func TestKubernetesCollector_Collect(t *testing.T) {
+	t.Setenv("NODE_NAME", "test-node")
+
+	ctx := context.TODO()
+	collector := createTestCollector()
+
+	m, err := collector.Collect(ctx)
+	assert.NoError(t, err)
+	assert.NotNil(t, m)
+	assert.Equal(t, measurement.TypeK8s, m.Type)
+	// server, image, policy, node, Slinky, MariaDB, OKE legacy plugin, OKE
+	// GPU plugin, default StorageClass, and Percona.
+	assert.Len(t, m.Subtypes, 10)
+
+	// Find the server subtype
+	var serverSubtype *measurement.Subtype
+	for i := range m.Subtypes {
+		if m.Subtypes[i].Name == "server" {
+			serverSubtype = &m.Subtypes[i]
+			break
+		}
+	}
+	if !assert.NotNil(t, serverSubtype, "Expected to find server subtype") {
+		return
+	}
+
+	data := serverSubtype.Data
+	if assert.Len(t, data, 3) {
+		if reading, ok := data["version"]; assert.True(t, ok) {
+			assert.Equal(t, "v1.28.0", reading.Any())
+		}
+		if reading, ok := data["platform"]; assert.True(t, ok) {
+			assert.Equal(t, "linux/amd64", reading.Any())
+		}
+		if reading, ok := data["goVersion"]; assert.True(t, ok) {
+			assert.Equal(t, "go1.20.7", reading.Any())
+		}
+	}
+}
+
+func TestKubernetesCollector_CustomResourceFailuresAreIsolated(t *testing.T) {
+	t.Setenv("NODE_NAME", "test-node")
+
+	collector := createTestCollector()
+	collector.slinkyDiscovery = &stubSlinkyDiscovery{
+		groupsErr: stderrors.New("Slinky discovery unavailable"),
+	}
+	collector.mariaDBDiscovery = &stubSlinkyDiscovery{
+		groupsErr: stderrors.New("MariaDB discovery unavailable"),
+	}
+	collector.perconaDiscovery = &stubSlinkyDiscovery{
+		groupsErr: stderrors.New("Percona discovery unavailable"),
+	}
+
+	m, err := collector.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+
+	server := m.GetSubtype("server")
+	if !assert.NotNil(t, server) {
+		return
+	}
+	assert.Equal(t, "v1.28.0", server.Data[measurement.KeyVersion].Any())
+	assert.NotNil(t, m.GetSubtype(SubtypeImage))
+	assert.NotNil(t, m.GetSubtype("policy"))
+	assert.NotNil(t, m.GetSubtype("node"))
+	assert.Equal(
+		t,
+		slinkyStateUnknown,
+		m.GetSubtype(SubtypeSlinkySlurm).Data[slinkyKeyCollectionState].Any(),
+	)
+	assert.Equal(
+		t,
+		mariaDBStateUnknown,
+		m.GetSubtype(SubtypeMariaDBOperator).Data[mariaDBKeyCollectionState].Any(),
+	)
+	assert.Equal(
+		t,
+		perconaStateUnknown,
+		m.GetSubtype(SubtypePerconaServerMongoDB).Data[perconaKeyCollectionState].Any(),
+	)
+	assert.Equal(
+		t,
+		storageClassStateAbsent,
+		m.GetSubtype(SubtypeDefaultStorageClass).Data[storageClassKeyCollectionState].Any(),
+	)
+}
+
+func TestKubernetesCollector_CollectWithCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.TODO())
+	cancel() // Cancel immediately
+
+	collector := createTestCollector()
+	m, err := collector.Collect(ctx)
+
+	assert.Error(t, err)
+	assert.Nil(t, m)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestKubernetesCollector_CollectWithTimeout(t *testing.T) {
+	// Create a context with very short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), expiredCtxTimeout)
+	defer cancel()
+
+	// Wait for context to timeout
+	time.Sleep(10 * time.Millisecond)
+
+	collector := createTestCollector()
+	m, err := collector.Collect(ctx)
+
+	// Should fail with deadline exceeded
+	assert.Error(t, err)
+	assert.Nil(t, m)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestCollectSafe(t *testing.T) {
+	tests := []struct {
+		name     string
+		collect  func() (map[string]measurement.Reading, error)
+		wantData map[string]measurement.Reading
+		wantErr  bool
+	}{
+		{
+			name: "successful collection",
+			collect: func() (map[string]measurement.Reading, error) {
+				return map[string]measurement.Reading{"value": measurement.Str("ok")}, nil
+			},
+			wantData: map[string]measurement.Reading{"value": measurement.Str("ok")},
+		},
+		{
+			name: "deterministic failure is isolated",
+			collect: func() (map[string]measurement.Reading, error) {
+				return nil, aicrerrors.New(aicrerrors.ErrCodeInternal, "collector failed")
+			},
+			wantData: map[string]measurement.Reading{},
+		},
+		{
+			name: "timeout propagates",
+			collect: func() (map[string]measurement.Reading, error) {
+				return nil, aicrerrors.Wrap(
+					aicrerrors.ErrCodeTimeout,
+					"collector timed out",
+					context.DeadlineExceeded,
+				)
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := collectSafe("test", tt.collect)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, data)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantData, data)
+		})
+	}
+}
+
+func TestKubernetesCollector_ErrorRecovery_NilClient(t *testing.T) {
+	// Match the client package's discovery-isolation pattern so this test
+	// cannot select a real workstation kubeconfig.
+	t.Setenv("KUBECONFIG", os.Getenv("KUBECONFIG"))
+	if err := os.Unsetenv("KUBECONFIG"); err != nil {
+		t.Fatalf("unset KUBECONFIG: %v", err)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	ctx := context.TODO()
+
+	// Create collector without a valid client
+	collector := &Collector{
+		ClientSet:  nil,
+		RestConfig: nil,
+	}
+
+	m, err := collector.Collect(ctx)
+
+	// Should degrade gracefully when client is unavailable
+	assert.NoError(t, err)
+	assert.NotNil(t, m)
+	assert.Equal(t, measurement.TypeK8s, m.Type)
+	// All standard subtypes should be present; custom-resource detection is unknown.
+	assert.Len(t, m.Subtypes, 10)
+	foundSlinky := false
+	foundMariaDB := false
+	foundOKELegacy := false
+	foundStorage := false
+	foundPercona := false
+	for _, subtype := range m.Subtypes {
+		if subtype.Name == SubtypeSlinkySlurm {
+			assert.Equal(t, slinkyStateUnknown, subtype.Data[slinkyKeyCollectionState].Any())
+			foundSlinky = true
+		}
+		if subtype.Name == SubtypeMariaDBOperator {
+			assert.Equal(t, mariaDBStateUnknown, subtype.Data[mariaDBKeyCollectionState].Any())
+			foundMariaDB = true
+		}
+		if subtype.Name == SubtypeOKELegacyPlugin {
+			assert.Equal(t, okeLegacyPluginUnknown, subtype.Data[okeLegacyKeyPlugin].Any())
+			foundOKELegacy = true
+		}
+		if subtype.Name == SubtypeDefaultStorageClass {
+			assert.Equal(t, storageClassStateUnknown, subtype.Data[storageClassKeyCollectionState].Any())
+			foundStorage = true
+		}
+		if subtype.Name == SubtypePerconaServerMongoDB {
+			assert.Equal(t, perconaStateUnknown, subtype.Data[perconaKeyCollectionState].Any())
+			foundPercona = true
+		}
+	}
+	assert.True(t, foundSlinky, "expected slinky-slurm subtype")
+	assert.True(t, foundMariaDB, "expected mariadb-operator subtype")
+	assert.True(t, foundOKELegacy, "expected oke-legacy-plugin subtype")
+	assert.True(t, foundStorage, "expected default-storage-class subtype")
+	assert.True(t, foundPercona, "expected percona-server-mongodb subtype")
+}
+
+// Helper function defined in image_test.go
+// Reused here to avoid duplication across test files

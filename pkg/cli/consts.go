@@ -1,0 +1,121 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cli
+
+// Cross-file string constants shared across CLI command definitions.
+// Command names, flag names, category labels, and well-known values live
+// here so the same literal is not declared in multiple files. File-local
+// strings stay with their owning file.
+
+// Command names (urfave/cli command.Name values).
+const (
+	cmdNameSnapshot   = "snapshot"
+	cmdNameRecipe     = "recipe"
+	cmdNameRecipeList = "list"
+)
+
+// Flag names (urfave/cli flag.Name values).
+const (
+	flagOutput              = "output"
+	flagFormat              = "format"
+	flagService             = "service"
+	flagAccelerator         = "accelerator"
+	flagIntent              = "intent"
+	flagOS                  = "os"
+	flagPlatform            = "platform"
+	flagNodes               = "nodes"
+	flagProfile             = "profile"
+	flagRequireEvidence     = "require-evidence"
+	flagSlurmAccountingMode = "slurm-accounting-mode"
+	flagRuntimeInventory    = "runtime-inventory"
+	flagGKETCPXOInterfaces  = "gke-tcpxo-interfaces"
+	flagInheritFrom         = "inherit-from"
+	flagInherit             = "inherit"
+	flagNoHealth            = "no-health"
+
+	// flagAddRolesToSA switches `aicr snapshot` into a generate-and-exit
+	// invocation that WRITES the RBAC manifests granting the agent's
+	// permissions to a named ServiceAccount and applies none of them. No
+	// cluster is contacted and no snapshot is taken.
+	flagAddRolesToSA = "add-roles-to-service-account"
+
+	// flagValidatorSA names the existing ServiceAccount `aicr validate` runs
+	// its validator Jobs as, in place of per-run RBAC.
+	flagValidatorSA = "validator-service-account-name"
+)
+
+// criteriaAny is the wildcard value for any criteria dimension.
+const criteriaAny = "any"
+
+// Signing, verification and OCI-push flag names shared by `validate`,
+// `bundle`, `verify` and the `evidence` publish, sign and verify commands.
+// Extracted so the same literal is declared once (goconst flags a string
+// repeated ≥3 times across the package) and the flag wiring stays consistent
+// across the commands that sign, verify and push.
+const (
+	flagIdentityToken      = "identity-token"
+	flagOIDCDeviceFlow     = "oidc-device-flow"
+	flagFulcioURL          = "fulcio-url"
+	flagRekorURL           = "rekor-url"
+	flagSigningConfig      = "signing-config"
+	flagEmitSigningConfig  = "emit-signing-config"
+	flagSigningKey         = "signing-key"
+	flagTLogUpload         = "tlog-upload"
+	flagVerifyKey          = "key"
+	flagTrustRoot          = "trust-root"
+	flagInsecureIgnoreTLog = "insecure-ignore-tlog"
+	flagInsecureTLS        = "insecure-tls"
+	flagPlainHTTP          = "plain-http"
+	flagPush               = "push"
+	flagImageRefs          = "image-refs"
+	flagChartName          = "chart-name"
+	// flagNoSign pushes an unsigned evidence bundle and writes a pointer whose
+	// attestation has a nil Signer (the unsigned state — distinct from a
+	// signed-without-Rekor pointer, which has a Signer with a nil
+	// rekorLogIndex). Decouples the network-light push leg from the
+	// Fulcio-bound signing leg, which the fork-based CI workflow completes later.
+	flagNoSign = "no-sign"
+	// flagFull ships an unredacted evidence bundle. By default the bundle is
+	// minimized (sensitive snapshot fields and CTRF logs removed).
+	flagFull = "full"
+	// flagAllowMutableValidatorTags emits evidence even when a validator image
+	// resolves to a moving tag, which emission otherwise refuses because the
+	// predicate identifies validators by tag alone (#2873).
+	flagAllowMutableValidatorTags = "allow-mutable-validator-tags"
+	// flagAssumeYes bypasses the interactive keyless-signing identity
+	// disclosure prompt (see confirmKeylessSigningDisclosure). The banner is
+	// still emitted; only the y/N pause is skipped.
+	flagAssumeYes = "yes"
+	// flagRelocate moves the pointer to its canonical per-source path after
+	// `aicr evidence sign` fills in the signer block. It completes the
+	// commit-flat -> CI-sign -> CI-relocate-to-nested flow (#1530): a flat
+	// pending pointer cannot be committed at its nested <source>/ path because
+	// that segment derives from the signer it does not yet have, so the
+	// fork-based CI leg relocates it once it is signed.
+	flagRelocate = "relocate"
+)
+
+// Category labels (urfave/cli flag.Category values, grouping flags in help output).
+const (
+	catInput             = "Input"
+	catOutput            = "Output"
+	catDeployment        = "Deployment"
+	catScheduling        = "Scheduling"
+	catOCIRegistry       = "OCI Registry"
+	catQueryParameters   = "Query Parameters"
+	catAgentDeployment   = "Agent Deployment"
+	catValidationControl = "Validation Control"
+	catEvidence          = "Evidence"
+)

@@ -1,0 +1,626 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# NVSentinel Health Check
+#
+# Validates that NVSentinel is running and healthy in the nvsentinel
+# namespace. Checks that the labeler deployment has at least one
+# available replica, that the required DaemonSets gated on the labeler's
+# driver.installed node label (metadata-collector,
+# syslog-health-monitor-regular; the optional syslog-health-monitor-kata
+# legitimately has 0 desired without Kata nodes and is excluded) are
+# actually rolled out, and that no pods
+# in the namespace are stuck in Pending, Failed, or Unknown phases.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: nvsentinel-health-check
+spec:
+  # 90s, deliberately below the 5m the sibling checks author. The
+  # in-process executor (pkg/chainsaw/inprocess.go) supports exactly one
+  # timeout knob — this Test-level assert budget caps the WHOLE check
+  # (per-step/per-operation timeouts are not honored) — and this check is
+  # uniquely prone to a legitimately-never-true wait: on a cluster in the
+  # #2175 broken state the driver-labeled DaemonSets sit at 0 desired
+  # FOREVER, so a 5m budget here does not buy readiness, it buys a stall.
+  # Verified live (issue #2186): the stalled assert pushed the
+  # expected-resources Job past its 8m activeDeadline, the pod was
+  # deleted, and the operator saw "pod not found" (status=other) instead
+  # of the assert diff naming the DaemonSets. 90s fails fast with the
+  # real message while still covering the healthy path, where every step
+  # passes in seconds (the components are already rolled out by the time
+  # the deployment phase runs).
+  timeouts:
+    assert: 90s
+  steps:
+    - name: validate-deployment-exists
+      try:
+        # Guard against vacuous pass on empty namespace: verify the
+        # nvsentinel-controller-manager deployment exists and has at least
+        # one ready replica.
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: labeler
+                namespace: nvsentinel
+              status:
+                (availableReplicas > `0`): true
+    - name: validate-driver-labeled-daemonsets-rolled-out
+      try:
+        # metadata-collector and syslog-health-monitor-regular select on
+        # the nvsentinel.dgxc.nvidia.com/driver.installed node label, which
+        # the labeler applies only when it can observe a GPU driver pod.
+        # Where the driver ships in the node image (AKS azure-managed, GKE
+        # COS gke-default, OKE) the label is never applied and both
+        # DaemonSets sit at 0 desired pods. That state is invisible to the
+        # assertions in the surrounding steps: pods that are never created
+        # cannot be Pending, Failed, or CrashLooping, and the labeler
+        # Deployment itself stays available — which is how issue #2175
+        # shipped unnoticed.
+        #
+        # Assert non-omitempty status fields only. numberUnavailable is
+        # omitempty, so it is ABSENT on a healthy DaemonSet and a
+        # `numberUnavailable: 0` assertion passes vacuously on a 0-desired
+        # DaemonSet too. desiredNumberScheduled and numberReady are always
+        # serialized, so the pair below fails closed on 0 desired.
+        #
+        # syslog-health-monitor-kata and gpu-health-monitor-dcgm-3.x are
+        # deliberately NOT asserted: both legitimately have 0 desired pods
+        # on clusters without Kata nodes / DCGM 3.x GPUs.
+        # metadata-collector uses the NEGATIVE (error-op) form, not a
+        # positive assert: the bundle-time RuntimeClass gate explicitly
+        # permits disabling the subchart (global.metadataCollector.enabled
+        # =false renders no DaemonSet), so a positive existence assert
+        # would fail deployment validation for a configuration bundling
+        # explicitly allows. The error ops below pass on a true 404
+        # (disabled subchart — the in-process executor fails closed on
+        # transient fetch errors, so this is not an API-blip loophole)
+        # while still catching both failure states when the DaemonSet IS
+        # rendered: the #2175 signature (present with 0 desired) and a
+        # partial rollout. Trade-off, stated plainly: a DaemonSet deleted
+        # out-of-band also passes — accepted, because the disabled-
+        # subchart configuration is supported and chainsaw cannot
+        # condition one resource's assert on another's values.
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: metadata-collector
+                namespace: nvsentinel
+              status:
+                # `> `0`: false` rather than `== `0`: true`: kyverno-json's
+                # equality between an int64 field (what unstructured cluster
+                # reads and the in-process fetcher both deliver) and a JMESPath
+                # numeric literal is type-strict and never matches, so the ==
+                # form silently disarms this op. The ordering comparator
+                # coerces numeric kinds and is already relied on by the assert
+                # ops below; expecting false inverts it into "desired is zero".
+                (desiredNumberScheduled > `0`): false
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: metadata-collector
+                namespace: nvsentinel
+              status:
+                (numberReady < desiredNumberScheduled): true
+        # Stale-rollout guard: numberReady alone can't distinguish a node
+        # still running the previous revision's pod (also Ready) from a
+        # fully current rollout. Flat (not status:-nested) so
+        # metadata.generation is addressable below. `<` (not `!=`) states
+        # the violated invariant directly: fewer nodes updated than desired.
+        # updatedNumberScheduled is itself omitempty (unlike
+        # desiredNumberScheduled/numberReady), so it needs the `|| `0``
+        # null-coalescing too.
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: metadata-collector
+                namespace: nvsentinel
+              ((status.updatedNumberScheduled || `0`) < status.desiredNumberScheduled): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: metadata-collector
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+        # syslog-health-monitor-regular: same negative form — the
+        # syslog-health-monitor subchart is switchable via its chart
+        # condition (global.syslogHealthMonitor.enabled) exactly like
+        # metadata-collector, and the driver-label gate's consumer-aware
+        # skip treats it as an optional label consumer, so the one
+        # coherent rule is "explicitly-disabled consumers render nothing
+        # and validation tolerates their absence; rendered consumers must
+        # be fully rolled out".
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: syslog-health-monitor-regular
+                namespace: nvsentinel
+              status:
+                (desiredNumberScheduled > `0`): false
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: syslog-health-monitor-regular
+                namespace: nvsentinel
+              status:
+                (numberReady < desiredNumberScheduled): true
+        # Stale-rollout guard: numberReady alone can't distinguish a node
+        # still running the previous revision's pod (also Ready) from a
+        # fully current rollout. Flat (not status:-nested) so
+        # metadata.generation is addressable below. updatedNumberScheduled
+        # is itself omitempty (unlike desiredNumberScheduled/numberReady),
+        # so it needs the `|| `0`` null-coalescing too.
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: syslog-health-monitor-regular
+                namespace: nvsentinel
+              ((status.updatedNumberScheduled || `0`) < status.desiredNumberScheduled): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: syslog-health-monitor-regular
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+        # nic-health-monitor: same negative form again. Its chart
+        # condition (global.nicHealthMonitor.enabled) is off in every
+        # recipe except those composing the nvsentinel-nic-health-monitor
+        # mixin, so on the other platforms these four ops pass vacuously
+        # on a 404 and only bite where the mixin is applied.
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: nic-health-monitor
+                namespace: nvsentinel
+              status:
+                (desiredNumberScheduled > `0`): false
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: nic-health-monitor
+                namespace: nvsentinel
+              status:
+                (numberReady < desiredNumberScheduled): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: nic-health-monitor
+                namespace: nvsentinel
+              ((status.updatedNumberScheduled || `0`) < status.desiredNumberScheduled): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: nic-health-monitor
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+    - name: validate-remediation-pipeline-rolled-out
+      try:
+        # The remediation workloads the nvsentinel-observe, -quarantine and
+        # -remediation mixins turn on, the health-events-analyzer the
+        # nvsentinel-health-events-analyzer mixin adds, the event-exporter the
+        # nvsentinel-event-exporter mixin adds, the in-cluster file server the
+        # nvsentinel-log-collector mixin adds, the lifecycle-manager the
+        # nvsentinel-node-validation mixin adds, and the csp-health-monitor the
+        # nvsentinel-csp-health-monitor-aws and -gcp mixins add; the datastore
+        # the others read is checked by nvsentinel-mongodb's own health check.
+        # Negative form, as above: off in every shipped recipe, so each op
+        # passes on a 404 and fails only when the workload renders without a
+        # complete rollout.
+        # The status counters are omitempty, hence the `|| 0`.
+        # updatedReplicas catches pods still on the previous revision, and
+        # replicas above spec a Deployment whose old ReplicaSet has not
+        # scaled down.
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: fault-quarantine
+                namespace: nvsentinel
+              ((status.readyReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: fault-quarantine
+                namespace: nvsentinel
+              ((status.updatedReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: fault-quarantine
+                namespace: nvsentinel
+              ((status.replicas || `0`) > spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: fault-quarantine
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: node-drainer
+                namespace: nvsentinel
+              ((status.readyReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: node-drainer
+                namespace: nvsentinel
+              ((status.updatedReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: node-drainer
+                namespace: nvsentinel
+              ((status.replicas || `0`) > spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: node-drainer
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: fault-remediation
+                namespace: nvsentinel
+              ((status.readyReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: fault-remediation
+                namespace: nvsentinel
+              ((status.updatedReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: fault-remediation
+                namespace: nvsentinel
+              ((status.replicas || `0`) > spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: fault-remediation
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: janitor
+                namespace: nvsentinel
+              ((status.readyReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: janitor
+                namespace: nvsentinel
+              ((status.updatedReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: janitor
+                namespace: nvsentinel
+              ((status.replicas || `0`) > spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: janitor
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: janitor-provider
+                namespace: nvsentinel
+              ((status.readyReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: janitor-provider
+                namespace: nvsentinel
+              ((status.updatedReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: janitor-provider
+                namespace: nvsentinel
+              ((status.replicas || `0`) > spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: janitor-provider
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: health-events-analyzer
+                namespace: nvsentinel
+              ((status.readyReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: health-events-analyzer
+                namespace: nvsentinel
+              ((status.updatedReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: health-events-analyzer
+                namespace: nvsentinel
+              ((status.replicas || `0`) > spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: health-events-analyzer
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: event-exporter
+                namespace: nvsentinel
+              ((status.readyReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: event-exporter
+                namespace: nvsentinel
+              ((status.updatedReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: event-exporter
+                namespace: nvsentinel
+              ((status.replicas || `0`) > spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: event-exporter
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: nvsentinel-incluster-file-server
+                namespace: nvsentinel
+              ((status.readyReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: nvsentinel-incluster-file-server
+                namespace: nvsentinel
+              ((status.updatedReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: nvsentinel-incluster-file-server
+                namespace: nvsentinel
+              ((status.replicas || `0`) > spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: nvsentinel-incluster-file-server
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: lifecycle-manager
+                namespace: nvsentinel
+              ((status.readyReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: lifecycle-manager
+                namespace: nvsentinel
+              ((status.updatedReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: lifecycle-manager
+                namespace: nvsentinel
+              ((status.replicas || `0`) > spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: lifecycle-manager
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: csp-health-monitor
+                namespace: nvsentinel
+              ((status.readyReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: csp-health-monitor
+                namespace: nvsentinel
+              ((status.updatedReplicas || `0`) < spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: csp-health-monitor
+                namespace: nvsentinel
+              ((status.replicas || `0`) > spec.replicas): true
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: csp-health-monitor
+                namespace: nvsentinel
+              ((status.observedGeneration || `0`) < metadata.generation): true
+    - name: validate-all-pods-healthy
+      try:
+        # Assert no pods are in unhealthy phases (Pending / Failed /
+        # Unknown) or stuck in Running phase with a known-bad
+        # container-waiting reason (CrashLoopBackOff,
+        # ImagePullBackOff, ErrImagePull, CreateContainerConfigError).
+        # Phase-only filtering misses CrashLoopBackOff because such
+        # pods typically remain in Running phase with an unhealthy
+        # container.
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: nvsentinel
+              status:
+                phase: Pending
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: nvsentinel
+              status:
+                phase: Failed
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: nvsentinel
+              status:
+                phase: Unknown
+        # JMESPath projection (not single-element match): kyverno-json's
+        # sliceNode.Assert gates on exact slice length before per-element
+        # comparison, so a `containerStatuses: - state: ...` shape only
+        # matches single-container pods and silently passes sidecars. Use
+        # `containerStatuses[?...] | length(@) > 0` to fire on any
+        # container at any index. Parallel initContainerStatuses block
+        # below catches init-container failures (invisible to
+        # containerStatuses). Per PR #1245 review (@ArangoGutierrez).
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: nvsentinel
+              status:
+                ((containerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: nvsentinel
+              status:
+                ((initContainerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true

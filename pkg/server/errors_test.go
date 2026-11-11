@@ -1,0 +1,292 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+)
+
+func TestHTTPStatusFromCodeMapping(t *testing.T) {
+	tests := []struct {
+		name string
+		code aicrerrors.ErrorCode
+		want int
+	}{
+		{"invalid request", aicrerrors.ErrCodeInvalidRequest, http.StatusBadRequest},
+		{"unauthorized", aicrerrors.ErrCodeUnauthorized, http.StatusUnauthorized},
+		{"not found", aicrerrors.ErrCodeNotFound, http.StatusNotFound},
+		{"method not allowed", aicrerrors.ErrCodeMethodNotAllowed, http.StatusMethodNotAllowed},
+		{"rate limit", aicrerrors.ErrCodeRateLimitExceeded, http.StatusTooManyRequests},
+		{"unavailable", aicrerrors.ErrCodeUnavailable, http.StatusServiceUnavailable},
+		{"timeout", aicrerrors.ErrCodeTimeout, http.StatusGatewayTimeout},
+		{"internal", aicrerrors.ErrCodeInternal, http.StatusInternalServerError},
+		{"unknown defaults to internal", aicrerrors.ErrorCode("SOMETHING_ELSE"), http.StatusInternalServerError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := httpStatusFromCode(tt.code); got != tt.want {
+				t.Fatalf("httpStatusFromCode(%q) = %d, want %d", tt.code, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRetryableFromCode(t *testing.T) {
+	tests := []struct {
+		name string
+		code aicrerrors.ErrorCode
+		want bool
+	}{
+		{"invalid request", aicrerrors.ErrCodeInvalidRequest, false},
+		{"unauthorized", aicrerrors.ErrCodeUnauthorized, false},
+		{"not found", aicrerrors.ErrCodeNotFound, false},
+		{"method not allowed", aicrerrors.ErrCodeMethodNotAllowed, false},
+		{"timeout", aicrerrors.ErrCodeTimeout, true},
+		{"unavailable", aicrerrors.ErrCodeUnavailable, true},
+		{"rate limit", aicrerrors.ErrCodeRateLimitExceeded, true},
+		{"internal", aicrerrors.ErrCodeInternal, true},
+		{"unknown defaults false", aicrerrors.ErrorCode("SOMETHING_ELSE"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := retryableFromCode(tt.code); got != tt.want {
+				t.Fatalf("retryableFromCode(%q) = %v, want %v", tt.code, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMergeDetails(t *testing.T) {
+	t.Run("both empty returns nil", func(t *testing.T) {
+		if got := mergeDetails(nil, nil); got != nil {
+			t.Fatalf("expected nil, got %#v", got)
+		}
+		if got := mergeDetails(map[string]any{}, map[string]any{}); got != nil {
+			t.Fatalf("expected nil, got %#v", got)
+		}
+	})
+
+	t.Run("merges and second overwrites", func(t *testing.T) {
+		a := map[string]any{"a": 1, "shared": "old"}
+		b := map[string]any{"b": 2, "shared": "new"}
+
+		got := mergeDetails(a, b)
+		if got == nil {
+			t.Fatal("expected map, got nil")
+		}
+		if got["a"].(int) != 1 {
+			t.Fatalf("expected a=1, got %#v", got["a"])
+		}
+		if got["b"].(int) != 2 {
+			t.Fatalf("expected b=2, got %#v", got["b"])
+		}
+		if got["shared"].(string) != "new" {
+			t.Fatalf("expected shared to be overwritten to 'new', got %#v", got["shared"])
+		}
+	})
+}
+
+func TestWriteError_WriteserrorResponse(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(context.WithValue(req.Context(), contextKeyRequestID, "req-123"))
+	w := httptest.NewRecorder()
+
+	WriteError(w, req, http.StatusBadRequest, aicrerrors.ErrCodeInvalidRequest, "bad request", false, map[string]any{"k": "v"})
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+
+	var resp errorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+
+	if resp.Code != string(aicrerrors.ErrCodeInvalidRequest) {
+		t.Fatalf("expected code %q, got %q", aicrerrors.ErrCodeInvalidRequest, resp.Code)
+	}
+	if resp.Message != "bad request" {
+		t.Fatalf("expected message %q, got %q", "bad request", resp.Message)
+	}
+	if resp.RequestID != "req-123" {
+		t.Fatalf("expected requestId %q, got %q", "req-123", resp.RequestID)
+	}
+	if resp.Retryable {
+		t.Fatalf("expected retryable=false, got true")
+	}
+	if resp.Details == nil || resp.Details["k"].(string) != "v" {
+		t.Fatalf("expected details to include k=v, got %#v", resp.Details)
+	}
+}
+
+func TestWriteErrorFromErr_StructuredErrorMapsStatusAndDetails(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+
+	cause := errors.New("db is down")
+	err := aicrerrors.WrapWithContext(aicrerrors.ErrCodeUnavailable, "service unavailable", cause, map[string]any{"component": "db"})
+
+	WriteErrorFromErr(w, req, err, "fallback", map[string]any{"extra": "yes"})
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
+	}
+
+	var resp errorResponse
+	if uerr := json.Unmarshal(w.Body.Bytes(), &resp); uerr != nil {
+		t.Fatalf("failed to unmarshal response: %v", uerr)
+	}
+
+	if resp.Code != string(aicrerrors.ErrCodeUnavailable) {
+		t.Fatalf("expected code %q, got %q", aicrerrors.ErrCodeUnavailable, resp.Code)
+	}
+	if resp.Message != "service unavailable" {
+		t.Fatalf("expected message %q, got %q", "service unavailable", resp.Message)
+	}
+	if !resp.Retryable {
+		t.Fatalf("expected retryable=true")
+	}
+	if resp.Details == nil {
+		t.Fatalf("expected details, got nil")
+	}
+	if resp.Details["component"].(string) != "db" {
+		t.Fatalf("expected component=db, got %#v", resp.Details["component"])
+	}
+	if resp.Details["extra"].(string) != "yes" {
+		t.Fatalf("expected extra=yes, got %#v", resp.Details["extra"])
+	}
+	// 5xx errors must NOT leak the underlying cause to clients (only logged
+	// server-side); the cause string is omitted from response details.
+	if _, present := resp.Details["error"]; present {
+		t.Fatalf("expected cause to be withheld for 5xx, got error=%v", resp.Details["error"])
+	}
+}
+
+func TestWriteErrorFromErr_4xxIncludesCause(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+
+	cause := errors.New("missing field 'name'")
+	err := aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest, "validation failed", cause)
+
+	WriteErrorFromErr(w, req, err, "fallback", nil)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+
+	var resp errorResponse
+	if uerr := json.Unmarshal(w.Body.Bytes(), &resp); uerr != nil {
+		t.Fatalf("failed to unmarshal response: %v", uerr)
+	}
+	if resp.Details == nil || resp.Details["error"].(string) != "missing field 'name'" {
+		t.Fatalf("expected 4xx response to include cause string, got %#v", resp.Details)
+	}
+}
+
+func TestWriteErrorFromErr_UnstructuredErrorWithholdsCause(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+
+	WriteErrorFromErr(w, req, errors.New("kubeconfig path /home/user/.kube/config not readable"), "internal error", nil)
+
+	var resp errorResponse
+	if uerr := json.Unmarshal(w.Body.Bytes(), &resp); uerr != nil {
+		t.Fatalf("failed to unmarshal response: %v", uerr)
+	}
+	if resp.Details != nil {
+		if _, present := resp.Details["error"]; present {
+			t.Fatalf("unstructured error must not leak Error() text, got %v", resp.Details["error"])
+		}
+	}
+}
+
+func TestWriteErrorFromErr_NilError(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+
+	WriteErrorFromErr(w, req, nil, "fallback msg", nil)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, w.Code)
+	}
+
+	var resp errorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.Message != "fallback msg" {
+		t.Fatalf("expected message %q, got %q", "fallback msg", resp.Message)
+	}
+}
+
+func TestWriteErrorFromErr_StructuredErrorEmptyMessage(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+
+	err := aicrerrors.New(aicrerrors.ErrCodeNotFound, "")
+	WriteErrorFromErr(w, req, err, "fallback", nil)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d, got %d", http.StatusNotFound, w.Code)
+	}
+
+	var resp errorResponse
+	if uerr := json.Unmarshal(w.Body.Bytes(), &resp); uerr != nil {
+		t.Fatalf("failed to unmarshal: %v", uerr)
+	}
+	if resp.Message != "fallback" {
+		t.Fatalf("expected fallback message, got %q", resp.Message)
+	}
+}
+
+func TestWriteErrorFromErr_NonStructuredFallsBackToInternal(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+
+	WriteErrorFromErr(w, req, errors.New("boom"), "fallback", map[string]any{"x": "y"})
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, w.Code)
+	}
+
+	var resp errorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+
+	if resp.Code != string(aicrerrors.ErrCodeInternal) {
+		t.Fatalf("expected code %q, got %q", aicrerrors.ErrCodeInternal, resp.Code)
+	}
+	if !resp.Retryable {
+		t.Fatalf("expected retryable=true")
+	}
+	if resp.Details == nil || resp.Details["x"].(string) != "y" {
+		t.Fatalf("expected details to include x=y, got %#v", resp.Details)
+	}
+	// Unstructured errors must NOT leak Error() text to clients (5xx).
+	if _, present := resp.Details["error"]; present {
+		t.Fatalf("expected unstructured cause to be withheld, got error=%v", resp.Details["error"])
+	}
+}

@@ -1,0 +1,125 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nodewright Operator Health Check
+#
+# Validates that the Nodewright Operator is running and healthy in the
+# skyhook namespace:
+# 1. skyhooks.skyhook.nvidia.com CRD Established=True (the apiserver
+#    will accept Skyhook CRs that nodewright-customizations declares).
+#    Both the pre- and post-rename charts render this CRD; the v0.18.0
+#    nodewrights.nodewright.nvidia.com CRD is deliberately not asserted
+#    here so a v0.17.x operator still passes. The Go readiness gate
+#    (resolveNodewrightGVR) fails closed when the recipe pins v0.18.0+ and
+#    that group is not served, so its absence is never mistaken for a
+#    legacy operator.
+# 2. Every Deployment labeled as the controller-manager has at least one
+#    available replica. Chainsaw cannot count, so the Go readiness check
+#    separately requires exactly one such Deployment.
+# 3. No pods stuck in Pending/Failed/Unknown phases or known-bad
+#    container-waiting states.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: nodewright-operator-health-check
+spec:
+  timeouts:
+    assert: 5m
+  steps:
+    - name: validate-skyhook-crd-established
+      try:
+        - assert:
+            resource:
+              apiVersion: apiextensions.k8s.io/v1
+              kind: CustomResourceDefinition
+              metadata:
+                name: skyhooks.skyhook.nvidia.com
+              status:
+                (conditions[?type == 'Established']):
+                  - status: "True"
+    - name: validate-deployment-exists
+      try:
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                namespace: nodewright
+                labels:
+                  app.kubernetes.io/component: manager
+                  control-plane: controller-manager
+              status:
+                (availableReplicas > `0`): true
+        # Any match without an available replica fails (omitted at zero).
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                namespace: nodewright
+                labels:
+                  app.kubernetes.io/component: manager
+                  control-plane: controller-manager
+              status:
+                ((availableReplicas || `0`) > `0`): false
+    - name: validate-all-pods-healthy
+      try:
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: nodewright
+              status:
+                phase: Pending
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: nodewright
+              status:
+                phase: Failed
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: nodewright
+              status:
+                phase: Unknown
+        # JMESPath projection (not single-element match): kyverno-json's
+        # sliceNode.Assert gates on exact slice length before per-element
+        # comparison, so a `containerStatuses: - state: ...` shape only
+        # matches single-container pods and silently passes sidecars. Use
+        # `containerStatuses[?...] | length(@) > 0` to fire on any
+        # container at any index. Parallel initContainerStatuses block
+        # below catches init-container failures (invisible to
+        # containerStatuses). Per PR #1245 review (@ArangoGutierrez).
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: nodewright
+              status:
+                ((containerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: nodewright
+              status:
+                ((initContainerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true

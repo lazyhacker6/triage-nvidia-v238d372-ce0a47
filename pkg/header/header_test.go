@@ -1,0 +1,360 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package header
+
+import (
+	"testing"
+	"time"
+)
+
+// testAPIVersion is an arbitrary well-formed value for the Init/InitWithTime
+// cases below, which exercise header construction rather than acceptance. It
+// tracks the stable target so a reader does not have to wonder whether the
+// choice is load-bearing.
+const testAPIVersion = GroupVersionV1
+
+// TestRetiredGroupVersionsKeepTheirHistoricalStrings pins the withdrawn values
+// to the exact bytes older artifacts carry on disk. They are no longer accepted
+// anywhere, so nothing else would catch a typo here -- and a typo would silently
+// cost the remediation clause RetirementNote exists to produce, leaving a user
+// with a pre-v1.0.0 artifact staring at a bare "unsupported apiVersion".
+func TestRetiredGroupVersionsKeepTheirHistoricalStrings(t *testing.T) {
+	t.Parallel()
+
+	retired := map[string]string{
+		RetiredGroupVersionV1Alpha2: "aicr.run/v1alpha2",
+		RetiredGroupVersionV1Alpha3: "aicr.run/v1alpha3",
+	}
+	for got, want := range retired {
+		if got != want {
+			t.Errorf("retired group/version = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestGroupVersion(t *testing.T) {
+	t.Parallel()
+
+	versions := map[string]string{
+		GroupVersionV1:      APIGroup + "/" + APIVersionV1,
+		GroupVersionV1Beta1: APIGroup + "/" + APIVersionV1Beta1,
+		GroupVersionV1Beta2: APIGroup + "/" + APIVersionV1Beta2,
+	}
+	for got, want := range versions {
+		if got != want {
+			t.Errorf("target group/version = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestIsSupportedAPIVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"target", "aicr.run/v1", true},
+		{"retired alpha2 rejected", "aicr.run/v1alpha2", false},
+		{"retired alpha3 rejected", "aicr.run/v1alpha3", false},
+		{"authoring target rejected", "aicr.run/v1beta1", false},
+		{"profile target rejected", "aicr.run/v1beta2", false},
+		{"old group+version rejected", "aicr.nvidia.com/v1alpha1", false},
+		{"old group new version rejected", "aicr.nvidia.com/v1alpha2", false},
+		{"new group old version rejected", "aicr.run/v1alpha1", false},
+		{"empty rejected", "", false},
+		{"garbage rejected", "v1", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsSupportedAPIVersion(tt.in); got != tt.want {
+				t.Errorf("IsSupportedAPIVersion(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSchemaTrackAPIVersions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		check    func(string) bool
+		accepted []string
+		rejected []string
+	}{
+		{
+			name:     "authoring",
+			check:    IsSupportedAuthoringAPIVersion,
+			accepted: []string{GroupVersionV1Beta1},
+			rejected: []string{
+				"", GroupVersionV1, GroupVersionV1Beta2,
+				RetiredGroupVersionV1Alpha2, RetiredGroupVersionV1Alpha3,
+			},
+		},
+		{
+			name:     "profile",
+			check:    IsSupportedProfileAPIVersion,
+			accepted: []string{GroupVersionV1Beta2},
+			rejected: []string{
+				"", GroupVersionV1, GroupVersionV1Beta1,
+				RetiredGroupVersionV1Alpha2, RetiredGroupVersionV1Alpha3,
+			},
+		},
+		{
+			name:     "bundleinfo",
+			check:    IsSupportedBundleInfoAPIVersion,
+			accepted: []string{GroupVersionV1},
+			rejected: []string{
+				"", GroupVersionV1Beta1, GroupVersionV1Beta2,
+				RetiredGroupVersionV1Alpha2, RetiredGroupVersionV1Alpha3,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			for _, version := range tt.accepted {
+				if !tt.check(version) {
+					t.Errorf("%s track rejected %q", tt.name, version)
+				}
+			}
+			for _, version := range tt.rejected {
+				if tt.check(version) {
+					t.Errorf("%s track accepted %q", tt.name, version)
+				}
+			}
+		})
+	}
+}
+
+func TestIsSupportedRecipeResultAPIVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		version string
+		want    bool
+	}{
+		{version: GroupVersionV1, want: true},
+		{version: GroupVersionV1Beta2, want: true},
+		{version: GroupVersionV1Beta1, want: false},
+		{version: RetiredGroupVersionV1Alpha2, want: false},
+		{version: RetiredGroupVersionV1Alpha3, want: false},
+		{version: "", want: false},
+		{version: "aicr.run/v1alpha4", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.version, func(t *testing.T) {
+			t.Parallel()
+			if got := IsSupportedRecipeResultAPIVersion(tt.version); got != tt.want {
+				t.Errorf("IsSupportedRecipeResultAPIVersion(%q) = %v, want %v",
+					tt.version, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestKind_String(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		kind Kind
+		want string
+	}{
+		{
+			name: "Snapshot kind",
+			kind: KindSnapshot,
+			want: "Snapshot",
+		},
+		{
+			name: "Recipe kind",
+			kind: KindRecipe,
+			want: "Recipe",
+		},
+		{
+			name: "Custom kind",
+			kind: Kind("CustomKind"),
+			want: "CustomKind",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tt.kind.String(); got != tt.want {
+				t.Errorf("Kind.String() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNew(t *testing.T) {
+	t.Parallel()
+
+	h := newHeader()
+	if h == nil {
+		t.Fatal("newHeader() returned nil")
+	}
+	if h.Metadata == nil {
+		t.Error("Metadata should be initialized")
+	}
+	if len(h.Metadata) != 0 {
+		t.Errorf("Metadata should be empty, got %d items", len(h.Metadata))
+	}
+}
+
+func TestHeader_Init(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		kind    Kind
+		version string
+		check   func(*testing.T, *Header)
+	}{
+		{
+			name:    "Init Snapshot with version",
+			kind:    KindSnapshot,
+			version: "v1.0.0",
+			check: func(t *testing.T, h *Header) {
+				if h.Kind != KindSnapshot {
+					t.Errorf("Kind = %v, want %v", h.Kind, KindSnapshot)
+				}
+				if h.APIVersion != testAPIVersion {
+					t.Errorf("APIVersion = %v, want %s", h.APIVersion, testAPIVersion)
+				}
+				if h.Metadata == nil {
+					t.Fatal("Metadata is nil")
+				}
+				if _, exists := h.Metadata["timestamp"]; !exists {
+					t.Error("timestamp not found in metadata")
+				}
+				if v := h.Metadata["version"]; v != "v1.0.0" {
+					t.Errorf("version = %v, want v1.0.0", v)
+				}
+			},
+		},
+		{
+			name:    "Init Recipe without version",
+			kind:    KindRecipe,
+			version: "",
+			check: func(t *testing.T, h *Header) {
+				if h.Kind != KindRecipe {
+					t.Errorf("Kind = %v, want %v", h.Kind, KindRecipe)
+				}
+				if h.APIVersion != testAPIVersion {
+					t.Errorf("APIVersion = %v, want %s", h.APIVersion, testAPIVersion)
+				}
+				if _, exists := h.Metadata["timestamp"]; !exists {
+					t.Error("timestamp not found in metadata")
+				}
+				if _, exists := h.Metadata["version"]; exists {
+					t.Error("version should not exist when version is empty")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := &Header{}
+			h.Init(tt.kind, testAPIVersion, tt.version)
+			tt.check(t, h)
+		})
+	}
+}
+
+func TestHeader_Init_TimestampFormat(t *testing.T) {
+	t.Parallel()
+
+	h := &Header{}
+	h.Init(KindSnapshot, testAPIVersion, "v1.0.0")
+
+	timestamp, exists := h.Metadata["timestamp"]
+	if !exists {
+		t.Fatal("timestamp not found in metadata")
+	}
+
+	// Parse the timestamp to ensure it's valid RFC3339
+	parsedTime, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		t.Errorf("Failed to parse timestamp as RFC3339: %v", err)
+	}
+
+	// Verify timestamp is recent (within last minute)
+	now := time.Now().UTC()
+	diff := now.Sub(parsedTime)
+	if diff < 0 || diff > time.Minute {
+		t.Errorf("Timestamp %v is not recent (diff: %v)", timestamp, diff)
+	}
+}
+
+func TestHeader_Init_OverwritesExistingData(t *testing.T) {
+	t.Parallel()
+
+	h := &Header{
+		Kind:       KindRecipe,
+		APIVersion: "old.example.com/v1",
+		Metadata: map[string]string{
+			"existing-key": "existing-value",
+		},
+	}
+
+	h.Init(KindSnapshot, testAPIVersion, "v2.0.0")
+
+	// Check that old data is replaced
+	if h.Kind != KindSnapshot {
+		t.Errorf("Kind was not updated, got %v, want %v", h.Kind, KindSnapshot)
+	}
+
+	if h.APIVersion != testAPIVersion {
+		t.Errorf("APIVersion was not updated, got %v, want %s", h.APIVersion, testAPIVersion)
+	}
+
+	// Metadata should be completely replaced
+	if _, exists := h.Metadata["existing-key"]; exists {
+		t.Error("Old metadata key should have been removed")
+	}
+
+	if _, exists := h.Metadata["version"]; !exists {
+		t.Error("New metadata should be present")
+	}
+}
+
+func TestConstants(t *testing.T) {
+	t.Parallel()
+
+	// Verify constant values haven't changed
+	if KindSnapshot != "Snapshot" {
+		t.Errorf("KindSnapshot = %v, want Snapshot", KindSnapshot)
+	}
+	if KindRecipe != "Recipe" {
+		t.Errorf("KindRecipe = %v, want Recipe", KindRecipe)
+	}
+	if KindRecipeResult != "RecipeResult" {
+		t.Errorf("KindRecipeResult = %v, want RecipeResult", KindRecipeResult)
+	}
+
+	// Note: API version constants moved to resource-specific packages
+	// - snapshotter.FullAPIVersion for Snapshot resources
+	// - recipe.FullAPIVersion for Recipe resources
+	// This allows independent evolution of each resource type's API version
+}

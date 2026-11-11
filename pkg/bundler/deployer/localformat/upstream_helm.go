@@ -1,0 +1,188 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package localformat
+
+import (
+	"embed"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"text/template"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer"
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+)
+
+//go:embed templates/install-upstream-helm.sh.tmpl
+var upstreamHelmTemplates embed.FS
+
+//go:embed templates/apply-crds.sh.tmpl
+var applyCRDsTemplates embed.FS
+
+// shellSingleQuote wraps s in single quotes for safe inclusion in a shell
+// `source`-able file (e.g. KEY='value'). Embedded single quotes are escaped
+// with the canonical close-escape-reopen sequence `'\”`.
+//
+// Single quotes (vs double quotes) are required: inside double quotes,
+// `$()`, backticks, and `$VAR` still expand, so a malicious or
+// pathological value could execute when sourced.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// shellFuncs is registered on every template that renders a shell script, so
+// recipe-supplied values reach the generated shell as single-quoted literals.
+// Component names are validated only as path components
+// (IsSafePathComponent rejects separators, not shell metacharacters), and
+// namespaces are not validated here at all, so neither is safe to interpolate
+// bare into a command.
+var shellFuncs = template.FuncMap{"shq": shellSingleQuote}
+
+var upstreamHelmTmpl = template.Must(
+	template.New("install-upstream-helm.sh.tmpl").
+		Funcs(deployer.TemplateFuncs).
+		Funcs(shellFuncs).
+		ParseFS(upstreamHelmTemplates, "templates/install-upstream-helm.sh.tmpl"),
+)
+
+var applyCRDsTmpl = template.Must(
+	template.New("apply-crds.sh.tmpl").
+		Funcs(deployer.TemplateFuncs).
+		Funcs(shellFuncs).
+		ParseFS(applyCRDsTemplates, "templates/apply-crds.sh.tmpl"),
+)
+
+// applyCRDsData is the render input for apply-crds.sh. FromUpstreamEnv picks
+// how the script names the chart: sourcing upstream.env for a non-vendored
+// folder, or "./" for a vendored wrapper whose subchart tarball sits under
+// charts/.
+type applyCRDsData struct {
+	Name      string
+	Namespace string
+	// ReleaseFilter anchors Name as a `helm list --filter` regex, so a release
+	// whose name merely contains Name cannot be mistaken for this one.
+	ReleaseFilter         string
+	FromUpstreamEnv       bool
+	CRDStepTimeoutSeconds int
+	// ExcludeSubcharts names subcharts whose crds/ the step skips.
+	ExcludeSubcharts []string
+}
+
+// writeApplyCRDsScript renders apply-crds.sh into folderDir and returns its
+// path relative to the bundle root, or "" when the component does not own its
+// CRDs. Non-owning components get no file at all, so the absence of the step
+// is visible on disk rather than encoded as a no-op script.
+func writeApplyCRDsScript(folderDir, dir string, c Component, fromUpstreamEnv bool) (string, error) {
+	data := applyCRDsData{
+		Name:                  c.Name,
+		Namespace:             c.Namespace,
+		ReleaseFilter:         "^" + regexp.QuoteMeta(c.Name) + "$",
+		FromUpstreamEnv:       fromUpstreamEnv,
+		CRDStepTimeoutSeconds: int(defaults.BundleCRDStepTimeout.Seconds()),
+		ExcludeSubcharts:      c.CRDExcludeSubcharts,
+	}
+	if err := renderTemplateToFile(applyCRDsTmpl, data, folderDir, "apply-crds.sh", 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "apply-crds.sh"), nil
+}
+
+// writeUpstreamHelmFolder writes values.yaml + cluster-values.yaml + upstream.env + install.sh
+// into outputDir/dir. Returns the Folder manifest (Files are all relative to outputDir).
+func writeUpstreamHelmFolder(outputDir, dir string, idx int, c Component) (Folder, error) {
+	folderDir, err := deployer.SafeJoin(outputDir, dir)
+	if err != nil {
+		return Folder{}, errors.Wrap(errors.ErrCodeInvalidRequest, "folder path unsafe", err)
+	}
+	if err = os.MkdirAll(folderDir, 0o755); err != nil {
+		return Folder{}, errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("create folder %s", dir), err)
+	}
+
+	if err = writeValueFiles(folderDir, c, true); err != nil {
+		return Folder{}, err
+	}
+
+	// For OCI charts, helm wants the full URI as the chart argument (no --repo).
+	// For HTTP/HTTPS charts, helm wants the chart name + a separate --repo flag.
+	// Encode that into upstream.env so install.sh can be branch-free.
+	chart, repo := c.ChartName, c.Repository
+	if c.IsOCI {
+		chart = strings.TrimRight(c.Repository, "/") + "/" + c.ChartName
+		repo = ""
+	}
+	// install.sh sources upstream.env; values must be shell-safe so a value
+	// containing a single quote, $(...), or backticks can't escape into
+	// command execution. shellSingleQuote wraps the value in single quotes
+	// and replaces any embedded single quote with the four-character
+	// sequence '\'' — a closed quote, an escaped quote, then a re-opened
+	// one — which is the only POSIX-safe escape inside single quotes.
+	envContent := fmt.Sprintf("CHART=%s\nREPO=%s\nVERSION=%s\n",
+		shellSingleQuote(chart), shellSingleQuote(repo), shellSingleQuote(c.Version))
+	envPath, err := deployer.SafeJoin(folderDir, "upstream.env")
+	if err != nil {
+		return Folder{}, errors.Wrap(errors.ErrCodeInvalidRequest, "upstream.env path unsafe", err)
+	}
+	if err = writeFile(envPath, []byte(envContent), 0o600); err != nil {
+		return Folder{}, err
+	}
+
+	installData := struct {
+		Name                 string
+		Namespace            string
+		OwnsCRDs             bool
+		RequiredDynamicPaths []string
+	}{c.Name, c.Namespace, c.OwnsCRDs, c.RequiredDynamicPaths}
+	if err = renderTemplateToFile(upstreamHelmTmpl, installData, folderDir, "install.sh", 0o755); err != nil {
+		return Folder{}, err
+	}
+
+	files := []string{
+		filepath.Join(dir, "values.yaml"),
+		filepath.Join(dir, "cluster-values.yaml"),
+		filepath.Join(dir, "upstream.env"),
+		filepath.Join(dir, "install.sh"),
+	}
+	if c.OwnsCRDs {
+		crdScript, crdErr := writeApplyCRDsScript(folderDir, dir, c, true)
+		if crdErr != nil {
+			return Folder{}, crdErr
+		}
+		files = append(files, crdScript)
+	}
+
+	return Folder{
+		Index:     idx,
+		Dir:       dir,
+		Kind:      KindUpstreamHelm,
+		Name:      c.Name,
+		Namespace: c.Namespace,
+		Parent:    c.Name,
+		Upstream: &Upstream{
+			Chart:   c.ChartName,
+			Repo:    c.Repository,
+			Version: c.Version,
+		},
+		Files:       files,
+		AppliesCRDs: c.OwnsCRDs,
+		// Upstream Helm folders don't ship AICR-rendered templates, so
+		// the chart-owns-Namespace detection in local_helm doesn't apply
+		// here. Default to true to match install.sh's --create-namespace.
+		CreateNamespace: true,
+	}, nil
+}

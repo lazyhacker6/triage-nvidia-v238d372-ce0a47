@@ -1,0 +1,18 @@
+.git
+.github
+.claude
+.vscode
+docs
+kwok
+tests
+tools
+*.md
+!go.mod
+!go.sum
+LICENSE
+CODEOWNERS
+.goreleaser.yaml
+Makefile
+
+# Test-only snapshot; the deployment validator image copies its testdata/ wholesale.
+validators/deployment/testdata/chart_contracts.yaml

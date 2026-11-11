@@ -1,0 +1,4117 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package validations
+
+import (
+	"context"
+	stderrors "errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"path"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/NVIDIA/aicr/pkg/allocpolicy"
+	"github.com/NVIDIA/aicr/pkg/bundler/config"
+	"github.com/NVIDIA/aicr/pkg/bundler/drainscope"
+	"github.com/NVIDIA/aicr/pkg/component"
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+)
+
+// overrideValueFalse and overrideValueTrue are the string forms of boolean
+// `--set` overrides — value overrides are collected as strings, so booleans
+// arrive as their string literal.
+const (
+	overrideValueFalse = "false"
+	overrideValueTrue  = "true"
+)
+
+// logKeyComponent is the shared structured-logging / error-context key
+// naming the component a validation message or error is about.
+const logKeyComponent = "component"
+
+// init auto-registers validation functions in this package.
+// This allows the registry to discover validation functions automatically.
+func init() {
+	// Register all validation functions in this package
+	// This is called automatically when the package is imported
+	registerCheck("CheckWorkloadSelectorMissing", CheckWorkloadSelectorMissing)
+	registerCheck("CheckAcceleratedSelectorMissing", CheckAcceleratedSelectorMissing)
+	registerCheck("CheckHostMofedWithoutNetworkOperator", CheckHostMofedWithoutNetworkOperator)
+	registerCheck("CheckNetworkOperatorEnabled", CheckNetworkOperatorEnabled)
+	registerCheck("CheckWildcardAcceleratedToleration", CheckWildcardAcceleratedToleration)
+	registerCheck("CheckNodewrightRuntimeRequiredTaintKey", CheckNodewrightRuntimeRequiredTaintKey)
+	registerCheck("CheckGB300HostKernelGranule", CheckGB300HostKernelGranule)
+	registerCheck("CheckNPDNotDuplicatingProviderNPD", CheckNPDNotDuplicatingProviderNPD)
+	registerCheck("CheckDriverOwnershipCoherence", CheckDriverOwnershipCoherence)
+	registerCheck("CheckMariaDBOperatorOwnershipCoherence", CheckMariaDBOperatorOwnershipCoherence)
+	registerCheck("CheckRDMANamespaceModeCoherent", CheckRDMANamespaceModeCoherent)
+	registerCheck("CheckRDMANamespaceModeEvidence", CheckRDMANamespaceModeEvidence)
+	registerCheck("CheckGKETCPXOInterfacesCoherence", CheckGKETCPXOInterfacesCoherence)
+	registerCheck("CheckNVSentinelDriverLabelDetectable", CheckNVSentinelDriverLabelDetectable)
+	registerCheck("CheckNVSentinelRuntimeClassCoherence", CheckNVSentinelRuntimeClassCoherence)
+	registerCheck("CheckNVSentinelTracingEndpointRequired", CheckNVSentinelTracingEndpointRequired)
+	registerCheck("CheckNVSentinelPreflightDCGMReachable", CheckNVSentinelPreflightDCGMReachable)
+	registerCheck("CheckNVSentinelPreflightGangSchedulerRequired", CheckNVSentinelPreflightGangSchedulerRequired)
+	registerCheck("CheckNVSentinelNicHealthMonitorRequiresMetadataCollector", CheckNVSentinelNicHealthMonitorRequiresMetadataCollector)
+	registerCheck("CheckNVSentinelSlurmDrainMonitorRequiresSlinky", CheckNVSentinelSlurmDrainMonitorRequiresSlinky)
+	registerCheck("CheckNVSentinelRemediationPipelineCoherent", CheckNVSentinelRemediationPipelineCoherent)
+	registerCheck("CheckNVSentinelSlurmCustomDrainCoherent", CheckNVSentinelSlurmCustomDrainCoherent)
+	registerCheck("CheckNVSentinelEventExporterCoherent", CheckNVSentinelEventExporterCoherent)
+	registerCheck("CheckNVSentinelLogCollectorCoherent", CheckNVSentinelLogCollectorCoherent)
+	registerCheck("CheckNVSentinelExternalRemediationCoherent", CheckNVSentinelExternalRemediationCoherent)
+	registerCheck("CheckNVSentinelFileServerStorageClass", CheckNVSentinelFileServerStorageClass)
+	registerCheck("CheckNVSentinelDrainScopeCoherent", CheckNVSentinelDrainScopeCoherent)
+	registerCheck("CheckNVSentinelNodeValidationCoherent", CheckNVSentinelNodeValidationCoherent)
+	registerCheck("CheckNVSentinelPostRemediationValidationCoherent", CheckNVSentinelPostRemediationValidationCoherent)
+	registerCheck("CheckNVSentinelMaintenanceRequestCoherent", CheckNVSentinelMaintenanceRequestCoherent)
+	registerCheck("CheckNVSentinelCSPHealthMonitorCoherent", CheckNVSentinelCSPHealthMonitorCoherent)
+	registerCheck("CheckNVSentinelMongoDBCoherent", CheckNVSentinelMongoDBCoherent)
+	registerCheck("CheckNVSentinelDatastorePrerequisites", CheckNVSentinelDatastorePrerequisites)
+	registerCheck("CheckNKTPExportersHaveBackend", CheckNKTPExportersHaveBackend)
+}
+
+// registerCheck is a helper to register validation functions from checks.go.
+// It's called from init() to auto-register functions.
+func registerCheck(name string, fn ValidationFunc) {
+	// Use Register which will initialize the registry if needed
+	Register(name, fn)
+}
+
+// CheckWorkloadSelectorMissing checks if workload-selector is missing when conditions are met.
+// This is a generic check that can be used by any component. A component that
+// renders only nodewrightNoInterruptManifests is skipped: those packages never
+// cordon or drain, so they cannot evict a workload.
+func CheckWorkloadSelectorMissing(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if bundlerConfig == nil {
+		return nil, nil
+	}
+
+	ref := recipeResult.GetComponentRef(componentName)
+	if ref == nil || rendersOnlyNoInterruptPackages(ref) {
+		return nil, nil
+	}
+
+	// Check conditions (e.g., intent: training)
+	if !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+
+	// Check if workload-selector is not set
+	selector := bundlerConfig.WorkloadSelector()
+	if len(selector) == 0 {
+		baseMsg := fmt.Sprintf("%s is enabled but --workload-selector is not set", componentName)
+		slog.Warn(baseMsg,
+			logKeyComponent, componentName,
+			"conditions", conditions,
+		)
+		return []string{baseMsg}, nil
+	}
+
+	return nil, nil
+}
+
+// CheckAcceleratedSelectorMissing checks if accelerated-node-selector is missing when conditions are met.
+// This is a generic check that can be used by any component. A component that
+// renders only nodewrightNoInterruptManifests is skipped: those manifests
+// select nodes by a fixed label and ignore the accelerated-node selector. A
+// disabled component renders nothing that a selector would scope, so it is
+// skipped too.
+func CheckAcceleratedSelectorMissing(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if bundlerConfig == nil {
+		return nil, nil
+	}
+
+	ref := recipeResult.GetComponentRef(componentName)
+	if ref == nil || rendersOnlyNoInterruptPackages(ref) {
+		return nil, nil
+	}
+
+	// Check conditions (e.g., intent: [training, inference])
+	if !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+
+	if componentDisabled(ref, bundlerConfig, componentOverrideKeys(componentName, recipeResult.DataProvider())) {
+		return nil, nil
+	}
+
+	// Check if accelerated-node-selector is not set
+	selector := bundlerConfig.AcceleratedNodeSelector()
+	if len(selector) == 0 {
+		baseMsg := fmt.Sprintf("%s is enabled but --accelerated-node-selector is not set", componentName)
+		slog.Warn(baseMsg,
+			logKeyComponent, componentName,
+			"conditions", conditions,
+		)
+		return []string{baseMsg}, nil
+	}
+
+	return nil, nil
+}
+
+// checkConditions verifies that the recipe result meets the specified conditions.
+// Conditions are arrays of strings for OR matching (single element arrays are equivalent to single values).
+// Reuses matching logic from recipe/criteria.go.
+func checkConditions(recipeResult *recipe.RecipeResult, conditions map[string][]string) bool {
+	if len(conditions) == 0 {
+		return true
+	}
+
+	if recipeResult.Criteria == nil {
+		return false
+	}
+
+	for key, expectedValues := range conditions {
+		var actualValue string
+
+		// Get actual value from criteria
+		switch key {
+		case "intent":
+			actualValue = string(recipeResult.Criteria.Intent)
+		case "service":
+			actualValue = string(recipeResult.Criteria.Service)
+		case "accelerator":
+			actualValue = string(recipeResult.Criteria.Accelerator)
+		case "os":
+			actualValue = string(recipeResult.Criteria.OS)
+		case "platform":
+			actualValue = string(recipeResult.Criteria.Platform)
+		default:
+			// Unknown condition key, skip
+			continue
+		}
+
+		// Check if actualValue matches any of the expected values (OR matching)
+		found := false
+		for _, expectedStr := range expectedValues {
+			// Use recipe.MatchesCriteriaField for consistent matching logic
+			if recipe.MatchesCriteriaField(actualValue, expectedStr) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	return true
+}
+
+// nodewrightCustomizationsOverrideAliases are the registry valueOverrideKeys for
+// the nodewright-customizations component — the aliases (beyond the exact
+// component name) a user passes to --set to disable it, e.g.
+// --set nodewrightcustomizations:enabled=false. The bundler resolves --set
+// overrides under the exact component name AND these aliases
+// (DefaultBundler.componentOverrideKeys), so the disable check below mirrors
+// that set to avoid a false positive when a user disables via one form and the
+// check reads another.
+var nodewrightCustomizationsOverrideAliases = []string{"nodewrightcustomizations", "skyhookcustomizations"}
+
+// nodewrightNoInterruptManifests are the nodewright-customizations manifests
+// whose packages declare no interrupt (no cordon, drain or reboot) and ignore
+// the accelerated-node selector. Any other manifest is treated as one that
+// does, so a new or custom manifest is checked until it is listed here.
+var nodewrightNoInterruptManifests = []string{
+	"components/nodewright-customizations/manifests/toolkit-hardening-aks.yaml",
+	"components/nodewright-customizations/manifests/toolkit-hardening-oke.yaml",
+}
+
+// rendersOnlyNoInterruptPackages reports whether every manifest ref wires is
+// in nodewrightNoInterruptManifests. A ref with no manifests reports false, so
+// the caller's check still runs.
+func rendersOnlyNoInterruptPackages(ref *recipe.ComponentRef) bool {
+	if len(ref.ManifestFiles) == 0 {
+		return false
+	}
+	for _, m := range ref.ManifestFiles {
+		if !slices.Contains(nodewrightNoInterruptManifests, m) {
+			return false
+		}
+	}
+	return true
+}
+
+// CheckWildcardAcceleratedToleration reports when the effective accelerated-node
+// tolerations for a component include a wildcard (keyless operator: Exists)
+// toleration. Scope it via registry conditions to services where the wildcard
+// is harmful — on AKS, admission collapses a pod's toleration list to just the
+// wildcard when one is present, which defeats the nodewright operator's drain
+// exemption for its own package pods and deadlocks packages that declare
+// interrupts (NVIDIA/nodewright#296). That deadlock requires manual node
+// cordon/reboot to recover, so the registry wires this at severity: error to
+// block the bundle until a keyed toleration is supplied.
+//
+// A component whose manifests are all in nodewrightNoInterruptManifests (the
+// AKS toolkit hardening alone) has nothing to deadlock and is skipped.
+//
+// The default bundle path always hits this: with no
+// --accelerated-node-toleration flag the CLI falls back to
+// snapshotter.DefaultTolerations() (a single bare operator: Exists). An empty
+// toleration list is flagged too, because the tuning manifest template renders
+// its own wildcard fallback when none are injected.
+//
+// A component disabled via --set nodewrightcustomizations:enabled=false
+// renders no package pods and cannot deadlock, so it is skipped regardless of
+// the toleration shape.
+func CheckWildcardAcceleratedToleration(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if bundlerConfig == nil {
+		return nil, nil
+	}
+
+	ref := recipeResult.GetComponentRef(componentName)
+	if ref == nil || rendersOnlyNoInterruptPackages(ref) {
+		return nil, nil
+	}
+
+	// Check conditions (e.g., service: aks)
+	if !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+
+	// A disabled component renders nothing, so it cannot deadlock — skip it.
+	// Check the exact component name and its registry aliases, mirroring how
+	// the bundler resolves --set overrides so any disable form is honored.
+	overrides := bundlerConfig.ValueOverrides()
+	for _, key := range append([]string{componentName}, nodewrightCustomizationsOverrideAliases...) {
+		if overrides[key]["enabled"] == overrideValueFalse {
+			return nil, nil
+		}
+	}
+
+	tolerations := bundlerConfig.AcceleratedNodeTolerations()
+	wildcard := len(tolerations) == 0 // template falls back to its own wildcard
+	for _, tol := range tolerations {
+		if tol.Key == "" {
+			wildcard = true
+			break
+		}
+	}
+
+	if !wildcard {
+		return nil, nil
+	}
+
+	baseMsg := fmt.Sprintf("%s renders a wildcard (keyless) accelerated-node toleration", componentName)
+	slog.Warn(baseMsg,
+		logKeyComponent, componentName,
+		"conditions", conditions,
+	)
+	return []string{baseMsg}, nil
+}
+
+// npdQualifiedServices are the platforms on which installing
+// node-problem-detector has been verified safe: nothing else publishes its Node
+// Conditions, so AICR's instance is the only writer.
+//
+// Verified on live clusters (EKS, Kind) or from upstream packaging (RKE2).
+//
+// OKE is deliberately NOT here. Oracle ships oke-node-problem-detector in
+// kube-system, disabled behind the
+// oci.oraclecloud.com/oke-node-problem-detector-enabled node label. Observed
+// disabled on a live cluster, but that is a mutable, per-node setting an
+// operator can turn on at any time, before or after this bundle is installed,
+// and nothing at bundle time can see it. Permitting OKE would therefore rest on
+// a snapshot of state AICR does not control -- exactly the assumption this
+// allowlist exists to refuse.
+var npdQualifiedServices = map[recipe.CriteriaServiceType]bool{
+	recipe.CriteriaServiceEKS:  true,
+	recipe.CriteriaServiceKind: true,
+	recipe.CriteriaServiceRKE2: true,
+}
+
+// npdProviderRunsItsOwn are the platforms whose managed control plane already
+// runs NPD by default. A second instance competes for ownership of the same
+// Node Conditions and one silently loses its writes.
+var npdProviderRunsItsOwn = map[recipe.CriteriaServiceType]bool{
+	recipe.CriteriaServiceGKE: true,
+	recipe.CriteriaServiceAKS: true,
+}
+
+// CheckNPDNotDuplicatingProviderNPD blocks a bundle that would install
+// node-problem-detector where doing so is unsafe or unverified.
+//
+// An ALLOWLIST, not a denylist. NPD is a privileged DaemonSet that patches Node
+// status, and getting its ownership wrong fails silently -- two writers produce
+// flapping conditions with no error anywhere. So only platforms where this has
+// actually been checked are permitted; everything else is rejected with a
+// message saying what would settle it. A denylist would have let every
+// unexamined platform through by omission.
+//
+// Rejected, and why:
+//   - gke, aks: the provider already runs its own (npdProviderRunsItsOwn).
+//   - ocp: NPD needs a privileged SecurityContextConstraints binding that AICR
+//     does not ship, so the DaemonSet bundles cleanly and then fails admission.
+//   - os talos: recipes/mixins/os-talos.yaml relocates privileged components
+//     into privileged-* namespaces for Pod Security Admission. NPD is not in
+//     that list, so it would land in a restricted namespace and be denied.
+//   - anything else (lke, bcm, metal3, generic, k0s, mk8s, nvke, ...): unverified.
+//   - no criteria at all: the platform is unknown, and checkConditions' "nil
+//     Criteria means condition not met" would skip the gate entirely. A
+//     hand-authored or already-hydrated RecipeResult legitimately carries no
+//     criteria (pkg/client/v1's loadedResultFromInternal), and that platform
+//     could be any of the above.
+func CheckNPDNotDuplicatingProviderNPD(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil {
+		return nil, nil
+	}
+
+	ref := recipeResult.GetComponentRef(componentName)
+	if ref == nil {
+		return nil, nil
+	}
+
+	// componentDisabled, not a per-key scan for "false": it resolves aliases in
+	// the bundler's own priority order, so a conflicting
+	// `--set npd:enabled=false --set node-problem-detector:enabled=true` cannot
+	// disarm the gate while the component is in fact still enabled.
+	keys := componentOverrideKeys(componentName, recipeResult.DataProvider())
+	if componentDisabled(ref, bundlerConfig, keys) {
+		return nil, nil
+	}
+
+	reject := func(reason string) ([]string, []error) {
+		err := aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s", componentName, reason))
+		slog.Warn(err.Error(), logKeyComponent, componentName)
+
+		return nil, []error{err}
+	}
+
+	if recipeResult.Criteria == nil {
+		return reject("installed but this recipe carries no criteria, so the target platform cannot be confirmed clear of a provider-installed node-problem-detector -- supply criteria, or disable it explicitly with --set once you have confirmed the platform")
+	}
+
+	service := recipeResult.Criteria.Service
+	switch {
+	case npdProviderRunsItsOwn[service]:
+		return reject(fmt.Sprintf("installed but %s already runs its own node-problem-detector by default; a second instance competes for ownership of the same Node Conditions and one silently loses its writes. Drop the npd mixin -- the platform's own NPD already publishes some of the conditions the nvsentinel-object-monitor policies read", service))
+	case service == recipe.CriteriaServiceOCP:
+		return reject("installed on OpenShift, where the privileged DaemonSet needs a SecurityContextConstraints binding that AICR does not ship; it would bundle cleanly and then be denied at admission")
+	case service == recipe.CriteriaServiceOKE:
+		return reject("installed on OKE, where Oracle ships its own oke-node-problem-detector in kube-system. It is disabled by default, behind the oci.oraclecloud.com/oke-node-problem-detector-enabled node label, but that label is operator-settable at any time and is not visible at bundle time -- so a second instance cannot be ruled out. Enable Oracle's instead, or disable node-problem-detector explicitly with --set if you have confirmed the label is unset and will stay so")
+	case !npdQualifiedServices[service]:
+		return reject(fmt.Sprintf("installed on %q, which has not been checked for a platform-provided node-problem-detector. Two instances fight over the same Node Conditions and one silently loses. Confirm the platform runs none, then add it to npdQualifiedServices", service))
+	case recipeResult.Criteria.OS == recipe.CriteriaOSTalos:
+		return reject("installed on Talos, where os-talos relocates privileged components into privileged-* namespaces for Pod Security Admission but does not relocate node-problem-detector; it would land in a restricted namespace and be denied at admission")
+	}
+
+	return nil, nil
+}
+
+// tuningEnabledKey is the nodewright-customizations value gating the
+// nvidia-tuned package. Absent or true renders it; only an explicit false
+// suppresses it, matching the Sprig-safe gate the tuning manifests use.
+const tuningEnabledKey = "tuningEnabled"
+
+// CheckGB300HostKernelGranule warns that the GB300 tuned profile assumes a
+// 64k-granule ARM64 host kernel. Scope it via registry conditions to the leaf
+// that has no nvidia-setup to pin one (service: generic, accelerator: gb300);
+// every other GB300 route runs nvidia-setup-kernel, which installs the pinned
+// 64k kernel itself.
+//
+// nvidia-gb300-performance sizes its hugepage pools for that granule
+// (hugepagesz=512M, and no 1G, which a 64k granule cannot register). A
+// 4k-granule host still boots and runs: Linux rejects the invalid hugepagesz
+// clause and silently drops the hugepages= count paired with it, so the node
+// comes up without the 512M pool the profile intended. That is a performance
+// regression rather than a failure, which is why the registry wires this at
+// severity: info — bundle time has no cluster-side signal to tell the two
+// apart, and blocking would refuse a configuration that works.
+//
+// A component disabled via --set, or one whose tuning is gated off with
+// tuningEnabled=false, renders no nvidia-tuned package and applies no profile,
+// so it is skipped. Both gates are read from the FINAL effective values
+// (recipe merge plus scalar --set and typed --set-json/--set-file, under the
+// canonical name and its registry aliases) rather than from the raw scalar
+// override map: a typed --set-json that suppresses the package must suppress
+// the advisory with it. The tuningEnabled comparison mirrors the manifest's
+// own `ne (toString ...) "false"` gate exactly, so the two cannot disagree.
+func CheckGB300HostKernelGranule(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if bundlerConfig == nil {
+		return nil, nil
+	}
+
+	ref := recipeResult.GetComponentRef(componentName)
+	if ref == nil {
+		return nil, nil
+	}
+
+	// Check conditions (e.g., service: generic, accelerator: gb300)
+	if !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+
+	keys := componentOverrideKeys(componentName, recipeResult.DataProvider())
+	if componentDisabled(ref, bundlerConfig, keys) {
+		return nil, nil
+	}
+
+	values, err := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, keys, "GB300 host kernel granule")
+	if err != nil {
+		return nil, []error{err}
+	}
+	if fmt.Sprint(values[tuningEnabledKey]) == overrideValueFalse {
+		return nil, nil
+	}
+
+	baseMsg := fmt.Sprintf("%s applies a tuned profile that sizes hugepages for a 64k-granule ARM64 host kernel", componentName)
+	slog.Warn(baseMsg,
+		logKeyComponent, componentName,
+		"conditions", conditions,
+	)
+	return []string{baseMsg}, nil
+}
+
+// CheckHostMofedWithoutNetworkOperator warns when network-operator is disabled
+// via --set but gpu-operator still has driver.rdma.useHostMofed=true (the
+// AKS default). Without network-operator, no host MOFED is present and
+// useHostMofed should be set to false.
+func CheckHostMofedWithoutNetworkOperator(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if bundlerConfig == nil {
+		return nil, nil
+	}
+
+	// Check conditions (e.g., service: aks)
+	if !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+
+	// Check if network-operator is disabled via --set
+	overrides := bundlerConfig.ValueOverrides()
+	netOpOverrides := overrides["networkoperator"]
+	if netOpOverrides == nil {
+		return nil, nil
+	}
+
+	enabledVal, hasEnabled := netOpOverrides["enabled"]
+	if !hasEnabled || enabledVal != overrideValueFalse {
+		return nil, nil
+	}
+
+	// network-operator is disabled — check if useHostMofed is overridden to false
+	gpuOpOverrides := overrides["gpuoperator"]
+	if gpuOpOverrides != nil {
+		if mofedVal, ok := gpuOpOverrides["driver.rdma.useHostMofed"]; ok && mofedVal == overrideValueFalse {
+			return nil, nil
+		}
+	}
+
+	msg := fmt.Sprintf(
+		"%s: network-operator is disabled but driver.rdma.useHostMofed is not set to false"+
+			" — add --set gpuoperator:driver.rdma.useHostMofed=false to avoid MOFED-related errors",
+		componentName,
+	)
+	slog.Warn(msg, logKeyComponent, componentName)
+
+	return []string{msg}, nil
+}
+
+// networkOperatorComponent is the canonical name of the network-operator
+// component.
+const networkOperatorComponent = "network-operator"
+
+// CheckNetworkOperatorEnabled reports when componentName is in the bundle but
+// network-operator is not: absent from the recipe, disabled there, or disabled
+// with --set (any registered override key and boolean spelling). The registry
+// entry's message says why the component needs it.
+func CheckNetworkOperatorEnabled(_ context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	ref := recipeResult.GetComponentRef(componentName)
+	if ref == nil || componentDisabled(ref, bundlerConfig, componentOverrideKeys(componentName, recipeResult.DataProvider())) {
+		return nil, nil
+	}
+	netop := recipeResult.GetComponentRef(networkOperatorComponent)
+	if netop != nil && !componentDisabled(netop, bundlerConfig, componentOverrideKeys(networkOperatorComponent, recipeResult.DataProvider())) {
+		return nil, nil
+	}
+	return []string{fmt.Sprintf("%s is in the bundle but %s is not", componentName, networkOperatorComponent)}, nil
+}
+
+// draDriverComponentName is the CANONICAL ComponentRef.Name used by the
+// recipe registry for the NVIDIA DRA GPU driver. Kept in sync with
+// recipes/registry.yaml. Used only in log/error message text below —
+// for actual component lookups, use resolveDRAComponentRef, which also
+// matches the OCP variant (see draDriverComponentNames).
+const draDriverComponentName = allocpolicy.ComponentDRADriver
+
+// draDriverComponentNames are every registry-level component name that
+// represents the NVIDIA DRA GPU driver, canonical plus OCP variant, from
+// config.DRADriverOwnership.
+var draDriverComponentNames = config.DRADriverOwnership.ComponentNames
+
+// resolveDRAComponentRef looks up the DRA driver's ComponentRef by
+// trying every known name variant in turn. recipeResult.GetComponentRef
+// only matches an EXACT name, so a bare call with the canonical
+// "nvidia-dra-driver-gpu" silently returns nil (skipping Rule 2
+// entirely, with no error) on any recipe using the OCP variant instead.
+func resolveDRAComponentRef(recipeResult *recipe.RecipeResult) *recipe.ComponentRef {
+	for _, name := range draDriverComponentNames {
+		if ref := recipeResult.GetComponentRef(name); ref != nil {
+			return ref
+		}
+	}
+	return nil
+}
+
+// operatorContainerDriverRoot is the host path the GPU Operator's driver
+// container populates when the operator manages the driver
+// (driver.enabled=true). It is also the gpu-operator chart default for
+// hostPaths.driverInstallDir, so CheckDriverOwnershipCoherence uses it
+// both as the fallback install dir when a recipe leaves the field unset
+// and as the "legacy pre-flip recipe" signature: with
+// driver.enabled=false nothing populates this path, so a DRA
+// nvidiaDriverRoot still pointing at it is incoherent.
+const operatorContainerDriverRoot = "/run/nvidia/driver"
+
+// gpuOperatorManagedOverrideSet is the documented bundle-time override
+// tuple that flips a preinstalled-driver recipe to GPU-Operator-managed
+// mode. A private sibling of this constant (and of driverAbsentRemedy
+// below) lives in pkg/client/v1's gpu_driver_state.go: importing across
+// would create a dependency cycle through pkg/bundler, and a shared
+// package for two small helpers was rejected — the duplication is the
+// agreed disposition. Keep both copies in sync.
+const gpuOperatorManagedOverrideSet = "--set gpuoperator:driver.enabled=true " +
+	"--set gpuoperator:toolkit.enabled=true " +
+	"--set gpuoperator:operator.runtimeClass=nvidia " +
+	"--set dradriver:nvidiaDriverRoot=/run/nvidia/driver"
+
+const ocpGPUOperatorManagedOverrideSet = "--set gpuoperatorocp:driver.enabled=true " +
+	"--set gpuoperatorocp:toolkit.enabled=true " +
+	"--set dradriverocp:nvidiaDriverRoot=/run/nvidia/driver"
+
+// gkeGPUOperatorManagedOverrideSet extends the override tuple for GKE
+// remedies. GKE preinstalled-driver profiles (Google driver installer,
+// documented for both COS and Ubuntu node images) pin
+// hostPaths.driverInstallDir to /home/kubernetes/bin/nvidia, so a flip
+// to operator-managed mode must move BOTH driver roots to the operator
+// container root — otherwise the DRA lockstep rule blocks the exact
+// bundle this remedy recommends.
+const gkeGPUOperatorManagedOverrideSet = gpuOperatorManagedOverrideSet +
+	" --set gpuoperator:hostPaths.driverInstallDir=/run/nvidia/driver"
+
+// gkeManagedDriverRootPath is the Google driver-installer root that GKE
+// preinstalled-driver profiles pin both driver roots to.
+const gkeManagedDriverRootPath = "/home/kubernetes/bin/nvidia"
+
+// legacyRecipeAlternativeRemedy returns the manual-override clause of the
+// Rule 2 legacy-recipe message (the alternative to regenerating the
+// recipe), scoped by service and OS exactly like driverAbsentRemedy: the
+// GPU Operator cannot install the driver on GKE COS node images, so
+// recommending the operator-managed override tuple there would produce a
+// bundle that clears this gate coherently and then fails at deploy —
+// COS gets a DRA-root retarget at the GKE-managed driver install path
+// instead, and an unknown GKE OS gets both paths without asserting the
+// recipe's OS supports either.
+func legacyRecipeAlternativeRemedy(service recipe.CriteriaServiceType, os recipe.CriteriaOSType) string {
+	const gkeCOSAlternative = "On GKE COS node images the GPU Operator cannot install the " +
+		"driver, so the GPU-Operator-managed override set is not available there; if the " +
+		"GPU nodes use the GKE-managed driver install, retarget the DRA driver root " +
+		"instead: --set dradriver:nvidiaDriverRoot=" + gkeManagedDriverRootPath + "."
+	switch service { //nolint:exhaustive // only GKE and OCP need dedicated override-key wording; every other service takes the generic gpuOperatorManagedOverrideSet default
+	case recipe.CriteriaServiceOCP:
+		return "Or supply the full GPU-Operator-managed override set: " +
+			ocpGPUOperatorManagedOverrideSet + "."
+	case recipe.CriteriaServiceGKE:
+		switch os { //nolint:exhaustive // COS and Ubuntu are the only GKE node images with specific wording; everything else (unknown, any, or an OS GKE does not offer) gets both supported GKE paths
+		case recipe.CriteriaOSCOS:
+			return gkeCOSAlternative
+		case recipe.CriteriaOSUbuntu:
+			return "Or supply the full GPU-Operator-managed override set: " +
+				gkeGPUOperatorManagedOverrideSet + "."
+		default:
+			return gkeCOSAlternative + " On GKE Ubuntu node images the GPU Operator can manage " +
+				"the driver, so those may instead supply the full GPU-Operator-managed " +
+				"override set: " + gkeGPUOperatorManagedOverrideSet + "."
+		}
+	default:
+		return "Or supply the full GPU-Operator-managed override set: " +
+			gpuOperatorManagedOverrideSet + "."
+	}
+}
+
+// driverAbsentRemedy returns the provider-appropriate remedy wording for
+// the "preinstalled-driver recipe on a driverless cluster" mismatch,
+// derived from the recipe's criteria service and OS. AKS pools created
+// with `--gpu-driver none` are fixed by recreating them without the flag
+// (or the override set); GKE+COS gets the COS-only wording (the GPU
+// Operator cannot install the driver on COS), GKE+Ubuntu gets the
+// operator-managed remedy (the pinned operator supports GKE driver
+// management only on Ubuntu node images), and any other GKE OS —
+// unknown, any, or one GKE does not offer — keeps the combined wording;
+// anything else gets the generic reprovision wording plus the override
+// set. Mirrors pkg/client/v1's resolution-time helper of the same name
+// (see gpuOperatorManagedOverrideSet above for why the duplication
+// exists).
+func driverAbsentRemedy(service recipe.CriteriaServiceType, os recipe.CriteriaOSType, profiled bool) string {
+	switch service { //nolint:exhaustive // only AKS, GKE, and OCP have provider-specific wording; every other service takes the generic default
+	case recipe.CriteriaServiceAKS:
+		if !profiled {
+			// Legacy pre-profile artifact: the ownership lock does not
+			// apply (no metadata.selectedProfile), so the four-flag
+			// bundle-time tuple remains this artifact's supported flip.
+			return "Either recreate the GPU node pools without --gpu-driver " +
+				"none (AKS installs the NVIDIA driver by default), or bundle " +
+				"in GPU-Operator-managed mode: " + gpuOperatorManagedOverrideSet + "."
+		}
+		return "Either repair the AKS-managed driver install (recreate the " +
+			"GPU node pools without --gpu-driver none; AKS installs the " +
+			"NVIDIA driver by default) and recapture the snapshot, or switch " +
+			"to operator-managed mode end to end: recreate the pools WITH " +
+			"--gpu-driver none, recapture the snapshot, and regenerate with " +
+			"--profile gpuStack=operator-managed. The operator-managed value's " +
+			"constraint " +
+			"requires the pools to read gpu-driver=None, so regenerating " +
+			"against the current snapshot alone fails closed; and the " +
+			"gpuStack profile owns the driver-ownership paths, so flipping " +
+			"them via per-path --set overrides is rejected."
+	case recipe.CriteriaServiceGKE:
+		switch os { //nolint:exhaustive // COS and Ubuntu are the only GKE node images with specific wording; everything else (unknown, any, or an OS GKE does not offer) gets both supported GKE paths
+		case recipe.CriteriaOSCOS:
+			return "On GKE COS node images the GPU Operator cannot install the " +
+				"driver. With the default gke-default gpuStack profile " +
+				"(opt-out label absent) provision the GPU node pools with " +
+				"the GKE-managed driver install (node pool " +
+				"gpu-driver-version=default). With --profile " +
+				"gpuStack=bundle-installer or gpuStack=dra (pools labeled " +
+				"gke-no-default-nvidia-gpu-device-plugin=true and created " +
+				"with gpu-driver-version=disabled) the bundle's " +
+				"gcp-driver-installer component supplies the driver with a " +
+				"recipe-pinned version — do not deploy a standalone " +
+				"DaemonSet alongside it; see " +
+				"docs/integrator/gke-gpu-setup.md."
+		case recipe.CriteriaOSUbuntu:
+			// The pinned GPU Operator supports driver management
+			// on GKE only on Ubuntu node images with containerd.
+			return "On GKE Ubuntu node images the GPU Operator can manage " +
+				"the driver: bundle in GPU-Operator-managed mode: " +
+				gkeGPUOperatorManagedOverrideSet + "."
+		default:
+			// Unknown/any OS, or an OS GKE does not offer as a node image —
+			// present both supported GKE paths without asserting the
+			// recipe's OS supports either.
+			return "On GKE COS node images the GPU Operator cannot install the " +
+				"driver: provision the GPU node pools with the GKE-managed " +
+				"driver install (node pool gpu-driver-version) instead. On " +
+				"GKE Ubuntu node images the GPU Operator can manage the " +
+				"driver, so those may bundle in GPU-Operator-managed mode: " +
+				gkeGPUOperatorManagedOverrideSet + "."
+		}
+	case recipe.CriteriaServiceOCP:
+		return "Either reprovision the GPU nodes with a platform-installed " +
+			"NVIDIA driver, or bundle in GPU-Operator-managed mode: " +
+			ocpGPUOperatorManagedOverrideSet + "."
+	default:
+		return "Either reprovision the GPU nodes with a platform-installed " +
+			"NVIDIA driver, or bundle in GPU-Operator-managed mode: " +
+			gpuOperatorManagedOverrideSet + "."
+	}
+}
+
+// componentOverrideKeys returns the candidate --set override-map keys for
+// componentName, in priority order: the exact name first, then either the
+// registry's ValueOverrideKeys aliases or (when the registry is
+// unavailable) the non-hyphenated form. Reimplements
+// DefaultBundler.componentOverrideKeys (pkg/bundler/bundler.go) locally —
+// this package cannot import pkg/bundler (cycle) — so overrides supplied
+// under canonical names and aliases are resolved exactly as the bundler
+// resolves them when it renders the same values moments later.
+func componentOverrideKeys(componentName string, provider recipe.DataProvider) []string {
+	keys := []string{componentName}
+
+	registry, err := recipe.GetComponentRegistryFor(provider)
+	if err != nil {
+		if nonHyphenated := strings.ReplaceAll(componentName, "-", ""); nonHyphenated != componentName {
+			keys = append(keys, nonHyphenated)
+		}
+		return keys
+	}
+
+	if comp := registry.Get(componentName); comp != nil {
+		keys = append(keys, comp.ValueOverrideKeys...)
+	}
+
+	return keys
+}
+
+// mergeOverridesAcrossKeys merges the per-path override maps stored under
+// every candidate key into a single map, higher-priority key (earlier in
+// keys) winning on a path collision. Local twin of the pkg/bundler helper
+// of the same name — see componentOverrideKeys for why it is duplicated.
+func mergeOverridesAcrossKeys[V any](allOverrides map[string]map[string]V, keys []string) map[string]V {
+	var merged map[string]V
+	for _, key := range slices.Backward(keys) {
+		overrides, ok := allOverrides[key]
+		if !ok {
+			continue
+		}
+		if merged == nil {
+			merged = make(map[string]V, len(overrides))
+		}
+		maps.Copy(merged, overrides)
+	}
+	return merged
+}
+
+// componentDisabled reports whether the component ref is disabled — by
+// the recipe (overrides.enabled=false) or by a bundle-time --set enabled
+// toggle. The toggle is resolved exactly as the bundler's
+// filterEnabledComponents resolves it (getSetEnabledOverride,
+// pkg/bundler/bundler.go): the enabled overrides supplied under the
+// canonical component name and its registry aliases are merged with the
+// canonical name winning on collision, then parsed with
+// strconv.ParseBool so spellings like "0" and "False" count. A value
+// that does not parse is treated as not-disabled here — the bundler
+// rejects it with ErrCodeInvalidRequest in filterEnabledComponents,
+// which runs before component validations, so the check never sees it
+// in the bundle flow. A disabled component renders nothing, so it
+// cannot participate in a driver mismatch.
+func componentDisabled(ref *recipe.ComponentRef, bundlerConfig *config.Config, keys []string) bool {
+	if !ref.IsEnabled() {
+		return true
+	}
+	if bundlerConfig == nil {
+		return false
+	}
+	merged := mergeOverridesAcrossKeys(bundlerConfig.ValueOverrides(), keys)
+	raw, ok := merged[config.ComponentEnabledKey]
+	if !ok {
+		return false
+	}
+	enabled, parseErr := strconv.ParseBool(raw)
+	if parseErr != nil {
+		return false
+	}
+	return !enabled
+}
+
+// effectiveComponentValues resolves the FINAL effective Helm values for a
+// component on behalf of the verification named by purpose (e.g.
+// "driver-ownership coherence"), which the error messages quote so each
+// gate reports its own subject.
+//
+// It resolves the values for a
+// component: the recipe merge (base values → valuesFile → inline
+// overrides) plus the user's bundle-time overrides applied in the
+// bundler's own order — scalar --set first, then typed
+// --set-json/--set-file — with the "enabled" toggle stripped (it controls
+// component inclusion, not chart values). Overrides are resolved under
+// the canonical component name and its registry aliases.
+//
+// A recipe-side resolution failure (GetValuesForComponentWithContext)
+// returns a blocking error so the gate fails closed rather than skip a
+// recipe whose driver ownership cannot be verified (e.g. a legacy recipe
+// with a missing valuesFile path). The bundler's extractComponentValues
+// independently fails closed on the same failure (pkg/bundler/bundler.go),
+// so a bundle whose values cannot be resolved is never emitted by either
+// path.
+//
+// Override-apply failures (--set / --set-json / --set-file) are blocking too.
+// Bundle generation normally rejects them during value extraction before
+// validations run, but this helper is also usable directly. Skipping an
+// override it cannot reconstruct would disarm the gate for that candidate —
+// with gpuDriverState=absent that could let a driverless configuration pass —
+// so the gate independently fails closed.
+func effectiveComponentValues(ctx context.Context, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, componentName string, keys []string, purpose string) (map[string]any, error) {
+	values, err := recipeResult.GetValuesForComponentWithContext(ctx, componentName)
+	if err != nil {
+		// Preserve an already-coded classification (overlay read failures
+		// are ErrCodeInternal, provider reads can be ErrCodeTimeout, ...):
+		// reclassifying everything as ErrCodeInvalidRequest would turn
+		// retryable infrastructure failures into deterministic 4xx caller
+		// mistakes for SDK and server consumers, which map HTTP status
+		// from the outermost code. Non-coded errors default to
+		// invalid-request — the recipe content is what failed to resolve.
+		code := aicrerrors.ErrCodeInvalidRequest
+		if structured, ok := stderrors.AsType[*aicrerrors.StructuredError](err); ok {
+			code = structured.Code
+		}
+		return nil, aicrerrors.WrapWithContext(code,
+			fmt.Sprintf("cannot verify %s for component %q: "+
+				"failed to resolve its effective values", purpose, componentName),
+			err, map[string]any{logKeyComponent: componentName})
+	}
+	if bundlerConfig == nil {
+		return values, nil
+	}
+
+	if setOverrides := mergeOverridesAcrossKeys(bundlerConfig.ValueOverrides(), keys); len(setOverrides) > 0 {
+		delete(setOverrides, config.ComponentEnabledKey)
+		if applyErr := component.ApplyMapOverrides(values, setOverrides); applyErr != nil {
+			return nil, aicrerrors.WrapWithContext(aicrerrors.ErrCodeInvalidRequest,
+				fmt.Sprintf("cannot verify %s for component %q: "+
+					"failed to apply --set overrides to its effective values", purpose, componentName),
+				applyErr, map[string]any{logKeyComponent: componentName})
+		}
+	}
+
+	if typedOverrides := mergeOverridesAcrossKeys(bundlerConfig.ValueOverridesTyped(), keys); len(typedOverrides) > 0 {
+		delete(typedOverrides, config.ComponentEnabledKey)
+		if applyErr := component.ApplyTypedOverrides(values, typedOverrides); applyErr != nil {
+			return nil, aicrerrors.WrapWithContext(aicrerrors.ErrCodeInvalidRequest,
+				fmt.Sprintf("cannot verify %s for component %q: "+
+					"failed to apply --set-json/--set-file overrides to its effective values", purpose, componentName),
+				applyErr, map[string]any{logKeyComponent: componentName})
+		}
+	}
+
+	return values, nil
+}
+
+// resolveInstallDir resolves the effective gpu-operator
+// hostPaths.driverInstallDir: absent → the chart default
+// (operatorContainerDriverRoot), declared non-empty string →
+// path.Clean'd (trailing-slash spellings compare equal, mirroring
+// pkg/recipe/driver_root_lockstep_test.go), declared empty string →
+// the default (the operator's own transformForDriverInstallDir treats
+// "" identically to the default, gpu-operator v26.7.0). An explicitly
+// null or non-map hostPaths section is rejected with a blocking
+// message: Helm null-coalescing deletes a null key together with its
+// chart defaults, so the chart's unconditional .Values.hostPaths.rootFS
+// access (clusterpolicy.yaml, v26.7.0) fails at install. A declared
+// value that cleans to a relative path is rejected too — host-path
+// mounts require absolute paths.
+func resolveInstallDir(values map[string]any, componentName string) (string, bool, []string) {
+	installDir := operatorContainerDriverRoot
+	rawHostPaths, hostPathsPresent := values["hostPaths"]
+	if !hostPathsPresent {
+		return installDir, false, nil
+	}
+	if rawHostPaths == nil {
+		return installDir, false, []string{fmt.Sprintf(
+			"%s: hostPaths is explicitly null — Helm deletes a null key together with "+
+				"its chart defaults, so the chart's unconditional hostPaths.* field "+
+				"accesses fail at install. Remove the null override or set "+
+				"hostPaths.driverInstallDir to a real path.", componentName)}
+	}
+	hostPaths, isMap := rawHostPaths.(map[string]any)
+	if !isMap {
+		return installDir, false, []string{fmt.Sprintf(
+			"%s: hostPaths=%v (%T) is not a map, so hostPaths.driverInstallDir cannot "+
+				"be read and driver-root coherence cannot be verified.",
+			componentName, rawHostPaths, rawHostPaths)}
+	}
+	rawDir, leafPresent := hostPaths["driverInstallDir"]
+	if !leafPresent {
+		return installDir, false, nil
+	}
+	dir, isStr := rawDir.(string)
+	if !isStr {
+		// A present non-string leaf (null, boolean, number, object) is
+		// rejected rather than silently defaulted: the emitted values
+		// would carry it verbatim, and the pinned ClusterPolicy CRD
+		// types hostPaths.driverInstallDir as a string (gpu-operator
+		// v26.7.0 nvidia.com_clusterpolicies.yaml), so the install
+		// fails while a defaulted check would have validated against
+		// /run/nvidia/driver instead.
+		return installDir, false, []string{fmt.Sprintf(
+			"%s: hostPaths.driverInstallDir=%v (%T) is not a string — the ClusterPolicy "+
+				"CRD requires a string path, so this value fails at install while the "+
+				"coherence check would otherwise validate against the substituted default. "+
+				"Set a string path (e.g. %s) or remove the override.",
+			componentName, rawDir, rawDir, operatorContainerDriverRoot)}
+	}
+	if dir == "" {
+		// Intentionally default-equivalent: the operator's own
+		// transformForDriverInstallDir early-returns on "" exactly like
+		// the default (gpu-operator v26.7.0, controllers/object_controls.go).
+		return installDir, false, nil
+	}
+	cleaned := path.Clean(dir)
+	if !path.IsAbs(cleaned) {
+		// A relative install dir can never be a valid host path — the
+		// operator renders it into host-path mounts, which require
+		// absolute paths — and a relative spelling would also compare
+		// unequal to every legitimate absolute driver root, so silently
+		// accepting it either blocks with a misleading mismatch remedy
+		// or (paired with a matching relative DRA root) passes the gate
+		// while the install is broken.
+		return installDir, false, []string{fmt.Sprintf(
+			"%s: hostPaths.driverInstallDir=%q is not an absolute path — the operator "+
+				"renders it into host-path mounts, which require absolute paths, so no "+
+				"node can mount it. Set an absolute path such as %s.",
+			componentName, dir, operatorContainerDriverRoot)}
+	}
+	return cleaned, true, nil
+}
+
+// resolveDRARoot resolves the effective nvidia-dra-driver-gpu
+// nvidiaDriverRoot for Rule 2. Only a genuinely ABSENT key falls back to
+// the chart-default assumption ("/", DRA chart v0.5.0 values.yaml). A
+// present null, empty-string, or non-string value is rejected: unlike the
+// gpu-operator's driverInstallDir (where "" is default-equivalent, see
+// resolveInstallDir), the DRA chart pipes the raw value through
+// trimSuffix/dir in its kubeletplugin template, so null fails Helm
+// rendering outright and "" renders empty/relative host paths — neither
+// matches the absent-key default, and Rule 2 would otherwise silently
+// skip every branch (rootDeclared=false with driver.enabled=false fires
+// nothing). A declared value that cleans to a relative path is rejected
+// for the same reason: it renders unmountable relative host paths AND
+// (being unequal to /run/nvidia/driver) slips past the legacy-signature
+// branch when the driver is disabled.
+func resolveDRARoot(draValues map[string]any, componentName string) (string, bool, []string) {
+	rawRoot, rootPresent := draValues["nvidiaDriverRoot"]
+	if !rootPresent {
+		return "", false, nil
+	}
+	root, isStr := rawRoot.(string)
+	if !isStr {
+		return "", false, []string{fmt.Sprintf(
+			"%s: %s nvidiaDriverRoot=%v (%T) is not a string — the DRA chart pipes this "+
+				"value through path template functions, so a non-string fails Helm rendering. "+
+				"Set a string path (the preinstalled-driver profile uses \"/\"; the "+
+				"operator-managed profile uses the driver install dir) or remove the override "+
+				"to use the chart default.",
+			componentName, draDriverComponentName, rawRoot, rawRoot)}
+	}
+	if root == "" {
+		return "", false, []string{fmt.Sprintf(
+			"%s: %s nvidiaDriverRoot is declared as an empty string — the DRA chart renders "+
+				"it verbatim into host paths (it is NOT treated as the absent-key default), "+
+				"producing empty/relative mounts. Set a real path or remove the override.",
+			componentName, draDriverComponentName)}
+	}
+	// path.Clean so /run/nvidia/driver/ and /run/nvidia/driver compare
+	// equal in both the managed-mode equality and the legacy-signature
+	// check.
+	cleaned := path.Clean(root)
+	if !path.IsAbs(cleaned) {
+		// Same hazard as the empty string above, plus a lockstep bypass:
+		// a relative spelling of the operator container root (e.g. the
+		// missing-leading-slash typo run/nvidia/driver) compares unequal
+		// to /run/nvidia/driver, so with driver.enabled=false no Rule 2
+		// branch would fire and the broken relative mount would bundle.
+		return "", false, []string{fmt.Sprintf(
+			"%s: %s nvidiaDriverRoot=%q is not an absolute path — the DRA chart renders "+
+				"it into kubelet-plugin host-path mounts, which require absolute paths. "+
+				"Set an absolute path (the preinstalled-driver profile uses \"/\"; the "+
+				"operator-managed profile uses the driver install dir).",
+			componentName, draDriverComponentName, root)}
+	}
+	return cleaned, true, nil
+}
+
+// dynamicOwnershipViolations returns one blocking message per --dynamic
+// declaration (resolved under the component's canonical name and registry
+// aliases, mirroring dynamicPathSetFor's override-key matching) that
+// targets a guarded ownership path, the parent of one, or a child of one.
+// A dynamic ownership path defers the value to the operator-editable
+// cluster-values.yaml, where no bundle-time gate runs — editing it there
+// recreates the driver/DRA incoherence this validation blocks.
+func dynamicOwnershipViolations(bundlerConfig *config.Config, componentName string, keys []string, guarded []string) []string {
+	hits := dynamicPathIntersections(bundlerConfig, keys, guarded)
+	msgs := make([]string, 0, len(hits))
+	for _, hit := range hits {
+		msgs = append(msgs, fmt.Sprintf(
+			"%s: --dynamic %s:%s targets the driver-ownership path %s — dynamic "+
+				"paths move to the operator-editable cluster-values.yaml at install "+
+				"time, where no ownership-coherence gate runs, so editing it there "+
+				"can recreate the driver/DRA incoherence this check blocks. Bake "+
+				"ownership values statically (--set/--set-json) instead.",
+			componentName, hit.key, hit.path, hit.guard))
+	}
+	return msgs
+}
+
+// dynamicPathIntersection records one --dynamic declaration (key:path)
+// that intersects a guarded values path.
+type dynamicPathIntersection struct {
+	key   string
+	path  string
+	guard string
+}
+
+// dynamicPathIntersections returns every --dynamic declaration under any
+// of the candidate component keys whose path intersects a guarded path
+// (equal, ancestor, or descendant). Shared by the driver-ownership guard
+// above and the NVSentinel gates below: dynamic paths are exported to
+// the operator-editable cluster-values.yaml, which the deployer loads
+// AFTER the statically validated values, so an install-time edit there
+// silently undoes whatever a bundle-time gate verified.
+func dynamicPathIntersections(bundlerConfig *config.Config, keys []string, guarded []string) []dynamicPathIntersection {
+	if bundlerConfig == nil || !bundlerConfig.HasDynamicValues() {
+		return nil
+	}
+	dynamic := bundlerConfig.DynamicValues()
+	var hits []dynamicPathIntersection
+	for _, key := range keys {
+		for _, p := range dynamic[key] {
+			for _, g := range guarded {
+				if p == g || strings.HasPrefix(g, p+".") || strings.HasPrefix(p, g+".") {
+					hits = append(hits, dynamicPathIntersection{key: key, path: p, guard: g})
+					break
+				}
+			}
+		}
+	}
+	return hits
+}
+
+// nvsentinelDynamicGuardViolations rejects --dynamic declarations that
+// intersect the values paths the NVSentinel gates verify. Both gates
+// validate the STATIC resolved values; a dynamic declaration on the same
+// path moves it into cluster-values.yaml, loaded after them at install
+// time, so an operator edit there undoes the validated remedy with no
+// gate left to notice — including the degenerate immediate case, where
+// a path the recipe never set is exported as an empty stub ready to be
+// filled with a breaking value. gateReason describes, in the message's
+// "which <gateReason>" slot, what the guarded path means to the gate and
+// what an install-time edit would break.
+func nvsentinelDynamicGuardViolations(bundlerConfig *config.Config, componentName string, keys []string, guarded []string, gateReason string) []string {
+	hits := dynamicPathIntersections(bundlerConfig, keys, guarded)
+	msgs := make([]string, 0, len(hits))
+	for _, hit := range hits {
+		msgs = append(msgs, fmt.Sprintf(
+			"%s: --dynamic %s:%s targets %s, which %s. Dynamic paths move to the "+
+				"operator-editable cluster-values.yaml at install time, loaded after "+
+				"the values this gate verified, so editing it there silently undoes "+
+				"the validated configuration. Bake the value statically "+
+				"(--set/--set-json) instead.",
+			componentName, hit.key, hit.path, hit.guard, gateReason))
+	}
+	return msgs
+}
+
+// ownershipToggle resolves the boolean toggle at values[section].enabled
+// for the driver-ownership rules, distinguishing absent from
+// present-but-invalid. Returns:
+//
+//   - (nil, ""): the toggle is genuinely absent — the section is missing,
+//     or the section map carries no "enabled" key. The caller falls back
+//     to the chart default.
+//   - (&b, ""): the toggle is a real boolean.
+//   - (nil, problem): the section or the toggle is present with an
+//     unusable value (an explicitly null section, a non-map section, or a
+//     non-boolean toggle). The caller must reject rather than default.
+//     An explicitly null section is NOT equivalent to absent: Helm's
+//     null-coalescing deletes the key together with its chart defaults,
+//     so .Values.<section> is nil at render time and the gpu-operator
+//     templates fail on unconditional field access (e.g.
+//     .Values.driver.manager.repository in _helpers.tpl, v26.7.0) —
+//     ownership cannot be verified and the install would fail anyway.
+//     A non-boolean toggle is rejected because the chart renders the
+//     value unquoted, so YAML re-typing at install time can flip it to a
+//     boolean this check never saw.
+func ownershipToggle(values map[string]any, section string) (*bool, string) {
+	raw, sectionPresent := values[section]
+	if !sectionPresent {
+		return nil, ""
+	}
+	if raw == nil {
+		return nil, fmt.Sprintf("%s is explicitly null — Helm deletes a null key together "+
+			"with its chart defaults, so the chart's unconditional %s.* field accesses fail "+
+			"at install and driver ownership cannot be verified", section, section)
+	}
+	m, isMap := raw.(map[string]any)
+	if !isMap {
+		return nil, fmt.Sprintf("%s=%v (%T) is not a map, so %s.enabled cannot be read",
+			section, raw, raw, section)
+	}
+	v, keyPresent := m["enabled"]
+	if !keyPresent {
+		return nil, ""
+	}
+	b, isBool := v.(bool)
+	if !isBool {
+		if v == nil {
+			return nil, fmt.Sprintf("%s.enabled is null, not a boolean", section)
+		}
+		return nil, fmt.Sprintf("%s.enabled=%v (%T) is not a boolean", section, v, v)
+	}
+	return &b, ""
+}
+
+// draLockstepViolations evaluates Rule 2 (DRA driver-root lockstep) on
+// the effective nvidia-dra-driver-gpu values. installDirTrusted is false
+// when resolveInstallDir rejected the declared driverInstallDir — the
+// lockstep switch is suppressed then, because it would compare against
+// the guessed chart default and emit a second, misleading remedy (the
+// same suppression applies to invalid declared roots and dynamic,
+// bundle-time-deferred root declarations).
+func draLockstepViolations(ctx context.Context, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config,
+	provider recipe.DataProvider, componentName string, service recipe.CriteriaServiceType,
+	osCriteria recipe.CriteriaOSType, driverEnabled bool, installDir string, installDirTrusted bool,
+) ([]string, []error) {
+
+	draRef := resolveDRAComponentRef(recipeResult)
+	if draRef == nil {
+		return nil, nil
+	}
+	draKeys := componentOverrideKeys(draRef.Name, provider)
+	if componentDisabled(draRef, bundlerConfig, draKeys) {
+		return nil, nil
+	}
+	var msgs []string
+	// Same install-time-deferral hazard as the gpu-operator ownership
+	// paths in the caller: a dynamic DRA driver root escapes Rule 2 at
+	// bundle time.
+	draDynMsgs := dynamicOwnershipViolations(bundlerConfig, draRef.Name, draKeys,
+		config.DRADriverOwnership.Paths)
+	msgs = append(msgs, draDynMsgs...)
+	draValues, draErr := effectiveComponentValues(ctx, recipeResult, bundlerConfig, draRef.Name, draKeys, "driver-ownership coherence")
+	if draErr != nil {
+		return msgs, []error{draErr}
+	}
+	root, rootDeclared, rootMsgs := resolveDRARoot(draValues, componentName)
+	msgs = append(msgs, rootMsgs...)
+	if len(rootMsgs) > 0 {
+		// An invalid declared root already blocks the bundle; running the
+		// lockstep switch against a guessed value would only add a
+		// misleading second remedy.
+		return msgs, nil
+	}
+	if !installDirTrusted || len(draDynMsgs) > 0 {
+		// Same suppression, other inputs: a rejected driverInstallDir left
+		// only a guessed default to compare against, and a dynamic
+		// nvidiaDriverRoot defers the real value past bundle time — either
+		// way the switch below would emit a second remedy computed from a
+		// value the bundle will not actually use.
+		return msgs, nil
+	}
+
+	switch {
+	case driverEnabled && rootDeclared && root != installDir:
+		msgs = append(msgs, fmt.Sprintf(
+			"%s: the operator-managed driver installs to hostPaths.driverInstallDir=%s "+
+				"but the DRA kubelet plugin reads nvidiaDriverRoot=%s; CDI spec generation "+
+				"will fail and DRA-allocated pods will stall in ContainerCreating. Fix with "+
+				"--set %s:nvidiaDriverRoot=%s (or, on a cluster with a "+
+				"platform-preinstalled driver, the full preinstalled-driver profile).",
+			componentName, installDir, root, draKeys[len(draKeys)-1], installDir))
+	case driverEnabled && !rootDeclared:
+		msgs = append(msgs, fmt.Sprintf(
+			"%s: nvidiaDriverRoot is not declared for %s, so it falls to the DRA chart "+
+				"default (/), which cannot match the operator-managed driver install dir. "+
+				"Set --set %s:nvidiaDriverRoot=%s.",
+			componentName, draRef.Name, draKeys[len(draKeys)-1], installDir))
+	case !driverEnabled && root == operatorContainerDriverRoot:
+		// The alternative clause is service- AND OS-aware (GKE profiles pin
+		// hostPaths.driverInstallDir to the Google installer path, and COS
+		// cannot take the operator-managed tuple at all) — see
+		// legacyRecipeAlternativeRemedy.
+		msgs = append(msgs, fmt.Sprintf(
+			"%s: driver.enabled=false but %s still reads nvidiaDriverRoot=%s — nothing "+
+				"populates that path when the operator does not manage the driver. This is "+
+				"commonly the signature of a recipe generated before the preinstalled-driver "+
+				"default flip: regenerate the recipe (aicr recipe ...) for this AICR version. %s",
+			componentName, draRef.Name, operatorContainerDriverRoot,
+			legacyRecipeAlternativeRemedy(service, osCriteria)))
+	}
+	return msgs, nil
+}
+
+// CheckDriverOwnershipCoherence fails a bundle whose FINAL effective
+// values (recipe merge plus all --set/--set-json/--set-file overrides)
+// render an incoherent GPU driver-ownership profile. Two rules:
+//
+// Rule 1 (driverless cluster, gated on recorded snapshot state): when the
+// snapshot that produced the recipe observed no NVIDIA kernel driver on
+// the sampled GPU node (metadata.gpuDriverState=absent — recorded by
+// pkg/client/v1's snapshot-driven resolution, the `--gpu-driver none`
+// signature), the effective config must have the operator install the
+// full stack: driver.enabled=true and, when declared, toolkit.enabled
+// not false. Deploying the preinstalled-driver assumption onto that
+// cluster leaves GPU nodes driverless — nothing on the node provides a
+// driver and the recipe does not install one. Recipes without a recorded
+// state (criteria-only resolves, older recipes, snapshots without a
+// usable driver-loaded reading) are not gated by this rule. A recorded
+// state outside the two documented constants is rejected outright — the
+// empty-string disarm is deliberate, an unrecognized nonempty spelling
+// in a loaded or hand-edited recipe is not.
+//
+// Rule 2 (DRA driver-root lockstep, metadata-independent): when
+// nvidia-dra-driver-gpu is bundled alongside gpu-operator, its
+// nvidiaDriverRoot must track the driver owner — see
+// pkg/recipe/driver_root_lockstep_test.go for the full invariant
+// rationale (issue #1087). With driver.enabled=true the DRA kubelet
+// plugin must read the operator install dir
+// (hostPaths.driverInstallDir), or CDI spec generation fails and
+// DRA-allocated pods stall in ContainerCreating; with
+// driver.enabled=false the root must not be the operator container root
+// /run/nvidia/driver, which nothing populates in that mode — the
+// signature of a legacy pre-flip recipe whose valuesFile now resolves
+// the preinstalled-driver defaults while its baked DRA override still
+// points at the operator path. Because this rule evaluates effective
+// values only, it catches those legacy recipes with no recorded
+// gpuDriverState.
+//
+// Independent of both rules, an explicitly declared gpu-operator
+// hostPaths.driverInstallDir that cleans to "/" is always rejected:
+// it is the host path the operator-validator bind-mounts as the
+// driver-validation container's rootfs target, and runc rejects a
+// mount whose destination is "/" — the issue #1106 regression (see
+// pkg/recipe/driver_root_lockstep_test.go, invariant 1). The DRA
+// nvidiaDriverRoot of "/" is NOT flagged — it is the legitimate
+// preinstalled-driver value.
+//
+// The check runs at bundle generation — not at snapshot-driven recipe
+// resolution, which only warns — because this is the first point where
+// the user's --set ownership overrides are known: `aicr recipe` has no
+// --set, so a resolution-time hard failure would leave supported LEGACY
+// GPU-Operator-managed clusters unable to reach the documented override.
+// On ADR-015-profiled recipes (AKS gpuStack) the --set escape does not
+// apply — ownership paths are profile-owned and per-path flips are
+// rejected — so the profiled remedy is out-of-band (fix/recreate pools,
+// recapture, regenerate with --profile); see driverAbsentRemedy.
+// Registered with severity error on gpu-operator (recipes/registry.yaml),
+// which converts the returned messages into a blocking
+// ErrCodeInvalidRequest in RunValidations. The check returns hard
+// errors only when a component's effective values cannot be resolved
+// or the user's overrides cannot be reapplied to them (see
+// effectiveComponentValues): either way the values this gate must
+// verify cannot be reconstructed, so coherence fails closed.
+func CheckDriverOwnershipCoherence(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil {
+		return nil, nil
+	}
+	if !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	gpuOpRef := recipeResult.GetComponentRef(componentName)
+	if gpuOpRef == nil {
+		return nil, nil
+	}
+	provider := recipeResult.DataProvider()
+	gpuOpKeys := componentOverrideKeys(componentName, provider)
+	if componentDisabled(gpuOpRef, bundlerConfig, gpuOpKeys) {
+		return nil, nil
+	}
+
+	// --dynamic declarations targeting an ownership path defer that value
+	// to install-time editing: the deployer moves the path (seeding it
+	// even when absent) into the operator-editable cluster-values.yaml
+	// (splitDynamicPaths, pkg/bundler/deployer/localformat), where no
+	// bundle-time gate runs. Flipping ownership there recreates exactly
+	// the driver/DRA incoherence this check exists to block, so such
+	// declarations are rejected up front — before values resolution, so
+	// the rejection fires even when resolution itself fails.
+	if dynMsgs := dynamicOwnershipViolations(bundlerConfig, componentName, gpuOpKeys,
+		config.GPUOperatorDriverOwnership.Paths); len(dynMsgs) > 0 {
+		for _, msg := range dynMsgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return dynMsgs, nil
+	}
+
+	// Nothing validates metadata.gpuDriverState on the load/adopt
+	// boundaries (PrepareAndValidate), so a loaded or hand-edited recipe
+	// can carry any string. Rule 1 keys on exact equality with "absent",
+	// so an unrecognized nonempty spelling ("Absent", "ABSENT", a typo)
+	// would silently degrade to the deliberate empty=unknown disarm state
+	// and let a driverless bundle through. Fail closed: reject nonempty
+	// values outside the two documented constants. Checked before values
+	// resolution so the rejection fires even when resolution fails.
+	var msgs []string
+	recordedState := recipeResult.Metadata.GPUDriverState
+	if recordedState != "" && recordedState != recipe.GPUDriverStatePreinstalled && recordedState != recipe.GPUDriverStateAbsent {
+		msgs = append(msgs, fmt.Sprintf(
+			"%s: metadata.gpuDriverState=%q is not a recognized value — expected %q, "+
+				"%q, or empty (unknown). The driverless-cluster rule keys on this field, "+
+				"so an unrecognized spelling would silently disarm it. Fix the field or "+
+				"regenerate the recipe (aicr recipe ...) with this AICR version.",
+			componentName, recordedState, recipe.GPUDriverStatePreinstalled, recipe.GPUDriverStateAbsent))
+	}
+
+	values, resolveErr := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, gpuOpKeys, "driver-ownership coherence")
+	if resolveErr != nil {
+		for _, msg := range msgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return msgs, []error{resolveErr}
+	}
+
+	var service recipe.CriteriaServiceType
+	var osCriteria recipe.CriteriaOSType
+	if recipeResult.Criteria != nil {
+		service = recipeResult.Criteria.Service
+		osCriteria = recipeResult.Criteria.OS
+	}
+
+	var errs []error
+
+	// driver.enabled defaults to true in the gpu-operator chart and
+	// toolkit.enabled matters only when explicitly declared false — but
+	// those defaults apply ONLY when the key is genuinely absent. A key
+	// that is present with a non-boolean value is rejected instead of
+	// defaulted: the pinned chart interpolates both toggles unquoted into
+	// the ClusterPolicy (`enabled: {{ .Values.driver.enabled }}`,
+	// deployments/gpu-operator/templates/clusterpolicy.yaml), so YAML
+	// re-types the rendered scalar at install time — the string "false"
+	// (e.g. --set-json gpuoperator:driver.enabled='"false"', or a --set
+	// spelling like "False" that ConvertMapValue does not coerce) deploys
+	// as boolean false while a defaulted check would still assume the
+	// operator manages the driver, silently bypassing both rules.
+	driverToggle, driverProblem := ownershipToggle(values, "driver")
+	toolkitToggle, toolkitProblem := ownershipToggle(values, "toolkit")
+	toggleRejected := false
+	for _, problem := range []string{driverProblem, toolkitProblem} {
+		if problem == "" {
+			continue
+		}
+		toggleRejected = true
+		msgs = append(msgs, fmt.Sprintf(
+			"%s: %s — the chart interpolates this value unquoted into the ClusterPolicy, "+
+				"so YAML re-types it at install time (a string \"false\" deploys as boolean "+
+				"false) and driver ownership cannot be verified. Set a bare boolean instead, "+
+				"e.g. --set gpuoperator:driver.enabled=false or --set-json "+
+				"gpuoperator:driver.enabled=false (no quotes around the value).",
+			componentName, problem))
+	}
+	if toggleRejected {
+		// The ownership rules below would evaluate against guessed
+		// defaults; with an unverifiable toggle the guess can invert the
+		// remedy (e.g. telling the user to retarget the DRA root at the
+		// operator install dir when their intent was to disable the
+		// driver). The rejection above already blocks the bundle, so
+		// return it alone.
+		for _, msg := range msgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return msgs, errs
+	}
+	driverEnabled := true
+	if driverToggle != nil {
+		driverEnabled = *driverToggle
+	}
+	toolkitDisabled := toolkitToggle != nil && !*toolkitToggle
+
+	// Rule 1: recorded driverless cluster vs preinstalled-driver profile.
+	// An effectively enabled gcp-driver-installer disarms it: the bundle
+	// itself provisions the driver, so the driverless snapshot is the
+	// expected pre-deployment state (a correctly provisioned
+	// bundle-installer pool must be able to generate its own bundle). The
+	// supply check runs lazily inside the guard so its hard-fail surface
+	// exists only when Rule 1 would actually fire; there, a resolution
+	// failure for the installer's values fails closed as a hard error
+	// rather than degrading to the misleading driverless remediation.
+	if recipeResult.Metadata.GPUDriverState == recipe.GPUDriverStateAbsent && (!driverEnabled || toolkitDisabled) {
+		bundleSuppliesDriver, supplyErr := BundleSuppliesGKEDriver(ctx, recipeResult, bundlerConfig)
+		if supplyErr != nil {
+			for _, msg := range msgs {
+				slog.Warn(msg, logKeyComponent, componentName)
+			}
+			return msgs, []error{supplyErr}
+		}
+		if !bundleSuppliesDriver {
+			msgs = append(msgs, fmt.Sprintf(
+				"%s: the effective values assume a platform-preinstalled NVIDIA driver "+
+					"and container toolkit (driver.enabled=false and/or toolkit.enabled=false), "+
+					"but the snapshot that produced this recipe observed no NVIDIA kernel "+
+					"driver on the sampled GPU node. Deploying this bundle would leave GPU "+
+					"nodes driverless. %s",
+				componentName, driverAbsentRemedy(service, osCriteria, recipeResult.Metadata.SelectedProfile != nil)))
+		}
+	}
+
+	installDir, installDirDeclared, hostPathMsgs := resolveInstallDir(values, componentName)
+	msgs = append(msgs, hostPathMsgs...)
+	// A rejected hostPaths/driverInstallDir declaration already blocks the
+	// bundle; installDir now holds the guessed chart default, so the
+	// lockstep switch below must not compare against it (mirrors the
+	// toggle-problem early return above and the rootMsgs break below).
+	installDirTrusted := len(hostPathMsgs) == 0
+
+	// driverInstallDir "/" is illegal regardless of DRA presence, driver
+	// ownership, or root equality: it is the host path the
+	// operator-validator bind-mounts as the driver-validation container's
+	// rootfs target, and runc rejects a mount whose destination is "/"
+	// ("mountpoint is on the top of rootfs") — the issue #1106 regression
+	// guarded by pkg/recipe/driver_root_lockstep_test.go invariant 1. The
+	// DRA nvidiaDriverRoot of "/" is NOT flagged: that is the legitimate
+	// preinstalled-driver value.
+	if installDirDeclared && installDir == "/" {
+		msgs = append(msgs, fmt.Sprintf(
+			"%s: hostPaths.driverInstallDir=/ is invalid — it is a mount destination "+
+				"the operator-validator bind-mounts as a container rootfs target, and runc "+
+				"rejects a mount whose destination is / (\"mountpoint is on the top of "+
+				"rootfs\", the issue #1106 regression). Point it at a dedicated host "+
+				"directory such as %s.",
+			componentName, operatorContainerDriverRoot))
+	}
+
+	// Rule 2: DRA driver-root lockstep on effective values.
+	draMsgs, draErrs := draLockstepViolations(ctx, recipeResult, bundlerConfig, provider,
+		componentName, service, osCriteria, driverEnabled, installDir, installDirTrusted)
+	msgs = append(msgs, draMsgs...)
+	// errs is still empty here — every earlier error path returns
+	// directly — so adopt the helper's slice instead of appending.
+	errs = draErrs
+
+	for _, msg := range msgs {
+		slog.Warn(msg, logKeyComponent, componentName)
+	}
+	return msgs, errs
+}
+
+// gpuOperatorComponentNames are the registry-level component names that
+// carry GPU Operator driver-ownership values (the canonical chart and its
+// OCP variant), from config.GPUOperatorDriverOwnership. They mirror the pair
+// that registers CheckDriverOwnershipCoherence in recipes/registry.yaml.
+var gpuOperatorComponentNames = config.GPUOperatorDriverOwnership.ComponentNames
+
+// nvsentinelAssumeDriverInstalledOverrideSet is the documented
+// bundle-time override that makes the NVSentinel labeler apply
+// nvsentinel.dgxc.nvidia.com/driver.installed without watching for a
+// driver pod. It renders the labeler's --assume-driver-installed flag,
+// the chart-level automation of the Manual Labeling Procedure in
+// NVSentinel design 018. Phrased as a remedy alongside
+// gpuOperatorManagedOverrideSet above.
+const nvsentinelAssumeDriverInstalledOverrideSet = "--set nv-sentinel:labeler.assumeDriverInstalled=true"
+
+// nvsentinelDriverLabelPath is the nvsentinel values path that carries
+// the flag. "labeler" is the subchart key (the chart declares no alias),
+// so the override path is subchart-scoped rather than top-level.
+const nvsentinelDriverLabelPath = "labeler.assumeDriverInstalled"
+
+// gkeBundleInstallerProfileValue is the GKE gpuStack value under which the
+// bundle's gcp-driver-installer component (issue #1716) carries the
+// cos-gpu-installer DaemonSet. Its pods ARE a driver pod the NVSentinel
+// labeler detects, so the label gate below must not reject this value.
+const gkeBundleInstallerProfileValue = "bundle-installer"
+
+// gkeDRAProfileValue is the GKE gpuStack value that advertises whole GPUs
+// through DRA ResourceClaims (issue #2517). It is the bundle-installer
+// pool shape with a different advertiser: the same gcp-driver-installer
+// component supplies the driver, so the labeler sees the same driver pods.
+const gkeDRAProfileValue = "dra"
+
+// gpuStackProfileName is the ADR-015 configuration-profile name that
+// selects who installs the GPU driver on AKS and GKE.
+const gpuStackProfileName = "gpuStack"
+
+// gcpDriverInstallerComponentName is the values-gated GKE COS driver
+// component (issue #1716): present unconditionally in the GKE COS
+// composition, it renders the cos-gpu-installer DaemonSet only when its
+// nested installer.enabled gate is on.
+const gcpDriverInstallerComponentName = "gcp-driver-installer"
+
+// BundleSuppliesGKEDriver reports whether the composed bundle carries an
+// effectively enabled gcp-driver-installer — i.e. the bundle itself
+// provisions the NVIDIA kernel driver, so metadata.gpuDriverState=absent
+// is the expected pre-deployment state of a correctly provisioned pool
+// (gpu-driver-version=disabled) rather than a misconfiguration. It keys
+// off the EFFECTIVE installer gate (recipe values plus any --set
+// overrides in bundlerConfig), not the selected profile name: a --set
+// that flips the gate must flip this answer with it. The gate mirrors
+// the manifest template exactly (toString(installer.enabled) == "true"),
+// so only a value that actually renders the DaemonSet counts as a
+// producer; anything else — absent, false, or an unrecognized type —
+// leaves the driverless Rule 1 gate armed (fail closed). The lookup runs
+// against the declared-union view so a subset bundle
+// (--bundlers gpu-operator) still observes the installer its sibling
+// bundle carries. bundlerConfig may be nil (the resolution-time caller
+// in pkg/client/v1 has no override channel).
+func BundleSuppliesGKEDriver(ctx context.Context, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config) (bool, error) {
+	if recipeResult == nil {
+		return false, nil
+	}
+	unionView := declaredUnionView(recipeResult)
+	ref := unionView.GetComponentRef(gcpDriverInstallerComponentName)
+	if ref == nil {
+		return false, nil
+	}
+	keys := componentOverrideKeys(gcpDriverInstallerComponentName, unionView.DataProvider())
+	if componentDisabled(ref, bundlerConfig, keys) {
+		return false, nil
+	}
+	values, err := effectiveComponentValues(ctx, unionView, bundlerConfig,
+		gcpDriverInstallerComponentName, keys, "bundle-supplied driver detection")
+	if err != nil {
+		return false, err
+	}
+	installer, ok := values["installer"].(map[string]any)
+	if !ok {
+		return false, nil
+	}
+	return fmt.Sprint(installer["enabled"]) == "true", nil
+}
+
+// resolveGPUOperatorRef looks up the GPU Operator's ComponentRef by
+// trying every known name variant in turn, mirroring
+// resolveDRAComponentRef: GetComponentRef matches an EXACT name, so a
+// bare canonical-name call silently returns nil on an OCP recipe.
+//
+// The lookup runs against a DECLARED-union view of the recipe
+// (declaredUnionView): the bundler filters ComponentRefs before
+// validations run, so on a subset bundle (bundlers=nvsentinel) the
+// gpu-operator ref is absent from the filtered refs even though its
+// declaration — driver.enabled, operator.runtimeClass — is exactly the
+// platform evidence the NVSentinel gates key on. The returned view must
+// also be what the caller resolves the GPU Operator's values against,
+// so GetValuesForComponentWithContext finds the ref.
+func resolveGPUOperatorRef(recipeResult *recipe.RecipeResult) (string, *recipe.ComponentRef, *recipe.RecipeResult) {
+	union := declaredUnionView(recipeResult)
+	for _, name := range gpuOperatorComponentNames {
+		if ref := union.GetComponentRef(name); ref != nil {
+			return name, ref, union
+		}
+	}
+	return "", nil, union
+}
+
+// declaredUnionView returns recipeResult when no pre-filter union is
+// attached, and otherwise a shallow copy whose ComponentRefs is the
+// declared union — so ref lookups and values resolution see every
+// component the recipe names, not just the ones this bundle renders.
+// Attachment is the explicit HasDeclaredComponents bit, not a slice-
+// length inference.
+func declaredUnionView(recipeResult *recipe.RecipeResult) *recipe.RecipeResult {
+	if !recipeResult.HasDeclaredComponents() {
+		return recipeResult
+	}
+	view := *recipeResult
+	view.ComponentRefs = recipeResult.DeclaredComponentRefs()
+	return &view
+}
+
+// helmTruthy reports whether value would satisfy a Helm `{{ if }}` guard,
+// which is how the labeler chart consumes assumeDriverInstalled
+// (`{{- if .Values.assumeDriverInstalled }}` → `--assume-driver-installed`).
+// Helm inherits Go's text/template truth rule, so delegate to
+// template.IsTrue rather than re-deriving it: empty maps, slices, arrays,
+// and strings are FALSE (an empty-map value — e.g. --set-json
+// nv-sentinel:labeler.assumeDriverInstalled={} — renders WITHOUT the
+// flag, recreating the exact silent 0-desired state the gate exists to
+// block), non-empty strings are TRUE (so a --set spelling the chart
+// would honor is never rejected), numbers by non-zero, booleans by
+// value. The !ok case (no meaningful truth value) is fail-closed to
+// not-the-remedy.
+func helmTruthy(value any) bool {
+	return drainscope.HelmTruthy(value)
+}
+
+// nvsentinelAssumesDriverInstalled reports whether the effective
+// nvsentinel values enable the labeler's assume-driver-installed mode.
+func nvsentinelAssumesDriverInstalled(values map[string]any) bool {
+	labeler, ok := values["labeler"].(map[string]any)
+	if !ok {
+		return false
+	}
+	raw, present := labeler["assumeDriverInstalled"]
+	if !present {
+		return false
+	}
+	return helmTruthy(raw)
+}
+
+// labelerObservesDriverPod reports whether some driver pod the NVSentinel
+// labeler recognizes exists on this recipe's platform even though the GPU
+// Operator installs no driver.
+//
+// Two shipping configurations qualify, both GKE COS on pools created with
+// gpu-driver-version=disabled (recipes/overlays/gke-cos.yaml):
+// --profile gpuStack=bundle-installer and --profile gpuStack=dra. In both,
+// the bundle's gcp-driver-installer component carries the
+// cos-gpu-installer DaemonSet (Google's standalone nvidia-driver-installer
+// shape); the two values differ only in who advertises whole GPUs. The
+// labeler's driver-pod detection sees those pods, so the driver.installed
+// label IS applied and the gate below must stay silent.
+// The sibling value gke-default bakes the driver into the node at pool
+// creation, so no driver pod exists there — that value is affected.
+//
+// The exemption is scoped to GKE COS recipes, not to the profile
+// identifier alone: profile names are not reserved, and an external
+// --data overlay on any service can declare a gpuStack profile whose
+// value happens to be named bundle-installer or dra — with no installer
+// DaemonSet ever deploying. Fail closed on anything but the shapes
+// the embedded catalog documents (recipes/overlays/gke-cos.yaml); a
+// recipe without criteria stays blocked for the same reason.
+func labelerObservesDriverPod(recipeResult *recipe.RecipeResult) bool {
+	if recipeResult.Criteria == nil ||
+		recipeResult.Criteria.Service != recipe.CriteriaServiceGKE ||
+		recipeResult.Criteria.OS != recipe.CriteriaOSCOS {
+
+		return false
+	}
+	selected := recipeResult.Metadata.SelectedProfile
+	if selected == nil || selected.Name != gpuStackProfileName {
+		return false
+	}
+	return selected.Value == gkeBundleInstallerProfileValue || selected.Value == gkeDRAProfileValue
+}
+
+// NVSENTINEL GATE POLICY — what an nvsentinel gate means when parts of
+// nvsentinel are disabled or filtered away (three review rounds probed
+// this from different angles; keep the rules in one place):
+//
+//  1. Evidence is the DECLARED union; enforcement follows the OUTPUT.
+//     The gates read other components (gpu-operator) from the
+//     pre-filter declaration via resolveGPUOperatorRef — a component
+//     excluded from a subset bundle still describes the platform — but
+//     a gate only runs at all when nvsentinel itself is rendered
+//     (RunComponentValidations iterates the filtered refs). This is
+//     the ADR-018 union rule.
+//  2. An explicitly-disabled consumer subchart renders nothing, so it
+//     neither triggers a gate nor may deployment validation require
+//     it: the RuntimeClass gate skips when metadata-collector is
+//     disabled, the driver-label gate skips when BOTH label consumers
+//     (metadata-collector, syslog monitors) are disabled, and the
+//     health check's DaemonSet assertions use the negative form that
+//     tolerates a true 404. A PARTIALLY disabled consumer set does not
+//     skip — the remaining consumer still needs the remedy.
+//  3. When rendered, a consumer must be fully rolled out — 0 desired
+//     (the #2175 signature) and partial rollout both fail the health
+//     check; the gates exist so that state is rejected at bundle time
+//     instead.
+//
+// CheckNVSentinelDriverLabelDetectable blocks a bundle whose NVSentinel
+// deployment would silently come up half-rolled-out.
+//
+// The NVSentinel labeler decides
+// nvsentinel.dgxc.nvidia.com/driver.installed by watching for a GPU
+// driver pod. Where the driver ships in the node image and no driver pod
+// exists — AKS gpuStack=azure-managed, GKE COS gpuStack=gke-default, OKE
+// — the label is never applied, so metadata-collector and both
+// syslog-health-monitor DaemonSets report 0 desired pods. Nothing
+// reports an error: a DaemonSet whose node selector matches no node is
+// not unhealthy, it emits no event, and gpu-health-monitor keeps running
+// because it selects on the DCGM label instead. The stack looks healthy
+// while half of it was never scheduled (issue #2175).
+//
+// The chart automates the remedy: labeler.assumeDriverInstalled renders
+// --assume-driver-installed, which is the Manual Labeling Procedure of
+// NVSentinel design 018 expressed as configuration. Manually labeling
+// nodes is NOT an equivalent workaround — the labeler computes an empty
+// desired value when no driver pod exists and removes the label on its
+// next reconcile.
+//
+// The gate fires only when every one of the following holds, so the flag
+// is never demanded where the GPU Operator owns the driver (setting it
+// there would skip detection and mask an unloaded or unhealthy driver):
+//
+//   - nvsentinel is present and enabled,
+//   - the GPU Operator is present, enabled, and has driver.enabled=false
+//     in its FINAL effective values (recipe merge plus the user's
+//     --set/--set-json overrides), so the documented
+//     GPU-Operator-managed override set clears the gate,
+//   - no other driver pod source the labeler recognizes exists
+//     (labelerObservesDriverPod — GKE gpuStack=bundle-installer or
+//     gpuStack=dra), and
+//   - labeler.assumeDriverInstalled is not truthy in nvsentinel's
+//     effective values.
+//
+// It stays silent when the GPU Operator is absent or disabled: no AICR
+// recipe ships nvsentinel without it, and with no driver-ownership
+// signal to key on the gate would be guessing rather than detecting.
+//
+// When the driver toggle cannot be read as a boolean the gate defers to
+// CheckDriverOwnershipCoherence, which rejects that on the same values,
+// rather than adding a second message derived from a guessed default.
+// That deferral holds only while the sibling actually runs: it is
+// registered on the GPU Operator (recipes/registry.yaml) and
+// RunComponentValidations iterates the FILTERED ComponentRefs, so a
+// subset bundle (bundlers=nvsentinel) renders nvsentinel without it and
+// nothing would report the malformed toggle. The declared union
+// supplies this gate's evidence but cannot make the sibling execute, so
+// the gate fails closed when the operator it read the toggle from is
+// not itself rendered.
+//
+// Registered with severity error on nvsentinel (recipes/registry.yaml),
+// which converts the returned message into a blocking
+// ErrCodeInvalidRequest in RunValidations. Hard errors are returned only
+// when a component's effective values cannot be resolved or the user's
+// overrides cannot be reapplied to them (see effectiveComponentValues):
+// the state this gate must verify is then unknown, so it fails closed.
+func CheckNVSentinelDriverLabelDetectable(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	// A nil bundler config is the values-only Client.BundleComponents SDK
+	// path, which exposes no way to pass --set. That used to no-op this
+	// gate: the remedy was a bundle-time flag only, so firing here would
+	// have made every affected recipe permanently unbundleable through
+	// that API with no expressible fix. Since #2181 the recipes
+	// themselves carry labeler.assumeDriverInstalled for every supported
+	// configuration that needs it, so the gate is satisfiable from
+	// resolved values alone and runs on this path too. The helpers below
+	// read recipe values and skip the override merge when the config is
+	// nil.
+	sentinelRef := recipeResult.GetComponentRef(componentName)
+	if sentinelRef == nil {
+		return nil, nil
+	}
+	provider := recipeResult.DataProvider()
+	sentinelKeys := componentOverrideKeys(componentName, provider)
+	if componentDisabled(sentinelRef, bundlerConfig, sentinelKeys) {
+		return nil, nil
+	}
+
+	gpuOpName, gpuOpRef, gpuOpView := resolveGPUOperatorRef(recipeResult)
+	if gpuOpRef == nil {
+		return nil, nil
+	}
+	gpuOpKeys := componentOverrideKeys(gpuOpName, provider)
+	if componentDisabled(gpuOpRef, bundlerConfig, gpuOpKeys) {
+		return nil, nil
+	}
+
+	gpuOpValues, err := effectiveComponentValues(ctx, gpuOpView, bundlerConfig, gpuOpName, gpuOpKeys, "NVSentinel driver-label detectability")
+	if err != nil {
+		return nil, []error{err}
+	}
+	driverToggle, driverProblem := ownershipToggle(gpuOpValues, "driver")
+	// unreadableOwnership records that the operator's driver toggle could
+	// not be read AND no sibling will report it. The gate deliberately
+	// does not block here: every exit below (an observable driver pod,
+	// both label consumers disabled, the remedy already set) is an
+	// independent reason #2175 cannot occur, and short-circuiting past
+	// them would reject bundles that are fine — a bundle carrying the
+	// remedy most of all, since the flag makes the label unconditional
+	// whatever the operator's toggle says. Ownership is instead read
+	// conservatively as host-installed, so the gate blocks exactly where
+	// a readable driver.enabled=false would have.
+	unreadableOwnership := false
+	if driverProblem != "" {
+		if recipeResult.GetComponentRef(gpuOpName) != nil {
+			// The operator renders in this bundle, so
+			// CheckDriverOwnershipCoherence reports the malformed toggle
+			// against the component that declares it; a second message
+			// derived from a guessed default would only mislead.
+			return nil, nil
+		}
+		// Subset bundle (bundlers=nvsentinel): the operator supplied the
+		// evidence through the declared union but its own checks never
+		// run, so this gate is the only place the malformed toggle can
+		// surface. A falsy non-boolean (--set-json
+		// gpuoperator:driver.enabled=0, an explicitly null section)
+		// renders no driver pod — exactly the state that leaves the
+		// labeler at 0 desired.
+		unreadableOwnership = true
+	}
+	if !unreadableOwnership && (driverToggle == nil || *driverToggle) {
+		// Absent key → the chart default (true): the operator installs
+		// the driver, so its driver pod is exactly what the labeler
+		// watches for. No dynamic guard fires on this exit: #2175 is
+		// unreachable here regardless of any install-time edit to the
+		// remedy or consumer paths (the driver pod exists either way),
+		// and the flag is likewise permitted statically on these
+		// platforms — a guard would reject valid unaffected bundles
+		// (e.g. EKS with a --dynamic on a consumer-enable path).
+		return nil, nil
+	}
+
+	if labelerObservesDriverPod(recipeResult) {
+		// Same reasoning as the driver-enabled exit: Google's installer
+		// DaemonSet supplies an observable driver pod, so no install-time
+		// edit to the guarded paths can create the 0-desired state.
+		return nil, nil
+	}
+
+	// Affected platform (host-installed driver, no observable pod) — the
+	// exits below are decisions an install-time edit could undo, so the
+	// dynamic guards are scoped from here on, each firing only when the
+	// gate's outcome actually depends on the guarded path. Truth table
+	// (pinned by the test rows):
+	//
+	//   (a)  both consumers statically disabled, no consumer-enable
+	//        dynamic → skip; a remedy-path dynamic is allowed (nothing
+	//        reads the label, so no install-time edit to the remedy can
+	//        recreate #2175);
+	//   (b)  both statically disabled, NO usable static remedy, and a
+	//        consumer-enable path is dynamic → blocked (the skip's basis
+	//        is install-time editable and a re-enabled consumer would
+	//        find no remedy);
+	//   (b1) both statically disabled, static remedy applied and the
+	//        remedy path itself static → a consumer-enable dynamic is
+	//        allowed (an install-time re-enable finds the remedy in
+	//        place, so #2175 cannot recur);
+	//   (b2) both statically disabled, static remedy applied but the
+	//        remedy path ALSO dynamic → blocked (both bases are
+	//        install-time editable: strip the remedy, re-enable a
+	//        consumer);
+	//   (c)  consumers active → the gate depends on the remedy, so a
+	//        remedy-path dynamic is blocked whether the static remedy is
+	//        set (an edit strips it) or not (the export defers it).
+	sentinelValues, err := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, sentinelKeys, "NVSentinel driver-label detectability")
+	if err != nil {
+		return nil, []error{err}
+	}
+	remedyStatic := nvsentinelAssumesDriverInstalled(sentinelValues)
+	remedyDynamic := len(dynamicPathIntersections(bundlerConfig, sentinelKeys,
+		[]string{nvsentinelDriverLabelPath})) > 0
+	// Consumer-aware skip: metadata-collector and the syslog monitors are
+	// the components that select on the driver.installed label. When the
+	// resolved values explicitly disable BOTH subcharts, nothing reads
+	// the label and demanding the remedy would serve no consumer. A
+	// single disabled consumer does not skip — the other still needs the
+	// label. (See the policy comment above CheckNVSentinelDriverLabelDetectable.)
+	// Evaluated BEFORE the remedy-path guard: with both consumers gone
+	// and their enable paths static, the remedy is irrelevant and a
+	// dynamic on it is harmless (row (a)).
+	if nvsentinelDriverLabelConsumerDisabled(sentinelValues, "metadataCollector") &&
+		nvsentinelDriverLabelConsumerDisabled(sentinelValues, "syslogHealthMonitor") {
+		// Row (b1): a static remedy on a static remedy path makes an
+		// install-time consumer re-enable safe — the label is applied
+		// regardless — so the consumer-enable guard must not fire.
+		if remedyStatic && !remedyDynamic {
+			return nil, nil
+		}
+		// Rows (b)/(b2): the consumer-enable paths are guarded exactly
+		// when this skip is what clears the gate AND no static remedy
+		// would cover a re-enabled consumer — either none is set, or the
+		// remedy path is itself dynamic and an install-time edit can
+		// strip it.
+		if dynMsgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+			[]string{nvsentinelMetadataCollectorEnabledPath, "global.syslogHealthMonitor.enabled"},
+			"cleared the driver-label gate (both label consumers are disabled, so "+
+				"nothing reads the label — an install-time edit re-enabling a consumer "+
+				"would recreate the silent 0-desired DaemonSet state of issue #2175, "+
+				"because the static remedy is absent or itself declared dynamic)"); len(dynMsgs) > 0 {
+			for _, msg := range dynMsgs {
+				slog.Warn(msg, logKeyComponent, componentName)
+			}
+			return dynMsgs, nil
+		}
+
+		return nil, nil
+	}
+
+	// Row (c): consumers render, so the gate stands or falls on the
+	// remedy — whether it passes via the static remedy or blocks
+	// demanding it, a dynamic on the path defers the remedy to the
+	// operator-editable cluster-values.yaml, where stripping it
+	// recreates #2175.
+	if dynMsgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+		[]string{nvsentinelDriverLabelPath},
+		"the driver-label gate verifies on this platform (an install-time edit "+
+			"can strip the remedy and recreate the silent 0-desired DaemonSet "+
+			"state of issue #2175)"); len(dynMsgs) > 0 {
+		for _, msg := range dynMsgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return dynMsgs, nil
+	}
+
+	if remedyStatic {
+		return nil, nil
+	}
+
+	// Name only the label consumers this configuration actually renders:
+	// with one subchart explicitly disabled its DaemonSets do not exist,
+	// and listing them would misstate the blast radius.
+	var affected []string
+	if !nvsentinelDriverLabelConsumerDisabled(sentinelValues, "metadataCollector") {
+		affected = append(affected, "metadata-collector")
+	}
+	if !nvsentinelDriverLabelConsumerDisabled(sentinelValues, "syslogHealthMonitor") {
+		affected = append(affected, "syslog-health-monitor-regular", "syslog-health-monitor-kata")
+	}
+
+	// The ownership clause differs when the toggle could not be read: the
+	// gate is acting on the conservative reading, and saying
+	// driver.enabled=false outright would misreport what the values say.
+	ownershipClause := fmt.Sprintf(
+		"the effective values leave the NVIDIA driver to the node image "+
+			"(%s driver.enabled=false)", gpuOpName)
+	if unreadableOwnership {
+		ownershipClause = fmt.Sprintf(
+			"the GPU Operator's driver ownership is unreadable (%s) and this bundle "+
+				"does not render the GPU Operator (a bundlers= subset), so the check "+
+				"that normally reports a malformed toggle does not run on it — read "+
+				"conservatively, the driver is left to the node image", driverProblem)
+	}
+	msg := fmt.Sprintf(
+		"%s: %s and no driver pod the NVSentinel labeler can "+
+			"observe is deployed, but %s is not set. The labeler therefore never "+
+			"applies the nvsentinel.dgxc.nvidia.com/driver.installed node label, and "+
+			"%s come up with 0 desired pods — silently: a "+
+			"DaemonSet that matches no node reports no error and emits no event, and "+
+			"gpu-health-monitor stays healthy because it selects on the DCGM label "+
+			"instead, so the stack looks fully rolled out. Set the documented upstream "+
+			"flag at bundle time: %s. Note that labeling the nodes by hand does not "+
+			"persist — the labeler removes the label on its next reconcile. Do not set "+
+			"the flag where the GPU Operator installs the driver: it skips driver-pod "+
+			"detection entirely and would mask an unloaded driver.",
+		componentName, ownershipClause, nvsentinelDriverLabelPath,
+		strings.Join(affected, ", "), nvsentinelAssumeDriverInstalledOverrideSet)
+	slog.Warn(msg, logKeyComponent, componentName)
+	return []string{msg}, nil
+}
+
+// defaultRuntimeClassName is the shared chart default: the gpu-operator
+// chart ships operator.runtimeClass: nvidia (v26.7.0, verified against
+// the pinned chart values), and nvsentinel's metadata-collector subchart
+// ships runtimeClassName: "nvidia" (v1.28.0, charts/metadata-collector/
+// values.yaml:40). Either side left unset therefore resolves to this
+// name.
+const defaultRuntimeClassName = "nvidia"
+
+// nvsentinelMetadataCollectorRuntimeClassPath is the nvsentinel values
+// path carrying the metadata-collector pod's runtimeClassName.
+// "metadata-collector" is the subchart key (no alias in the parent
+// Chart.yaml), so the override path is subchart-scoped.
+const nvsentinelMetadataCollectorRuntimeClassPath = "metadata-collector.runtimeClassName"
+
+// resolvedStringValue walks a dot-separated path through values and
+// returns the string found there. ok is false when the path is absent
+// or any intermediate step is not a map — the caller then applies the
+// chart default. A present-but-non-string leaf returns ok=false with
+// valid=false so callers can distinguish "absent → default" from
+// "present but unreadable → cannot verify".
+func resolvedStringValue(values map[string]any, path string) (value string, ok bool, valid bool) {
+	cur := values
+	parts := strings.Split(path, ".")
+	for i, part := range parts {
+		raw, present := cur[part]
+		if !present {
+			return "", false, true
+		}
+		if i == len(parts)-1 {
+			s, isString := raw.(string)
+			if !isString {
+				return "", false, false
+			}
+			return s, true, true
+		}
+		next, isMap := raw.(map[string]any)
+		if !isMap {
+			return "", false, true
+		}
+		cur = next
+	}
+	return "", false, true
+}
+
+// nvsentinelDriverLabelConsumerDisabled reports whether the resolved
+// nvsentinel values switch OFF the named subchart via its chart
+// condition (global.<key>.enabled=false). Absent or malformed keys
+// count as enabled — the chart defaults both consumers to true, and the
+// gate must fail closed when it cannot prove nobody reads the label.
+func nvsentinelDriverLabelConsumerDisabled(values map[string]any, key string) bool {
+	global, ok := values["global"].(map[string]any)
+	if !ok {
+		return false
+	}
+	section, ok := global[key].(map[string]any)
+	if !ok {
+		return false
+	}
+	enabled, isBool := section["enabled"].(bool)
+	return isBool && !enabled
+}
+
+// nvsentinelMetadataCollectorDisabled reports whether the resolved
+// nvsentinel values switch the metadata-collector subchart off
+// (global.metadataCollector.enabled=false, the chart's subchart
+// condition). With the subchart disabled no DaemonSet renders, so a
+// runtime-class mismatch has nothing to reject.
+func nvsentinelMetadataCollectorDisabled(values map[string]any) bool {
+	return nvsentinelDriverLabelConsumerDisabled(values, "metadataCollector")
+}
+
+// CheckNVSentinelRuntimeClassCoherence blocks a bundle whose NVSentinel
+// metadata-collector pods would be rejected at admission.
+//
+// The metadata-collector DaemonSet sets runtimeClassName (chart default
+// "nvidia"), and the GPU Operator's ClusterPolicy controller creates the
+// primary RuntimeClass named after operator.runtimeClass (also default
+// "nvidia"). When a recipe retargets operator.runtimeClass — the AKS
+// azure-managed profile sets nvidia-container-runtime because that is
+// the handler preconfigured on the AKS node image — no RuntimeClass
+// named "nvidia" exists on the cluster, and the API server rejects every
+// metadata-collector pod at admission: `pod rejected: RuntimeClass
+// "nvidia" not found` (issue #2176).
+//
+// The failure mode is easy to misread: the pods are rejected before a
+// pod object is created, so there is nothing to kubectl describe — the
+// DaemonSet shows N desired / 0 created and the only signal is a
+// FailedCreate event on it. Distinct from and additive to the
+// driver-label gap (CheckNVSentinelDriverLabelDetectable, #2175): the
+// label gets metadata-collector scheduled, the runtime class gets its
+// pods admitted.
+//
+// This is a value comparison, not a platform matrix: the gate fires
+// exactly when the two resolved names differ, treating either side
+// unset as the shared chart default "nvidia" (both defaults verified
+// against the pinned charts — see defaultRuntimeClassName). It
+// therefore passes wherever the recipes leave operator.runtimeClass at
+// its default (EKS, GKE, OKE, AKS operator-managed) and fails AKS
+// azure-managed until the override is passed. An explicitly EMPTY
+// metadata-collector.runtimeClassName also passes: the subchart omits
+// the field entirely then, and a pod without runtimeClassName is always
+// admitted.
+//
+// The gate stays silent when the GPU Operator is absent or disabled
+// (nothing manages RuntimeClasses, so there is no authoritative name to
+// compare against), when the metadata-collector subchart is disabled
+// (global.metadataCollector.enabled=false — no DaemonSet renders), when
+// either value is present but not a string (the install fails on its
+// own terms; guessing a default here could invert the verdict).
+//
+// It also runs on a nil bundler config — the values-only
+// Client.BundleComponents path. That path used to be exempt because the
+// remedy was a --set it cannot express; since #2181 the AKS profile
+// owns both operator.runtimeClass and
+// metadata-collector.runtimeClassName, so the coherent state is
+// reachable from resolved values alone.
+//
+// Registered with severity error on nvsentinel (recipes/registry.yaml).
+// Hard errors are returned only when effective values cannot be
+// resolved (effectiveComponentValues) — the state this gate must verify
+// is then unknown, so it fails closed.
+func CheckNVSentinelRuntimeClassCoherence(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	sentinelRef := recipeResult.GetComponentRef(componentName)
+	if sentinelRef == nil {
+		return nil, nil
+	}
+	provider := recipeResult.DataProvider()
+	sentinelKeys := componentOverrideKeys(componentName, provider)
+	if componentDisabled(sentinelRef, bundlerConfig, sentinelKeys) {
+		return nil, nil
+	}
+
+	gpuOpName, gpuOpRef, gpuOpView := resolveGPUOperatorRef(recipeResult)
+	if gpuOpRef == nil {
+		return nil, nil
+	}
+	gpuOpKeys := componentOverrideKeys(gpuOpName, provider)
+	if componentDisabled(gpuOpRef, bundlerConfig, gpuOpKeys) {
+		return nil, nil
+	}
+
+	gpuOpValues, err := effectiveComponentValues(ctx, gpuOpView, bundlerConfig, gpuOpName, gpuOpKeys, "NVSentinel RuntimeClass coherence")
+	if err != nil {
+		return nil, []error{err}
+	}
+	operatorClass, present, valid := resolvedStringValue(gpuOpValues, gpuOperatorRuntimeClassPath)
+	if !valid {
+		return nil, nil
+	}
+	if !present || operatorClass == "" {
+		// Absent and explicitly empty both fall back to the chart
+		// default: the gpu-operator chart templates the RuntimeClass
+		// name via a default-applying helper.
+		operatorClass = defaultRuntimeClassName
+	}
+
+	sentinelValues, err := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, sentinelKeys, "NVSentinel RuntimeClass coherence")
+	if err != nil {
+		return nil, []error{err}
+	}
+	if nvsentinelMetadataCollectorDisabled(sentinelValues) {
+		// The enable condition is guarded exactly when this skip is what
+		// clears the gate AND an install-time re-enable would deploy a
+		// collector whose runtime class is NOT verifiably coherent. When
+		// the statically resolved collector class is already coherent
+		// with the operator's (matching, or explicitly empty and
+		// therefore omitted) and neither class path is itself dynamic, a
+		// re-enabled collector is admitted — the alignment was verified
+		// even though nothing renders now — so the guard must not fire.
+		// It fires when the class is unset-default-
+		// mismatched, misaligned, unreadable, or either class path is
+		// install-time editable.
+		disabledClass, disabledPresent, disabledValid := resolvedStringValue(sentinelValues, nvsentinelMetadataCollectorRuntimeClassPath)
+		if !disabledPresent {
+			disabledClass = defaultRuntimeClassName
+		}
+		coherent := disabledValid && (disabledClass == "" || disabledClass == operatorClass)
+		// Which class paths make the coherent state install-time editable
+		// mirrors the enabled-collector logic below: an explicitly EMPTY
+		// collector class omits runtimeClassName from the pod spec, so a
+		// re-enabled collector is admitted under ANY operator class and
+		// only the collector's own path (an edit could fill it with a
+		// nonexistent class) endangers the verified state —
+		// operator.runtimeClass does not. A MATCHING non-empty class
+		// depends on both sides staying put, so both paths count.
+		classPathsDynamic := len(dynamicPathIntersections(bundlerConfig, sentinelKeys,
+			[]string{nvsentinelMetadataCollectorRuntimeClassPath})) > 0
+		if !disabledValid || disabledClass != "" {
+			classPathsDynamic = classPathsDynamic ||
+				len(dynamicPathIntersections(bundlerConfig, gpuOpKeys,
+					[]string{gpuOperatorRuntimeClassPath})) > 0
+		}
+		if coherent && !classPathsDynamic {
+			return nil, nil
+		}
+		if dynMsgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+			[]string{nvsentinelMetadataCollectorEnabledPath},
+			"cleared the RuntimeClass-coherence gate (the metadata-collector "+
+				"subchart is disabled and its runtime class is not verifiably "+
+				"coherent — misaligned, unreadable, or itself declared dynamic — so "+
+				"an install-time edit re-enabling it can deploy a collector whose "+
+				"pods are rejected at admission, issue #2176)"); len(dynMsgs) > 0 {
+			for _, msg := range dynMsgs {
+				slog.Warn(msg, logKeyComponent, componentName)
+			}
+			return dynMsgs, nil
+		}
+
+		return nil, nil
+	}
+
+	collectorClass, present, valid := resolvedStringValue(sentinelValues, nvsentinelMetadataCollectorRuntimeClassPath)
+	if !valid {
+		return nil, nil
+	}
+	if !present {
+		collectorClass = defaultRuntimeClassName
+	}
+	guardReason := "the RuntimeClass-coherence gate verifies (an install-time edit can " +
+		"desynchronize the collector from the operator's RuntimeClass and every " +
+		"metadata-collector pod is then rejected at admission — issue #2176)"
+	if collectorClass == "" {
+		// Explicitly empty: the subchart omits runtimeClassName from the
+		// pod spec entirely, and a pod without one is always admitted —
+		// so retargeting the OPERATOR's class at install time cannot
+		// cause #2176 and operator.runtimeClass is not guarded here. The
+		// COLLECTOR path stays guarded: an install-time edit could
+		// replace the empty value with a class name no RuntimeClass
+		// matches, recreating exactly the admission rejection this exit
+		// stands behind not happening.
+		if dynMsgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+			[]string{nvsentinelMetadataCollectorRuntimeClassPath}, guardReason); len(dynMsgs) > 0 {
+			for _, msg := range dynMsgs {
+				slog.Warn(msg, logKeyComponent, componentName)
+			}
+			return dynMsgs, nil
+		}
+
+		return nil, nil
+	}
+
+	// The collector renders with a real runtime class and this gate is
+	// about to stand behind the coherence of the two resolved names. A
+	// --dynamic on either class path defers it to the operator-editable
+	// cluster-values.yaml, where a retarget desynchronizes exactly what
+	// was verified — so both paths are guarded whenever the comparison is
+	// reached, on every platform (a matching pair is one edit away from a
+	// mismatched one). Not guarded on the blocking path below: a
+	// mismatched bundle is rejected outright either way.
+	dynMsgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+		[]string{nvsentinelMetadataCollectorRuntimeClassPath}, guardReason)
+	dynMsgs = append(dynMsgs, nvsentinelDynamicGuardViolations(bundlerConfig, componentName, gpuOpKeys,
+		[]string{gpuOperatorRuntimeClassPath}, guardReason)...)
+	if len(dynMsgs) > 0 {
+		for _, msg := range dynMsgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return dynMsgs, nil
+	}
+
+	if collectorClass == operatorClass {
+		return nil, nil
+	}
+
+	msg := fmt.Sprintf(
+		"%s: metadata-collector sets runtimeClassName=%q but the GPU Operator creates "+
+			"its primary RuntimeClass as %q (%s operator.runtimeClass), so no RuntimeClass "+
+			"with that name will exist and the API server rejects every metadata-collector "+
+			"pod at admission (`pod rejected: RuntimeClass %q not found`). The DaemonSet "+
+			"then shows desired pods but zero created — no pod object ever exists, so there "+
+			"is nothing to kubectl describe; the only signal is a FailedCreate event on the "+
+			"DaemonSet. Align the collector with the operator's runtime class at bundle "+
+			"time: --set nv-sentinel:%s=%s.",
+		componentName, collectorClass, operatorClass, gpuOpName, collectorClass,
+		nvsentinelMetadataCollectorRuntimeClassPath, operatorClass)
+	slog.Warn(msg, logKeyComponent, componentName)
+	return []string{msg}, nil
+}
+
+// nvsentinelTracingEnabled reports whether the resolved nvsentinel values
+// turn on distributed tracing. The root chart gates tracing with a raw
+// `{{- if .Values.global.tracing.enabled }}`, so this matches Helm's truth
+// rule via helmTruthy rather than a strict Go bool assertion.
+func nvsentinelTracingEnabled(values map[string]any) bool {
+	global, ok := values["global"].(map[string]any)
+	if !ok {
+		return false
+	}
+	tracing, ok := global["tracing"].(map[string]any)
+	if !ok {
+		return false
+	}
+	raw, present := tracing["enabled"]
+	if !present {
+		return false
+	}
+	return helmTruthy(raw)
+}
+
+// CheckNVSentinelTracingEndpointRequired blocks a bundle that enables
+// NVSentinel distributed tracing without supplying an OTLP collector
+// endpoint. The chart has no fail-closed guard of its own:
+// templates/daemonset.yaml sets OTEL_EXPORTER_OTLP_ENDPOINT to
+// .Values.global.tracing.endpoint with no `required` guard, so
+// global.tracing.enabled=true with an empty endpoint renders and deploys
+// without error — the pod starts, and the OTel exporter fails at runtime
+// with no signal visible to `aicr bundle`/`aicr validate`. This gate is
+// the only point in the pipeline that inspects resolved Helm values
+// (including --set/--set-json/--dynamic) before a bundle is produced, so
+// it is the only mechanism that can catch this before deploy. Registration
+// details (severity, no-op conditions) are in recipes/registry.yaml.
+func CheckNVSentinelTracingEndpointRequired(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	sentinelRef := recipeResult.GetComponentRef(componentName)
+	if sentinelRef == nil {
+		return nil, nil
+	}
+	provider := recipeResult.DataProvider()
+	sentinelKeys := componentOverrideKeys(componentName, provider)
+	if componentDisabled(sentinelRef, bundlerConfig, sentinelKeys) {
+		return nil, nil
+	}
+
+	values, err := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, sentinelKeys, "NVSentinel tracing endpoint")
+	if err != nil {
+		return nil, []error{err}
+	}
+
+	// Relation-aware dynamic guard: a --dynamic declaration on ONE of
+	// {enabled, endpoint} is only a hazard if the OTHER field's static
+	// state can't already rule out "enabled=true, endpoint empty" after
+	// an install-time edit. Blocking both unconditionally rejects safe
+	// configurations too -- e.g. dynamic enabled with a real static
+	// endpoint can never reach the bad combination, since nothing dynamic
+	// can blank the endpoint.
+	enabledDynamic := len(dynamicPathIntersections(bundlerConfig, sentinelKeys, []string{"global.tracing.enabled"})) > 0
+	endpointDynamic := len(dynamicPathIntersections(bundlerConfig, sentinelKeys, []string{"global.tracing.endpoint"})) > 0
+	if enabledDynamic || endpointDynamic {
+		staticEndpoint, _, staticEndpointValid := resolvedStringValue(values, "global.tracing.endpoint")
+		// Reliable only when NOT itself dynamic -- a dynamic endpoint
+		// can be edited to empty at install time regardless of what
+		// the static layer currently resolves to.
+		endpointReliablyNonEmpty := staticEndpointValid && strings.TrimSpace(staticEndpoint) != "" && !endpointDynamic
+		// Reliable only when NOT itself dynamic -- a dynamic enabled
+		// can be flipped to true at install time regardless of the
+		// static/default value.
+		enabledReliablyOff := !nvsentinelTracingEnabled(values) && !enabledDynamic
+
+		hazard := (enabledDynamic && !endpointReliablyNonEmpty) || (endpointDynamic && !enabledReliablyOff)
+		if hazard {
+			var paths []string
+			if enabledDynamic {
+				paths = append(paths, "global.tracing.enabled")
+			}
+			if endpointDynamic {
+				paths = append(paths, "global.tracing.endpoint")
+			}
+			dynMsgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys, paths,
+				"controls whether the OTLP exporter is enabled and where it sends traces, and the other field's "+
+					"current static state can't rule out enabled=true with an empty endpoint after an install-time edit")
+			for _, msg := range dynMsgs {
+				slog.Warn(msg, logKeyComponent, componentName)
+			}
+			return dynMsgs, nil
+		}
+	}
+
+	if !nvsentinelTracingEnabled(values) {
+		return nil, nil
+	}
+
+	// A non-string endpoint is blocked outright, not skipped: this gate
+	// exists specifically to catch a broken tracing config before deploy.
+	endpoint, _, valid := resolvedStringValue(values, "global.tracing.endpoint")
+	if !valid {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: global.tracing.endpoint must be a string", componentName))}
+	}
+	if strings.TrimSpace(endpoint) != "" {
+		return nil, nil
+	}
+
+	return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+		fmt.Sprintf("component %q: global.tracing.enabled=true but global.tracing.endpoint is empty; "+
+			"the chart renders an OTLP exporter with no destination and fails silently at runtime -- "+
+			"set --set nv-sentinel:global.tracing.endpoint=<host:port>", componentName))}
+}
+
+// nvsentinelNicHealthMonitorEnabledPath is the subchart condition
+// Chart.yaml gates nic-health-monitor on.
+const nvsentinelNicHealthMonitorEnabledPath = "global.nicHealthMonitor.enabled"
+
+// nvsentinelMetadataCollectorEnabledPath is the subchart condition
+// Chart.yaml gates metadata-collector on.
+const nvsentinelMetadataCollectorEnabledPath = "global.metadataCollector.enabled"
+
+// nicInclusionRegexOverridePath is the documented bypass for
+// nic-health-monitor's metadata-collector dependency: a manual device list
+// used instead of discovered inventory. Subchart-scoped, since
+// "nic-health-monitor" has no alias in the parent Chart.yaml.
+const nicInclusionRegexOverridePath = "nic-health-monitor.nicInclusionRegexOverride"
+
+// nicInclusionOverrideUsable reports whether an inclusion-regex override is
+// one nic-health-monitor will actually accept.
+//
+// The chart writes the value straight into config.toml, where the monitor
+// compiles every comma-separated pattern at startup and refuses to start on
+// one that does not compile, or on a list with no non-empty pattern at all
+// (upstream's validateInclusionRegexList). An override it rejects is not a
+// bypass for the missing metadata-collector inventory -- it is the same
+// missing inventory, in a crash loop. Empty patterns between separators are
+// skipped rather than rejected, matching upstream.
+func nicInclusionOverrideUsable(override string) bool {
+	if strings.TrimSpace(override) == "" {
+		return false
+	}
+
+	usable := false
+
+	for _, pattern := range strings.Split(override, ",") {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		if _, err := regexp.Compile(pattern); err != nil {
+			return false
+		}
+		usable = true
+	}
+
+	return usable
+}
+
+// nvsentinelSubchartRenders reports whether a Chart.yaml dependency
+// condition at global.<key>.enabled leaves its subchart rendering.
+//
+// Dependency conditions are strictly boolean, unlike a template's
+// `{{ if }}` -- helmTruthy is the wrong reader here. Helm resolves the
+// path and, on anything that is not a Go bool, logs "returned non-bool
+// value", ignores the condition, and renders the subchart anyway
+// (verified against chart v1.28.0: `--set global.nicHealthMonitor.enabled=0`
+// still renders nic-health-monitor, while `=false` does not). So only the
+// literal false switches a subchart off, and only a well-formed table can
+// carry it. An absent key reports false: every subchart this reads defaults
+// to off.
+func nvsentinelSubchartRenders(values map[string]any, key string) bool {
+	return drainscope.SubchartRenders(values, key)
+}
+
+// CheckNVSentinelNicHealthMonitorRequiresMetadataCollector blocks a bundle
+// that enables the nic-health-monitor subchart without the NIC inventory it
+// depends on.
+//
+// nic-health-monitor's link-state and link-counter checks run against the
+// GPU-to-NIC topology metadata-collector writes to
+// /var/lib/nvsentinel/gpu_metadata.json; the one documented bypass is an
+// operator-supplied nicInclusionRegexOverride, which substitutes a manual
+// device list and forfeits the automatic management-NIC exclusion with it.
+// With metadata-collector disabled and no override the DaemonSet renders,
+// deploys, and discovers zero devices, which nothing downstream reports.
+// Registration details (severity, no-op conditions) are in
+// recipes/registry.yaml.
+func CheckNVSentinelNicHealthMonitorRequiresMetadataCollector(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	sentinelRef := recipeResult.GetComponentRef(componentName)
+	if sentinelRef == nil {
+		return nil, nil
+	}
+	provider := recipeResult.DataProvider()
+	sentinelKeys := componentOverrideKeys(componentName, provider)
+	if componentDisabled(sentinelRef, bundlerConfig, sentinelKeys) {
+		return nil, nil
+	}
+
+	values, err := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, sentinelKeys,
+		"NVSentinel nic-health-monitor metadata-collector dependency")
+	if err != nil {
+		return nil, []error{err}
+	}
+
+	// Absent means the chart default, which is off for nicHealthMonitor and
+	// on for metadataCollector -- hence the asymmetry in how each is read.
+	monitorEnabled := nvsentinelSubchartRenders(values, "nicHealthMonitor")
+	collectorDisabled := nvsentinelMetadataCollectorDisabled(values)
+	override, _, overrideValid := resolvedStringValue(values, nicInclusionRegexOverridePath)
+	overrideEmpty := overrideValid && strings.TrimSpace(override) == ""
+
+	// Relation-aware dynamic guard: the broken state needs the monitor
+	// enabled, the collector disabled, and no usable override. A --dynamic
+	// declaration on any one of them is only a hazard when the others can
+	// still reach their bad polarity after an install-time edit, so each
+	// term below is "could be bad", not "is bad". Blocking any dynamic
+	// path unconditionally would reject safe configurations — e.g. a
+	// dynamic monitor toggle alongside a statically enabled collector can
+	// never reach the broken state.
+	monitorDynamic := len(dynamicPathIntersections(bundlerConfig, sentinelKeys, []string{nvsentinelNicHealthMonitorEnabledPath})) > 0
+	collectorDynamic := len(dynamicPathIntersections(bundlerConfig, sentinelKeys, []string{nvsentinelMetadataCollectorEnabledPath})) > 0
+	overrideDynamic := len(dynamicPathIntersections(bundlerConfig, sentinelKeys, []string{nicInclusionRegexOverridePath})) > 0
+	// Only a readable, usable, non-dynamic override rescues the broken
+	// state. Empty cannot, a value the operator can still blank cannot,
+	// an unreadable one cannot, and neither can one the monitor will
+	// reject at startup.
+	overrideRescues := overrideValid && !overrideDynamic && nicInclusionOverrideUsable(override)
+	if monitorDynamic || collectorDynamic || overrideDynamic {
+		if (monitorDynamic || monitorEnabled) && (collectorDynamic || collectorDisabled) && !overrideRescues {
+			var paths []string
+			if monitorDynamic {
+				paths = append(paths, nvsentinelNicHealthMonitorEnabledPath)
+			}
+			if collectorDynamic {
+				paths = append(paths, nvsentinelMetadataCollectorEnabledPath)
+			}
+			if overrideDynamic {
+				paths = append(paths, nicInclusionRegexOverridePath)
+			}
+			dynMsgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys, paths,
+				"decides whether nic-health-monitor runs, whether metadata-collector can supply the NIC "+
+					"inventory it reads, or whether an override replaces that inventory — and the other fields "+
+					"cannot rule out an enabled monitor with nothing to discover after an install-time edit")
+			for _, msg := range dynMsgs {
+				slog.Warn(msg, logKeyComponent, componentName)
+			}
+			return dynMsgs, nil
+		}
+	}
+
+	if !monitorEnabled || !collectorDisabled {
+		return nil, nil
+	}
+	// Fail closed on an unreadable override: this gate exists to catch a
+	// monitor that cannot discover devices, and a non-string override
+	// leaves that unverifiable rather than merely unset.
+	if !overrideValid {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s must be a string", componentName, nicInclusionRegexOverridePath))}
+	}
+	if nicInclusionOverrideUsable(override) {
+		return nil, nil
+	}
+	// A present-but-unusable override gets its own message: "set the
+	// override" would be unhelpful advice to someone who already has.
+	if !overrideEmpty {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s is set to %q, which nic-health-monitor rejects at startup -- "+
+				"every comma-separated pattern must compile and at least one must be non-empty. "+
+				"The monitor would crash-loop with the same missing inventory it is meant to work around",
+				componentName, nicInclusionRegexOverridePath, override))}
+	}
+
+	return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+		fmt.Sprintf("component %q: %s=true but global.metadataCollector.enabled=false and %s is unset; "+
+			"nic-health-monitor reads its NIC inventory from metadata-collector and has no devices to check "+
+			"without it -- enable metadata-collector, or set --set nv-sentinel:%s=<regex>",
+			componentName, nvsentinelNicHealthMonitorEnabledPath, nicInclusionRegexOverridePath,
+			nicInclusionRegexOverridePath))}
+}
+
+// Paths and names CheckNVSentinelSlurmDrainMonitorRequiresSlinky reads.
+// slurmDrainMonitorChartNamespace is the subchart's default for
+// slurm-drain-monitor.namespace (NVSentinel chart v1.28.0); it also stands in
+// for slinky-slurm's namespace on a ref that does not carry one, which recipe
+// resolution otherwise fills from the registry's defaultNamespace, also slurm.
+const (
+	nvsentinelSlurmDrainMonitorEnabledPath = "global.slurmDrainMonitor.enabled"
+	slurmDrainMonitorNamespacePath         = "slurm-drain-monitor.namespace"
+	slurmDrainMonitorChartNamespace        = "slurm"
+	slinkySlurmComponent                   = "slinky-slurm"
+	slinkySlurmEnabledPath                 = "enabled"
+)
+
+// CheckNVSentinelSlurmDrainMonitorRequiresSlinky blocks a bundle that enables
+// the slurm-drain-monitor subchart without the Slinky worker pods it watches.
+//
+// The monitor reads the SlurmNodeStateDrain condition off pods in one
+// namespace, and only slinky-slurm's NodeSets create them. Without
+// slinky-slurm, or watching a namespace slinky-slurm does not deploy to, the
+// Deployment renders, runs, and never sees a pod, which nothing downstream
+// reports. Registration details are in recipes/registry.yaml.
+func CheckNVSentinelSlurmDrainMonitorRequiresSlinky(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	sentinelRef := recipeResult.GetComponentRef(componentName)
+	if sentinelRef == nil {
+		return nil, nil
+	}
+	provider := recipeResult.DataProvider()
+	sentinelKeys := componentOverrideKeys(componentName, provider)
+	if componentDisabled(sentinelRef, bundlerConfig, sentinelKeys) {
+		return nil, nil
+	}
+
+	values, err := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, sentinelKeys,
+		"NVSentinel slurm-drain-monitor Slinky dependency")
+	if err != nil {
+		return nil, []error{err}
+	}
+
+	// A statically-off monitor still needs its toggle guarded: a --dynamic
+	// declaration on it would let an operator switch it on at install time,
+	// after this gate concluded there was nothing to check.
+	monitorEnabled := nvsentinelSubchartRenders(values, "slurmDrainMonitor")
+	if !monitorEnabled {
+		msgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+			[]string{nvsentinelSlurmDrainMonitorEnabledPath},
+			"decides whether slurm-drain-monitor runs at all, and this recipe has it statically off -- so the gate would validate nothing while an install-time edit switched it on")
+		for _, msg := range msgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return msgs, nil
+	}
+
+	slinkyKeys := componentOverrideKeys(slinkySlurmComponent, provider)
+	dynMsgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+		[]string{nvsentinelSlurmDrainMonitorEnabledPath, slurmDrainMonitorNamespacePath},
+		"decides whether slurm-drain-monitor runs and which namespace it watches for Slinky worker pods")
+	dynMsgs = append(dynMsgs, nvsentinelDynamicGuardViolations(bundlerConfig, slinkySlurmComponent, slinkyKeys,
+		[]string{slinkySlurmEnabledPath},
+		"decides whether the Slinky worker pods slurm-drain-monitor watches exist at all")...)
+	if len(dynMsgs) > 0 {
+		for _, msg := range dynMsgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return dynMsgs, nil
+	}
+
+	namespace, set, valid := resolvedStringValue(values, slurmDrainMonitorNamespacePath)
+	if !valid {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s must be a string", componentName, slurmDrainMonitorNamespacePath))}
+	}
+	// The monitor restricts its watch only to a non-empty namespace, verbatim:
+	// "" watches every namespace, while a whitespace-only value is a real
+	// namespace nothing can create, so it watches nothing.
+	if set && namespace != "" && strings.TrimSpace(namespace) == "" {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s is whitespace-only, so slurm-drain-monitor would watch a namespace that cannot exist",
+				componentName, slurmDrainMonitorNamespacePath))}
+	}
+	if !set {
+		namespace = slurmDrainMonitorChartNamespace
+	}
+
+	// Read the DECLARED union, not the enabled set: a `bundlers=` subset that
+	// omits slinky-slurm is a legitimate partial install of a correct recipe.
+	union := declaredUnionView(recipeResult)
+	slinky := union.GetComponentRef(slinkySlurmComponent)
+	if slinky == nil {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s=true but %s is not in the recipe; slurm-drain-monitor watches Slinky worker pods "+
+				"and would run without ever seeing one -- adopt the nvsentinel-slurm-drain-monitor mixin only on a platform: slurm recipe",
+				componentName, nvsentinelSlurmDrainMonitorEnabledPath, slinkySlurmComponent))}
+	}
+	if componentDisabled(slinky, bundlerConfig, slinkyKeys) {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s=true but %s is disabled, so no Slinky worker pods exist for slurm-drain-monitor to watch; "+
+				"re-enable %s or drop the nvsentinel-slurm-drain-monitor mixin",
+				componentName, nvsentinelSlurmDrainMonitorEnabledPath, slinkySlurmComponent, slinkySlurmComponent))}
+	}
+	slinkyNamespace := slinky.Namespace
+	if slinkyNamespace == "" {
+		slinkyNamespace = slurmDrainMonitorChartNamespace
+	}
+	if namespace != "" && namespace != slinkyNamespace {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s is %q but %s is deployed to %q; slurm-drain-monitor would watch a namespace "+
+				"with no Slinky worker pods -- pass --set nv-sentinel:%s=%s at bundle time",
+				componentName, slurmDrainMonitorNamespacePath, namespace, slinkySlurmComponent, slinkyNamespace,
+				slurmDrainMonitorNamespacePath, slinkyNamespace))}
+	}
+
+	return nil, nil
+}
+
+// Values paths CheckNVSentinelRemediationPipelineCoherent reads. The
+// subchart toggles are the Chart.yaml dependency conditions.
+const (
+	nvsentinelDryRunPath                  = "global.dryRun"
+	nvsentinelDatastoreProviderPath       = "global.datastore.provider"
+	nvsentinelMongodbStoreEnabledPath     = "global.mongodbStore.enabled"
+	nvsentinelFaultQuarantineEnabledPath  = "global.faultQuarantine.enabled"
+	nvsentinelNodeDrainerEnabledPath      = "global.nodeDrainer.enabled"
+	nvsentinelFaultRemediationEnabledPath = "global.faultRemediation.enabled"
+	nvsentinelJanitorEnabledPath          = "global.janitor.enabled"
+	nvsentinelJanitorProviderEnabledPath  = "global.janitorProvider.enabled"
+	nvsentinelAnalyzerEnabledPath         = "global.healthEventsAnalyzer.enabled"
+	nvsentinelMultipleRemediationsPath    = "health-events-analyzer.enableMultipleRemediationsRule"
+	nvsentinelAnalyzerConfigPath          = "health-events-analyzer.config"
+	nvsentinelResetJobRuntimeClassPath    = "janitor.config.controllers.gpuReset.resetJob.runtimeClassName"
+	nvsentinelResetJobHostDriverRootPath  = "janitor.config.controllers.gpuReset.resetJob.hostDriverRootPath"
+	nvsentinelResetJobDriverRootPath      = "janitor.config.controllers.gpuReset.resetJob.driverRoot"
+	nvsentinelResetServiceManagerPath     = "janitor.config.controllers.gpuReset.serviceManager"
+	nvsentinelResetServiceManagerNamePath = "janitor.config.controllers.gpuReset.serviceManager.name"
+)
+
+// nvsentinelResetGPUOperatorPaths are the GPU Operator values the GPU reset
+// rules read.
+var nvsentinelResetGPUOperatorPaths = []string{
+	"driver.enabled", "hostPaths.driverInstallDir", gpuOperatorRuntimeClassPath, "cdi.nriPluginEnabled",
+	"devicePlugin.enabled", "dcgm.enabled", "dcgmExporter.enabled", "gfd.enabled",
+}
+
+// nvsentinelDryRun reads global.dryRun. Absent is the chart default, false.
+// A present non-bool is not wellFormed: the chart interpolates it into
+// --dry-run unchecked, so whether the pipeline acts depends on how each
+// binary parses it.
+func nvsentinelDryRun(values map[string]any) (dryRun, wellFormed bool) {
+	global, ok := values["global"].(map[string]any)
+	if !ok {
+		return false, true
+	}
+	raw, present := global["dryRun"]
+	if !present {
+		return false, true
+	}
+	dryRun, isBool := raw.(bool)
+	return dryRun, isBool
+}
+
+// CheckNVSentinelRemediationPipelineCoherent blocks a bundle that enables
+// part of NVSentinel's remediation pipeline without what that part depends
+// on. Each subchart renders on its own condition and none checks the
+// others, so every broken combination below deploys cleanly:
+//
+//   - fault-quarantine, node-drainer, fault-remediation,
+//     health-events-analyzer, event-exporter and csp-health-monitor read a
+//     datastore: a global.datastore.provider of mongodb or postgresql, and,
+//     when it is nvsentinel-mongodb's, that component and psmdb-operator
+//     deployed alongside (see nvsentinelDatastoreViolations).
+//   - each stage acts only on events the one before it marked, so
+//     node-drainer needs fault-quarantine and fault-remediation needs
+//     node-drainer.
+//   - without janitor nothing acts on the GPUReset/RebootNode requests
+//     fault-remediation creates, yet it labels the node
+//     remediation-succeeded on creating one.
+//   - live fault-remediation needs health-events-analyzer with its
+//     MultipleRemediations rule on: maxRemediationAttempts resets when a
+//     node leaves quarantine, so that rule is the only signal that a node is
+//     repaired again and again without the fault going away.
+//   - janitor reboots through janitor-provider, and its GPU reset Job must
+//     run where the GPU Operator puts the driver and its RuntimeClass (see
+//     nvsentinelResetJobViolations).
+//   - the GPU reset is scoped to the GPU UUID metadata-collector supplies;
+//     without it the GPU and syslog monitors downgrade COMPONENT_RESET to
+//     RESTART_VM, so a recoverable GPU fault reboots the node.
+//
+// It is a no-op unless one of these components is enabled, and rejects
+// --dynamic on any path it verifies.
+func CheckNVSentinelRemediationPipelineCoherent(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	sentinelRef := recipeResult.GetComponentRef(componentName)
+	if sentinelRef == nil {
+		return nil, nil
+	}
+	provider := recipeResult.DataProvider()
+	sentinelKeys := componentOverrideKeys(componentName, provider)
+	if componentDisabled(sentinelRef, bundlerConfig, sentinelKeys) {
+		return nil, nil
+	}
+
+	values, err := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, sentinelKeys,
+		"NVSentinel remediation pipeline dependencies")
+	if err != nil {
+		return nil, []error{err}
+	}
+
+	// Every toggle here defaults to off in the chart, so absent reads as
+	// not rendering, unlike metadataCollector.
+	quarantine := nvsentinelSubchartRenders(values, "faultQuarantine")
+	drainer := nvsentinelSubchartRenders(values, "nodeDrainer")
+	remediation := nvsentinelSubchartRenders(values, "faultRemediation")
+	janitor := nvsentinelSubchartRenders(values, "janitor")
+	janitorProvider := nvsentinelSubchartRenders(values, "janitorProvider")
+	analyzer := nvsentinelSubchartRenders(values, "healthEventsAnalyzer")
+	exporter := nvsentinelSubchartRenders(values, "eventExporter")
+	cspMonitor := nvsentinelSubchartRenders(values, "cspHealthMonitor")
+
+	// Dynamic guard: a dynamic path matters only when a rule reading it can
+	// still fire, i.e. when that rule's stage renders or its toggle is
+	// itself dynamic. A dynamic stage toggle always matters.
+	dynamic := func(path string) bool {
+		return len(dynamicPathIntersections(bundlerConfig, sentinelKeys, []string{path})) > 0
+	}
+	guarded := []string{
+		nvsentinelFaultQuarantineEnabledPath, nvsentinelNodeDrainerEnabledPath,
+		nvsentinelFaultRemediationEnabledPath, nvsentinelJanitorEnabledPath, nvsentinelAnalyzerEnabledPath,
+		eventExporterEnabledPath,
+		cspMonitorEnabledPath,
+	}
+	remediationCanRun := remediation || dynamic(nvsentinelFaultRemediationEnabledPath)
+	readerCanRun := remediationCanRun || quarantine || dynamic(nvsentinelFaultQuarantineEnabledPath) ||
+		drainer || dynamic(nvsentinelNodeDrainerEnabledPath) || analyzer || dynamic(nvsentinelAnalyzerEnabledPath) ||
+		exporter || dynamic(eventExporterEnabledPath) ||
+		cspMonitor || dynamic(cspMonitorEnabledPath)
+	if readerCanRun {
+		guarded = append(guarded, nvsentinelMongodbStoreEnabledPath, nvsentinelDatastoreProviderPath,
+			nvsentinelDatastoreSecretPath, nvsentinelDatastoreAuthMechPath, nvsentinelDatastoreClientCertKey)
+	}
+	if remediationCanRun {
+		guarded = append(guarded, nvsentinelMetadataCollectorEnabledPath, nvsentinelMultipleRemediationsPath,
+			nvsentinelAnalyzerConfigPath)
+		// dryRun only feeds the janitor and analyzer rules, which cannot
+		// fire while janitor is statically on and the analyzer statically
+		// runs MultipleRemediations from the chart's own rule config.
+		if !janitor || dynamic(nvsentinelJanitorEnabledPath) || !analyzer || dynamic(nvsentinelAnalyzerEnabledPath) ||
+			len(nvsentinelMultipleRemediationsViolations(componentName, values, analyzer)) > 0 {
+
+			guarded = append(guarded, nvsentinelDryRunPath)
+		}
+	}
+	resetCanRun := janitor || dynamic(nvsentinelJanitorEnabledPath)
+	if resetCanRun {
+		guarded = append(guarded, nvsentinelJanitorProviderEnabledPath, nvsentinelResetJobRuntimeClassPath,
+			nvsentinelResetJobHostDriverRootPath, nvsentinelResetJobDriverRootPath, nvsentinelResetServiceManagerPath)
+	}
+	dynMsgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys, guarded,
+		"decides whether a remediation stage runs or whether what it depends on is present, "+
+			"so an install-time edit can deploy the pipeline without its datastore, the stage before "+
+			"it, janitor, janitor-provider, GPU inventory, what the GPU reset Job needs, or the "+
+			"analyzer rule that reports repeated remediation")
+	if resetCanRun {
+		// The reset rules also read the GPU Operator's driver, runtime and
+		// operand settings, so an install-time edit there undoes them too.
+		for _, name := range gpuOperatorComponentNames {
+			if recipeResult.GetComponentRef(name) == nil {
+				continue
+			}
+			dynMsgs = append(dynMsgs, nvsentinelDynamicGuardViolations(bundlerConfig, name,
+				componentOverrideKeys(name, provider), nvsentinelResetGPUOperatorPaths,
+				"decides where janitor's GPU reset Job finds the driver, which RuntimeClass it may request, or "+
+					"which operands janitor waits for after a reset")...)
+		}
+	}
+	if len(dynMsgs) > 0 {
+		for _, msg := range dynMsgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return dynMsgs, nil
+	}
+
+	var errs []error
+	if quarantine || drainer || remediation || analyzer || exporter || cspMonitor {
+		errs = append(errs, nvsentinelDatastoreViolations(recipeResult, bundlerConfig, componentName, values)...)
+	}
+	// NVSentinel v1.28.0's PostgreSQL client has no $lookup or $replaceRoot,
+	// which four of the analyzer's XID 74 rules use.
+	if provider, _, _ := resolvedStringValue(values, nvsentinelDatastoreProviderPath); analyzer && provider == "postgresql" {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: health-events-analyzer is enabled on a postgresql datastore -- NVSentinel's "+
+				"PostgreSQL client cannot run the aggregation stages several of its rules use. Use mongodb, as the "+
+				"remediation step mixins do", componentName)))
+	}
+	if drainer && !quarantine {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: node-drainer is enabled without fault-quarantine -- it drains only for "+
+				"health events fault-quarantine has quarantined, so it never acts. Enable fault-quarantine "+
+				"(--set nv-sentinel:%s=true)", componentName, nvsentinelFaultQuarantineEnabledPath)))
+	}
+	if remediation && !drainer {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: fault-remediation is enabled without node-drainer -- it remediates only "+
+				"health events node-drainer has drained, so it never acts. Enable node-drainer "+
+				"(--set nv-sentinel:%s=true)", componentName, nvsentinelNodeDrainerEnabledPath)))
+	}
+	dryRun, dryRunWellFormed := nvsentinelDryRun(values)
+	if remediation && !dryRunWellFormed {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s is not a bool -- the chart passes it to --dry-run unchecked, so "+
+				"whether fault-remediation acts is left to each binary's parser. Set it to true or false",
+				componentName, nvsentinelDryRunPath)))
+	}
+	if remediation && dryRunWellFormed && !dryRun && !janitor {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: fault-remediation is live (%s is false) but janitor is disabled -- "+
+				"nothing acts on the GPUReset and RebootNode requests it creates, yet it labels each node "+
+				"remediation-succeeded on creating one, so nodes read as repaired when nothing was. Use the "+
+				"nvsentinel-remediation mixin, or nvsentinel-quarantine to cordon and drain without "+
+				"remediating", componentName, nvsentinelDryRunPath)))
+	}
+	if remediation && dryRunWellFormed && !dryRun {
+		errs = append(errs, nvsentinelMultipleRemediationsViolations(componentName, values, analyzer)...)
+	}
+	if janitor && !janitorProvider {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: janitor is enabled without janitor-provider, which performs its reboots -- "+
+				"set --set nv-sentinel:%s=true", componentName, nvsentinelJanitorProviderEnabledPath)))
+	}
+	if janitor {
+		resetErrs, err := nvsentinelResetJobViolations(ctx, recipeResult, bundlerConfig, componentName, values)
+		if err != nil {
+			return nil, []error{err}
+		}
+		errs = append(errs, resetErrs...)
+	}
+	if remediation && nvsentinelMetadataCollectorDisabled(values) {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: fault-remediation is enabled but metadata-collector is disabled -- the GPU "+
+				"reset is scoped to the GPU UUID it supplies, and without it COMPONENT_RESET is downgraded to "+
+				"RESTART_VM, so a recoverable GPU fault reboots the node. Enable metadata-collector "+
+				"(--set nv-sentinel:%s=true)", componentName, nvsentinelMetadataCollectorEnabledPath)))
+	}
+
+	return nil, errs
+}
+
+// nvsentinelMultipleRemediationsViolations requires health-events-analyzer
+// with its MultipleRemediations rule on beside live fault-remediation. The
+// chart interpolates the rule toggle into the analyzer's TOML config
+// unchecked, so absent is the chart default, on, and only a bool is usable.
+// The rule itself lives in that config, a Helm template string a values
+// override can replace. A replacement is rejected outright: its effective
+// rules exist only after Helm renders it and TOML parses the result, so no
+// text scan can prove it still evaluates the rule.
+func nvsentinelMultipleRemediationsViolations(componentName string, values map[string]any, analyzer bool) []error {
+	if !analyzer {
+		return []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: fault-remediation is live without health-events-analyzer -- "+
+				"fault-remediation.maxRemediationAttempts resets when a node leaves quarantine, so only the "+
+				"analyzer's MultipleRemediations rule reports a node repaired again and again without the fault "+
+				"going away. Compose the nvsentinel-health-events-analyzer mixin", componentName))}
+	}
+	if _, present := component.GetValueByPath(values, nvsentinelAnalyzerConfigPath); present {
+		return []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: fault-remediation is live with %s replacing the analyzer's rule config, "+
+				"which AICR cannot verify still evaluates MultipleRemediations, the only signal that remediation "+
+				"is not fixing a node. Keep the chart's rule config and choose rules with its "+
+				"health-events-analyzer.enable<Rule>Rule toggles", componentName, nvsentinelAnalyzerConfigPath))}
+	}
+	raw, present := component.GetValueByPath(values, nvsentinelMultipleRemediationsPath)
+	if !present {
+		return nil
+	}
+	on, isBool := raw.(bool)
+	switch {
+	case !isBool:
+		return []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s is not a bool -- the chart writes it into the analyzer's rule config "+
+				"unchecked. Set it to true", componentName, nvsentinelMultipleRemediationsPath))}
+	case !on:
+		return []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: fault-remediation is live with %s=false -- MultipleRemediations is the "+
+				"only signal that remediation is not fixing a node. Set it to true", componentName,
+				nvsentinelMultipleRemediationsPath))}
+	}
+	return nil
+}
+
+// nvsentinelResetJobViolations checks janitor's GPU reset Job: its driver
+// paths on their own, then against the enabled GPU Operator variant's driver,
+// runtime and operands. OCP recipes carry a disabled gpu-operator beside the
+// gpu-operator-ocp they deploy, so the first enabled variant is the one that
+// matters. Without one only the path checks apply.
+func nvsentinelResetJobViolations(ctx context.Context, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, componentName string, values map[string]any) ([]error, error) {
+	errs, pathsUsable := nvsentinelResetJobPathViolations(componentName, values)
+	gpuOpView := declaredUnionView(recipeResult)
+	var gpuOpName, gpuOpNamespace string
+	var gpuOpKeys []string
+	for _, name := range gpuOperatorComponentNames {
+		ref := gpuOpView.GetComponentRef(name)
+		if ref == nil {
+			continue
+		}
+		keys := componentOverrideKeys(name, recipeResult.DataProvider())
+		if !componentDisabled(ref, bundlerConfig, keys) {
+			gpuOpName, gpuOpKeys, gpuOpNamespace = name, keys, componentNamespace(gpuOpView, name)
+			break
+		}
+	}
+	if gpuOpName == "" {
+		return errs, nil
+	}
+	gpuOpValues, err := effectiveComponentValues(ctx, gpuOpView, bundlerConfig, gpuOpName, gpuOpKeys,
+		"NVSentinel GPU reset Job")
+	if err != nil {
+		return nil, err
+	}
+	errs = append(errs, nvsentinelResetJobRuntimeClassViolations(gpuOpName, gpuOpValues, componentName, values)...)
+	if !pathsUsable {
+		return errs, nil
+	}
+	rootErrs, unsupported := nvsentinelResetJobDriverRootViolations(gpuOpName, gpuOpValues, componentName, values)
+	if unsupported {
+		// No reset runs on this platform, so nothing waits on its operands.
+		return append(errs, rootErrs...), nil
+	}
+	errs = append(errs, rootErrs...)
+	return append(errs, nvsentinelResetServiceManagerViolations(gpuOpName, gpuOpNamespace, gpuOpValues, componentName, values)...), nil
+}
+
+// gpuOperatorRuntimeClassPath names the RuntimeClass the GPU Operator creates.
+const gpuOperatorRuntimeClassPath = "operator.runtimeClass"
+
+// gpuOperatorServiceManager is janitor's built-in service manager for the GPU
+// Operator, its chart default, and the namespace that manager watches.
+const gpuOperatorServiceManager = "gpu-operator"
+
+// gpuOperatorOperands maps each operand janitor's gpu-operator service
+// manager restarts around a GPU reset, by its pod app label, to the GPU
+// Operator toggle that deploys it and that toggle's chart default.
+var gpuOperatorOperands = []struct {
+	app, toggle      string
+	enabledByDefault bool
+}{
+	{"nvidia-device-plugin-daemonset", "devicePlugin", true},
+	{"nvidia-dcgm", "dcgm", false},
+	{"nvidia-dcgm-exporter", "dcgmExporter", true},
+	{"gpu-feature-discovery", "gfd", true},
+}
+
+// nvsentinelResetServiceManagerViolations checks the operands janitor stops
+// before a GPU reset and waits for afterwards. It waits for every operand
+// listed, deployed or not, so an operand the GPU Operator does not run, or a
+// namespace it does not use, fails every reset with RestoreTimeoutExceeded.
+// A custom spec's timeouts default to zero, which fails the wait at once.
+// Without a spec, the gpu-operator manager, which is also the chart's default
+// name, uses janitor's built-in list: all four operands in namespace
+// gpu-operator.
+func nvsentinelResetServiceManagerViolations(gpuOpName, gpuOpNamespace string, gpuOpValues map[string]any, componentName string, values map[string]any) []error {
+	manager, present, valid := resolvedStringValue(values, nvsentinelResetServiceManagerNamePath)
+	if !present {
+		manager = gpuOperatorServiceManager // the janitor chart's default
+	}
+	if !valid || manager == "" {
+		return nil
+	}
+	fail := func(format string, args ...any) error {
+		return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: janitor's GPU reset service manager ", componentName)+fmt.Sprintf(format, args...)+
+				fmt.Sprintf(" -- set %s.spec to the operands %s runs", nvsentinelResetServiceManagerPath, gpuOpName))
+	}
+
+	spec, hasSpec := values, true
+	for _, key := range strings.Split(nvsentinelResetServiceManagerPath+".spec", ".") {
+		if spec, hasSpec = spec[key].(map[string]any); !hasSpec {
+			break
+		}
+	}
+	apps := make([]string, 0, len(gpuOperatorOperands))
+	namespace := gpuOperatorServiceManager
+	if hasSpec {
+		namespace, _, _ = resolvedStringValue(spec, "namespace")
+		var errs []error
+		for _, key := range []string{"teardownTimeout", "restoreTimeout"} {
+			raw, _, _ := resolvedStringValue(spec, key)
+			if d, err := time.ParseDuration(raw); err != nil || d <= 0 {
+				errs = append(errs, fail("spec.%s is %q, want a positive duration such as 10m: janitor reads an unset one as zero and fails the wait at once", key, raw))
+			}
+		}
+		list, _ := spec["apps"].([]any)
+		for _, item := range list {
+			app, _ := item.(map[string]any)
+			selector, _ := app["appSelector"].(map[string]any)
+			name, _ := selector["app"].(string)
+			if name != "" {
+				apps = append(apps, name)
+			}
+			// A custom spec gets no default label values: janitor writes an
+			// empty one, so the operand never redeploys after a reset.
+			label, _ := app["nodeLabel"].(string)
+			enabled, _ := app["enabledValue"].(string)
+			disabled, _ := app["disabledValue"].(string)
+			if label == "" || enabled == "" || disabled == "" || enabled == disabled {
+				errs = append(errs, fail("spec app %q needs nodeLabel and distinct, non-empty enabledValue and "+
+					"disabledValue (the GPU Operator's are \"true\" and \"false\"): janitor uses them as given, so an "+
+					"empty value leaves the operand undeployed and every reset fails with RestoreTimeoutExceeded", name))
+			}
+		}
+		if len(errs) > 0 {
+			return errs
+		}
+	} else {
+		if manager != gpuOperatorServiceManager {
+			return nil
+		}
+		for _, o := range gpuOperatorOperands {
+			apps = append(apps, o.app)
+		}
+	}
+
+	var errs []error
+	if gpuOpNamespace != "" && namespace != gpuOpNamespace {
+		errs = append(errs, fail("waits for operand pods in namespace %q, but %s runs in %q", namespace, gpuOpName, gpuOpNamespace))
+	}
+	for _, o := range gpuOperatorOperands {
+		if !slices.Contains(apps, o.app) {
+			continue
+		}
+		section, _ := gpuOpValues[o.toggle].(map[string]any)
+		enabled, set := section["enabled"].(bool)
+		if !set {
+			enabled = o.enabledByDefault
+		}
+		if !enabled {
+			errs = append(errs, fail("waits for %s after every GPU reset, but %s runs none (%s.enabled=false), so each reset fails with RestoreTimeoutExceeded",
+				o.app, gpuOpName, o.toggle))
+		}
+	}
+	return errs
+}
+
+// nvsentinelResetJobRuntimeClassViolations checks that the reset Job requests
+// a RuntimeClass the cluster has: the one the GPU Operator creates, or none
+// under CDI with the NRI plugin, which registers no runtime handler. The Job
+// sets NVIDIA_VISIBLE_DEVICES=void, so it never needs runtime injection, and
+// an explicitly empty class omits runtimeClassName and is always admitted.
+// CheckNVSentinelRuntimeClassCoherence guards the same failure for
+// metadata-collector.
+func nvsentinelResetJobRuntimeClassViolations(gpuOpName string, gpuOpValues map[string]any, componentName string, values map[string]any) []error {
+	resetClass, present, valid := resolvedStringValue(values, nvsentinelResetJobRuntimeClassPath)
+	if !valid {
+		return []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s must be a string", componentName, nvsentinelResetJobRuntimeClassPath))}
+	}
+	if !present {
+		resetClass = defaultRuntimeClassName
+	}
+	if resetClass == "" {
+		return nil
+	}
+	cdi, _ := gpuOpValues["cdi"].(map[string]any)
+	if nri, _ := cdi["nriPluginEnabled"].(bool); nri {
+		return []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: janitor's GPU reset Job requests runtimeClassName=%q but %s runs CDI with "+
+				"the NRI plugin, which registers no runtime handler, so every reset Job fails to start and each "+
+				"GPU reset fails. Set --set-json 'nv-sentinel:%s=\"\"'",
+				componentName, resetClass, gpuOpName, nvsentinelResetJobRuntimeClassPath))}
+	}
+	operatorClass, present, valid := resolvedStringValue(gpuOpValues, gpuOperatorRuntimeClassPath)
+	if !valid {
+		return nil
+	}
+	if !present || operatorClass == "" {
+		operatorClass = defaultRuntimeClassName
+	}
+	if resetClass == operatorClass {
+		return nil
+	}
+	return []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+		fmt.Sprintf("component %q: janitor's GPU reset Job requests runtimeClassName=%q but %s creates its "+
+			"RuntimeClass as %q, so every reset Job is rejected at admission and each GPU reset fails. Set "+
+			"--set nv-sentinel:%s=%s", componentName, resetClass, gpuOpName, operatorClass,
+			nvsentinelResetJobRuntimeClassPath, operatorClass))}
+}
+
+// nvsentinelResetJobDriverRootViolations checks the host path the reset Job
+// chroots into to run nvidia-smi. The gpu-reset image ships no nvidia-smi, so
+// that path must hold a complete filesystem with the driver: the operator's
+// driver container root when the GPU Operator installs the driver, and the
+// host root when the node image does. GKE's managed driver install holds only
+// driver files, so no setting works there.
+func nvsentinelResetJobDriverRootViolations(gpuOpName string, gpuOpValues map[string]any, componentName string, values map[string]any) (errs []error, unsupported bool) {
+	hostRoot, present, _ := resolvedStringValue(values, nvsentinelResetJobHostDriverRootPath)
+	if !present || hostRoot == "" {
+		hostRoot = operatorContainerDriverRoot
+	}
+	hostRoot = path.Clean(hostRoot)
+
+	driverToggle, problem := ownershipToggle(gpuOpValues, "driver")
+	if problem != "" {
+		// CheckDriverOwnershipCoherence rejects the toggle itself.
+		return nil, false
+	}
+	installDir := operatorContainerDriverRoot
+	if dir, ok, _ := resolvedStringValue(gpuOpValues, "hostPaths.driverInstallDir"); ok && dir != "" {
+		installDir = path.Clean(dir)
+	}
+
+	if driverToggle == nil || *driverToggle {
+		if hostRoot != installDir {
+			errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: %s installs the driver into %s, but janitor's GPU reset Job reads it from "+
+					"%s, so the reset cannot run nvidia-smi and each GPU reset fails. Set --set nv-sentinel:%s=%s",
+					componentName, gpuOpName, installDir, hostRoot, nvsentinelResetJobHostDriverRootPath, installDir)))
+		}
+		return errs, false
+	}
+	if installDir == gkeManagedDriverRootPath || hostRoot == gkeManagedDriverRootPath {
+		return []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: janitor's GPU reset is not supported with GKE's managed driver install: %s "+
+				"holds only driver files, not the complete filesystem the reset Job chroots into, and the gpu-reset "+
+				"image ships no nvidia-smi. Use a GPU-Operator-managed driver (%s), or a step without janitor",
+				componentName, gkeManagedDriverRootPath, gkeGPUOperatorManagedOverrideSet))}, true
+	}
+	if hostRoot == operatorContainerDriverRoot {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s leaves the driver to the node image (driver.enabled=false), so nothing "+
+				"populates %s, which janitor's GPU reset Job reads the driver from; each GPU reset fails. Set "+
+				"--set nv-sentinel:%s=/", componentName, gpuOpName, operatorContainerDriverRoot,
+				nvsentinelResetJobHostDriverRootPath)))
+	}
+	return errs, false
+}
+
+// nvsentinelResetJobPathViolations checks the reset Job's two driver paths
+// on their own, whatever GPU Operator the recipe runs: janitor refuses to
+// start on a driverRoot that is not absolute and clean, "/" runs the
+// gpu-reset image's nvidia-smi, which it does not ship, and a relative
+// hostDriverRootPath cannot be mounted. ok is false when hostDriverRootPath
+// is unusable, so callers skip comparing it.
+func nvsentinelResetJobPathViolations(componentName string, values map[string]any) (errs []error, ok bool) {
+	root, rootSet, rootValid := resolvedStringValue(values, nvsentinelResetJobDriverRootPath)
+	if !rootValid || (rootSet && root != "" && (!path.IsAbs(root) || path.Clean(root) != root || root == "/")) {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s must be unset or an absolute, clean path holding a complete filesystem: "+
+				"janitor refuses to start on any other path, and \"/\" runs nvidia-smi from the gpu-reset image, "+
+				"which does not ship it, so every GPU reset fails. "+
+				"Remove the override and set %s instead", componentName, nvsentinelResetJobDriverRootPath,
+				nvsentinelResetJobHostDriverRootPath)))
+	}
+	hostRoot, present, valid := resolvedStringValue(values, nvsentinelResetJobHostDriverRootPath)
+	if !valid || (present && hostRoot != "" && !path.IsAbs(hostRoot)) {
+		return append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s must be an absolute path", componentName, nvsentinelResetJobHostDriverRootPath))), false
+	}
+	return errs, true
+}
+
+// Names the remediation step mixins wire NVSentinel's datastore to: the
+// Percona components they add and the URI Secret nvsentinel-mongodb renders.
+const (
+	nvsentinelComponentName          = "nvsentinel"
+	nvsentinelMongoDBComponent       = "nvsentinel-mongodb"
+	psmdbOperatorComponent           = "psmdb-operator"
+	nvsentinelMongoDBURISecret       = "nvsentinel-mongodb-uri"
+	nvsentinelDatastoreSecretPath    = "global.datastore.credentialsFromSecret.name"
+	nvsentinelDatastoreAuthMechPath  = "global.datastore.auth.mechanism"
+	nvsentinelDatastoreClientCertKey = "global.datastore.auth.clientCertSecretName"
+	nvsentinelMongoDBClientCert      = "nvsentinel-mongodb-app-client"
+)
+
+// nvsentinelDatastoreViolations checks the pipeline's datastore. NVSentinel's
+// embedded mongodb-store is not supported with the stages: AICR bundles
+// Percona separately and excludes the subchart's CRDs from nvsentinel's CRD
+// step. The pipeline therefore needs a global.datastore.provider NVSentinel
+// supports; when it points at the Secret nvsentinel-mongodb renders, both
+// Percona components must be deployed in nvsentinel's namespace with the
+// x509 client certificate they issue.
+func nvsentinelDatastoreViolations(recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, componentName string, values map[string]any) []error {
+	var errs []error
+	embedded := nvsentinelSubchartRenders(values, "mongodbStore")
+	if embedded {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s is on with a remediation stage, health-events-analyzer, event-exporter or csp-health-monitor -- "+
+				"the embedded MongoDB is not supported here. Use a remediation step mixin, which bundles "+
+				"Percona separately, or set it to false and configure %s", componentName,
+				nvsentinelMongodbStoreEnabledPath, nvsentinelDatastoreProviderPath)))
+	}
+
+	// A present provider, even a blank one, switches the chart to its
+	// datastore config, so only an absent key reads as unset.
+	provider, providerSet, providerIsString := resolvedStringValue(values, nvsentinelDatastoreProviderPath)
+	switch {
+	case !providerSet && providerIsString && embedded:
+		// The embedded store is the datastore here; the error above covers it.
+		return errs
+	case !providerSet && providerIsString:
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: a remediation stage, health-events-analyzer, event-exporter or csp-health-monitor is enabled with no "+
+				"datastore -- they read health events from it and crash-loop without one. Use a remediation "+
+				"step mixin or set %s to mongodb or postgresql", componentName, nvsentinelDatastoreProviderPath)))
+		return errs
+	case provider != "mongodb" && provider != "postgresql":
+		got := "not a string"
+		if providerIsString {
+			got = strconv.Quote(provider)
+		}
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s is %s -- NVSentinel supports only \"mongodb\" and \"postgresql\", "+
+				"and the remediation stages, health-events-analyzer, event-exporter and csp-health-monitor crash-loop on any other provider",
+				componentName, nvsentinelDatastoreProviderPath, got)))
+		return errs
+	}
+
+	if secret, _, _ := resolvedStringValue(values, nvsentinelDatastoreSecretPath); provider != "mongodb" || secret != nvsentinelMongoDBURISecret {
+		return errs
+	}
+	if mech, _, _ := resolvedStringValue(values, nvsentinelDatastoreAuthMechPath); mech != "x509" {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s is %q -- %s authenticates only the x509 client certificate %s issues",
+				componentName, nvsentinelDatastoreAuthMechPath, mech, nvsentinelMongoDBComponent, nvsentinelMongoDBComponent)))
+	}
+	if cert, _, _ := resolvedStringValue(values, nvsentinelDatastoreClientCertKey); cert != nvsentinelMongoDBClientCert {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s is %q, want %q -- the certificate %s issues for NVSentinel",
+				componentName, nvsentinelDatastoreClientCertKey, cert, nvsentinelMongoDBClientCert, nvsentinelMongoDBComponent)))
+	}
+
+	// Checked against declared refs: a disabled dependency is otherwise
+	// pruned from the resolved view and reads as satisfied elsewhere.
+	declared := declaredUnionView(recipeResult)
+	sentinelNS := componentNamespace(recipeResult, componentName)
+	for _, name := range []string{psmdbOperatorComponent, nvsentinelMongoDBComponent} {
+		ref := declared.GetComponentRef(name)
+		if ref == nil || componentDisabled(ref, bundlerConfig, componentOverrideKeys(name, recipeResult.DataProvider())) {
+			errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: the datastore is %s's %s, but %q is not deployed -- compose a "+
+					"remediation step mixin, which adds it", componentName, nvsentinelMongoDBComponent,
+					nvsentinelMongoDBURISecret, name)))
+			continue
+		}
+		if ns := componentNamespace(declared, name); ns != sentinelNS {
+			errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: %q deploys to namespace %q but NVSentinel to %q -- NVSentinel mounts "+
+					"the datastore's Secrets from its own namespace, and the operator watches only its own",
+					componentName, name, ns, sentinelNS)))
+		}
+	}
+	return errs
+}
+
+// componentNamespace returns a ref's namespace, falling back to its
+// registry default.
+func componentNamespace(recipeResult *recipe.RecipeResult, name string) string {
+	ref := recipeResult.GetComponentRef(name)
+	if ref == nil {
+		return ""
+	}
+	if ref.Namespace != "" {
+		return ref.Namespace
+	}
+	if registry, err := recipe.GetComponentRegistryFor(recipeResult.DataProvider()); err == nil {
+		if cfg := registry.Get(name); cfg != nil {
+			return cfg.Helm.DefaultNamespace
+		}
+	}
+	return ""
+}
+
+// nvsentinelMongoDBAppUserDN is the x509 subject NVSentinel authenticates
+// with: the $external user nvsentinel-mongodb must create and the subject of
+// its client certificate.
+const nvsentinelMongoDBAppUserDN = "CN=mongo-user-client,OU=DGXC,O=Nvidia,L=SantaClara,ST=California,C=US"
+
+// NVSentinel's database, and the custom role nvsentinel-mongodb grants its
+// app user for the setup Job's collMod.
+const (
+	nvsentinelMongoDBDatabase = "HealthEventsDatabase"
+	nvsentinelMongoDBTTLRole  = "nvsentinelTTLIndex"
+)
+
+// mongoDBUserHasRole reports whether a psmdb-db users entry holds role on db.
+func mongoDBUserHasRole(user map[string]any, role, db string) bool {
+	roles, _ := user["roles"].([]any)
+	for _, r := range roles {
+		entry, _ := r.(map[string]any)
+		if entry["name"] == role && entry["db"] == db {
+			return true
+		}
+	}
+	return false
+}
+
+// mongoDBDefinesTTLRole reports whether values define nvsentinelMongoDBTTLRole
+// with collMod on NVSentinel's database.
+func mongoDBDefinesTTLRole(values map[string]any) bool {
+	roles, _ := values["roles"].([]any)
+	for _, r := range roles {
+		role, _ := r.(map[string]any)
+		if role["role"] != nvsentinelMongoDBTTLRole || role["db"] != "admin" {
+			continue
+		}
+		privileges, _ := role["privileges"].([]any)
+		for _, p := range privileges {
+			privilege, _ := p.(map[string]any)
+			resource, _ := privilege["resource"].(map[string]any)
+			actions, _ := privilege["actions"].([]any)
+			if resource["db"] == nvsentinelMongoDBDatabase && slices.Contains(actions, any("collMod")) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// imageMinor returns the major.minor of an image tag such as
+// "1.21.2@sha256:..." or of a version such as "1.21.2".
+func imageMinor(tag string) string {
+	tag, _, _ = strings.Cut(tag, "@")
+	parts := strings.SplitN(strings.TrimPrefix(tag, "v"), ".", 3)
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[0] + "." + parts[1]
+}
+
+// CheckNVSentinelMongoDBCoherent blocks an nvsentinel-mongodb bundle that
+// NVSentinel cannot use or psmdb-operator cannot reconcile: no NVSentinel to
+// consume it, TLS below requireTLS, the x509 app user missing or without the
+// roles NVSentinel and its setup Job use, sharding on, no psmdb-operator, an
+// operator that watches every namespace or sends telemetry, or a crVersion or
+// initImage at a different minor than the operator image. It rejects
+// --dynamic on any path it verifies. Registration details are in
+// recipes/registry.yaml.
+func CheckNVSentinelMongoDBCoherent(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	ref := recipeResult.GetComponentRef(componentName)
+	if ref == nil {
+		return nil, nil
+	}
+	provider := recipeResult.DataProvider()
+	keys := componentOverrideKeys(componentName, provider)
+	if componentDisabled(ref, bundlerConfig, keys) {
+		return nil, nil
+	}
+
+	operatorKeys := componentOverrideKeys(psmdbOperatorComponent, provider)
+	const mongoDBGateReason = "decides whether NVSentinel's TLS and x509 identity are accepted or whether " +
+		"psmdb-operator can reconcile the cluster"
+	dynMsgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, keys,
+		[]string{"tls.mode", "users", "roles", "sharding.enabled", "crVersion", "initImage.tag"}, mongoDBGateReason)
+	dynMsgs = append(dynMsgs, nvsentinelDynamicGuardViolations(bundlerConfig, componentName, operatorKeys,
+		[]string{"image.tag", "watchAllNamespaces", "disableTelemetry"}, mongoDBGateReason)...)
+	if len(dynMsgs) > 0 {
+		for _, msg := range dynMsgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return dynMsgs, nil
+	}
+
+	var errs []error
+	fail := func(format string, args ...any) {
+		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: ", componentName)+fmt.Sprintf(format, args...)))
+	}
+
+	// Dependencies are read from the declared union so a bundle filtered
+	// to this component alone still sees the NVSentinel and operator refs.
+	declared := declaredUnionView(recipeResult)
+	sentinelRef := declared.GetComponentRef(nvsentinelComponentName)
+	if sentinelRef == nil || componentDisabled(sentinelRef, bundlerConfig, componentOverrideKeys(nvsentinelComponentName, provider)) {
+		fail("NVSentinel is not deployed, so nothing uses this datastore -- it is added only by the nvsentinel remediation step mixins")
+	}
+
+	values, err := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, keys, "NVSentinel MongoDB coherence")
+	if err != nil {
+		return nil, []error{err}
+	}
+	if mode, _, _ := resolvedStringValue(values, "tls.mode"); mode != "requireTLS" {
+		fail("tls.mode is %q, want requireTLS -- NVSentinel connects with TLS and x509 client auth", mode)
+	}
+	if sharding, _ := values["sharding"].(map[string]any); sharding["enabled"] != false {
+		fail("sharding.enabled must be false -- NVSentinel is wired to the rs0 replica set")
+	}
+	var appUser map[string]any
+	users, _ := values["users"].([]any)
+	for _, u := range users {
+		user, _ := u.(map[string]any)
+		if user["name"] == nvsentinelMongoDBAppUserDN && user["db"] == "$external" {
+			appUser = user
+		}
+	}
+	if appUser == nil {
+		fail("users has no $external user %q -- NVSentinel's x509 identity would be rejected", nvsentinelMongoDBAppUserDN)
+	} else {
+		if !mongoDBUserHasRole(appUser, "readWrite", nvsentinelMongoDBDatabase) {
+			fail("the $external user %q lacks readWrite on %s -- NVSentinel reads and writes health events there, "+
+				"and its setup Job creates the collections and indexes", nvsentinelMongoDBAppUserDN, nvsentinelMongoDBDatabase)
+		}
+		if !mongoDBUserHasRole(appUser, nvsentinelMongoDBTTLRole, "admin") || !mongoDBDefinesTTLRole(values) {
+			fail("the $external user %q lacks role %s (collMod on %s, defined under roles) -- NVSentinel's setup Job "+
+				"runs collMod when mongodb-store.collectionExpirySeconds changes, so without it that upgrade fails",
+				nvsentinelMongoDBAppUserDN, nvsentinelMongoDBTTLRole, nvsentinelMongoDBDatabase)
+		}
+	}
+
+	operatorRef := declared.GetComponentRef(psmdbOperatorComponent)
+	if operatorRef == nil || componentDisabled(operatorRef, bundlerConfig, operatorKeys) {
+		fail("psmdb-operator is not deployed, so nothing reconciles the PerconaServerMongoDB cluster -- it is " +
+			"added by the same nvsentinel remediation step mixins")
+		return nil, errs
+	}
+	operatorValues, err := effectiveComponentValues(ctx, declared, bundlerConfig, psmdbOperatorComponent, operatorKeys, "NVSentinel MongoDB coherence")
+	if err != nil {
+		return nil, []error{err}
+	}
+	if operatorValues["watchAllNamespaces"] != false {
+		fail("psmdb-operator watchAllNamespaces is %v, want false -- AICR scopes the operator to its own namespace "+
+			"with a Role; watching every namespace needs a ClusterRole and lets it reconcile other teams' "+
+			"PerconaServerMongoDB resources", operatorValues["watchAllNamespaces"])
+	}
+	if operatorValues["disableTelemetry"] != true {
+		fail("psmdb-operator disableTelemetry is %v, want true -- the operator otherwise reports cluster details "+
+			"to Percona", operatorValues["disableTelemetry"])
+	}
+	operatorTag, _, _ := resolvedStringValue(operatorValues, "image.tag")
+	operatorMinor := imageMinor(operatorTag)
+	if operatorMinor == "" {
+		fail("cannot read psmdb-operator's image.tag %q, so the crVersion skew cannot be checked", operatorTag)
+		return nil, errs
+	}
+	if crVersion, _, _ := resolvedStringValue(values, "crVersion"); imageMinor(crVersion) != operatorMinor {
+		fail("crVersion %q is not at psmdb-operator's minor %s -- Percona upgrades one minor at a time, so the two move together", crVersion, operatorMinor)
+	}
+	if initTag, _, _ := resolvedStringValue(values, "initImage.tag"); imageMinor(initTag) != operatorMinor {
+		fail("initImage.tag %q is not at psmdb-operator's minor %s", initTag, operatorMinor)
+	}
+	return nil, errs
+}
+
+// CheckMariaDBOperatorOwnershipCoherence enforces the snapshot-driven
+// installation-safety policy for AICR-provided Slurm accounting. Existing
+// MariaDB CRs and inconclusive discovery block bundling; an API with no
+// detected CRs produces a warning; conclusive absence is silent. An empty
+// state means no snapshot evidence was recorded and produces a non-blocking
+// warning so criteria-only and older-snapshot workflows remain compatible.
+func CheckMariaDBOperatorOwnershipCoherence(_ context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	ref := recipeResult.GetComponentRef(componentName)
+	if ref == nil {
+		return nil, nil
+	}
+	keys := componentOverrideKeys(componentName, recipeResult.DataProvider())
+	if componentDisabled(ref, bundlerConfig, keys) {
+		return nil, nil
+	}
+	mode, configured := recipeResult.AccountingMode()
+	if !configured || mode != recipe.AccountingModeAICRProvided {
+		return nil, nil
+	}
+
+	state := recipeResult.Metadata.MariaDBOperatorState
+	switch state {
+	case "":
+		return []string{fmt.Sprintf(
+			"%s: no metadata.mariaDBOperatorState snapshot evidence was recorded. "+
+				"Bundling AICR-provided accounting is allowed, but MariaDB Operator conflicts "+
+				"were not evaluated. Regenerate the recipe from a current snapshot to verify "+
+				"the target cluster before deployment",
+			componentName)}, nil
+	case recipe.MariaDBOperatorStateAbsent:
+		return nil, nil
+	case recipe.MariaDBOperatorStateAPIDetected:
+		return []string{fmt.Sprintf(
+			"%s: the snapshot detected the official MariaDB Operator API but no MariaDB resources. "+
+				"Bundling AICR-provided accounting is allowed, but verify that installing another "+
+				"operator instance will not conflict; otherwise regenerate with "+
+				"--slurm-accounting-mode customer-managed",
+			componentName)}, nil
+	case recipe.MariaDBOperatorStateCRsDetected:
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeConflict, fmt.Sprintf(
+			"%s: the snapshot detected existing official MariaDB resources. "+
+				"AICR-provided accounting would install a competing database stack. "+
+				"Regenerate the recipe with --slurm-accounting-mode customer-managed "+
+				"to use the existing database",
+			componentName))}
+	case recipe.MariaDBOperatorStateUnknown:
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeConflict, fmt.Sprintf(
+			"%s: MariaDB Operator conflict evidence is inconclusive, so AICR-provided "+
+				"accounting cannot be installed safely. Capture a fresh snapshot with sufficient "+
+				"Kubernetes discovery permissions, or regenerate the recipe with "+
+				"--slurm-accounting-mode customer-managed",
+			componentName))}
+	default:
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, fmt.Sprintf(
+			"%s: metadata.mariaDBOperatorState=%q is not recognized. Regenerate the recipe "+
+				"with this AICR version before bundling AICR-provided accounting",
+			componentName, state))}
+	}
+}
+
+// CheckGKETCPXOInterfacesCoherence compares the FINAL resolved
+// kubeflow-trainer tcpxoInterfaces value against the mapping the recipe
+// records in configuration.gke.tcpxoInterfaces. Validity alone is not
+// enough: a value that is well-formed but different from what the recipe
+// records is exactly the failure case — the recipe would attest to one
+// wiring while the bundle renders another (the realistic shape: networks
+// get reprovisioned and someone --sets the current names to make the bundle
+// work). The bundler's ownership enforcement already rejects all four
+// override channels for this path; this check is the defense-in-depth for
+// hand-edited recipes and any future channel.
+func CheckGKETCPXOInterfacesCoherence(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	if !declaredUnionView(recipeResult).ShipsGKETCPXORuntime() {
+		return nil, nil
+	}
+	ref := recipeResult.GetComponentRef(componentName)
+	if ref == nil {
+		return nil, nil
+	}
+	keys := componentOverrideKeys(componentName, recipeResult.DataProvider())
+	if componentDisabled(ref, bundlerConfig, keys) {
+		return nil, nil
+	}
+
+	recorded, present := recipeResult.GKETCPXOInterfaces()
+	if !present {
+		// Fail closed, defense-in-depth: the bundler's ownership enforcement
+		// already rejects this recipe before validations run, but the check
+		// registry is also reachable from the SDK preflight path.
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, fmt.Sprintf(
+			"%s: recipe ships torch-distributed-tcpxo but records no "+
+				"configuration.gke.tcpxoInterfaces mapping; regenerate the recipe with "+
+				"--gke-tcpxo-interfaces eth1=<network>,...,eth8=<network>", componentName))}
+	}
+
+	values, err := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, keys,
+		"GKE TCPXO interface mapping coherence")
+	if err != nil {
+		return nil, []error{err}
+	}
+	rawResolved, ok := values["tcpxoInterfaces"]
+	if !ok {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, fmt.Sprintf(
+			"%s: recipe records configuration.gke.tcpxoInterfaces but the resolved values carry "+
+				"no tcpxoInterfaces; regenerate the recipe rather than editing one half", componentName))}
+	}
+	resolved, normErr := recipe.NormalizeGKETCPXOInterfaces(rawResolved)
+	if normErr != nil {
+		return nil, []error{normErr}
+	}
+	if !slices.Equal(resolved, recorded) {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, fmt.Sprintf(
+			"%s: the resolved tcpxoInterfaces value disagrees with "+
+				"configuration.gke.tcpxoInterfaces; the bundle would render a different wiring "+
+				"than the recipe records", componentName))}
+	}
+	return nil, nil
+}
+
+// nvsentinelPreflightEnabled reports whether the resolved values turn the
+// preflight admission webhook on.
+func nvsentinelPreflightEnabled(values map[string]any) bool {
+	global, ok := values["global"].(map[string]any)
+	if !ok {
+		return false
+	}
+	preflight, ok := global["preflight"].(map[string]any)
+	if !ok {
+		return false
+	}
+	raw, present := preflight["enabled"]
+	if !present {
+		return false
+	}
+	return helmTruthy(raw)
+}
+
+// kaiPodGroupGVR is the complete GroupVersionResource the preflight controller
+// resolves at startup for KAI gang discovery. All three parts matter: the
+// controller resolves the GVR against the API server, so scheduling.run.ai with
+// the wrong version or resource fails exactly as a missing CRD would, and a
+// group-only match would wave it through.
+var kaiPodGroupGVR = struct{ group, version, resource string }{
+	group:    "scheduling.run.ai",
+	version:  "v2alpha2",
+	resource: "podgroups",
+}
+
+// preflightGangTarget classifies what the configured gang discovery points at.
+type preflightGangTarget int
+
+const (
+	// gangTargetNone: coordination is off, or no podGroupGVR is configured.
+	gangTargetNone preflightGangTarget = iota
+	// gangTargetOtherScheduler: a non-KAI API group. Someone else's problem.
+	gangTargetOtherScheduler
+	// gangTargetKAI: exactly KAI's GVR. Requires kai-scheduler.
+	gangTargetKAI
+	// gangTargetKAIMalformed: KAI's group with the wrong version or resource.
+	// Rejected rather than skipped: the controller resolves the GVR against the
+	// API server at startup and exits when it does not exist, so this crash-loops
+	// exactly like a missing CRD -- and failurePolicy: Ignore then admits every
+	// GPU pod unchecked. Skipping it would be fail-open.
+	gangTargetKAIMalformed
+)
+
+// nvsentinelPreflightGangTarget classifies the configured gang discovery, and
+// returns the version/resource so a malformed KAI GVR can be named in the error.
+func nvsentinelPreflightGangTarget(values map[string]any) (target preflightGangTarget, version, resource string) {
+	preflight, ok := values["preflight"].(map[string]any)
+	if !ok {
+		return gangTargetNone, "", ""
+	}
+	// The chart ships gangCoordination.enabled: true, so only an explicit false
+	// turns coordination off. Treating an absent key as off would skip the
+	// kai-scheduler requirement for values that still build a KAI discoverer.
+	if coordination, isMap := preflight["gangCoordination"].(map[string]any); isMap {
+		if raw, present := coordination["enabled"]; present && !helmTruthy(raw) {
+			return gangTargetNone, "", ""
+		}
+	}
+	discovery, ok := preflight["gangDiscovery"].(map[string]any)
+	if !ok {
+		return gangTargetNone, "", ""
+	}
+	gvr, ok := discovery["podGroupGVR"].(map[string]any)
+	if !ok {
+		return gangTargetNone, "", ""
+	}
+	group, _ := gvr["group"].(string)
+	version, _ = gvr["version"].(string)
+	resource, _ = gvr["resource"].(string)
+	if group != kaiPodGroupGVR.group {
+		return gangTargetOtherScheduler, version, resource
+	}
+	if version == kaiPodGroupGVR.version && resource == kaiPodGroupGVR.resource {
+		return gangTargetKAI, version, resource
+	}
+	return gangTargetKAIMalformed, version, resource
+}
+
+// preflightEnabledPath is the value that decides whether the preflight webhook
+// runs at all. Both preflight gates read it, and both must guard it against a
+// --dynamic declaration even when it is statically off -- otherwise an
+// install-time edit turns preflight on with nothing validated.
+const preflightEnabledPath = "global.preflight.enabled"
+
+// preflightDCGMDiagContainer is the init container whose DCGM_HOSTENGINE_ADDR
+// decides which hostengine the check talks to.
+const preflightDCGMDiagContainer = "preflight-dcgm-diag"
+
+// chartDefaultDCGMHostengineAddr is the ClusterPolicy-mode entry in the
+// DCGM_HOSTENGINE_ADDR candidate list the preflight subchart ships on
+// preflight-dcgm-diag. Helm replaces lists wholesale, so an unset
+// preflight.initContainers means the chart's own list runs -- the check is
+// injected with that list, and in ClusterPolicy mode only this candidate
+// resolves. Treating that as "no check configured" would skip validation for
+// exactly the configurations this gate exists to reject.
+const chartDefaultDCGMHostengineAddr = "nvidia-dcgm.gpu-operator.svc:5555"
+
+// preflightConfiguredDCGMAddr returns the DCGM_HOSTENGINE_ADDR configured on
+// the preflight-dcgm-diag init container in the resolved values.
+//
+// The address is read rather than assumed because the mixin restates
+// preflight.initContainers, so a leaf override or --set-json can legitimately
+// point the check at a different hostengine. found=false means the DCGM check
+// is not configured at all, which is not this gate's business.
+func preflightConfiguredDCGMAddr(values map[string]any) (addr string, found bool, problem string) {
+	// A missing key means Helm supplies the chart default; a malformed one means
+	// an override replaced the block with something the chart cannot render.
+	rawPreflight, present := values["preflight"]
+	if !present {
+		return chartDefaultDCGMHostengineAddr, true, ""
+	}
+	preflight, ok := rawPreflight.(map[string]any)
+	if !ok {
+		return "", false, fmt.Sprintf("preflight is %T, want a map", rawPreflight)
+	}
+	raw, present := preflight["initContainers"]
+	if !present {
+		return chartDefaultDCGMHostengineAddr, true, ""
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return "", false, fmt.Sprintf("preflight.initContainers is %T, want a list", raw)
+	}
+	var matches []map[string]any
+	for _, entry := range list {
+		container, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, _ := container["name"].(string); name == preflightDCGMDiagContainer {
+			matches = append(matches, container)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", false, ""
+	case 1:
+	default:
+		// Ambiguous rather than merely odd: the webhook injects whichever the
+		// controller resolves first, so the validated address may not be the
+		// one that runs.
+		return "", false, fmt.Sprintf("preflight.initContainers declares %s %d times; which address applies is ambiguous",
+			preflightDCGMDiagContainer, len(matches))
+	}
+	env, _ := matches[0]["env"].([]any)
+	for _, e := range env {
+		entry, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, _ := entry["name"].(string); name != "DCGM_HOSTENGINE_ADDR" {
+			continue
+		}
+		value, ok := entry["value"].(string)
+		if !ok || strings.TrimSpace(value) == "" {
+			return "", false, fmt.Sprintf("%s sets DCGM_HOSTENGINE_ADDR to %v, want a non-empty string", preflightDCGMDiagContainer, entry["value"])
+		}
+		// A candidate list would parse as one external host and skip the gate.
+		if strings.Contains(value, ",") {
+			return "", false, fmt.Sprintf("%s sets DCGM_HOSTENGINE_ADDR to the list %q; this gate verifies a single "+
+				"host:port, so set the one hostengine the check should use", preflightDCGMDiagContainer, value)
+		}
+		return value, true, ""
+	}
+	return "", false, fmt.Sprintf("%s declares no DCGM_HOSTENGINE_ADDR; the check cannot reach a hostengine", preflightDCGMDiagContainer)
+}
+
+// gpuOperatorDCGMService is the Service the GPU Operator creates for the
+// standalone DCGM hostengine. Only an address naming THIS Service is the GPU
+// Operator's; a differently-named Service in the same namespace is somebody
+// else's hostengine and nothing about gpu-operator constrains it.
+const gpuOperatorDCGMService = "nvidia-dcgm"
+
+// preflightDCGMServingGPUOperator picks the GPU Operator variant that could
+// serve the DCGM Service, with its override keys. An enabled ref wins over a
+// declared-but-disabled one: recipes/overlays/ocp.yaml declares gpu-operator-ocp
+// enabled alongside a disabled canonical gpu-operator in the same namespace, and
+// gpuOperatorComponentNames lists the canonical name first. With none enabled the
+// first declared ref is returned rather than nil, so the caller reports the
+// disabled case rather than the absent one.
+func preflightDCGMServingGPUOperator(
+	unionView *recipe.RecipeResult,
+	bundlerConfig *config.Config,
+	provider recipe.DataProvider,
+) (name string, ref *recipe.ComponentRef, keys []string) {
+
+	for _, candidate := range gpuOperatorComponentNames {
+		declared := unionView.GetComponentRef(candidate)
+		if declared == nil {
+			continue
+		}
+		candidateKeys := componentOverrideKeys(candidate, provider)
+		if !componentDisabled(declared, bundlerConfig, candidateKeys) {
+			return candidate, declared, candidateKeys
+		}
+		if ref == nil {
+			name, ref, keys = candidate, declared, candidateKeys
+		}
+	}
+	return name, ref, keys
+}
+
+// gpuOperatorDCGMPort is the port the GPU Operator's nvidia-dcgm Service
+// listens on. It comes from that operator's own Service spec, not from
+// anything AICR sets, so a different port on that Service name reaches nothing.
+const gpuOperatorDCGMPort = "5555"
+
+// gpuOperatorDCGMGuardPaths are the GPU Operator values that decide whether
+// its DCGM hostengine Service exists.
+var gpuOperatorDCGMGuardPaths = []string{"enabled", "dcgm.enabled"}
+
+// clusterLocalServiceRef splits a cluster-local Service address
+// (service.namespace.svc[.cluster.local][:port]) into its Service, namespace
+// and port. ok=false means the address is not of that form -- an external host
+// or IP, which this gate cannot reason about and deliberately leaves alone.
+//
+// All three parts are returned because none alone identifies the GPU Operator's
+// hostengine: custom-hostengine.gpu-operator.svc sits in that namespace without
+// being its Service, and nvidia-dcgm.gpu-operator.svc:5556 names the right
+// Service on a port it does not serve. port is "" when the address omits one.
+func clusterLocalServiceRef(addr string) (service, namespace, port string, ok bool) {
+	host := addr
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host, port = host[:idx], host[idx+1:]
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) < 3 || parts[2] != "svc" {
+		return "", "", "", false
+	}
+	return parts[0], parts[1], port, true
+}
+
+// CheckNVSentinelPreflightDCGMReachable rejects a bundle whose preflight DCGM
+// check cannot reach a hostengine.
+//
+// The address is read from the preflight-dcgm-diag init container rather than
+// assumed: the mixin restates preflight.initContainers, so a leaf override or
+// --set-json can legitimately retarget it, and a bogus address must fail even
+// when gpu-operator sits where the default expects. Once the address names a
+// cluster-local Service in gpu-operator's own namespace, every part of that has
+// to hold. Three ways it does not, none of
+// them visible until a GPU pod starts in an opted-in namespace:
+//
+//   - gpu-operator is absent or disabled, so nothing serves the Service;
+//   - gpu-operator is relocated (os-talos moves it to
+//     privileged-gpu-operator), so the DNS name does not resolve;
+//   - gpu-operator runs with dcgm.enabled: false, which is what the shipped
+//     Kind overlay does — only the embedded exporter runs and the standalone
+//     hostengine Service is never created.
+//
+// Registration details are in recipes/registry.yaml.
+func CheckNVSentinelPreflightDCGMReachable(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	sentinelRef := recipeResult.GetComponentRef(componentName)
+	if sentinelRef == nil {
+		return nil, nil
+	}
+	provider := recipeResult.DataProvider()
+	sentinelKeys := componentOverrideKeys(componentName, provider)
+	if componentDisabled(sentinelRef, bundlerConfig, sentinelKeys) {
+		return nil, nil
+	}
+
+	values, err := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, sentinelKeys, "NVSentinel preflight DCGM endpoint")
+	if err != nil {
+		return nil, []error{err}
+	}
+	// The DECLARED union, so a `bundlers=` subset that omits gpu-operator is not
+	// mistaken for a recipe that never had it. The same view must carry through
+	// to the values read below: resolving against the filtered result fails
+	// outright for a component that was filtered out, which would reject a
+	// legitimate partial bundle.
+	unionView := declaredUnionView(recipeResult)
+	gpuName, gpuOperator, gpuKeys := preflightDCGMServingGPUOperator(unionView, bundlerConfig, provider)
+
+	// EVALUATED BEFORE the static enabled check below, not after. A dynamic
+	// declaration on global.preflight.enabled lets an operator turn preflight on
+	// at install time; returning early on the static "off" would mean this gate
+	// validated nothing and the DCGM endpoint was never checked at all.
+	if !nvsentinelPreflightEnabled(values) {
+		if msgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+			[]string{preflightEnabledPath},
+			"decides whether the preflight DCGM check runs, and this recipe has it statically off -- so the gate would validate nothing while an install-time edit switched it on",
+		); len(msgs) > 0 {
+			for _, msg := range msgs {
+				slog.Warn(msg, logKeyComponent, componentName)
+			}
+			return msgs, nil
+		}
+		return nil, nil
+	}
+
+	// NVSentinel-side guard first: these two decide whether a DCGM check runs at
+	// all and where it points, so a dynamic declaration on either invalidates
+	// everything below regardless of what the static address turns out to be.
+	// The gpu-operator paths are NOT guarded here -- see below.
+	if msgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+		[]string{preflightEnabledPath, "preflight.initContainers"},
+		"decides whether the preflight DCGM check runs and which hostengine it targets",
+	); len(msgs) > 0 {
+		for _, msg := range msgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return msgs, nil
+	}
+
+	// Read the address the check is actually configured with rather than
+	// assuming the chart default: the mixin restates preflight.initContainers,
+	// so a leaf override or --set-json can legitimately retarget it.
+	dcgmAddr, configured, problem := preflightConfiguredDCGMAddr(values)
+	if problem != "" {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: %s", componentName, problem))}
+	}
+	if !configured {
+		// No DCGM check is injected, so there is no hostengine dependency.
+		return nil, nil
+	}
+
+	fail := func(reason string) ([]string, []error) {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: preflight is enabled but its %s check cannot reach %s -- %s. "+
+				"The check would fail at pod-start time in every opted-in namespace. Either deploy gpu-operator "+
+				"with dcgm.enabled: true in the namespace that address names, retarget DCGM_HOSTENGINE_ADDR on the "+
+				"%s init container, or do not compose the nvsentinel-preflight mixin onto this recipe",
+				componentName, preflightDCGMDiagContainer, dcgmAddr, reason, preflightDCGMDiagContainer))}
+	}
+
+	// Only a cluster-local Service address can be checked from here. An
+	// external host or IP is a deliberate choice this gate cannot verify.
+	service, namespace, port, isClusterLocal := clusterLocalServiceRef(dcgmAddr)
+	if !isClusterLocal {
+		return nil, nil
+	}
+	// A Service this operator does not own, even inside gpu-operator's own
+	// namespace, is an independent hostengine: whether gpu-operator is enabled
+	// or runs dcgm.enabled says nothing about whether it resolves.
+	if service != gpuOperatorDCGMService {
+		return nil, nil
+	}
+	// A wrong port on the right Service reaches nothing, and every check below
+	// would otherwise pass. Only an explicitly stated port is rejected: an
+	// address that omits one leaves the default to the DCGM client, which is
+	// not something this gate can determine.
+	if port != "" && port != gpuOperatorDCGMPort {
+		return fail(fmt.Sprintf("it names port %q but the GPU Operator's %s Service listens on %s",
+			port, gpuOperatorDCGMService, gpuOperatorDCGMPort))
+	}
+
+	if gpuOperator == nil {
+		return fail("no GPU Operator component is in the recipe, so nothing serves that Service")
+	}
+	if componentDisabled(gpuOperator, bundlerConfig, gpuKeys) {
+		return fail(fmt.Sprintf("%s is disabled", gpuName))
+	}
+	// Compared against where gpu-operator actually lands, so any relocation is
+	// caught -- os-talos's today, and any other tomorrow.
+	gpuNamespace := gpuOperator.Namespace
+	if gpuNamespace == "" {
+		gpuNamespace = "gpu-operator"
+	}
+	if namespace != gpuNamespace {
+		return fail(fmt.Sprintf("it names namespace %q but %s is deployed to %q", namespace, gpuName, gpuNamespace))
+	}
+
+	// Only here is a gpu-operator dependency established: the check is
+	// configured, cluster-local, and pointed at gpu-operator's own namespace.
+	// Guarding these paths any earlier rejects a --dynamic on gpu-operator for
+	// recipes where the DCGM check is absent or targets an external hostengine,
+	// neither of which depends on gpu-operator at all.
+	if msgs := nvsentinelDynamicGuardViolations(bundlerConfig, gpuName, gpuKeys,
+		gpuOperatorDCGMGuardPaths,
+		"decides whether the DCGM hostengine this check depends on is deployed at all",
+	); len(msgs) > 0 {
+		for _, msg := range msgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return msgs, nil
+	}
+
+	// dcgm.enabled gates the standalone hostengine DaemonSet and its Service.
+	gpuValues, err := effectiveComponentValues(ctx, unionView, bundlerConfig, gpuName, gpuKeys, "NVSentinel preflight DCGM endpoint")
+	if err != nil {
+		return nil, []error{err}
+	}
+	// Unset is NOT "enabled": gpu-operator's chart defaults dcgm.enabled to
+	// false ("disabled by default to use embedded nv-hostengine by exporter"),
+	// so an absent key means no standalone hostengine and no Service. AICR's own
+	// values set it true, so absence here means an override removed it --
+	// `--set-json gpuoperator:dcgm='{"enabled":null}'` deletes enabled and leaves
+	// dcgm as an empty map, which a type assertion on the section alone accepts. Treating that as a pass shipped a green bundle whose GPU pods
+	// all strand in Init:Error, which is the state this gate exists to reject.
+	//
+	// ownershipToggle is the established reader for this shape: it separates
+	// unset from set-to-false and reports null/non-bool as a problem rather than
+	// silently coercing.
+	dcgmEnabled, problem := ownershipToggle(gpuValues, "dcgm")
+
+	switch {
+	case problem != "":
+		return fail(problem)
+	case dcgmEnabled == nil:
+		return fail(fmt.Sprintf("%s does not set dcgm.enabled, and the chart defaults it to false, so the standalone DCGM hostengine Service is never created", gpuName))
+	case !*dcgmEnabled:
+		return fail(fmt.Sprintf("%s runs with dcgm.enabled: false, so the standalone DCGM hostengine Service is never created", gpuName))
+	}
+
+	return nil, nil
+}
+
+// CheckNVSentinelPreflightGangSchedulerRequired blocks a bundle that enables
+// preflight gang coordination against KAI PodGroups while kai-scheduler is
+// disabled or absent.
+//
+// The dependencyRefs edge the mixin adds only orders the install; it does not
+// require the scheduler to stay enabled, and the bundler prunes an edge to a
+// declared-but-disabled component as "satisfied externally". Without the
+// PodGroup CRD the preflight controller fails its startup GVR resolution and
+// crash-loops — and because the webhook is failurePolicy: Ignore, every GPU pod
+// in a labeled namespace is then admitted unchecked, silently. Registration
+// details are in recipes/registry.yaml.
+func CheckNVSentinelPreflightGangSchedulerRequired(ctx context.Context, componentName string, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config, conditions map[string][]string) ([]string, []error) {
+	if recipeResult == nil || !checkConditions(recipeResult, conditions) {
+		return nil, nil
+	}
+	sentinelRef := recipeResult.GetComponentRef(componentName)
+	if sentinelRef == nil {
+		return nil, nil
+	}
+	provider := recipeResult.DataProvider()
+	sentinelKeys := componentOverrideKeys(componentName, provider)
+	if componentDisabled(sentinelRef, bundlerConfig, sentinelKeys) {
+		return nil, nil
+	}
+
+	values, err := effectiveComponentValues(ctx, recipeResult, bundlerConfig, componentName, sentinelKeys, "NVSentinel preflight gang scheduler")
+	if err != nil {
+		return nil, []error{err}
+	}
+
+	// Same fail-open shape as the gate-applies check below: returning early on
+	// a static "preflight off" would skip validation entirely while a dynamic
+	// declaration on that very flag lets an operator switch it on at install
+	// time.
+	if !nvsentinelPreflightEnabled(values) {
+		if msgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+			[]string{preflightEnabledPath},
+			"decides whether the preflight controller runs at all, and this recipe has it statically off -- so the gate would validate nothing while an install-time edit switched it on",
+		); len(msgs) > 0 {
+			for _, msg := range msgs {
+				slog.Warn(msg, logKeyComponent, componentName)
+			}
+			return msgs, nil
+		}
+		return nil, nil
+	}
+	target, gvrVersion, gvrResource := nvsentinelPreflightGangTarget(values)
+
+	// EVALUATED BEFORE the static early return below, not after. The paths that
+	// decide whether this gate applies at all are exactly the ones whose
+	// dynamic declaration would let an operator opt into the KAI path at
+	// install time, after this gate concluded it had nothing to check. Guarding
+	// them only once the static config already targets KAI is fail-open.
+	gateApplies := target == gangTargetKAI || target == gangTargetKAIMalformed
+	if !gateApplies {
+		if msgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+			[]string{preflightEnabledPath, "preflight.gangCoordination.enabled", "preflight.gangDiscovery.podGroupGVR"},
+			"decides whether the preflight controller resolves KAI PodGroups at startup, and this recipe does not statically target them -- so the gate would validate nothing while an install-time edit switched it on",
+		); len(msgs) > 0 {
+			for _, msg := range msgs {
+				slog.Warn(msg, logKeyComponent, componentName)
+			}
+			return msgs, nil
+		}
+		return nil, nil
+	}
+
+	// A KAI group with the wrong version or resource is rejected, not skipped:
+	// the controller resolves the GVR at startup and exits when it is absent,
+	// so this crash-loops exactly like a missing CRD.
+	if target == gangTargetKAIMalformed {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: preflight gang discovery targets %s/%s resource %q, but KAI serves %s/%s resource %q; "+
+				"the preflight controller resolves this GVR at startup and exits when it does not exist, so the Deployment "+
+				"crash-loops and the webhook (failurePolicy: Ignore) then admits every GPU pod unchecked. Set "+
+				"preflight.gangDiscovery.podGroupGVR to %s/%s/%s",
+				componentName, kaiPodGroupGVR.group, gvrVersion, gvrResource,
+				kaiPodGroupGVR.group, kaiPodGroupGVR.version, kaiPodGroupGVR.resource,
+				kaiPodGroupGVR.group, kaiPodGroupGVR.version, kaiPodGroupGVR.resource))}
+	}
+
+	// The gate applies. Now guard the dependency paths too.
+	kaiKeysForGuard := componentOverrideKeys("kai-scheduler", provider)
+	dynMsgs := nvsentinelDynamicGuardViolations(bundlerConfig, componentName, sentinelKeys,
+		[]string{preflightEnabledPath, "preflight.gangCoordination.enabled", "preflight.gangDiscovery.podGroupGVR"},
+		"decides whether the preflight controller resolves KAI PodGroups at startup")
+	dynMsgs = append(dynMsgs, nvsentinelDynamicGuardViolations(bundlerConfig, "kai-scheduler", kaiKeysForGuard,
+		[]string{"enabled"},
+		"decides whether the PodGroup CRD the preflight controller requires exists at all")...)
+	if len(dynMsgs) > 0 {
+		for _, msg := range dynMsgs {
+			slog.Warn(msg, logKeyComponent, componentName)
+		}
+		return dynMsgs, nil
+	}
+
+	// Read the DECLARED union, not the enabled set: a `bundlers=` subset that
+	// omits kai-scheduler is a legitimate partial install of a correct recipe.
+	// What must fail is a recipe where the scheduler is disabled or was never
+	// declared at all.
+	union := declaredUnionView(recipeResult)
+	kaiRef := union.GetComponentRef("kai-scheduler")
+	if kaiRef == nil {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: preflight gang discovery targets scheduling.run.ai PodGroups but kai-scheduler is not in the recipe; "+
+				"the preflight controller resolves that GVR at startup and exits when the CRD is absent, so the Deployment crash-loops "+
+				"and the webhook (failurePolicy: Ignore) then admits every GPU pod unchecked", componentName))}
+	}
+	kaiKeys := componentOverrideKeys("kai-scheduler", provider)
+	if componentDisabled(kaiRef, bundlerConfig, kaiKeys) {
+		return nil, []error{aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q: preflight gang discovery targets scheduling.run.ai PodGroups but kai-scheduler is disabled; "+
+				"the PodGroup CRD will not exist, so the preflight controller crash-loops on startup GVR resolution and the webhook "+
+				"(failurePolicy: Ignore) admits every GPU pod unchecked. Re-enable kai-scheduler or drop the nvsentinel-preflight mixin", componentName))}
+	}
+	return nil, nil
+}

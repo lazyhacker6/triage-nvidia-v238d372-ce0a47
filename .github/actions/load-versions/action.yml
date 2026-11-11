@@ -1,0 +1,378 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: 'Load Versions'
+description: 'Loads tool versions and the validated Docker Hub mirror from .settings.yaml, and Go version from .go-version'
+
+outputs:
+  go:
+    description: 'Go version'
+    value: ${{ steps.versions.outputs.go }}
+  goreleaser:
+    description: 'GoReleaser version'
+    value: ${{ steps.versions.outputs.goreleaser }}
+  ko:
+    description: 'Ko version'
+    value: ${{ steps.versions.outputs.ko }}
+  crane:
+    description: 'Crane version'
+    value: ${{ steps.versions.outputs.crane }}
+  dockerhub_mirror:
+    description: 'Docker Hub pull-through mirror URL (build.dockerhub_mirror), for dockerd registry-mirrors'
+    value: ${{ steps.versions.outputs.dockerhub_mirror }}
+  dockerhub_mirror_host:
+    description: 'Host of dockerhub_mirror, for image refs and BuildKit mirror config'
+    value: ${{ steps.versions.outputs.dockerhub_mirror_host }}
+  golangci_lint:
+    description: 'golangci-lint version'
+    value: ${{ steps.versions.outputs.golangci_lint }}
+  apidiff:
+    description: 'API-diff version pinned in .settings.yaml'
+    value: ${{ steps.versions.outputs.apidiff }}
+  oasdiff:
+    description: 'oasdiff version from .settings.yaml (linting.oasdiff)'
+    value: ${{ steps.versions.outputs.oasdiff }}
+  oasdiff_sha256_linux_amd64:
+    description: 'Pinned linux/amd64 SHA256 for the oasdiff release archive (linting.oasdiff_sha256_linux_amd64)'
+    value: ${{ steps.versions.outputs.oasdiff_sha256_linux_amd64 }}
+  addlicense:
+    description: 'addlicense version'
+    value: ${{ steps.versions.outputs.addlicense }}
+  addlicense_sha256_linux_amd64:
+    description: 'Pinned linux/amd64 SHA256 for the addlicense release archive (linting.addlicense_sha256_linux_amd64)'
+    value: ${{ steps.versions.outputs.addlicense_sha256_linux_amd64 }}
+  go_licenses:
+    description: 'go-licenses version'
+    value: ${{ steps.versions.outputs.go_licenses }}
+  kind:
+    description: 'Kind version'
+    value: ${{ steps.versions.outputs.kind }}
+  nvkind:
+    description: 'nvkind git ref'
+    value: ${{ steps.versions.outputs.nvkind }}
+  ctlptl:
+    description: 'ctlptl version'
+    value: ${{ steps.versions.outputs.ctlptl }}
+  tilt:
+    description: 'Tilt version'
+    value: ${{ steps.versions.outputs.tilt }}
+  setup_envtest:
+    description: 'setup-envtest version'
+    value: ${{ steps.versions.outputs.setup_envtest }}
+  setup_envtest_sha256_linux_amd64:
+    description: 'Pinned linux/amd64 SHA256 for the setup-envtest release binary (testing_tools.setup_envtest_sha256_linux_amd64)'
+    value: ${{ steps.versions.outputs.setup_envtest_sha256_linux_amd64 }}
+  helm:
+    description: 'Helm version'
+    value: ${{ steps.versions.outputs.helm }}
+  helmfile:
+    description: 'Helmfile version'
+    value: ${{ steps.versions.outputs.helmfile }}
+  helmfile_sha256_linux_amd64:
+    description: 'Helmfile SHA256 checksum for linux/amd64'
+    value: ${{ steps.versions.outputs.helmfile_sha256_linux_amd64 }}
+  helmfile_sha256_linux_arm64:
+    description: 'Helmfile SHA256 checksum for linux/arm64'
+    value: ${{ steps.versions.outputs.helmfile_sha256_linux_arm64 }}
+  grype:
+    description: 'Grype version'
+    value: ${{ steps.versions.outputs.grype }}
+  cosign:
+    description: 'Cosign version (must be >= v3.1.0 so DSSE attestations are logged to Rekor v2 as hashedrekord/PAE, not the legacy dsse entry type)'
+    value: ${{ steps.versions.outputs.cosign }}
+  oras:
+    description: 'ORAS version (attaches the aiperf-bench source archive as an OCI 1.1 referrer; cosign cannot attach arbitrary artifacts)'
+    value: ${{ steps.versions.outputs.oras }}
+  oras_sha256_linux_amd64:
+    description: 'ORAS SHA256 for linux/amd64'
+    value: ${{ steps.versions.outputs.oras_sha256_linux_amd64 }}
+  yamllint:
+    description: 'yamllint version'
+    value: ${{ steps.versions.outputs.yamllint }}
+  kubectl:
+    description: 'kubectl version'
+    value: ${{ steps.versions.outputs.kubectl }}
+  kubelogin:
+    description: 'kubelogin version'
+    value: ${{ steps.versions.outputs.kubelogin }}
+  kwok:
+    description: 'KWOK version'
+    value: ${{ steps.versions.outputs.kwok }}
+  chainsaw:
+    description: 'Chainsaw version'
+    value: ${{ steps.versions.outputs.chainsaw }}
+  chainsaw_sha256_linux_amd64:
+    description: 'Chainsaw SHA256 for linux/amd64'
+    value: ${{ steps.versions.outputs.chainsaw_sha256_linux_amd64 }}
+  chainsaw_sha256_linux_arm64:
+    description: 'Chainsaw SHA256 for linux/arm64'
+    value: ${{ steps.versions.outputs.chainsaw_sha256_linux_arm64 }}
+  yq:
+    description: 'yq version'
+    value: ${{ steps.versions.outputs.yq }}
+  registry_image:
+    description: 'OCI registry image (in-cluster registry for KWOK deployer-matrix CI)'
+    value: ${{ steps.versions.outputs.registry_image }}
+  argocd_chart:
+    description: 'Argo CD Helm chart version (for KWOK deployer-matrix CI)'
+    value: ${{ steps.versions.outputs.argocd_chart }}
+  scaffold_chart:
+    description: 'sigstore scaffold Helm chart version (for the private-Sigstore signing e2e)'
+    value: ${{ steps.versions.outputs.scaffold_chart }}
+  flux:
+    description: 'Flux CLI version'
+    value: ${{ steps.versions.outputs.flux }}
+  hauler:
+    description: 'Hauler version'
+    value: ${{ steps.versions.outputs.hauler }}
+  zarf:
+    description: 'Zarf version'
+    value: ${{ steps.versions.outputs.zarf }}
+  coverage_threshold:
+    description: 'Minimum test coverage percentage'
+    value: ${{ steps.versions.outputs.coverage_threshold }}
+  lint_timeout:
+    description: 'Lint timeout duration'
+    value: ${{ steps.versions.outputs.lint_timeout }}
+  test_timeout:
+    description: 'Test timeout duration'
+    value: ${{ steps.versions.outputs.test_timeout }}
+  kind_node_image:
+    description: 'Kind node image for testing'
+    value: ${{ steps.versions.outputs.kind_node_image }}
+  h100_kind_node_image:
+    description: 'Kind node image for H100 GPU tests'
+    value: ${{ steps.versions.outputs.h100_kind_node_image }}
+  gpu_operator_chart_version:
+    description: 'GPU Operator Helm chart version for GPU smoke tests'
+    value: ${{ steps.versions.outputs.gpu_operator_chart_version }}
+  snapshot_agent_base_image:
+    description: 'Base image for the snapshot agent image'
+    value: ${{ steps.versions.outputs.snapshot_agent_base_image }}
+  awscli:
+    description: 'AWS CLI version (pip package, used by the KMS MiniStack e2e)'
+    value: ${{ steps.versions.outputs.awscli }}
+  ministack_image:
+    description: 'MiniStack image (token-free AWS emulator for the KMS e2e)'
+    value: ${{ steps.versions.outputs.ministack_image }}
+  openbao_image:
+    description: 'OpenBAO image (Vault-compatible Transit server for the Vault KMS e2e)'
+    value: ${{ steps.versions.outputs.openbao_image }}
+  mkcert:
+    description: 'mkcert version (trusted localhost TLS cert for the KMS e2e)'
+    value: ${{ steps.versions.outputs.mkcert }}
+  mkcert_sha256_linux_amd64:
+    description: 'mkcert SHA256 for linux/amd64'
+    value: ${{ steps.versions.outputs.mkcert_sha256_linux_amd64 }}
+  mkcert_sha256_linux_arm64:
+    description: 'mkcert SHA256 for linux/arm64'
+    value: ${{ steps.versions.outputs.mkcert_sha256_linux_arm64 }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Load versions from .settings.yaml
+      id: versions
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # apidiff and go-licenses are built from the main module (#2667), so
+        # go.mod holds their only pin. Reuse the repo's parser rather than a
+        # second copy of the require-line regex.
+        # shellcheck source=tools/common
+        . tools/common
+
+        # Languages — Go version is owned by .go-version (single source of truth)
+        echo "go=$(cat .go-version)" >> $GITHUB_OUTPUT
+
+        # Build tools
+        echo "goreleaser=$(yq eval '.build_tools.goreleaser' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "ko=$(yq eval '.build_tools.ko' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "crane=$(yq eval '.build_tools.crane' .settings.yaml)" >> $GITHUB_OUTPUT
+
+        # Build configuration. Validated, unlike the pins around it: a missing
+        # key reads as "null", and a mirror consumer handed that would fall
+        # back to anonymous Docker Hub pulls instead of failing.
+        dockerhub_mirror="$(yq eval '.build.dockerhub_mirror' .settings.yaml)"
+        if [[ ! ${dockerhub_mirror} =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+          echo "::error file=.settings.yaml::build.dockerhub_mirror must be an https:// host URL with no path, got '${dockerhub_mirror}'"
+          exit 1
+        fi
+        echo "dockerhub_mirror=${dockerhub_mirror}" >> $GITHUB_OUTPUT
+        echo "dockerhub_mirror_host=${dockerhub_mirror#https://}" >> $GITHUB_OUTPUT
+
+        # Linting
+        echo "golangci_lint=$(yq eval '.linting.golangci_lint' .settings.yaml)" >> $GITHUB_OUTPUT
+        # Assigned first so `set -e` sees the lookup's exit status: inside an
+        # `echo` argument a failure is invisible, and an empty apidiff output
+        # makes the go-test action skip the SDK API compatibility check rather
+        # than fail.
+        apidiff_version="$(go_mod_required_version golang.org/x/exp go.mod)"
+        echo "apidiff=${apidiff_version}" >> $GITHUB_OUTPUT
+        echo "oasdiff=$(yq eval '.linting.oasdiff' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "oasdiff_sha256_linux_amd64=$(yq eval '.linting.oasdiff_sha256_linux_amd64' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "yamllint=$(yq eval '.linting.yamllint' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "addlicense=$(yq eval '.linting.addlicense' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "addlicense_sha256_linux_amd64=$(yq eval '.linting.addlicense_sha256_linux_amd64' .settings.yaml)" >> $GITHUB_OUTPUT
+        go_licenses_version="$(go_mod_required_version github.com/google/go-licenses/v2 go.mod)"
+        echo "go_licenses=${go_licenses_version}" >> $GITHUB_OUTPUT
+
+        # Security tools
+        echo "grype=$(yq eval '.security_tools.grype' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "cosign=$(yq eval '.security_tools.cosign' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "oras=$(yq eval '.security_tools.oras' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "oras_sha256_linux_amd64=$(yq eval '.security_tools.oras_sha256_linux_amd64' .settings.yaml)" >> $GITHUB_OUTPUT
+
+        # Testing tools
+        echo "kubectl=$(yq eval '.testing_tools.kubectl' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "kubelogin=$(yq eval '.testing_tools.kubelogin' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "kind=$(yq eval '.testing_tools.kind' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "nvkind=$(yq eval '.testing_tools.nvkind' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "ctlptl=$(yq eval '.testing_tools.ctlptl' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "tilt=$(yq eval '.testing_tools.tilt' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "setup_envtest=$(yq eval '.testing_tools.setup_envtest' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "setup_envtest_sha256_linux_amd64=$(yq eval '.testing_tools.setup_envtest_sha256_linux_amd64' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "helm=$(yq eval '.testing_tools.helm' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "helmfile=$(yq eval '.testing_tools.helmfile' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "helmfile_sha256_linux_amd64=$(yq eval '.testing_tools.helmfile_checksums.linux_amd64' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "helmfile_sha256_linux_arm64=$(yq eval '.testing_tools.helmfile_checksums.linux_arm64' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "kwok=$(yq eval '.testing_tools.kwok' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "chainsaw=$(yq eval '.testing_tools.chainsaw' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "chainsaw_sha256_linux_amd64=$(yq eval '.testing_tools.chainsaw_checksums.linux_amd64' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "chainsaw_sha256_linux_arm64=$(yq eval '.testing_tools.chainsaw_checksums.linux_arm64' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "yq=$(yq eval '.testing_tools.yq' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "registry_image=$(yq eval '.testing_tools.registry_image' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "argocd_chart=$(yq eval '.testing_tools.argocd_chart' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "scaffold_chart=$(yq eval '.testing_tools.scaffold_chart' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "flux=$(yq eval '.testing_tools.flux_version' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "hauler=$(yq eval '.testing_tools.hauler' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "zarf=$(yq eval '.testing_tools.zarf' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "awscli=$(yq eval '.testing_tools.awscli' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "ministack_image=$(yq eval '.testing_tools.ministack_image' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "openbao_image=$(yq eval '.testing_tools.openbao_image' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "mkcert=$(yq eval '.testing_tools.mkcert' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "mkcert_sha256_linux_amd64=$(yq eval '.testing_tools.mkcert_checksums.linux_amd64' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "mkcert_sha256_linux_arm64=$(yq eval '.testing_tools.mkcert_checksums.linux_arm64' .settings.yaml)" >> $GITHUB_OUTPUT
+
+        # Quality thresholds
+        echo "coverage_threshold=$(yq eval '.quality.coverage_threshold' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "lint_timeout=$(yq eval '.quality.lint_timeout' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "test_timeout=$(yq eval '.quality.test_timeout' .settings.yaml)" >> $GITHUB_OUTPUT
+
+        # Testing configuration
+        echo "kind_node_image=$(yq eval '.testing.kind_node_image' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "h100_kind_node_image=$(yq eval '.testing.h100_kind_node_image' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "gpu_operator_chart_version=$(yq eval '.testing.gpu_operator_chart_version' .settings.yaml)" >> $GITHUB_OUTPUT
+        echo "snapshot_agent_base_image=$(yq eval '.testing.snapshot_agent_base_image' .settings.yaml)" >> $GITHUB_OUTPUT
+
+    - name: Display loaded versions
+      shell: bash
+      # Routed through env rather than interpolated into the script body: these
+      # values come from .settings.yaml, which is fork-controlled on the
+      # ok-to-test path. Matches the env: form in setup-build-tools.
+      env:
+        LOADED_GO: ${{ steps.versions.outputs.go }}
+        LOADED_GORELEASER: ${{ steps.versions.outputs.goreleaser }}
+        LOADED_KO: ${{ steps.versions.outputs.ko }}
+        LOADED_CRANE: ${{ steps.versions.outputs.crane }}
+        LOADED_DOCKERHUB_MIRROR: ${{ steps.versions.outputs.dockerhub_mirror }}
+        LOADED_GOLANGCI_LINT: ${{ steps.versions.outputs.golangci_lint }}
+        LOADED_APIDIFF: ${{ steps.versions.outputs.apidiff }}
+        LOADED_OASDIFF: ${{ steps.versions.outputs.oasdiff }}
+        LOADED_YAMLLINT: ${{ steps.versions.outputs.yamllint }}
+        LOADED_ADDLICENSE: ${{ steps.versions.outputs.addlicense }}
+        LOADED_GO_LICENSES: ${{ steps.versions.outputs.go_licenses }}
+        LOADED_GRYPE: ${{ steps.versions.outputs.grype }}
+        LOADED_COSIGN: ${{ steps.versions.outputs.cosign }}
+        LOADED_KUBECTL: ${{ steps.versions.outputs.kubectl }}
+        LOADED_KUBELOGIN: ${{ steps.versions.outputs.kubelogin }}
+        LOADED_KIND: ${{ steps.versions.outputs.kind }}
+        LOADED_NVKIND: ${{ steps.versions.outputs.nvkind }}
+        LOADED_CTLPTL: ${{ steps.versions.outputs.ctlptl }}
+        LOADED_TILT: ${{ steps.versions.outputs.tilt }}
+        LOADED_HELM: ${{ steps.versions.outputs.helm }}
+        LOADED_HELMFILE: ${{ steps.versions.outputs.helmfile }}
+        LOADED_HELMFILE_SHA256_LINUX_AMD64: ${{ steps.versions.outputs.helmfile_sha256_linux_amd64 }}
+        LOADED_HELMFILE_SHA256_LINUX_ARM64: ${{ steps.versions.outputs.helmfile_sha256_linux_arm64 }}
+        LOADED_KWOK: ${{ steps.versions.outputs.kwok }}
+        LOADED_CHAINSAW: ${{ steps.versions.outputs.chainsaw }}
+        LOADED_CHAINSAW_SHA256_LINUX_AMD64: ${{ steps.versions.outputs.chainsaw_sha256_linux_amd64 }}
+        LOADED_CHAINSAW_SHA256_LINUX_ARM64: ${{ steps.versions.outputs.chainsaw_sha256_linux_arm64 }}
+        LOADED_YQ: ${{ steps.versions.outputs.yq }}
+        LOADED_REGISTRY_IMAGE: ${{ steps.versions.outputs.registry_image }}
+        LOADED_ARGOCD_CHART: ${{ steps.versions.outputs.argocd_chart }}
+        LOADED_SCAFFOLD_CHART: ${{ steps.versions.outputs.scaffold_chart }}
+        LOADED_FLUX: ${{ steps.versions.outputs.flux }}
+        LOADED_HAULER: ${{ steps.versions.outputs.hauler }}
+        LOADED_ZARF: ${{ steps.versions.outputs.zarf }}
+        LOADED_COVERAGE_THRESHOLD: ${{ steps.versions.outputs.coverage_threshold }}
+        LOADED_LINT_TIMEOUT: ${{ steps.versions.outputs.lint_timeout }}
+        LOADED_TEST_TIMEOUT: ${{ steps.versions.outputs.test_timeout }}
+        LOADED_KIND_NODE_IMAGE: ${{ steps.versions.outputs.kind_node_image }}
+        LOADED_H100_KIND_NODE_IMAGE: ${{ steps.versions.outputs.h100_kind_node_image }}
+        LOADED_GPU_OPERATOR_CHART_VERSION: ${{ steps.versions.outputs.gpu_operator_chart_version }}
+        LOADED_AWSCLI: ${{ steps.versions.outputs.awscli }}
+        LOADED_MINISTACK_IMAGE: ${{ steps.versions.outputs.ministack_image }}
+        LOADED_OPENBAO_IMAGE: ${{ steps.versions.outputs.openbao_image }}
+        LOADED_MKCERT: ${{ steps.versions.outputs.mkcert }}
+        LOADED_SNAPSHOT_AGENT_BASE_IMAGE: ${{ steps.versions.outputs.snapshot_agent_base_image }}
+      run: |
+        set -euo pipefail
+        echo "Loaded versions from .settings.yaml:"
+        echo "  go: ${LOADED_GO}"
+        echo "  goreleaser: ${LOADED_GORELEASER}"
+        echo "  ko: ${LOADED_KO}"
+        echo "  crane: ${LOADED_CRANE}"
+        echo "  dockerhub_mirror: ${LOADED_DOCKERHUB_MIRROR}"
+        echo "  golangci_lint: ${LOADED_GOLANGCI_LINT}"
+        echo "  apidiff: ${LOADED_APIDIFF}"
+        echo "  oasdiff: ${LOADED_OASDIFF}"
+        echo "  yamllint: ${LOADED_YAMLLINT}"
+        echo "  addlicense: ${LOADED_ADDLICENSE}"
+        echo "  go_licenses: ${LOADED_GO_LICENSES}"
+        echo "  grype: ${LOADED_GRYPE}"
+        echo "  cosign: ${LOADED_COSIGN}"
+        echo "  kubectl: ${LOADED_KUBECTL}"
+        echo "  kubelogin: ${LOADED_KUBELOGIN}"
+        echo "  kind: ${LOADED_KIND}"
+        echo "  nvkind: ${LOADED_NVKIND}"
+        echo "  ctlptl: ${LOADED_CTLPTL}"
+        echo "  tilt: ${LOADED_TILT}"
+        echo "  helm: ${LOADED_HELM}"
+        echo "  helmfile: ${LOADED_HELMFILE}"
+        echo "  helmfile_sha256_linux_amd64: ${LOADED_HELMFILE_SHA256_LINUX_AMD64}"
+        echo "  helmfile_sha256_linux_arm64: ${LOADED_HELMFILE_SHA256_LINUX_ARM64}"
+        echo "  kwok: ${LOADED_KWOK}"
+        echo "  chainsaw: ${LOADED_CHAINSAW}"
+        echo "  chainsaw_sha256_linux_amd64: ${LOADED_CHAINSAW_SHA256_LINUX_AMD64}"
+        echo "  chainsaw_sha256_linux_arm64: ${LOADED_CHAINSAW_SHA256_LINUX_ARM64}"
+        echo "  yq: ${LOADED_YQ}"
+        echo "  registry_image: ${LOADED_REGISTRY_IMAGE}"
+        echo "  argocd_chart: ${LOADED_ARGOCD_CHART}"
+        echo "  scaffold_chart: ${LOADED_SCAFFOLD_CHART}"
+        echo "  flux: ${LOADED_FLUX}"
+        echo "  hauler: ${LOADED_HAULER}"
+        echo "  zarf: ${LOADED_ZARF}"
+        echo "  coverage_threshold: ${LOADED_COVERAGE_THRESHOLD}"
+        echo "  lint_timeout: ${LOADED_LINT_TIMEOUT}"
+        echo "  test_timeout: ${LOADED_TEST_TIMEOUT}"
+        echo "  kind_node_image: ${LOADED_KIND_NODE_IMAGE}"
+        echo "  h100_kind_node_image: ${LOADED_H100_KIND_NODE_IMAGE}"
+        echo "  gpu_operator_chart_version: ${LOADED_GPU_OPERATOR_CHART_VERSION}"
+        echo "  awscli: ${LOADED_AWSCLI}"
+        echo "  ministack_image: ${LOADED_MINISTACK_IMAGE}"
+        echo "  openbao_image: ${LOADED_OPENBAO_IMAGE}"
+        echo "  mkcert: ${LOADED_MKCERT}"
+        echo "  snapshot_agent_base_image: ${LOADED_SNAPSHOT_AGENT_BASE_IMAGE}"

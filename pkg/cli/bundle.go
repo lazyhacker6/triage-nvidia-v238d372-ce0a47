@@ -1,0 +1,2296 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cli
+
+import (
+	"context"
+	stderrors "errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/attestation"
+	"github.com/NVIDIA/aicr/pkg/bundler/checksum"
+	"github.com/NVIDIA/aicr/pkg/bundler/config"
+	"github.com/NVIDIA/aicr/pkg/bundler/result"
+	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/oci"
+	"github.com/NVIDIA/aicr/pkg/serializer"
+	"github.com/urfave/cli/v3"
+)
+
+// bundleCmdOptions holds parsed options for the bundle command.
+type bundleCmdOptions struct {
+	recipeFilePath             string
+	outputDir                  string
+	kubeconfig                 string
+	deployer                   config.DeployerType
+	repoURL                    string
+	valueOverrides             []config.ComponentPath
+	valueOverridesTyped        []config.TypedComponentPath
+	systemNodeSelector         map[string]string
+	systemNodeTolerations      []corev1.Toleration
+	acceleratedNodeSelector    map[string]string
+	acceleratedNodeTolerations []corev1.Toleration
+	draEvictionNodeLabel       config.NodeLabel
+	workloadGateTaint          *corev1.Taint
+	workloadSelector           map[string]string
+	estimatedNodeCount         int
+	storageClass               string
+	sharedStorageClass         string
+	targetRevision             string
+
+	// dynamicValues declares value paths provided at install time.
+	dynamicValues []config.ComponentPath
+
+	// ociSourceName is the name of the outer OCIRepository that Flux uses
+	// to pull the bundle. Set from --flux-oci-source-name when deployer=flux
+	// with OCI output.
+	ociSourceName string
+
+	// fluxNamespace is the Kubernetes namespace where Flux CRs are deployed.
+	fluxNamespace string
+
+	// fleetNamespace is the Fleet workspace the generated GitRepo or HelmOps
+	// are applied to.
+	fleetNamespace string
+
+	// fleetMode selects GitRepo or HelmOp output for --deployer fleet.
+	fleetMode string
+
+	// vendorCharts pulls upstream Helm chart bytes into the bundle so
+	// the resulting artifact is self-contained and air-gap deployable.
+	vendorCharts bool
+
+	// readinessHooks emits a per-component readiness gate chart for each
+	// component that ships a readiness.yaml. Off by default. See #904.
+	readinessHooks bool
+
+	// serial forces deployers to install components strictly one at a time in
+	// deployment order, disabling the parallel rollout of independent
+	// components. Off by default (parallel). An escape hatch for operators.
+	serial bool
+
+	// split renders a class-partitioned bundle set (ADR-018) instead of one
+	// bundle. Off by default; helm deployer and local output only.
+	split bool
+
+	// terraformClusterRollover emits the cluster-rollover containment shim
+	// in a --deployer terraform bundle. Off by default. See
+	// config.WithTerraformClusterRollover for why it is not the default.
+	terraformClusterRollover bool
+
+	// terraformChildModule emits a --deployer terraform bundle as a child
+	// module rather than a root module. Off by default.
+	terraformChildModule bool
+
+	// attest enables bundle attestation and binary verification.
+	attest bool
+
+	// certificateIdentityRegexp overrides the identity pattern for binary attestation.
+	certificateIdentityRegexp string
+
+	// identityToken is a pre-fetched OIDC identity token used for keyless signing.
+	// When non-empty it short-circuits all OIDC acquisition flows. Mirrors cosign's
+	// --identity-token / COSIGN_IDENTITY_TOKEN.
+	identityToken string
+
+	// signingKey selects KMS-backed (key-based) signing for --attest instead of
+	// keyless OIDC. A non-empty value is a KMS key URI (awskms:// | gcpkms:// |
+	// azurekms:// | hashivault://). Mutually exclusive with the keyless-only flags. See #407.
+	signingKey string
+
+	// tlogUpload controls the Rekor transparency-log upload for KMS signing.
+	// Default true (upload). Setting it false with --signing-key produces a
+	// fully offline / air-gapped signature (no Rekor entry); false without
+	// --signing-key is rejected because keyless OIDC signing requires Fulcio +
+	// Rekor network access. See #409.
+	tlogUpload bool
+
+	// oidcDeviceFlow opts in to the OAuth 2.0 Device Authorization Grant flow
+	// (RFC 8628) for headless hosts where a browser callback is unavailable.
+	oidcDeviceFlow bool
+
+	// assumeYes bypasses the interactive keyless-signing identity-disclosure
+	// prompt (--yes / AICR_ASSUME_YES). The banner is still emitted.
+	assumeYes bool
+
+	// fulcioURL and rekorURL override the public-good Sigstore endpoints so
+	// keyless signing targets a private Fulcio CA and/or Rekor transparency
+	// log. Empty leaves the public defaults in place. See #408.
+	fulcioURL string
+	rekorURL  string
+
+	// useTUFSigningConfig signs to Rekor v2 using the TUF-distributed signing
+	// config — the default for both keyless and KMS signing. Computed as the
+	// absence of a v1/custom opt-out (rekorURL, signingConfigPath), not a user
+	// flag; signingKey is deliberately not an opt-out, so KMS also defaults to v2.
+	// See #1650.
+	useTUFSigningConfig bool
+
+	// signingConfigPath signs with a custom Sigstore signing config file instead
+	// of the default Rekor v2 config (advanced escape hatch, e.g. an edited
+	// config or a private v2 instance). See #1650.
+	signingConfigPath string
+
+	// OCI output reference: a registry reference or an OCI image layout
+	// target (nil if outputting to local directory)
+	ociRef        *oci.Reference
+	plainHTTP     bool
+	insecureTLS   bool
+	imageRefsPath string // Path to write published image references (like ko --image-refs)
+
+	// bundleChartName overrides the chart name written by the argocd-helm
+	// deployer. Derived from ociRef.ChartName() when --output is OCI; the
+	// deployer's "aicr-bundle" default is used when this is empty. See #1019.
+	bundleChartName string
+
+	// bundleChartVersion is the strict semantic Helm Chart.yaml version.
+	// The corresponding OCI reference retains its raw Distribution tag.
+	bundleChartVersion string
+
+	// ociParentNamespace is the OCI registry + repository path with the
+	// chart segment stripped; used as the default repoURL baked into the
+	// argocd-helm bundle's values.yaml. Derived from ociRef when --output
+	// is an OCI reference; empty for local-directory output. See #1342.
+	ociParentNamespace string
+
+	// appName overrides the parent Argo Application's metadata.name. Empty
+	// means each deployer applies its own default ("aicr-stack" for
+	// argocd-helm, "nvidia-stack" for argocd). See #1011.
+	appName string
+
+	// argoCD is the --argocd-* flags layered over
+	// spec.bundle.deployment.argocd. See #3264.
+	argoCD config.ArgoCDSettings
+
+	// verifiedBundleSource is the private immutable snapshot captured before
+	// the generated bundle is published into the caller-visible output path.
+	// It is runtime state, not a parsed command option, and remains owned by
+	// runBundleCmdWithDependencies until OCI publication finishes.
+	verifiedBundleSource *verifiedBundleSource
+
+	// publishedLayout is the OCI layout directory that publication wrote. It
+	// is runtime state: runBundleCmdWithDependencies removes it when the
+	// command fails afterward.
+	publishedLayout *publishedOCILayout
+}
+
+// publishedOCILayout is a layout directory publication wrote, with the
+// identity it had then so cleanup removes only that directory.
+type publishedOCILayout struct {
+	path string
+	info os.FileInfo
+}
+
+type verifiedBundleSource struct {
+	path      string
+	inventory *checksum.Inventory
+}
+
+// parseBundleCmdOptions parses and validates command options. spec.bundle is
+// derived up-front through the facade — cfg.BundleOptions for the settings
+// the bundler itself reads, cfg.BundleInputOptions for the settings the CLI
+// (not the bundler) consumes — so this function only layers CLI flag
+// overrides onto already-typed values. All string→typed conversion of
+// config-supplied fields happens at that derivation boundary; errors from it
+// carry "spec.bundle.<path>" attribution.
+//
+//nolint:gocyclo,funlen // option resolution is inherently long but linear
+func parseBundleCmdOptions(cmd *cli.Command, cfg *aicr.Config) (*bundleCmdOptions, error) {
+	bundleOpts, err := cfg.BundleOptions()
+	if err != nil {
+		return nil, err
+	}
+	bundleInput, err := cfg.BundleInputOptions()
+	if err != nil {
+		return nil, err
+	}
+
+	opts := &bundleCmdOptions{
+		recipeFilePath:            stringFlagOrConfig(cmd, "recipe", bundleInput.RecipePath),
+		kubeconfig:                cmd.String("kubeconfig"),
+		repoURL:                   stringFlagOrConfig(cmd, "repo", bundleOpts.Repo),
+		attest:                    boolFlagOrConfig(cmd, "attest", bundleOpts.Attest),
+		vendorCharts:              boolFlagOrConfig(cmd, "vendor-charts", bundleOpts.VendorCharts),
+		readinessHooks:            cmd.Bool("readiness-hooks"),
+		serial:                    cmd.Bool("serial"),
+		split:                     cmd.Bool("split"),
+		terraformClusterRollover:  cmd.Bool("terraform-cluster-rollover"),
+		terraformChildModule:      cmd.Bool("terraform-child-module"),
+		certificateIdentityRegexp: stringFlagOrConfig(cmd, "certificate-identity-regexp", bundleOpts.CertIDRegexp),
+		identityToken:             cmd.String(flagIdentityToken),
+		signingKey:                stringFlagOrConfig(cmd, flagSigningKey, bundleOpts.OIDCResolve.SigningKey),
+		// tlogUpload reads the flag directly (not via boolFlagOrConfig): a config
+		// default of false would silently disable the transparency log for every
+		// bundle, the exact fail-open this flag exists to prevent. Keep it flag-only.
+		tlogUpload:        cmd.Bool(flagTLogUpload),
+		oidcDeviceFlow:    boolFlagOrConfig(cmd, flagOIDCDeviceFlow, bundleOpts.OIDCResolve.DeviceFlow),
+		assumeYes:         cmd.Bool(flagAssumeYes),
+		fulcioURL:         stringFlagOrConfig(cmd, flagFulcioURL, bundleOpts.OIDCResolve.FulcioURL),
+		rekorURL:          stringFlagOrConfig(cmd, flagRekorURL, bundleOpts.OIDCResolve.RekorURL),
+		signingConfigPath: cmd.String(flagSigningConfig),
+		insecureTLS:       boolFlagOrConfig(cmd, flagInsecureTLS, bundleInput.InsecureTLS),
+		plainHTTP:         boolFlagOrConfig(cmd, flagPlainHTTP, bundleInput.PlainHTTP),
+		imageRefsPath:     stringFlagOrConfig(cmd, flagImageRefs, bundleInput.ImageRefsPath),
+	}
+
+	// Rekor v2 is the default for both keyless and KMS --attest signing: the
+	// TUF-distributed v2 signing config is used unless the caller opts out to a
+	// Rekor v1 URL or supplies a custom signing config file. Shared with
+	// recipe sign-catalog so the derivation and the exclusivity rule stay in sync.
+	opts.useTUFSigningConfig, err = signingTargetFromFlags(opts.rekorURL, opts.signingConfigPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if opts.recipeFilePath == "" {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			"--recipe is required (or set spec.bundle.input.recipe in --config)")
+	}
+
+	// Resolve recipe path to absolute and validate it exists early.
+	// This prevents confusing "file not found" errors when the working
+	// directory context differs from where the recipe was created.
+	if opts.recipeFilePath != "" &&
+		!strings.HasPrefix(opts.recipeFilePath, "http://") &&
+		!strings.HasPrefix(opts.recipeFilePath, "https://") &&
+		!strings.HasPrefix(opts.recipeFilePath, serializer.ConfigMapURIScheme) {
+
+		absPath, absErr := filepath.Abs(opts.recipeFilePath)
+		if absErr != nil {
+			return nil, errors.Wrap(errors.ErrCodeInternal, "failed to resolve recipe path", absErr)
+		}
+		if _, statErr := os.Stat(absPath); statErr != nil {
+			if os.IsNotExist(statErr) {
+				return nil, errors.New(errors.ErrCodeNotFound, "recipe file not found: "+absPath)
+			}
+			return nil, errors.Wrap(errors.ErrCodeInternal, "cannot access recipe file: "+absPath, statErr)
+		}
+		opts.recipeFilePath = absPath
+	}
+
+	if opts.deployer, err = resolveDeployer(cmd, bundleOpts.Deployer); err != nil {
+		return nil, err
+	}
+
+	ref, err := resolveOutputTarget(cmd, bundleInput)
+	if err != nil {
+		return nil, err
+	}
+
+	if ref.IsOCI || ref.IsLayout {
+		// Use CLI version as default tag when not specified in URI
+		if ref.Tag == "" {
+			opts.ociRef = ref.WithTag(version)
+		} else {
+			opts.ociRef = ref
+		}
+		if ref.IsLayout {
+			if err = oci.CheckLayoutTarget(opts.ociRef); err != nil {
+				return nil, err
+			}
+		}
+		// For OCI output, retain one absolute planned path from preflight
+		// through generation and publication.
+		opts.outputDir, err = ociBundleStagingPath()
+		if err != nil {
+			return nil, err
+		}
+		// Derive the Helm chart name from the OCI artifact path so the
+		// argocd-helm bundle's Chart.yaml and parent Application
+		// `source.chart` match what `helm push` actually publishes. Without
+		// this the parent App's `repoURL/chart:targetRevision` triple
+		// resolves against an artifact that doesn't exist in the registry
+		// when the user picks a non-default name. See #1019.
+		opts.bundleChartName = opts.ociRef.ChartName()
+		if opts.deployer == config.DeployerArgoCDHelm {
+			opts.bundleChartVersion, err = oci.HelmChartVersionFromTag(opts.ociRef.Tag)
+			if err != nil {
+				return nil, errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest,
+					"invalid Helm OCI tag")
+			}
+		}
+		// Derive the parent namespace (strip chart segment) so the argocd-helm
+		// deployer can bake it into values.yaml as the default repoURL. See #1342.
+		opts.ociParentNamespace = opts.ociRef.ParentNamespace()
+	} else {
+		if opts.imageRefsPath != "" {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"--image-refs is only valid with OCI output")
+		}
+		// Resolve local output path to absolute to ensure consistent behavior
+		// regardless of how the binary is invoked.
+		absOut, absErr := filepath.Abs(ref.LocalPath)
+		if absErr != nil {
+			return nil, errors.Wrap(errors.ErrCodeInternal, "failed to resolve output path: "+ref.LocalPath, absErr)
+		}
+		opts.outputDir = absOut
+	}
+
+	// When using --deployer argocd with OCI output and no explicit --repo,
+	// auto-populate repoURL from the OCI reference. The oci:// scheme is
+	// required so Argo CD routes to its native OCI artifact source instead
+	// of treating the value as a Git remote.
+	//
+	// argocd-helm is intentionally excluded: that bundle is URL-portable
+	// by design — the publish location is supplied at `helm install`
+	// time via `--set repoURL=...`, and the bundler's --repo flag is a
+	// no-op for it (the helper logs `--repo is ignored with --deployer
+	// argocd-helm`). Auto-filling repoURL here would surface that
+	// "ignored" warning even when the user never passed --repo, which
+	// blurs the URL-portable contract of the deployer.
+	// An OCI layout has no registry location to derive it from, so --repo
+	// must name the oci:// repository the layout will be published to.
+	if opts.deployer == config.DeployerArgoCD && opts.ociRef != nil && opts.ociRef.IsLayout {
+		if opts.repoURL, err = argoCDLayoutRepoURL(opts.repoURL); err != nil {
+			return nil, err
+		}
+	}
+	if opts.deployer == config.DeployerArgoCD && opts.ociRef != nil && opts.repoURL == "" {
+		opts.repoURL = oci.EnsureScheme(opts.ociRef.Registry + "/" + opts.ociRef.Repository)
+	}
+
+	if err = resolveArgoCDHelmLayoutOptions(cmd, opts); err != nil {
+		return nil, err
+	}
+	if err = checkLayoutTargetConflicts(opts); err != nil {
+		return nil, err
+	}
+
+	// When using --deployer flux with OCI output, set the OCIRepository
+	// source name so local-chart components emit ArtifactGenerator +
+	// ExternalArtifact pairs instead of placeholder GitRepository references.
+	if opts.deployer == config.DeployerFlux && opts.ociRef != nil {
+		opts.ociSourceName = cmd.String("flux-oci-source-name")
+	}
+
+	// A split set is a directory tree published create-only; OCI output is
+	// outside the ADR-018 v1 support matrix.
+	if opts.split && !cmd.IsSet("output") && bundleInput.OutputTarget == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			"--split requires an explicit --output path for the bundle set, one that does not exist yet")
+	}
+	if opts.split && opts.ociRef != nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			"--split does not support OCI output in this release; use a local --output directory that does not exist yet")
+	}
+
+	// Flux namespace applies to all Flux deployer output (Git and OCI).
+	if opts.deployer == config.DeployerFlux {
+		opts.fluxNamespace = cmd.String("flux-namespace")
+	}
+
+	if opts.deployer == config.DeployerFleet {
+		// Fleet consumes a Git repository (GitRepo mode) or a HelmOp file
+		// applied directly (HelmOp mode); neither reads an OCI bundle.
+		if opts.ociRef != nil {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"--deployer fleet does not support OCI output: push the bundle to a Git repository "+
+					"(--fleet-mode gitrepo) or apply helmops.yaml directly (--fleet-mode helmop)")
+		}
+		opts.fleetNamespace = cmd.String("fleet-namespace")
+		if nsErr := config.ValidateFleetName("--fleet-namespace", opts.fleetNamespace); nsErr != nil {
+			return nil, nsErr
+		}
+		mode, modeErr := config.ParseFleetMode(cmd.String("fleet-mode"))
+		if modeErr != nil {
+			return nil, modeErr
+		}
+		opts.fleetMode = mode
+		// A HelmOp references charts, not a Git repository, so --repo has no
+		// effect there. Warn as --deployer argocd-helm does.
+		if mode == config.FleetModeHelmOp && opts.repoURL != "" {
+			slog.Warn("--repo is ignored with --fleet-mode helmop; HelmOps reference charts, not a Git repository",
+				"repo", opts.repoURL)
+		}
+	} else {
+		for _, name := range []string{"fleet-namespace", "fleet-mode"} {
+			if cmd.IsSet(name) {
+				return nil, errors.New(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("--%s is only valid with --deployer fleet", name))
+			}
+		}
+	}
+
+	// Reject Flux-specific flags when deployer is not flux — a user who
+	// sets them on --deployer helm/argocd would otherwise not realize
+	// their config was silently ignored.
+	if opts.deployer != config.DeployerFlux {
+		if cmd.IsSet("flux-oci-source-name") {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"--flux-oci-source-name is only valid with --deployer flux")
+		}
+		if cmd.IsSet("flux-namespace") {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"--flux-namespace is only valid with --deployer flux")
+		}
+	}
+
+	// Reject the terraform-specific flag on other deployers, for the same
+	// reason as the flux flags above: silent acceptance with no effect.
+	if opts.deployer != config.DeployerTerraform {
+		if cmd.IsSet("terraform-cluster-rollover") {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"--terraform-cluster-rollover is only valid with --deployer terraform")
+		}
+		if cmd.IsSet("terraform-child-module") {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"--terraform-child-module is only valid with --deployer terraform")
+		}
+	}
+
+	// Reject the --argocd-* flags on other deployers, for the same reason as
+	// the flux and terraform flags above.
+	if opts.deployer != config.DeployerArgoCD && opts.deployer != config.DeployerArgoCDHelm {
+		for _, name := range argoCDFlags {
+			if cmd.IsSet(name) {
+				return nil, errors.New(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("--%s is only valid with --deployer argocd or --deployer argocd-helm", name))
+			}
+		}
+	}
+
+	// --app-name applies to argocd-helm, argocd, and fleet only. Reject on
+	// other deployers so a user passing it on --deployer helm/flux gets a
+	// clear error instead of silent acceptance with no effect.
+	opts.appName = stringFlagOrConfig(cmd, "app-name", bundleOpts.AppName)
+	if opts.appName != "" {
+		if opts.deployer != config.DeployerArgoCD && opts.deployer != config.DeployerArgoCDHelm &&
+			opts.deployer != config.DeployerFleet {
+
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"--app-name is only valid with --deployer argocd, --deployer argocd-helm, or --deployer fleet")
+		}
+		if validateErr := config.ValidateAppName(opts.appName); validateErr != nil {
+			return nil, validateErr
+		}
+		// Fleet uses the app name as the GitRepo name and as a bundle-name
+		// prefix, both of which must be DNS-1123 labels.
+		if opts.deployer == config.DeployerFleet {
+			if validateErr := config.ValidateFleetName("--app-name", opts.appName); validateErr != nil {
+				return nil, validateErr
+			}
+		}
+	}
+
+	// Derive target revision: use OCI tag when available
+	if opts.ociRef != nil && opts.ociRef.Tag != "" {
+		opts.targetRevision = opts.ociRef.Tag
+		if opts.deployer == config.DeployerArgoCDHelm {
+			opts.targetRevision = opts.bundleChartVersion
+		}
+	}
+
+	if opts.valueOverrides, err = resolveComponentPaths(cmd, "set", bundleOpts.ValueOverrides, config.ParseValueOverrides); err != nil {
+		return nil, err
+	}
+	opts.valueOverrides, opts.argoCD = resolveArgoCDSettings(cmd, opts.valueOverrides, bundleOpts.ArgoCD)
+	if opts.valueOverridesTyped, err = resolveTypedOverrides(cmd); err != nil {
+		return nil, err
+	}
+	if opts.dynamicValues, err = resolveComponentPaths(cmd, "dynamic", bundleOpts.DynamicValues, config.ParseDynamicValues); err != nil {
+		return nil, err
+	}
+
+	if opts.systemNodeSelector, err = resolveNodeSelector(cmd, "system-node-selector", bundleOpts.SystemNodeSelector); err != nil {
+		return nil, err
+	}
+	if opts.acceleratedNodeSelector, err = resolveNodeSelector(cmd, "accelerated-node-selector", bundleOpts.AcceleratedNodeSelector); err != nil {
+		return nil, err
+	}
+
+	if opts.systemNodeTolerations, err = resolveTolerations(cmd, "system-node-toleration", bundleOpts.SystemNodeTolerations); err != nil {
+		return nil, err
+	}
+	if opts.acceleratedNodeTolerations, err = resolveTolerations(cmd, "accelerated-node-toleration", bundleOpts.AcceleratedNodeTolerations); err != nil {
+		return nil, err
+	}
+	if opts.draEvictionNodeLabel, err = resolveDRAEvictionNodeLabel(cmd, bundleOpts.DRAEvictionNodeLabel); err != nil {
+		return nil, err
+	}
+
+	if opts.workloadGateTaint, err = resolveTaint(cmd, "workload-gate", bundleOpts.WorkloadGate); err != nil {
+		return nil, err
+	}
+
+	if opts.workloadSelector, err = resolveNodeSelector(cmd, "workload-selector", bundleOpts.WorkloadSelector); err != nil {
+		return nil, err
+	}
+
+	// Estimated node count for bundle; 0 = unset.
+	n := intFlagOrConfig(cmd, "nodes", bundleOpts.Nodes)
+	if n < 0 {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "--nodes must be >= 0")
+	}
+	opts.estimatedNodeCount = n
+
+	if cmd.IsSet("storage-class") {
+		sc := strings.TrimSpace(cmd.String("storage-class"))
+		if sc == "" {
+			return nil, errors.New(errors.ErrCodeInvalidRequest, "--storage-class cannot be blank when specified")
+		}
+		opts.storageClass = sc
+	} else if bundleOpts.StorageClass != "" {
+		sc := strings.TrimSpace(bundleOpts.StorageClass)
+		if sc == "" {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"spec.bundle.scheduling.storageClass cannot be blank")
+		}
+		opts.storageClass = sc
+	}
+
+	if cmd.IsSet("shared-storage-class") {
+		sc := strings.TrimSpace(cmd.String("shared-storage-class"))
+		if sc == "" {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"--shared-storage-class cannot be blank when specified")
+		}
+		opts.sharedStorageClass = sc
+	} else if bundleOpts.SharedStorageClass != "" {
+		sc := strings.TrimSpace(bundleOpts.SharedStorageClass)
+		if sc == "" {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"spec.bundle.scheduling.sharedStorageClass cannot be blank")
+		}
+		opts.sharedStorageClass = sc
+	}
+
+	// Validate any private Sigstore endpoints up front so a malformed
+	// --fulcio-url / --rekor-url fails before bundling instead of at sign
+	// time. Both must be HTTPS (#408): keyless signing exchanges OIDC
+	// credentials with these endpoints, so plaintext transport is rejected.
+	if err := validateSigstoreEndpoints(opts); err != nil {
+		return nil, err
+	}
+
+	// Reject --signing-key combined with keyless-only options. Checked against
+	// the resolved opts (not just cmd.IsSet) so config-sourced keyless values
+	// are caught too.
+	if err := validateSigningKeyExclusivity(cmd, opts); err != nil {
+		return nil, err
+	}
+
+	// Reject --tlog-upload=false without --signing-key (air-gapped signing is a
+	// KMS-only capability) or combined with a Rekor/signing-config target.
+	if err := validateTLogUpload(opts); err != nil {
+		return nil, err
+	}
+
+	return opts, nil
+}
+
+// validateTLogUpload rejects --tlog-upload=false unless --signing-key (KMS) is
+// set, and rejects it when combined with a transparency-log target flag.
+//
+// Skipping the Rekor transparency-log upload is only meaningful for KMS-backed
+// signing; keyless OIDC signing requires Fulcio + Rekor network access to mint a
+// verifiable certificate, so an air-gapped keyless signature is not achievable
+// and the request is rejected rather than silently ignored.
+//
+// --tlog-upload=false is also mutually exclusive with --rekor-url and
+// --signing-config: those select WHERE the transparency-log entry goes, which
+// directly contradicts "do not write one". WithoutTransparencyLog overrides the
+// target policy that --rekor-url / --signing-config would otherwise build (see
+// KMSAttester.Attest), so accepting both would silently discard the operator's
+// chosen endpoint. Fail closed instead.
+func validateTLogUpload(opts *bundleCmdOptions) error {
+	if opts.tlogUpload {
+		return nil
+	}
+	if opts.signingKey == "" {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"--"+flagTLogUpload+"=false (air-gapped signing) applies only to KMS attestation and "+
+				"requires --attest with --"+flagSigningKey+"; keyless OIDC signing needs "+
+				"Fulcio/Rekor network access")
+	}
+	return validateTLogOptOutTarget(opts.rekorURL, opts.signingConfigPath)
+}
+
+// validateTLogOptOutTarget rejects a transparency-log target alongside
+// --tlog-upload=false; see validateTLogUpload. Shared with evidence signing.
+func validateTLogOptOutTarget(rekorURL, signingConfigPath string) error {
+	if rekorURL != "" {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"--"+flagTLogUpload+"=false is mutually exclusive with --"+flagRekorURL+
+				": one skips the transparency log, the other selects a Rekor endpoint")
+	}
+	if signingConfigPath != "" {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"--"+flagTLogUpload+"=false is mutually exclusive with --"+flagSigningConfig+
+				": one skips the transparency log, the other selects a signing config")
+	}
+	return nil
+}
+
+// validateSigningKeyExclusivity rejects --signing-key combined with any
+// keyless-only flag. KMS (key-based) and keyless OIDC signing are distinct
+// paths; mixing them is a request error, not a silently-ignored flag.
+//
+// Only the flags that are meaningless under KMS signing conflict:
+// --identity-token / --oidc-device-flow (OIDC token sources) and --fulcio-url
+// (the certificate authority — KMS signing issues no Fulcio certificate).
+// --rekor-url is deliberately NOT in this set: the transparency log is
+// orthogonal to how the artifact is signed, and KMS signing uploads to Rekor
+// by default, so a private --rekor-url is valid alongside --signing-key (the
+// enterprise / air-gapped "KMS key + private Rekor" case).
+//
+// Conflicts are evaluated against the resolved opts (which merge flags, env,
+// and config) rather than cmd.IsSet alone, so a config-sourced keyless option
+// cannot bypass the check and then be silently ignored by the KMS path.
+//
+// config.resolveSigningKey enforces the same exclusivity for every caller of
+// Resolve; this one is not redundant with it. It runs on merged values, the only
+// layer that sees a flag-introduced conflict against a clean config,
+// --identity-token, an explicitly blank --signing-key (via cmd.IsSet), and the
+// --oidc-device-flow correction that rule deliberately leaves to it.
+func validateSigningKeyExclusivity(cmd *cli.Command, opts *bundleCmdOptions) error {
+	// A signing key that is present but blank must not reach the KMS resolver:
+	// it selects the KMS path (non-empty opts.signingKey) yet fails late at
+	// sign time with an opaque key-URI error. Reject it up front, naming the
+	// source the caller actually used. An explicit blank --signing-key flag is
+	// caught via cmd.IsSet; a whitespace-only config value (cmd.IsSet is false)
+	// is caught by the non-empty-but-blank check.
+	trimmed := strings.TrimSpace(opts.signingKey)
+	if trimmed == "" {
+		if cmd.IsSet(flagSigningKey) {
+			return errors.New(errors.ErrCodeInvalidRequest, "--"+flagSigningKey+" must not be empty")
+		}
+		if opts.signingKey != "" {
+			return errors.New(errors.ErrCodeInvalidRequest,
+				"spec.bundle.attestation.signingKey must not be blank")
+		}
+		return nil // keyless mode; no exclusivity to enforce
+	}
+	// Normalize the confirmed-non-blank key so surrounding whitespace (e.g. from
+	// a YAML block-scalar config value) does not reach the KMS URI parser and
+	// fail late at sign time.
+	opts.signingKey = trimmed
+	return validateKeylessOnlyUnset(opts.identityToken, opts.oidcDeviceFlow, opts.fulcioURL)
+}
+
+// validateKeylessOnlyUnset rejects the keyless-only options that are
+// meaningless under KMS signing; see validateSigningKeyExclusivity. Shared with
+// evidence signing.
+func validateKeylessOnlyUnset(identityToken string, deviceFlow bool, fulcioURL string) error {
+	conflicts := []struct {
+		name   string
+		active bool
+	}{
+		{flagIdentityToken, identityToken != ""},
+		{flagOIDCDeviceFlow, deviceFlow},
+		{flagFulcioURL, fulcioURL != ""},
+	}
+	for _, c := range conflicts {
+		if c.active {
+			return errors.New(errors.ErrCodeInvalidRequest,
+				"--"+flagSigningKey+" is mutually exclusive with --"+c.name)
+		}
+	}
+	return nil
+}
+
+// validateSigstoreEndpoints rejects malformed --fulcio-url / --rekor-url
+// values (non-empty endpoints that are not absolute https:// URLs). The
+// HTTPS check is shared with the config layer via config.ValidateHTTPSURL.
+func validateSigstoreEndpoints(opts *bundleCmdOptions) error {
+	// The --rekor-url / --signing-config exclusivity is enforced up-front by
+	// signingTargetFromFlags (in parseBundleCmdOptions), so only URL shape is
+	// checked here.
+	if err := config.ValidateHTTPSURL("fulcio URL", opts.fulcioURL); err != nil {
+		return err
+	}
+	return config.ValidateHTTPSURL("rekor URL", opts.rekorURL)
+}
+
+// signingTargetFromFlags derives the transparency-signing target shared by the
+// signing commands (bundle --attest, recipe sign-catalog): with neither opt-out
+// set, signing uses the TUF-distributed Rekor v2 default (useTUF == true);
+// --rekor-url selects a Rekor v1 URL and --signing-config a custom config file,
+// and the two are mutually exclusive. Either value can also arrive from a
+// non-flag source (AICR_REKOR_URL / AICR_SIGNING_CONFIG env, or
+// spec.bundle.rekorURL in --config), so the message names those sources rather
+// than citing a flag the caller may never have typed. Centralized so a future
+// policy change lands in one place instead of drifting across per-command copies.
+func signingTargetFromFlags(rekorURL, signingConfigPath string) (useTUF bool, err error) {
+	if rekorURL != "" && signingConfigPath != "" {
+		return false, errors.New(errors.ErrCodeInvalidRequest,
+			"--"+flagRekorURL+" and --"+flagSigningConfig+
+				" (or their env vars AICR_REKOR_URL / AICR_SIGNING_CONFIG, or spec.bundle.rekorURL in --config) are mutually exclusive")
+	}
+	return rekorURL == "" && signingConfigPath == "", nil
+}
+
+// argoCDLayoutRepoURL returns repo, which must be the oci://<registry>/<repository>
+// an argocd OCI layout will be published to, in the form oci:// output derives.
+// Without the oci:// scheme the bundler renders Git-sourced Applications.
+func argoCDLayoutRepoURL(repo string) (string, error) {
+	const want = "--deployer argocd with --output " + oci.LayoutScheme +
+		" requires --repo oci://<registry>/<repository> with no tag or digest, the repository the layout will be published to"
+	// A digest would parse but be dropped from the derived repoURL.
+	if !strings.HasPrefix(repo, oci.URIScheme) || strings.Contains(repo, "@") {
+		return "", errors.New(errors.ErrCodeInvalidRequest, want)
+	}
+	ref, err := oci.ParseOutputTarget(repo)
+	if err != nil || ref.Tag != "" {
+		return "", errors.Wrap(errors.ErrCodeInvalidRequest, want, err)
+	}
+	return oci.EnsureScheme(ref.Registry + "/" + ref.Repository), nil
+}
+
+// checkLayoutTargetConflicts rejects an OCI layout path that this command
+// also writes, which would otherwise fail only after generation: the bundle
+// staging directory or a path below it, and the --image-refs file.
+func checkLayoutTargetConflicts(opts *bundleCmdOptions) error {
+	if opts.ociRef == nil || !opts.ociRef.IsLayout {
+		return nil
+	}
+	layout := resolvedTargetPath(opts.ociRef.LocalPath)
+	if pathsConflict(layout, opts.outputDir) {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"--output "+oci.LayoutScheme+" path must be outside the bundle staging directory "+opts.outputDir)
+	}
+	if opts.imageRefsPath != "" && pathsConflict(resolvedTargetPath(opts.imageRefsPath), layout) {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"--"+flagImageRefs+" must not be the --output "+oci.LayoutScheme+" directory")
+	}
+	return nil
+}
+
+// resolvedTargetPath returns path made absolute with its parent's symlinks
+// resolved, for comparing targets that may not exist yet. It falls back to
+// the absolute path when the parent cannot be resolved; later checks report that.
+func resolvedTargetPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return abs
+	}
+	return filepath.Join(parent, filepath.Base(abs))
+}
+
+// resolveArgoCDHelmLayoutOptions applies --chart-name and --repo to an
+// argocd-helm bundle written as an OCI layout. With oci:// output both come
+// from the registry reference; a layout has none, so --chart-name names the
+// chart (default aicr-bundle) and --repo, the registry namespace the layout
+// will be published under, becomes the default repoURL in values.yaml.
+func resolveArgoCDHelmLayoutOptions(cmd *cli.Command, opts *bundleCmdOptions) error {
+	layoutArgoCDHelm := opts.deployer == config.DeployerArgoCDHelm && opts.ociRef != nil && opts.ociRef.IsLayout
+	if !layoutArgoCDHelm {
+		if cmd.IsSet(flagChartName) {
+			return errors.New(errors.ErrCodeInvalidRequest,
+				"--"+flagChartName+" is only valid with --deployer argocd-helm and --output "+oci.LayoutScheme)
+		}
+		return nil
+	}
+	if cmd.IsSet(flagChartName) {
+		opts.bundleChartName = cmd.String(flagChartName)
+		if err := oci.ValidateChartName(opts.bundleChartName); err != nil {
+			return errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest, "invalid --"+flagChartName)
+		}
+	}
+	if opts.repoURL == "" {
+		return nil
+	}
+	if !strings.HasPrefix(opts.repoURL, oci.URIScheme) {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"--repo with --deployer argocd-helm and --output "+oci.LayoutScheme+
+				" must be the oci://<registry>/<namespace> the chart will be published under")
+	}
+	// Derive it as oci:// output does, from a chart reference under the
+	// namespace; ParentNamespace strips the placeholder chart segment again.
+	chartRef, err := oci.ParseOutputTarget(opts.repoURL + "/chart")
+	if err != nil || chartRef.Tag != "" {
+		return errors.Wrap(errors.ErrCodeInvalidRequest,
+			"invalid --repo: want oci://<registry>/<namespace> with no tag", err)
+	}
+	opts.ociParentNamespace = chartRef.ParentNamespace()
+	// The bundler warns that --repo is ignored for argocd-helm; here it is not.
+	opts.repoURL = ""
+	return nil
+}
+
+// resolveOutputTarget returns the parsed *oci.Reference for --output,
+// preferring CLI input over the typed fallback in input. When the
+// CLI flag is set to an empty string OR neither source supplies a
+// value, defaults to the current directory ("."). The empty-CLI case
+// matches pre-refactor behavior where stringFlagOrConfig surfaced ""
+// and the caller substituted "." before parsing.
+func resolveOutputTarget(cmd *cli.Command, input aicr.BundleInputOptions) (*oci.Reference, error) {
+	const flagName = "output"
+	if cmd.IsSet(flagName) {
+		target := cmd.String(flagName)
+		if target == "" {
+			target = "."
+		}
+		if input.OutputTargetRaw != "" && input.OutputTargetRaw != target {
+			slog.Info("CLI flag overriding config value", "flag", flagName,
+				"config", input.OutputTargetRaw, "override", target)
+		}
+		ref, err := oci.ParseOutputTarget(target)
+		if err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInvalidRequest, "invalid --"+flagName+" value", err)
+		}
+		return ref, nil
+	}
+	if input.OutputTarget != nil {
+		return input.OutputTarget, nil
+	}
+	ref, err := oci.ParseOutputTarget(".")
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to resolve default output target", err)
+	}
+	return ref, nil
+}
+
+// ociBundleStagingPath returns the bundle directory under the working
+// directory, with symlinks in the working directory path resolved.
+func ociBundleStagingPath() (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", errors.Wrap(errors.ErrCodeInternal,
+			"failed to resolve working directory for OCI bundle staging", err)
+	}
+	// Preflight rejects symlinked ancestors, and macOS /tmp and $TMPDIR are symlinks.
+	resolved, err := filepath.EvalSymlinks(wd)
+	if err != nil {
+		return "", errors.Wrap(errors.ErrCodeInternal,
+			"failed to resolve working directory symlinks for OCI bundle staging", err)
+	}
+	return filepath.Join(resolved, "bundle"), nil
+}
+
+// ociBundleStagingError wraps err with stagingDir, keeping err's error code,
+// or ErrCodeInternal if err has none.
+func ociBundleStagingError(stagingDir string, err error) error {
+	code := errors.ErrCodeInternal
+	if structured, ok := stderrors.AsType[*errors.StructuredError](err); ok {
+		code = structured.Code
+	}
+	return errors.Wrap(code, "cannot stage OCI bundle in "+stagingDir, err)
+}
+
+//nolint:funlen // bundle command is inherently large (flags + description + action)
+func bundleCmd() *cli.Command {
+	return &cli.Command{
+		Name: "bundle",
+		// Treat commas literally in repeatable slice flags rather than as
+		// value separators. Required so --set-json / --set-file can carry
+		// JSON lists/objects (which are comma-heavy) in a single flag, and it
+		// removes a latent footgun where a --set string value containing a
+		// comma would be silently split. urfave/cli splits slice-flag values
+		// on commas by default, and this disables that for EVERY slice flag on
+		// the command (--set, --dynamic, --*-node-selector/-toleration,
+		// --workload-selector) — not just the typed ones. Repeat-to-add is the
+		// only documented form in AICR; comma-packing multiple values into one
+		// flag was never part of AICR's documented contract, so the only
+		// affected usage is a CI script that relied on the framework default.
+		DisableSliceFlagSeparator: true,
+		Category:                  functionalCategoryName,
+		Usage:                     "Generate deployment bundle from a given recipe.",
+		Description: `Generates a deployment bundle from a given recipe.
+Use --deployer argocd to generate Argo CD Applications.
+Use --deployer argocd-helm to generate a Helm chart that renders the Argo CD Applications, with values overridable at install time.
+Use --deployer flux to generate Flux HelmRelease and Kustomization manifests.
+Use --deployer helmfile to generate a helmfile.yaml release graph (apply/diff/destroy with the upstream helmfile CLI).
+Use --deployer fleet to generate a Rancher Fleet GitRepo bundle (one fleet.yaml per component, chained with dependsOn).
+Use --deployer terraform to generate a Terraform root module (plan/apply with terraform), or a child module with --terraform-child-module.
+
+Helm:
+  - README.md: Root deployment guide with ordered steps
+  - deploy.sh: Automation script
+  - recipe.yaml: Copy of the input recipe for reference
+  - NNN-<component>/values.yaml: Helm values per component
+  - NNN-<component>/install.sh: Component install/upgrade script
+  - checksums.txt: SHA256 checksums of generated files
+
+Argo CD:
+  - app-of-apps.yaml: Parent Argo CD Application
+  - NNN-<component>/application.yaml: Argo CD Application per component
+  - NNN-<component>/values.yaml: Values for each component
+  - README.md: Deployment instructions
+  - checksums.txt: SHA256 checksums of generated files
+
+Argo CD Helm chart (argocd-helm):
+  - Chart.yaml, values.yaml: Bundle packaged as a Helm chart; values.yaml holds install-time inputs
+  - templates/aicr-stack.yaml: Parent Argo CD Application
+  - templates/<component>.yaml: Argo CD Application template per component
+  - static/<component>.yaml: Static values per component
+  - NNN-<component>/: Per-component values and local chart content for path-based Applications
+  - README.md: Deployment instructions
+  - checksums.txt: SHA256 checksums of generated files
+
+Flux:
+  - kustomization.yaml: Root Kustomize orchestration
+  - sources/: HelmRepository and GitRepository source CRs (omitted when no
+    component contributes a source, as with --vendor-charts and an OCI output)
+  - <component>/helmrelease.yaml: Flux HelmRelease with inline values
+  - README.md: Deployment instructions
+  - checksums.txt: SHA256 checksums of generated files
+
+Flux with OCI output (--output oci://... or oci-layout:...):
+  When --output targets an OCI registry or layout, local-chart components emit
+  ArtifactGenerator + ExternalArtifact CRs instead of GitRepository sources.
+  This requires Flux v2.7+ with:
+    - source-watcher controller deployed (source.extensions.fluxcd.io)
+    - ExternalArtifact=true feature gate enabled on helm-controller
+  Without both, bundles generate successfully but HelmReleases will not
+  reconcile. Use --flux-oci-source-name to match your OCIRepository CR name
+  (default: aicr-bundle). Use --flux-namespace to target a non-default Flux
+  installation namespace (default: flux-system).
+
+Flux network-operator migration (git and OCI output):
+  The one-time network-operator migration in the component catalog's upgrade
+  notes needs Flux v2.8+ (helm-controller v1.5.0+) because it sets
+  spec.upgrade.serverSideApply. That is separate from the OCI prerequisites
+  above, and AICR does not emit the field.
+
+Helmfile:
+  - helmfile.yaml: Declarative release graph (repositories + releases + needs)
+  - NNN-<component>/: Per-component chart dirs (Chart.yaml, values.yaml)
+  - README.md: helmfile apply/diff/destroy walkthrough
+  - checksums.txt: SHA256 checksums of generated files
+
+Fleet:
+  - gitrepo.yaml: Fleet GitRepo listing every component folder
+  - NNN-<component>/fleet.yaml: Fleet bundle per component (dependsOn chains
+    them in install order)
+  - NNN-<component>/: values.yaml, cluster-values.yaml, or a local chart
+  - README.md: Push, apply, and cluster opt-in walkthrough
+  - checksums.txt: SHA256 checksums of generated files
+  Use --fleet-namespace to pick the Fleet workspace (default: fleet-default;
+  fleet-local targets the Rancher local cluster). --app-name names the GitRepo
+  and prefixes bundle names (default: aicr). --fleet-mode helmop writes
+  helmops.yaml (one HelmOp per component) instead of fleet.yaml + GitRepo.
+
+Terraform:
+  - main.tf: One module call per component; depends_on carries the recipe's
+    dependency graph exactly, so independent components apply concurrently
+  - versions.tf / variables.tf / outputs.tf: Provider config and the cluster
+    connection surface (root form; a child module uses the caller's provider).
+    The bundle does not create a cluster
+  - modules/component/: The shared module every call resolves to, holding the
+    component's pre / chart / post / readiness releases chained in order
+  - NNN-<component>/: Per-component values.yaml and cluster-values.yaml, plus
+    Chart.yaml + templates/ for a bundled chart (no install.sh: Terraform is
+    the only installer)
+  - README.md: terraform init/plan/apply walkthrough
+  - checksums.txt: SHA256 checksums of generated files
+
+Examples:
+
+Generate Helm per-component bundle (default):
+  aicr bundle --recipe recipe.yaml --output ./my-bundle
+
+Generate Argo CD App of Apps:
+  aicr bundle --recipe recipe.yaml --output ./my-bundle --deployer argocd
+
+Generate Argo CD Helm chart:
+  aicr bundle --recipe recipe.yaml --output ./my-bundle --deployer argocd-helm
+
+Generate Flux manifests:
+  aicr bundle --recipe recipe.yaml --output ./my-bundle --deployer flux
+
+Generate Helmfile release graph:
+  aicr bundle --recipe recipe.yaml --output ./my-bundle --deployer helmfile
+
+Generate Rancher Fleet GitRepo bundle:
+  aicr bundle --recipe recipe.yaml --output ./my-bundle --deployer fleet --repo https://github.com/my-org/fleet.git
+
+Generate a Terraform root module (add --terraform-child-module for a child module):
+  aicr bundle --recipe recipe.yaml --output ./my-bundle --deployer terraform
+
+Override values in generated bundle:
+  aicr bundle --recipe recipe.yaml --set gpuoperator:driver.version=570.133.20
+
+Override a list/object value (--set cannot express these):
+  aicr bundle --recipe recipe.yaml \
+    --set-json agentgateway:allowedSourceRanges='["216.228.127.128/30"]'
+
+Set node selectors for GPU workloads:
+  aicr bundle --recipe recipe.yaml \
+    --accelerated-node-selector nodeGroup=gpu-nodes \
+    --accelerated-node-toleration nvidia.com/gpu=present:NoSchedule
+
+Package and push bundle to OCI registry (uses CLI version as tag):
+  aicr bundle --recipe recipe.yaml --output oci://ghcr.io/nvidia/aicr-bundle
+
+Package with explicit tag (overrides CLI version):
+  aicr bundle --recipe recipe.yaml --output oci://ghcr.io/nvidia/aicr-bundle:v1.0.0
+
+Write the same artifact as an OCI image layout without pushing, then publish it:
+  aicr bundle --recipe recipe.yaml --output oci-layout:./aicr-bundle:v1.0.0
+  oras cp --from-oci-layout ./aicr-bundle:v1.0.0 ghcr.io/nvidia/aicr-bundle:v1.0.0
+`,
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    cmdNameRecipe,
+				Aliases: []string{"r"},
+				Usage: `Path/URI to previously generated recipe from which to build the bundle.
+	Supports: file paths, HTTP/HTTPS URLs, or ConfigMap URIs (cm://namespace/name).
+	May also be supplied via spec.bundle.input.recipe in --config.`,
+				Category: catInput,
+			},
+			configFlag(),
+			&cli.StringFlag{
+				Name:    flagOutput,
+				Aliases: []string{"o"},
+				Usage: `Output target: local directory path, OCI registry URI, or OCI image layout (default: current dir).
+	For local output: ./my-bundle or /tmp/bundle
+	For OCI registry: oci://ghcr.io/nvidia/bundle:v1.0.0
+	For OCI image layout: oci-layout:./bundle-layout:v1.0.0 (the directory must not exist;
+	same artifact as oci://, written locally instead of pushed)
+	If no tag specified, CLI version is used (e.g., oci://ghcr.io/nvidia/bundle)
+	May also be supplied via spec.bundle.output.target in --config.`,
+				Category: catOutput,
+			},
+			&cli.StringSliceFlag{
+				Name: "set",
+				Usage: `Override values in generated bundle files
+	(format: component:path.to.field=value, e.g., --set gpuoperator:gds.enabled=true).
+	Use the special 'enabled' key to include/exclude components at bundle time
+	(e.g., --set awsebscsidriver:enabled=false to skip aws-ebs-csi-driver).
+	The reserved 'deployer' prefix (e.g., --set deployer:namePrefix=tenant-a-)
+	is deprecated; use the --argocd-* flags instead.
+	--set is scalar-only; use --set-json / --set-file for list or object values.`,
+				Category: catDeployment,
+			},
+			&cli.StringSliceFlag{
+				Name: "set-json",
+				Usage: `Override values with a JSON-encoded scalar, list, or object
+	(format: component:path.to.field=<json>, can be repeated). Use this for
+	typed fields that --set cannot express, e.g.
+	--set-json agentgateway:allowedSourceRanges='["216.228.127.128/30"]'.
+	Object values deep-merge into existing maps; lists and scalars replace.
+	Takes precedence over --set on the same path.`,
+				Category: catDeployment,
+			},
+			&cli.StringSliceFlag{
+				Name: "set-file",
+				Usage: `Override values by reading a JSON/YAML value from a file
+	(format: component:path.to.field=<filepath>, can be repeated). The file
+	holds a single value (list, object, or scalar) for larger structures than
+	--set-json. Merge semantics match --set-json.`,
+				Category: catDeployment,
+			},
+			&cli.StringSliceFlag{
+				Name: "dynamic",
+				Usage: `Declare value paths as install-time parameters
+	(format: component:path.to.field, e.g.,
+	--dynamic kubeprometheusstack:prometheus.prometheusSpec.externalLabels.cluster).
+	Dynamic paths are removed from values.yaml and placed in cluster-values.yaml
+	for the user to fill in at install time.`,
+				Category: catDeployment,
+			},
+			&cli.StringSliceFlag{
+				Name:     "system-node-selector",
+				Usage:    "Node selector for system components (format: key=value, can be repeated)",
+				Category: catScheduling,
+			},
+			&cli.StringSliceFlag{
+				Name:     "system-node-toleration",
+				Usage:    "Toleration for system components (format: key=value:effect, can be repeated)",
+				Category: catScheduling,
+			},
+			&cli.StringSliceFlag{
+				Name:     "accelerated-node-selector",
+				Usage:    "Node selector for accelerated/GPU nodes (format: key=value, can be repeated)",
+				Category: catScheduling,
+			},
+			&cli.StringSliceFlag{
+				Name:     "accelerated-node-toleration",
+				Usage:    "Toleration for accelerated/GPU nodes (format: key=value:effect, can be repeated)",
+				Category: catScheduling,
+			},
+			&cli.StringFlag{
+				Name:     "dra-eviction-node-label",
+				Usage:    "Opt in to DRA kubelet-plugin eviction coordination with GPU Operator driver upgrades (format: key=value; applied only when both components are enabled). Unset means AICR injects nothing and the plugin needs no extra node label; when set, every GPU node must carry it",
+				Category: catScheduling,
+			},
+			&cli.StringFlag{
+				Name:     "workload-gate",
+				Usage:    "Taint for nodewright-operator runtime required (format: key=value:effect or key:effect; the key must have no DNS prefix and be at most 53 characters). This is a day 2 option for cluster scaling operations.",
+				Category: catScheduling,
+			},
+			&cli.StringSliceFlag{
+				Name:     "workload-selector",
+				Usage:    "Label selector for nodewright-customizations to prevent eviction of running training jobs (format: key=value, can be repeated). Required when nodewright-customizations is enabled with training intent.",
+				Category: catScheduling,
+			},
+			&cli.IntFlag{
+				Name:     "nodes",
+				Value:    0,
+				Usage:    "Estimated number of GPU nodes (written to nodeScheduling.nodeCountPaths in registry). 0 = unset.",
+				Category: catScheduling,
+			},
+			&cli.StringFlag{
+				Name:     "storage-class",
+				Usage:    "Kubernetes StorageClass name to inject into components at bundle time (written to registry-declared storageClassPaths). Overrides any storageClassName set in recipe overlays.",
+				Category: catScheduling,
+			},
+			&cli.StringFlag{
+				Name:     "shared-storage-class",
+				Usage:    "RWX-capable Kubernetes StorageClass name for opt-in shared filesystem PVCs (written to registry-declared sharedStorageClassPaths).",
+				Category: catScheduling,
+			},
+			withCompletions(&cli.StringFlag{
+				Name:     "deployer",
+				Aliases:  []string{"d"},
+				Usage:    fmt.Sprintf("Deployment method (default: helm; e.g. %s)", strings.Join(config.GetDeployerTypes(), ", ")),
+				Category: catDeployment,
+			}, config.GetDeployerTypes),
+			&cli.StringFlag{
+				Name:  "repo",
+				Value: "",
+				Usage: "Git repository URL for GitOps deployers (used with --deployer argocd, flux, and fleet). " +
+					"Ignored by --deployer argocd-helm: that bundle is URL-portable and the publish " +
+					"location is supplied at install time via `helm install --set repoURL=...`. " +
+					"With --deployer argocd-helm and --output oci-layout:, an oci://<registry>/<namespace> " +
+					"value becomes the default repoURL, as oci:// output sets it.",
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name: flagChartName,
+				Usage: "Helm chart name for --deployer argocd-helm with --output oci-layout: (default: aicr-bundle). " +
+					"With oci:// output the name is the repository's last path segment.",
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name: "app-name",
+				Usage: "Parent Argo Application name (used by --deployer argocd and --deployer argocd-helm), " +
+					"or the Fleet GitRepo name and bundle-name prefix (--deployer fleet). " +
+					"Defaults: \"aicr-stack\" for argocd-helm, \"nvidia-stack\" for argocd, \"aicr\" for fleet. " +
+					"Override when deploying multiple non-overlapping AICR bundles to the same " +
+					"Argo CD namespace so the parent Applications do not collide. " +
+					"For --deployer argocd-helm, the value is the chart default and can be " +
+					"overridden at install time via `helm install --set appName=...`. " +
+					"Must be a DNS-1123 subdomain; with --deployer fleet, a DNS-1123 label whose " +
+					"<app-name>-<release> bundle names stay within 63 characters.",
+				Category: catDeployment,
+			},
+			&cli.BoolFlag{
+				Name: "vendor-charts",
+				Usage: `Pull upstream Helm chart bytes into the bundle at bundle time so the
+	resulting artifact eliminates Helm chart registry egress at deploy time.
+	Container-image pulls and other non-chart resources may still require
+	network access. Each vendored chart is recorded in provenance.yaml with
+	name, version, source URL, and SHA256. Trades the upstream CVE-yank
+	fail-loud signal for offline deployability — vendored bundles silently
+	install a frozen chart version even after upstream yank. A chart that keeps
+	its registry pin must match the registry's helm.defaultDigest when one is
+	set, or the bundle fails. Requires the 'helm' binary on PATH at bundle time.`,
+				Category: "Deployment",
+			},
+			&cli.BoolFlag{
+				Name: "readiness-hooks",
+				Usage: `Emit a standalone readiness gate chart (NNN-<name>-readiness/) for each
+	component that ships a recipes/components/<name>/readiness.yaml chainsaw
+	Test. The chart runs the gate CLI as a post-component Job so deployers
+	block on component-specific readiness signals (e.g. ClusterPolicy state)
+	that Helm/Argo CD cannot assess natively: under helm and terraform the
+	gate Job is a post-install/post-upgrade hook the release blocks on, under
+	Argo CD it is held by the gate's sync-wave and built-in Job health.
+	Supported with --deployer helm, argocd, argocd-helm, and terraform; off
+	by default. See #904.`,
+				Category: catDeployment,
+			},
+			&cli.BoolFlag{
+				Name: "serial",
+				Usage: `Sequence components strictly one at a time in deployment order,
+	disabling the parallel rollout of independent components. Affects the
+	argocd, argocd-helm, flux, helmfile, and terraform deployers (helm is
+	already serial): argocd falls back to a linear sync-wave per folder, flux
+	chains each HelmRelease dependsOn to the previous component, helmfile
+	chains every release via needs:, and terraform chains every module call
+	via depends_on, into one linear apply order. An escape hatch for
+	reproducing the pre-parallelism ordering or bisecting a misbehaving
+	rollout; off by default.`,
+				Category: catDeployment,
+			},
+			&cli.BoolFlag{
+				Name: "split",
+				Usage: `Generate a bundle set partitioned by registry class (ADR-018) instead
+	of one bundle: one directory per class with enabled components (core,
+	then ops), under a set root holding the full recipe.yaml, split.yaml,
+	bundle-info.yaml, checksums.txt and, with --attest, the attestation.
+	Install the classes in order and tear
+	them down in reverse. The complete recipe is validated once before the
+	partition is rendered, and the set is published with one atomic move to
+	--output, which must not exist yet. Supported only with --deployer helm
+	and a local output directory; off by default.`,
+				Category: catDeployment,
+			},
+			&cli.BoolFlag{
+				Name: "terraform-cluster-rollover",
+				Usage: `Emit a containment shim in each component module so replacing the
+	cluster replaces every release, instead of leaving state that describes
+	objects in a cluster that no longer exists (--deployer terraform only).
+	The shim keys on var.cluster_keepers: attributes of the cluster that change
+	when it is rebuilt (its CA certificate, a provider id, an endpoint minted
+	per cluster), which the caller sets; the variable is required in both
+	forms. Off by default.`,
+				Category: catDeployment,
+			},
+			&cli.BoolFlag{
+				Name: "terraform-child-module",
+				Usage: `Emit the bundle as a child module rather than a standalone root
+	module: no provider configuration and no cluster-connection variables, so
+	the calling configuration owns the provider and the module calls inherit
+	it (--deployer terraform only). Use this when the cluster is declared in
+	the same configuration as the bundle — a module carrying its own provider
+	block cannot take depends_on, count or for_each, which is exactly what a
+	caller needs to sequence the bundle behind the cluster that hosts it.`,
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name: "flux-oci-source-name",
+				Usage: "Name of the OCIRepository CR that Flux uses to pull the bundle " +
+					"(--deployer flux only, OCI output). Must match the " +
+					"OCIRepository deployed in the target cluster.",
+				Value:    "aicr-bundle",
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name: "flux-namespace",
+				Usage: "Kubernetes namespace where Flux CRs (HelmRelease, sources, " +
+					"ArtifactGenerator) are deployed (--deployer flux only). Must " +
+					"match the namespace of the Flux installation in the target cluster.",
+				Value:    config.DefaultFluxNamespace,
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name: "fleet-namespace",
+				Usage: "Fleet workspace (namespace) the generated GitRepo or HelmOps are applied to " +
+					"(--deployer fleet only). fleet-default targets downstream clusters " +
+					"registered with Rancher; fleet-local targets the Rancher local cluster.",
+				Value:    config.DefaultFleetNamespace,
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name: "fleet-mode",
+				Usage: "Fleet output shape (--deployer fleet only): gitrepo writes a fleet.yaml per " +
+					"component and a GitRepo; helmop writes one HelmOp per component in helmops.yaml, " +
+					"which references charts instead of embedding them (no ~1MiB Bundle limit) but " +
+					"cannot deploy local charts (raw manifests).",
+				Value:    config.FleetModeGitRepo,
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name: flagArgoCDNamePrefix,
+				Usage: "Prefix prepended to every child Application name, for multi-tenant installs " +
+					"sharing an Argo CD namespace (--deployer argocd or argocd-helm only; the parent " +
+					"is named by --app-name). May also be supplied via spec.bundle.deployment.argocd.namePrefix in --config.",
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name: flagArgoCDDestinationServer,
+				Usage: "Cluster API URL child Applications deploy to (default https://kubernetes.default.svc; " +
+					"--deployer argocd or argocd-helm only). The parent stays on the Argo CD cluster. " +
+					"May also be supplied via spec.bundle.deployment.argocd.destinationServer in --config.",
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name: flagArgoCDProject,
+				Usage: "Argo CD project for child Applications (default \"default\"; --deployer argocd or " +
+					"argocd-helm only). The parent stays in \"default\". " +
+					"May also be supplied via spec.bundle.deployment.argocd.project in --config.",
+				Category: catDeployment,
+			},
+			&cli.BoolFlag{
+				Name: flagArgoCDCascadeDelete,
+				Usage: "Add Argo CD's resources finalizer to the parent and every child Application, so " +
+					"deleting the parent removes the managed resources (--deployer argocd or argocd-helm only). " +
+					"May also be supplied via spec.bundle.deployment.argocd.cascadeDelete in --config.",
+				Category: catDeployment,
+			},
+			&cli.IntFlag{
+				Name: flagArgoCDSyncRetryLimit,
+				Usage: "Set spec.syncPolicy.retry.limit on every child Application: how many times Argo CD " +
+					"retries a failed sync (--deployer argocd or argocd-helm only). Unset leaves retry to " +
+					"Argo CD's auto-sync default; 0 disables retries. " +
+					"May also be supplied via spec.bundle.deployment.argocd.syncRetry.limit in --config.",
+				// Unset and 0 differ (see Usage), so the rendered "(default: 0)" misleads.
+				HideDefault: true,
+				Category:    catDeployment,
+			},
+			&cli.StringFlag{
+				Name: flagArgoCDSyncRetryBackoffDuration,
+				Usage: "Delay before the first sync retry, as a duration (e.g. 30s). " +
+					"Requires a sync retry limit, from --" + flagArgoCDSyncRetryLimit + " or --config.",
+				Category: catDeployment,
+			},
+			&cli.IntFlag{
+				Name: flagArgoCDSyncRetryBackoffFactor,
+				Usage: "Multiplier applied to the retry delay after each failed sync (>= 1). " +
+					"Requires a sync retry limit, from --" + flagArgoCDSyncRetryLimit + " or --config.",
+				// Unset leaves Argo CD's factor, and 0 is rejected.
+				HideDefault: true,
+				Category:    catDeployment,
+			},
+			&cli.StringFlag{
+				Name: flagArgoCDSyncRetryBackoffMaxDuration,
+				Usage: "Upper bound on the delay between sync retries, as a duration (e.g. 5m); " +
+					"must not be less than --" + flagArgoCDSyncRetryBackoffDuration + ". " +
+					"Requires a sync retry limit, from --" + flagArgoCDSyncRetryLimit + " or --config.",
+				Category: catDeployment,
+			},
+			&cli.BoolFlag{
+				Name:     "attest",
+				Usage:    "Enable bundle attestation and binary provenance verification (requires binary installed via install script; uses OIDC authentication)",
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name: "certificate-identity-regexp",
+				Usage: `Override the certificate identity pattern for binary attestation verification.
+	Must begin with "https://github.com/NVIDIA/aicr/" (a leading "^" is allowed) and
+	must not use top-level alternation. Use for testing with binaries attested by non-release
+	workflows (e.g., build-attested.yaml). Not intended for production use.`,
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name:     flagIdentityToken,
+				Usage:    "Pre-fetched OIDC identity token for --attest keyless signing. Skips ambient/browser/device-code flows. Prefer COSIGN_IDENTITY_TOKEN on shared hosts; flag values are visible in process listings (ps, /proc/<pid>/cmdline).",
+				Sources:  cli.EnvVars("COSIGN_IDENTITY_TOKEN"),
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name:     flagSigningKey,
+				Usage:    "Sign --attest bundles with a KMS-backed key (awskms:// | gcpkms:// | azurekms:// | hashivault://) instead of keyless OIDC, for CI/CD without OIDC. Mutually exclusive with --identity-token, --oidc-device-flow, --fulcio-url. Like keyless, KMS signs to Rekor v2 by default; opt out with --rekor-url (v1) or --signing-config (custom). Verify the resulting bundle with `aicr verify --key <uri>`.",
+				Category: catDeployment,
+			},
+			&cli.BoolFlag{
+				Name:  flagTLogUpload,
+				Value: true,
+				Usage: "Upload the KMS signature to the Rekor transparency log (default: true). " +
+					"Set --tlog-upload=false to skip the Rekor upload for fully offline / air-gapped " +
+					"signing; this requires --signing-key (KMS) because keyless OIDC signing needs " +
+					"Fulcio + Rekor network access. Verify the resulting bundle offline with " +
+					"`aicr verify --key <public-key.pem> --insecure-ignore-tlog`; use a local PEM " +
+					"public key for a fully offline verify, since a KMS --key URI still makes a live " +
+					"GetPublicKey call to resolve the key.",
+				Category: catDeployment,
+			},
+			&cli.BoolFlag{
+				Name:     flagOIDCDeviceFlow,
+				Usage:    "Use the OAuth 2.0 device authorization grant for --attest OIDC instead of opening a browser callback. Useful on headless hosts (bastions, remote build boxes) when --identity-token / COSIGN_IDENTITY_TOKEN and ambient GitHub Actions OIDC are both unavailable.",
+				Sources:  cli.EnvVars("AICR_OIDC_DEVICE_FLOW"),
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name:     flagFulcioURL,
+				Usage:    "Override the Fulcio CA URL for --attest keyless signing (e.g. a private Sigstore instance). Must be an absolute https:// URL with no embedded credentials. Defaults to the public-good Fulcio. Also reads AICR_FULCIO_URL.",
+				Sources:  cli.EnvVars("AICR_FULCIO_URL"),
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name:     flagRekorURL,
+				Usage:    "Sign --attest bundles to Rekor v1 at this URL instead of the Rekor v2 default (e.g. a private Sigstore instance, or the public-good v1 URL). Must be an absolute https:// URL with no embedded credentials. Also reads AICR_REKOR_URL.",
+				Sources:  cli.EnvVars("AICR_REKOR_URL"),
+				Category: catDeployment,
+			},
+			&cli.StringFlag{
+				Name:     flagSigningConfig,
+				Usage:    "Sign --attest bundles with a custom Sigstore signing config JSON instead of the default Rekor v2 config (advanced). Also reads AICR_SIGNING_CONFIG.",
+				Sources:  cli.EnvVars("AICR_SIGNING_CONFIG"),
+				Category: catDeployment,
+			},
+			assumeYesFlag(catDeployment),
+			kubeconfigFlag(),
+			dataFlag(),
+			// OCI registry connection flags (used when --output is oci://...)
+			&cli.BoolFlag{
+				Name:     flagInsecureTLS,
+				Usage:    "Skip TLS certificate verification for OCI registry",
+				Category: catOCIRegistry,
+			},
+			&cli.BoolFlag{
+				Name:     flagPlainHTTP,
+				Usage:    "Use HTTP instead of HTTPS for OCI registry (for local development)",
+				Category: catOCIRegistry,
+			},
+			&cli.StringFlag{
+				Name:     flagImageRefs,
+				Usage:    "File to receive the published bundle digest (sha256:...); valid only with OCI output. A target on a different device from its directory, such as a Kubernetes termination-message file, is written in place. The target is checked, including that it can be written, before the bundle is generated.",
+				Category: catOCIRegistry,
+			},
+		},
+		Action: runBundleCmd,
+	}
+}
+
+type bundleCommandDependencies struct {
+	makeBundle func(
+		context.Context,
+		*aicr.Client,
+		*aicr.RecipeResult,
+		aicr.BundleOptions,
+	) (aicr.BundleArtifact, error)
+	prepareBundleOutput    func(context.Context, string) (*bundleOutputTarget, error)
+	prepareImageRefsTarget func(
+		context.Context,
+		*bundleOutputTarget,
+		string,
+	) (*imageRefsTarget, error)
+	newGenerationWorkspace func(context.Context, string, ...string) (*oci.Workspace, error)
+	pushOCIBundle          func(
+		context.Context,
+		*bundleCmdOptions,
+		*result.Output,
+		*bundleOutputTarget,
+		*imageRefsTarget,
+	) error
+	removeLayout func(*publishedOCILayout) error
+}
+
+func defaultBundleCommandDependencies() bundleCommandDependencies {
+	return bundleCommandDependencies{
+		makeBundle: func(
+			ctx context.Context,
+			client *aicr.Client,
+			recipe *aicr.RecipeResult,
+			opts aicr.BundleOptions,
+		) (aicr.BundleArtifact, error) {
+
+			return client.MakeBundle(ctx, recipe, opts)
+		},
+		prepareBundleOutput:    prepareBundleOutputTarget,
+		prepareImageRefsTarget: prepareImageRefsTarget,
+		newGenerationWorkspace: oci.NewPrivateWorkspace,
+		pushOCIBundle:          pushOCIBundle,
+		removeLayout:           removePublishedLayout,
+	}
+}
+
+func normalizeBundleCommandDependencies(deps bundleCommandDependencies) bundleCommandDependencies {
+	defaults := defaultBundleCommandDependencies()
+	if deps.makeBundle == nil {
+		deps.makeBundle = defaults.makeBundle
+	}
+	if deps.prepareBundleOutput == nil {
+		deps.prepareBundleOutput = defaults.prepareBundleOutput
+	}
+	if deps.prepareImageRefsTarget == nil {
+		deps.prepareImageRefsTarget = defaults.prepareImageRefsTarget
+	}
+	if deps.newGenerationWorkspace == nil {
+		deps.newGenerationWorkspace = defaults.newGenerationWorkspace
+	}
+	if deps.pushOCIBundle == nil {
+		deps.pushOCIBundle = defaults.pushOCIBundle
+	}
+	if deps.removeLayout == nil {
+		deps.removeLayout = defaults.removeLayout
+	}
+	return deps
+}
+
+// runBundleCmd is the Action handler for the bundle command.
+func runBundleCmd(ctx context.Context, cmd *cli.Command) error {
+	return runBundleCmdWithDependencies(ctx, cmd, defaultBundleCommandDependencies())
+}
+
+func prepareBundlePublicationTargets(
+	ctx context.Context,
+	opts *bundleCmdOptions,
+	deps bundleCommandDependencies,
+) (*bundleOutputTarget, *imageRefsTarget, error) {
+
+	if opts.ociRef == nil {
+		return nil, nil, nil
+	}
+	preflightCtx, preflightCancel := context.WithTimeout(ctx, defaults.FileReadTimeout)
+	bundleTarget, err := deps.prepareBundleOutput(preflightCtx, opts.outputDir)
+	if err != nil {
+		// --output is a registry reference, so name the local path that failed.
+		err = ociBundleStagingError(opts.outputDir, err)
+	}
+	err = authoritativeFilesystemContextError(preflightCtx, "bundle output preflight canceled", err)
+	var imageRefs *imageRefsTarget
+	if err == nil && opts.imageRefsPath != "" {
+		imageRefs, err = deps.prepareImageRefsTarget(preflightCtx, bundleTarget, opts.imageRefsPath)
+		if err == nil {
+			err = imageRefs.preflightWrite(preflightCtx)
+		}
+		err = authoritativeFilesystemContextError(preflightCtx,
+			"image-reference target preflight canceled", err)
+	}
+	preflightCancel()
+	if err == nil {
+		return bundleTarget, imageRefs, nil
+	}
+	if closeErr := imageRefs.close(); closeErr != nil {
+		slog.Warn("failed to close image-reference target after preflight failure", "error", closeErr)
+	}
+	if closeErr := bundleTarget.close(); closeErr != nil {
+		slog.Warn("failed to close bundle output target after preflight failure", "error", closeErr)
+	}
+	return nil, nil, err
+}
+
+//nolint:funlen // command orchestration keeps ownership and cleanup order explicit
+func runBundleCmdWithDependencies(
+	ctx context.Context,
+	cmd *cli.Command,
+	deps bundleCommandDependencies,
+) (retErr error) {
+
+	deps = normalizeBundleCommandDependencies(deps)
+
+	// Validate single-value flags are not duplicated
+	if err := validateSingleValueFlags(cmd, "recipe", "config", "output", "deployer", "repo", "storage-class", "shared-storage-class", "dra-eviction-node-label", "app-name", flagChartName, flagFulcioURL, flagRekorURL, flagSigningKey); err != nil {
+		return err
+	}
+	if err := validateSingleValueFlags(cmd, argoCDFlags...); err != nil {
+		return err
+	}
+
+	cfg, err := loadFacadeConfig(ctx, cmd)
+	if err != nil {
+		return err
+	}
+
+	// Build the Client from the resolved data source (--data flag, else
+	// spec.recipe.data). The shared helper layers a filesystem source over
+	// the embedded data when --data resolves, and uses embedded data alone
+	// otherwise. The Client owns its DataProvider — LoadRecipe and
+	// MakeBundle thread it through, replacing the old process-global
+	// data provider.
+	client, err := recipeClientFromCmd(ctx, cmd, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	opts, err := parseBundleCmdOptions(cmd, cfg)
+	if err != nil {
+		return errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest, "invalid bundle command options")
+	}
+	// Registered before every later cleanup so it runs after them and sees
+	// their errors too: a failed run must not leave a layout that makes a
+	// rerun to the same path conflict.
+	defer func() {
+		if retErr == nil || opts.publishedLayout == nil {
+			return
+		}
+		if removeErr := deps.removeLayout(opts.publishedLayout); removeErr != nil {
+			retErr = stderrors.Join(retErr, errors.PropagateOrWrap(removeErr, errors.ErrCodeInternal,
+				"failed to remove OCI layout "+opts.publishedLayout.path+" after a failed run"))
+		}
+	}()
+
+	bundleTarget, imageRefs, err := prepareBundlePublicationTargets(ctx, opts, deps)
+	if err != nil {
+		return err
+	}
+	if bundleTarget != nil {
+		defer func() {
+			retErr = preservePrimaryCloseError(retErr, imageRefs.close(), "image-reference target")
+			retErr = preservePrimaryCloseError(retErr, bundleTarget.close(), "bundle output target")
+		}()
+	}
+
+	outputType := "Helm per-component bundle"
+	switch opts.deployer {
+	case config.DeployerHelm:
+		// default
+	case config.DeployerArgoCD:
+		outputType = "Argo CD applications"
+	case config.DeployerArgoCDHelm:
+		outputType = "Argo CD Helm chart app-of-apps"
+	case config.DeployerFlux:
+		outputType = "Flux manifests"
+	case config.DeployerHelmfile:
+		outputType = "Helmfile release graph"
+	case config.DeployerFleet:
+		outputType = "Rancher Fleet bundle"
+	case config.DeployerTerraform:
+		outputType = "Terraform root module"
+		if opts.terraformChildModule {
+			outputType = "Terraform child module"
+		}
+	}
+	slog.Info("generating bundle",
+		slog.String("deployer", opts.deployer.String()),
+		slog.String("type", outputType),
+		slog.String("recipe", opts.recipeFilePath),
+		slog.String("output", opts.outputDir),
+		slog.Bool("oci", opts.ociRef != nil),
+	)
+
+	// Load recipe from file/URL/ConfigMap through the Client's own data
+	// provider; auto-hydrates RecipeMetadata overlays against that provider.
+	rec, err := client.LoadRecipe(ctx, opts.recipeFilePath, opts.kubeconfig)
+	if err != nil {
+		return err
+	}
+
+	// Validate custom identity pattern if provided
+	if opts.certificateIdentityRegexp != "" {
+		if validErr := aicr.ValidateIdentityPattern(opts.certificateIdentityRegexp); validErr != nil {
+			return validErr
+		}
+	}
+
+	// Create bundler with config
+	bcfg := config.NewConfig(
+		config.WithVersion(version),
+		config.WithDeployer(opts.deployer),
+		config.WithRepoURL(opts.repoURL),
+		config.WithTargetRevision(opts.targetRevision),
+		config.WithAttest(opts.attest),
+		config.WithCertificateIdentityRegexp(opts.certificateIdentityRegexp),
+		config.WithValueOverridePaths(opts.valueOverrides),
+		config.WithValueOverridesTypedPaths(opts.valueOverridesTyped),
+		config.WithDynamicValuePaths(opts.dynamicValues),
+		config.WithSystemNodeSelector(opts.systemNodeSelector),
+		config.WithSystemNodeTolerations(opts.systemNodeTolerations),
+		config.WithAcceleratedNodeSelector(opts.acceleratedNodeSelector),
+		config.WithAcceleratedNodeTolerations(opts.acceleratedNodeTolerations),
+		config.WithDRAEvictionNodeLabel(opts.draEvictionNodeLabel),
+		config.WithWorkloadGateTaint(opts.workloadGateTaint),
+		config.WithWorkloadSelector(opts.workloadSelector),
+		config.WithEstimatedNodeCount(opts.estimatedNodeCount),
+		config.WithStorageClass(opts.storageClass),
+		config.WithSharedStorageClass(opts.sharedStorageClass),
+		config.WithVendorCharts(opts.vendorCharts),
+		config.WithReadinessHooks(opts.readinessHooks),
+		config.WithSerial(opts.serial),
+		config.WithSplit(opts.split),
+		config.WithTerraformClusterRollover(opts.terraformClusterRollover),
+		config.WithTerraformChildModule(opts.terraformChildModule),
+		config.WithOCISourceName(opts.ociSourceName),
+		config.WithFluxNamespace(opts.fluxNamespace),
+		config.WithFleetNamespace(opts.fleetNamespace),
+		config.WithFleetMode(opts.fleetMode),
+		config.WithBundleChartName(opts.bundleChartName),
+		config.WithBundleChartVersion(opts.bundleChartVersion),
+		config.WithOCIParentNamespace(opts.ociParentNamespace),
+		config.WithAppName(opts.appName),
+		config.WithArgoCDSettings(opts.argoCD),
+	)
+
+	// Gate the interactive keyless-signing login behind an identity-disclosure
+	// prompt before any browser/device-code flow opens. Only fires when
+	// --attest is set and the resolved OIDC path is interactive; pre-fetched
+	// token / ambient / KMS-key paths and non-TTY runs pass through.
+	if opts.attest {
+		if discErr := confirmKeylessSigningDisclosure(bundleOIDCResolveOptions(opts), opts.assumeYes, os.Stdin, os.Stderr); discErr != nil {
+			return discErr
+		}
+	}
+
+	// Note: binary attestation pre-flight check is handled inside
+	// MakeBundle via bundler.New().
+	attester, err := selectAttester(ctx, opts)
+	if err != nil {
+		return err
+	}
+
+	// OCI generation runs in a private workspace outside the caller-controlled
+	// output path. The verified tree is copied through the retained output Root
+	// and published into the caller-visible path only after generation succeeds.
+	generationDir := opts.outputDir
+	var generationWorkspace *oci.Workspace
+	if bundleTarget != nil {
+		stageCtx, stageCancel := context.WithTimeout(ctx, defaults.FileReadTimeout)
+		var excludedRoots []string
+		if bundleTarget.generated != nil {
+			excludedRoots = append(excludedRoots, bundleTarget.path)
+		}
+		generationWorkspace, err = deps.newGenerationWorkspace(
+			stageCtx, "aicr-bundle-generation-", excludedRoots...)
+		err = authoritativeFilesystemContextError(
+			stageCtx, "bundle generation workspace allocation canceled", err)
+		stageCancel()
+		if err != nil {
+			return err
+		}
+		defer func() {
+			retErr = joinInternalCleanup(
+				retErr, generationWorkspace.Close(), "bundle generation workspace")
+		}()
+		generationDir = generationWorkspace.Path()
+	}
+
+	// Generate bundle through the Client facade. MakeBundle constructs the
+	// bundler (with config + attester), bundles from the Client-owned
+	// recipe, and writes the same artifact bundler.Make produced directly.
+	out, err := deps.makeBundle(ctx, client, rec, aicr.BundleOptions{
+		Config:    bcfg,
+		Attester:  attester,
+		OutputDir: generationDir,
+	})
+	if err != nil {
+		return err
+	}
+	if out == nil {
+		return errors.New(errors.ErrCodeInternal, "bundle generation returned no output")
+	}
+	if generationWorkspace != nil {
+		captureCtx, captureCancel := context.WithTimeout(ctx, defaults.OCISourceStageTimeout)
+		captureErr := validateGeneratedStageOutput(generationDir, out.OutputDir)
+		if captureErr == nil {
+			captureErr = bundleTarget.deps.beforeGeneratedOpen(bundleTarget)
+		}
+		captureErr = authoritativeFilesystemContextError(
+			captureCtx, "generated bundle output capture canceled", captureErr)
+		inventoryOpts := checksum.InventoryOptions{
+			AllowedMetadataPaths: attestation.BundleMetadataPaths(),
+		}
+		var verifiedDir string
+		var verifiedCleanup func() error
+		var inventory *checksum.Inventory
+		if captureErr == nil {
+			verifiedDir, inventory, verifiedCleanup, captureErr = checksum.StageVerifiedBundle(
+				captureCtx, generationDir, inventoryOpts)
+		}
+		if verifiedCleanup != nil {
+			defer func() {
+				retErr = joinInternalCleanup(
+					retErr, verifiedCleanup(), "verified generated bundle")
+			}()
+		}
+		var generationStage *bundleGenerationStage
+		if captureErr == nil {
+			generationStage, captureErr = bundleTarget.newGenerationStage(captureCtx)
+		}
+		if generationStage != nil {
+			defer func() {
+				retErr = joinInternalCleanup(
+					retErr, generationStage.close(), "bundle generation stage")
+			}()
+		}
+		if captureErr == nil {
+			captureErr = generationStage.copyInventory(captureCtx, inventory)
+		}
+		if captureErr == nil {
+			_, _, _, captureErr = checksum.ReadAndVerifyBundle(
+				captureCtx, generationStage.path, inventoryOpts)
+		}
+		captureErr = authoritativeFilesystemContextError(captureCtx,
+			"generated bundle output capture canceled", captureErr)
+		if captureErr == nil {
+			captureErr = generationStage.publish(captureCtx)
+		}
+		captureCancel()
+		if captureErr != nil {
+			return captureErr
+		}
+		opts.verifiedBundleSource = &verifiedBundleSource{
+			path:      verifiedDir,
+			inventory: inventory,
+		}
+		relocateGeneratedBundleOutput(out, generationDir, bundleTarget.path)
+	}
+
+	slog.Info("bundle generated",
+		"type", outputType,
+		"files", out.TotalFiles,
+		"size_bytes", out.TotalSize,
+		"duration_sec", out.TotalDuration.Seconds(),
+		"output_dir", out.OutputDir,
+	)
+
+	// Print deployment instructions (only for dir output)
+	if opts.ociRef == nil && out.Deployment != nil {
+		printDeploymentInstructions(cmd.Root().Writer, out)
+	}
+
+	// Package and push as OCI artifact when output is oci://
+	if opts.ociRef != nil {
+		if err := deps.pushOCIBundle(ctx, opts, out, bundleTarget, imageRefs); err != nil {
+			return err
+		}
+		// argocd-helm is the only deployer that publishes a Helm chart
+		// artifact consumers run `helm install` against; for everyone
+		// else the OCI artifact is a generic AICR bundle with its own
+		// distribution path. Surface the canonical install line so
+		// users don't have to derive it from the registry URL + the
+		// chart's {{ required }} error. See issue #1020.
+		if opts.deployer == config.DeployerArgoCDHelm {
+			printArgoCDHelmOCIInstructions(cmd.Root().Writer, opts.ociRef)
+		}
+	}
+
+	return nil
+}
+
+func validateGeneratedStageOutput(stagePath, outputPath string) error {
+	stageAbs, stageErr := filepath.Abs(stagePath)
+	outputAbs, outputErr := filepath.Abs(outputPath)
+	if stageErr != nil || outputErr != nil {
+		return errors.Wrap(errors.ErrCodeInternal,
+			"generated bundle output differs from private stage",
+			stderrors.Join(stageErr, outputErr))
+	}
+	if filepath.Clean(stageAbs) != filepath.Clean(outputAbs) {
+		return errors.New(errors.ErrCodeInternal,
+			"generated bundle output differs from private stage")
+	}
+	return nil
+}
+
+func relocateGeneratedBundleOutput(out *result.Output, fromDir, toDir string) {
+	out.OutputDir = toDir
+	for _, bundleResult := range out.Results {
+		if bundleResult == nil {
+			continue
+		}
+		for index, file := range bundleResult.Files {
+			rel, err := filepath.Rel(fromDir, file)
+			if err == nil && filepath.IsLocal(rel) {
+				bundleResult.Files[index] = filepath.Join(toDir, rel)
+			}
+		}
+	}
+	if out.Deployment == nil {
+		return
+	}
+	for index, step := range out.Deployment.Steps {
+		out.Deployment.Steps[index] = strings.ReplaceAll(step, fromDir, toDir)
+	}
+}
+
+// selectAttester wires CLI flags and runtime environment into the
+// attestation package's source-precedence resolver. All token-acquisition
+// and precedence logic lives in attestation.ResolveAttesterLazy; this
+// function only translates pkg/cli surface (flags + env vars + stderr)
+// into a ResolveOptions value.
+//
+// Uses ResolveAttesterLazy so the OIDC token is resolved at first
+// Attest() call (which fires during bundler.Make), not at attester
+// construction. Fulcio binds the certificate to a fresh nonce at
+// token-issue time; resolving early-and-holding can exceed Fulcio's
+// tolerance for long bundle runs and fail with "error processing the
+// identity token". Matches the deferred-resolve pattern used by
+// aicr validate --emit-attestation --push.
+//
+// On failure it surfaces the "remove --attest to skip" remediation hint via
+// slog so headless users who hit a 5-minute device-flow timeout know the
+// escape hatch — the underlying error is propagated unchanged so its
+// pkg/errors classification (and the resulting CLI exit code) is preserved.
+func selectAttester(ctx context.Context, opts *bundleCmdOptions) (attestation.Attester, error) {
+	att, err := attestation.ResolveAttesterLazy(ctx, bundleOIDCResolveOptions(opts))
+	if err != nil && opts.attest {
+		slog.Error("bundle attestation requires authentication; remove --attest to bundle without signing", "error", err)
+	}
+	return att, err
+}
+
+// bundleOIDCResolveOptions translates the bundle command's signing flags and
+// runtime environment into the attestation package's ResolveOptions. Shared
+// by selectAttester (which builds the lazy attester) and the keyless-signing
+// disclosure gate so both reason about the identical token-source precedence.
+func bundleOIDCResolveOptions(opts *bundleCmdOptions) attestation.ResolveOptions {
+	return attestation.ResolveOptions{
+		Attest:              opts.attest,
+		IdentityToken:       opts.identityToken,
+		SigningKey:          opts.signingKey,
+		DisableTLogUpload:   !opts.tlogUpload,
+		AmbientURL:          os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL"),
+		AmbientToken:        os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN"),
+		DeviceFlow:          opts.oidcDeviceFlow,
+		FulcioURL:           opts.fulcioURL,
+		RekorURL:            opts.rekorURL,
+		SigningConfigPath:   opts.signingConfigPath,
+		UseTUFSigningConfig: opts.useTUFSigningConfig,
+		// Prompts (verification URL + user code) go to stderr so they don't
+		// pollute stdout when callers redirect bundle output.
+		PromptWriter: os.Stderr,
+	}
+}
+
+// pushOCIBundle packages and pushes the bundle to an OCI registry.
+// Branches on deployer: --deployer argocd-helm uses the Helm OCI flow
+// (helm.config.v1+json config + helm.chart.content.v1.tar+gzip layer)
+// so `helm pull oci://…` discovers the chart at pull time; every other
+// deployer uses AICR's generic OCI artifactType. See #961.
+type bundlePublishDependencies struct {
+	stageVerifiedBundle func(
+		context.Context,
+		string,
+		checksum.InventoryOptions,
+	) (string, *checksum.Inventory, func() error, error)
+	newWorkspace       func(context.Context, string, ...string) (*oci.Workspace, error)
+	packageAndPush     func(context.Context, oci.OutputConfig) (*oci.PackageAndPushResult, error)
+	packageAndPushHelm func(context.Context, oci.HelmChartOptions) (*oci.PackageAndPushResult, error)
+	writeLayout        func(context.Context, oci.OutputConfig) (*oci.PackageAndPushResult, error)
+	writeHelmLayout    func(context.Context, oci.HelmChartOptions) (*oci.PackageAndPushResult, error)
+	writeImageRefs     func(context.Context, *imageRefsTarget, []byte) error
+}
+
+func defaultBundlePublishDependencies() bundlePublishDependencies {
+	return bundlePublishDependencies{
+		stageVerifiedBundle: checksum.StageVerifiedBundle,
+		newWorkspace:        oci.NewPrivateWorkspace,
+		packageAndPush:      oci.PackageAndPush,
+		packageAndPushHelm:  oci.PackageAndPushHelmChart,
+		writeLayout:         oci.WriteLayout,
+		writeHelmLayout:     oci.WriteHelmChartLayout,
+		writeImageRefs: func(ctx context.Context, target *imageRefsTarget, data []byte) error {
+			return target.write(ctx, data)
+		},
+	}
+}
+
+func normalizeBundlePublishDependencies(deps bundlePublishDependencies) bundlePublishDependencies {
+	defaults := defaultBundlePublishDependencies()
+	if deps.stageVerifiedBundle == nil {
+		deps.stageVerifiedBundle = defaults.stageVerifiedBundle
+	}
+	if deps.newWorkspace == nil {
+		deps.newWorkspace = defaults.newWorkspace
+	}
+	if deps.packageAndPush == nil {
+		deps.packageAndPush = defaults.packageAndPush
+	}
+	if deps.packageAndPushHelm == nil {
+		deps.packageAndPushHelm = defaults.packageAndPushHelm
+	}
+	if deps.writeLayout == nil {
+		deps.writeLayout = defaults.writeLayout
+	}
+	if deps.writeHelmLayout == nil {
+		deps.writeHelmLayout = defaults.writeHelmLayout
+	}
+	if deps.writeImageRefs == nil {
+		deps.writeImageRefs = defaults.writeImageRefs
+	}
+	return deps
+}
+
+// removePublishedLayout removes layout only while its path still names the
+// directory publication wrote; anything put there since is left in place.
+// The contents are removed through a handle on that directory, and the
+// directory itself without recursion, so a replacement that appears after
+// the check survives unless it is empty.
+func removePublishedLayout(layout *publishedOCILayout) error {
+	root, err := os.OpenRoot(filepath.Dir(layout.path))
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to open OCI layout parent", err)
+	}
+	defer func() { _ = root.Close() }()
+	name := filepath.Base(layout.path)
+	layoutRoot, err := root.OpenRoot(name)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to open OCI layout", err)
+	}
+	defer func() { _ = layoutRoot.Close() }()
+	current, err := layoutRoot.Stat(".")
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to inspect OCI layout", err)
+	}
+	if !os.SameFile(layout.info, current) {
+		return errors.New(errors.ErrCodeConflict,
+			"OCI layout "+layout.path+" was replaced after publication; leaving it in place")
+	}
+	dir, err := layoutRoot.Open(".")
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to open OCI layout contents", err)
+	}
+	entries, err := dir.Readdirnames(-1)
+	_ = dir.Close()
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to read OCI layout contents", err)
+	}
+	for _, entry := range entries {
+		if err = layoutRoot.RemoveAll(entry); err != nil {
+			return errors.Wrap(errors.ErrCodeInternal, "failed to remove OCI layout contents", err)
+		}
+	}
+	if err = root.Remove(name); err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to remove OCI layout", err)
+	}
+	return nil
+}
+
+func pushOCIBundle(
+	ctx context.Context,
+	opts *bundleCmdOptions,
+	out *result.Output,
+	bundle *bundleOutputTarget,
+	imageRefs *imageRefsTarget,
+) error {
+
+	return pushOCIBundleWithDependencies(
+		ctx, opts, out, bundle, imageRefs, defaultBundlePublishDependencies())
+}
+
+// pushOCIBundleWithDependencies publishes only a retained, closed-world bundle
+// snapshot. Callers must not concurrently mutate the planned bundle or the
+// image-reference directory from preflight through publication. Portable Go
+// has no identity-conditional rename; rename atomicity is not guaranteed on
+// non-Unix platforms, and no fsync means visibility is not crash durability.
+// SameFile, case-folding, and Unicode-normalization guarantees depend on the
+// filesystem. Local syscalls are cooperatively checked between calls but may
+// not be forcibly interruptible, and os.Root's complete retained-root behavior
+// is unavailable on its excluded platforms. Registry push and final local
+// image-reference publication are intentionally non-transactional. A written
+// OCI layout is recorded in opts.publishedLayout, even when a later step here
+// fails, for the command to remove.
+//
+//nolint:funlen // publication ownership and cleanup order is intentionally linear
+func pushOCIBundleWithDependencies(
+	ctx context.Context,
+	opts *bundleCmdOptions,
+	out *result.Output,
+	bundle *bundleOutputTarget,
+	imageRefs *imageRefsTarget,
+	deps bundlePublishDependencies,
+) (retErr error) {
+
+	deps = normalizeBundlePublishDependencies(deps)
+	if opts == nil || opts.ociRef == nil || (!opts.ociRef.IsOCI && !opts.ociRef.IsLayout) {
+		return errors.New(errors.ErrCodeInvalidRequest, "OCI bundle options are required")
+	}
+	if out == nil || bundle == nil {
+		return errors.New(errors.ErrCodeInternal, "generated bundle output is required")
+	}
+	absOut, absErr := filepath.Abs(out.OutputDir)
+	if absErr != nil {
+		return errors.Wrap(errors.ErrCodeInternal,
+			"generated bundle output differs from retained target", absErr)
+	}
+	if filepath.Clean(absOut) != bundle.path {
+		return errors.New(errors.ErrCodeInternal,
+			"generated bundle output differs from retained target")
+	}
+	if (opts.imageRefsPath == "") != (imageRefs == nil) {
+		return errors.New(errors.ErrCodeInternal,
+			"image-reference target does not match resolved command options")
+	}
+
+	publishCtx, publishCancel := context.WithTimeout(ctx, defaults.OCIBundlePublishTimeout)
+	defer publishCancel()
+	if err := cliFilesystemContextError(publishCtx, "OCI bundle publication canceled"); err != nil {
+		return err
+	}
+	if err := bundle.validate(publishCtx); err != nil {
+		return err
+	}
+	if imageRefs != nil {
+		if err := imageRefs.validateParent(publishCtx); err != nil {
+			return err
+		}
+		if err := imageRefs.validateTarget(publishCtx); err != nil {
+			return err
+		}
+		if err := imageRefs.validateGuardAliases(publishCtx); err != nil {
+			return err
+		}
+	}
+
+	var stagedDir string
+	var inventory *checksum.Inventory
+	if opts.verifiedBundleSource != nil {
+		stagedDir = opts.verifiedBundleSource.path
+		inventory = opts.verifiedBundleSource.inventory
+	} else {
+		stageCtx, stageCancel := context.WithTimeout(publishCtx, defaults.OCISourceStageTimeout)
+		var cleanup func() error
+		var stageErr error
+		stagedDir, inventory, cleanup, stageErr = deps.stageVerifiedBundle(
+			stageCtx,
+			out.OutputDir,
+			checksum.InventoryOptions{AllowedMetadataPaths: attestation.BundleMetadataPaths()},
+		)
+		stageErr = authoritativeFilesystemContextError(
+			stageCtx, "verified bundle staging canceled", stageErr)
+		stageCancel()
+		if cleanup != nil {
+			defer func() {
+				retErr = preservePrimaryCloseError(retErr, cleanup(), "verified bundle stage")
+			}()
+		}
+		if stageErr != nil {
+			return stageErr
+		}
+		if cleanup == nil {
+			return errors.New(
+				errors.ErrCodeInternal, "verified bundle staging returned incomplete ownership")
+		}
+	}
+	if inventory == nil || stagedDir == "" {
+		return errors.New(errors.ErrCodeInternal, "verified bundle staging returned incomplete ownership")
+	}
+
+	if err := bundle.validate(publishCtx); err != nil {
+		return err
+	}
+	if imageRefs != nil {
+		if err := imageRefs.validateGuardAliases(publishCtx); err != nil {
+			return err
+		}
+	}
+	workspace, workspaceErr := deps.newWorkspace(
+		publishCtx,
+		"aicr-oci-layout-",
+		out.OutputDir,
+		stagedDir,
+	)
+	workspaceErr = authoritativeFilesystemContextError(publishCtx,
+		"OCI layout workspace creation canceled", workspaceErr)
+	if workspace != nil {
+		defer func() {
+			retErr = preservePrimaryCloseError(retErr, workspace.Close(), "OCI layout workspace")
+		}()
+	}
+	if workspaceErr != nil {
+		return workspaceErr
+	}
+	if workspace == nil || workspace.Path() == "" {
+		return errors.New(errors.ErrCodeInternal, "OCI layout workspace ownership is incomplete")
+	}
+
+	sourceFiles := inventory.RelativeFiles()
+	if len(sourceFiles) == 0 {
+		return errors.New(errors.ErrCodeInternal, "verified bundle inventory is empty")
+	}
+	packageGeneric, packageHelm := deps.packageAndPush, deps.packageAndPushHelm
+	if opts.ociRef.IsLayout {
+		packageGeneric, packageHelm = deps.writeLayout, deps.writeHelmLayout
+	}
+	var pushResult *oci.PackageAndPushResult
+	var publishErr error
+	if opts.deployer == config.DeployerArgoCDHelm {
+		pushResult, publishErr = packageHelm(publishCtx, oci.HelmChartOptions{
+			SourceDir:   stagedDir,
+			OutputDir:   workspace.Path(),
+			SourceFiles: sourceFiles,
+			Reference:   opts.ociRef,
+			Version:     version,
+			PlainHTTP:   opts.plainHTTP,
+			InsecureTLS: opts.insecureTLS,
+		})
+	} else {
+		pushResult, publishErr = packageGeneric(publishCtx, oci.OutputConfig{
+			SourceDir:   stagedDir,
+			OutputDir:   workspace.Path(),
+			SourceFiles: sourceFiles,
+			Reference:   opts.ociRef,
+			Version:     version,
+			PlainHTTP:   opts.plainHTTP,
+			InsecureTLS: opts.insecureTLS,
+		})
+	}
+	if opts.ociRef.IsLayout && publishErr == nil && pushResult != nil {
+		if pushResult.StorePath == "" || pushResult.StoreInfo == nil {
+			return errors.New(errors.ErrCodeInternal, "OCI layout publication returned no layout identity")
+		}
+		opts.publishedLayout = &publishedOCILayout{path: pushResult.StorePath, info: pushResult.StoreInfo}
+	}
+	publishErr = authoritativeFilesystemContextError(publishCtx,
+		"OCI bundle publication canceled", publishErr)
+	if publishErr != nil {
+		return publishErr
+	}
+	if pushResult == nil || pushResult.Digest == "" || pushResult.Reference == "" {
+		return errors.New(errors.ErrCodeInternal, "OCI publication returned an incomplete result")
+	}
+	if err := bundle.validate(publishCtx); err != nil {
+		return err
+	}
+	if imageRefs != nil {
+		if err := imageRefs.validateGuardAliases(publishCtx); err != nil {
+			return err
+		}
+	}
+
+	for i := range out.Results {
+		if out.Results[i].Success {
+			out.Results[i].SetOCIMetadata(pushResult.Digest, pushResult.Reference, opts.ociRef.IsOCI)
+		}
+	}
+
+	if imageRefs != nil {
+		writeCtx, writeCancel := context.WithTimeout(publishCtx, defaults.OCIImageRefsWriteTimeout)
+		writeErr := deps.writeImageRefs(writeCtx, imageRefs, []byte(pushResult.Digest+"\n"))
+		writeErr = authoritativeFilesystemContextError(writeCtx,
+			"image-reference publication canceled", writeErr)
+		writeCancel()
+		if writeErr != nil {
+			return writeErr
+		}
+		slog.Info("wrote image reference", "path", opts.imageRefsPath, "ref", pushResult.Digest)
+	}
+	return cliFilesystemContextError(publishCtx, "OCI bundle publication canceled")
+}
+
+// printDeploymentInstructions writes user-friendly deployment instructions to w.
+func printDeploymentInstructions(w io.Writer, out *result.Output) {
+	fmt.Fprintf(w, "\n%s generated successfully!\n", out.Deployment.Type)
+	fmt.Fprintf(w, "Output directory: %s\n", out.OutputDir)
+	fmt.Fprintf(w, "Files generated: %d\n", out.TotalFiles)
+
+	if len(out.Deployment.Notes) > 0 {
+		fmt.Fprintln(w, "\nNote:")
+		for _, note := range out.Deployment.Notes {
+			fmt.Fprintf(w, "  ⚠ %s\n", note)
+		}
+	}
+
+	if len(out.Deployment.Steps) > 0 {
+		fmt.Fprintln(w, "\nTo deploy:")
+		for i, step := range out.Deployment.Steps {
+			fmt.Fprintf(w, "  %d. %s\n", i+1, step)
+		}
+	}
+}
+
+// printArgoCDHelmOCIInstructions emits the canonical `helm install` line
+// for an argocd-helm bundle pushed to OCI. The post-#1051 contract is:
+//
+//   - `helm install` targets the untagged OCI repository and supplies the
+//     strict semantic chart version through `--version`.
+//   - `--set repoURL` carries the PARENT namespace only — the chart's
+//     parent App template appends .Chart.Name itself to assemble the
+//     final reference, so the chart name must NOT be included in
+//     `repoURL`.
+//
+// Skips silently for non-OCI references; the OCI-mode call site in
+// runBundleCmd already gates on opts.ociRef != nil, this guard is
+// defense-in-depth for callers that may construct ociRef differently.
+func printArgoCDHelmOCIInstructions(w io.Writer, ref *oci.Reference) {
+	if ref == nil || !ref.IsOCI {
+		return
+	}
+
+	chartRepository := fmt.Sprintf("%s%s/%s", oci.URIScheme, ref.Registry, ref.Repository)
+	chartVersion, err := oci.HelmChartVersionFromTag(ref.Tag)
+	if err != nil {
+		slog.Warn("cannot print Helm install instructions for an invalid OCI tag", "error", err)
+		return
+	}
+
+	// Delegate to canonical derivation so baked repoURL and printed hint always match. See #1342.
+	repoURL := ref.ParentNamespace()
+
+	fmt.Fprintf(w, "\nargocd-helm bundle pushed: %s:%s\n", chartRepository, ref.Tag)
+	fmt.Fprintln(w, "\nTo install:")
+	fmt.Fprintf(w, "  helm install <release> %s \\\n", chartRepository)
+	fmt.Fprintln(w, "    --namespace argocd \\")
+	fmt.Fprintf(w, "    --version %s\n", chartVersion)
+	fmt.Fprintf(w, "    # repoURL defaults to %s (override with --set repoURL=oci://mirror if mirroring)\n", repoURL)
+}

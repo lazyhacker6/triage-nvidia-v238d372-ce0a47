@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# check-tools: Verifies required tools are installed and shows version comparison
+#
+# This script dynamically reads from .settings.yaml and checks each tool.
+# Adding a new tool to .settings.yaml automatically includes it in the check
+# (as long as the tool metadata is defined in TOOL_METADATA below).
+#
+# Usage:
+#   ./tools/check-tools              # Run tool check
+#   DEBUG=true ./tools/check-tools   # Run with debug output
+
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools/common
+. "${DIR}/common"
+VERSIONS_FILE="${REPO_ROOT}/.settings.yaml"
+GO_MOD_FILE="${CHECK_TOOLS_GO_MOD_FILE:-${REPO_ROOT}/go.mod}"
+
+# Check if yq is available
+if ! command -v yq &>/dev/null; then
+    log_error "yq is required for this script"
+    log_info "Install it with: make tools-setup"
+    exit 1
+fi
+
+# Check if .settings.yaml exists
+if [[ ! -f "${VERSIONS_FILE}" ]]; then
+    log_error "Version file not found: ${VERSIONS_FILE}"
+    exit 1
+fi
+
+# Tool metadata: defines how to detect versions and compare them
+# Format: "command_name:::version_cmd:::match_strategy"
+#
+# command_name: The actual command name to check (e.g., "go", "golangci-lint")
+# version_cmd: Command to extract version
+# match_strategy: How to compare versions
+#   - exact: Full version must match
+#   - strict_exact: Full version must match; missing/unverifiable/mismatch fails the check
+#   - major: Only major version must match
+#   - major_minor: Major.minor must match
+#   - presence: Only check if installed (no version comparison)
+#
+# To add a new tool:
+# 1. Add it to .settings.yaml under the appropriate category
+# 2. Add its metadata entry in get_tool_metadata() with the yaml_key matching the key in .settings.yaml
+
+# Returns tool metadata for a given yaml_key
+# Compatible with bash 3.x (no associative arrays)
+get_tool_metadata() {
+    local yaml_key="$1"
+    case "$yaml_key" in
+        # Languages
+        go)
+            echo "go:::go version 2>/dev/null | grep -oE 'go[0-9]+\.[0-9]+' | sed 's/go//':::major_minor"
+            ;;
+        # Build tools
+        goreleaser)
+            echo "goreleaser:::goreleaser --version 2>/dev/null | sed -n 's/^GitVersion:[[:space:]]*//p':::major"
+            ;;
+        ko)
+            echo "ko:::ko version 2>/dev/null | head -1:::major_minor"
+            ;;
+        crane)
+            echo "crane:::crane version 2>/dev/null:::major_minor"
+            ;;
+        git_cliff)
+            echo "git-cliff:::git-cliff --version 2>/dev/null | awk '{print \$2}':::major"
+            ;;
+        # Linting
+        golangci_lint)
+            echo "golangci-lint:::golangci-lint version --short 2>/dev/null:::major"
+            ;;
+        apidiff)
+            echo "apidiff:::go_binary_module_version \"\$(command -v apidiff)\" golang.org/x/exp:::strict_exact"
+            ;;
+        oasdiff)
+            # `oasdiff --version` reports "main" when installed with go install,
+            # so the module version recorded in the binary is the only reliable
+            # source.
+            echo "oasdiff:::go_binary_module_version \"\$(command -v oasdiff)\" github.com/oasdiff/oasdiff:::strict_exact"
+            ;;
+        yamllint)
+            echo "yamllint:::yamllint --version 2>/dev/null | awk '{print \$2}':::major"
+            ;;
+        addlicense)
+            echo "addlicense:::go_binary_module_version \"\$(command -v addlicense)\" github.com/google/addlicense:::strict_exact"
+            ;;
+        go_licenses)
+            echo "go-licenses:::go_binary_module_version \"\$(command -v go-licenses)\" github.com/google/go-licenses/v2:::strict_exact"
+            ;;
+        # Security tools
+        grype)
+            echo "grype:::grype version 2>/dev/null | grep -E '^Version:' | awk '{print \$2}' | grep -v '^\[' || echo installed:::presence"
+            ;;
+        syft)
+            echo "syft:::syft version 2>/dev/null | grep -E '^Version:' | awk '{print \$2}':::major_minor"
+            ;;
+        oras)
+            echo "oras:::oras version 2>/dev/null | grep -E '^Version:' | awk '{print \$2}' | sed 's/+.*$//':::strict_exact"
+            ;;
+        # Testing tools
+        kubectl)
+            echo "kubectl:::kubectl version --client -o json 2>/dev/null | grep gitVersion | grep -oE 'v[0-9]+\.[0-9]+' || echo installed:::major"
+            ;;
+        kind)
+            echo "kind:::kind version 2>/dev/null | awk '{print \$2}' | sed 's/^v//':::major_minor"
+            ;;
+        ctlptl)
+            echo "ctlptl:::ctlptl version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+':::major_minor"
+            ;;
+        tilt)
+            echo "tilt:::tilt version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+':::major_minor"
+            ;;
+        helm)
+            echo "helm:::helm version --short 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+':::strict_exact"
+            ;;
+        helmfile)
+            echo "helmfile:::helmfile --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+':::major_minor"
+            ;;
+        chainsaw)
+            echo "chainsaw:::chainsaw version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+':::major_minor"
+            ;;
+        mkcert)
+            echo "mkcert:::mkcert -version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+':::major_minor"
+            ;;
+        awscli)
+            echo "aws:::aws --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1:::major_minor"
+            ;;
+        hauler)
+            echo "hauler:::hauler version 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+':::major_minor"
+            ;;
+        zarf)
+            echo "zarf:::zarf version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+':::major_minor"
+            ;;
+        # Optional tools (no version in .settings.yaml)
+        docker)
+            echo "docker:::docker version --format '{{.Server.Version}}' 2>/dev/null || echo 'not running':::presence"
+            ;;
+        *)
+            # Unknown tool - return empty
+            echo ""
+            ;;
+    esac
+}
+
+# Extract major version from a version string
+get_major() {
+    local version="$1"
+    echo "$version" | sed 's/^v//' | cut -d. -f1
+}
+
+# Extract major.minor version from a version string
+get_major_minor() {
+    local version="$1"
+    echo "$version" | sed 's/^v//' | cut -d. -f1,2
+}
+
+# Compare versions based on strategy
+# Returns: 0 if match, 1 if mismatch
+compare_versions() {
+    local expected="$1"
+    local installed="$2"
+    local strategy="$3"
+
+    case "$strategy" in
+        exact|strict_exact)
+            [[ "$installed" == "$expected" ]]
+            ;;
+        major)
+            local exp_major inst_major
+            exp_major=$(get_major "$expected")
+            inst_major=$(get_major "$installed")
+            [[ "$exp_major" == "$inst_major" ]]
+            ;;
+        major_minor)
+            local exp_mm inst_mm
+            exp_mm=$(get_major_minor "$expected")
+            inst_mm=$(get_major_minor "$installed")
+            [[ "$exp_mm" == "$inst_mm" ]]
+            ;;
+        presence)
+            # Any version is acceptable
+            return 0
+            ;;
+        *)
+            log_error "Unknown match strategy: $strategy"
+            return 1
+            ;;
+    esac
+}
+
+# Print a formatted row
+print_row() {
+    local tool="$1"
+    local expected="$2"
+    local installed="$3"
+    local status="$4"
+    printf "%-20s %-15s %-15s %s\n" "$tool" "$expected" "$installed" "$status"
+}
+
+# Check a single tool
+check_tool() {
+    local yaml_key="$1"
+    local expected_version="$2"
+
+    # Look up tool metadata
+    local metadata
+    metadata=$(get_tool_metadata "$yaml_key")
+    if [[ -z "$metadata" ]]; then
+        log_debug "No metadata for tool: $yaml_key (skipping)"
+        return
+    fi
+
+    # Parse metadata (using ::: as delimiter to avoid conflicts with pipes in commands)
+    cmd_name="${metadata%%:::*}"
+    local rest="${metadata#*:::}"
+    version_cmd="${rest%%:::*}"
+    match_strategy="${rest##*:::}"
+
+    # Check if command exists
+    if ! command -v "$cmd_name" &>/dev/null; then
+        print_row "$cmd_name" "$expected_version" "-" "✗"
+        if [[ "$match_strategy" == "strict_exact" ]]; then
+            CHECK_FAILED=1
+        fi
+        return
+    fi
+
+    # Checked before the version command, whose fallback output (such as
+    # "installed") would otherwise pass a binary that cannot run here.
+    local binary_goos host
+    binary_goos=$(go version -m "$(command -v "$cmd_name")" 2>/dev/null | build_info_goos || true)
+    host=$(host_goos)
+    if [[ -n "$binary_goos" && -n "$host" && "$binary_goos" != "$host" ]]; then
+        print_row "$cmd_name" "$expected_version" "${binary_goos}-binary" "⚠"
+        if [[ "$match_strategy" == "strict_exact" ]]; then
+            CHECK_FAILED=1
+        fi
+        return
+    fi
+
+    # Get installed version
+    local installed_version
+    installed_version=$(eval "$version_cmd" 2>/dev/null || echo "unknown")
+
+    # Handle special case for docker not running
+    if [[ "$installed_version" == "not running" ]]; then
+        print_row "$cmd_name" "$expected_version" "not running" "⚠"
+        return
+    fi
+
+    # Compare versions
+    if compare_versions "$expected_version" "$installed_version" "$match_strategy"; then
+        print_row "$cmd_name" "$expected_version" "$installed_version" "✓"
+    else
+        print_row "$cmd_name" "$expected_version" "$installed_version" "⚠"
+        if [[ "$match_strategy" == "strict_exact" ]]; then
+            CHECK_FAILED=1
+        fi
+    fi
+}
+
+# Main
+CHECK_FAILED=0
+echo "=== Tool Version Check ==="
+echo ""
+print_row "Tool" "Expected" "Installed" "Status"
+print_row "----" "--------" "---------" "------"
+
+# Get all categories from .settings.yaml
+categories=$(yq 'keys | .[]' "${VERSIONS_FILE}")
+
+# Iterate through each category
+for category in $categories; do
+    # Get all tools in this category
+    tools=$(yq ".$category | keys | .[]" "${VERSIONS_FILE}" 2>/dev/null || true)
+
+    for tool in $tools; do
+        # Get expected version
+        expected=$(yq ".$category.$tool" "${VERSIONS_FILE}")
+
+        # Check the tool
+        check_tool "$tool" "$expected"
+    done
+done
+
+# apidiff and go-licenses are built from this module (#2667), so go.mod holds
+# their only pin and the loop above -- which is driven by .settings.yaml keys --
+# never sees them. Check them from the require lines instead, keeping the stale
+# -binary-on-PATH warning that the settings-driven check used to provide.
+for module_tool in "apidiff:golang.org/x/exp" "go_licenses:github.com/google/go-licenses/v2"; do
+    tool_key="${module_tool%%:*}"
+    tool_module="${module_tool#*:}"
+    if expected=$(go_mod_required_version "${tool_module}" "${GO_MOD_FILE}"); then
+        check_tool "${tool_key}" "${expected}"
+    else
+        log_error "No ${tool_module} require line in go.mod; restore it with 'go get -tool'."
+        CHECK_FAILED=1
+    fi
+done
+
+# Docker is intentionally not pinned in .settings.yaml: developers use Docker
+# Desktop while CI uses the runner's preinstalled daemon. Reuse the presence
+# metadata so the table states that any running version is acceptable.
+check_tool docker any
+
+echo ""
+echo "Legend: ✓ = installed, ⚠ = version mismatch or warning, ✗ = missing"
+echo "        <os>-binary = built for another OS. Reinstall with 'make tools-setup'."
+exit "${CHECK_FAILED}"

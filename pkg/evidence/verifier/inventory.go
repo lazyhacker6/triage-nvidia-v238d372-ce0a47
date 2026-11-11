@@ -1,0 +1,419 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package verifier
+
+import (
+	"context"
+	"encoding/json"
+	stderrors "errors"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/evidence/attestation"
+	"github.com/NVIDIA/aicr/pkg/evidence/internal/boundedio"
+)
+
+// CheckInventory verifies the bundle's integrity chain:
+//
+//  1. sha256(manifest.json) matches expectedManifestDigest (the
+//     predicate's Manifest.Digest field). This is what binds the
+//     unsigned manifest to the predicate — without it, a tampered
+//     bundle could rewrite manifest.json to match its own contents and
+//     pass file-by-file hash checks.
+//  2. Every file the manifest names exists, has the expected size,
+//     and hashes to the recorded sha256.
+//  3. No file in the bundle is unmanaged (i.e., not in the manifest).
+//
+// expectedManifestDigest must be the "sha256:<hex>" form from
+// pred.Manifest.Digest. An empty value is rejected — the verifier
+// refuses to operate without a predicate-side digest to compare against.
+//
+// ctx is honored between files (large bundles, hostile manifests with
+// many entries) and during the bundle walk for stray-file detection.
+//
+// Returns per-file mismatch rows and an error summarizing the failure;
+// both nil on success.
+func CheckInventory(ctx context.Context, mat *MaterializedBundle, expectedManifestDigest string) ([]KV, error) {
+	_, mismatches, err := checkInventoryCaptureRecipe(ctx, mat, expectedManifestDigest)
+	return mismatches, err
+}
+
+// checkInventoryCaptureRecipe is CheckInventory plus recipe-byte capture: it
+// returns the exact recipe.yaml bytes the inventory pass read and hashed, so
+// checkRecipeIdentity can bind identity to the manifest-verified content
+// instead of reopening the file by path. For InputFormDir the bundle
+// directory is caller-owned, so a path-based reread after the inventory
+// check is a TOCTOU window (CWE-367): a writer replacing recipe.yaml between
+// the two reads would have identity checks accept bytes the manifest never
+// covered. The recipe entry is therefore read ONCE — the retained bytes are
+// the hashed bytes by construction. recipeYAML is nil when the manifest
+// carries no recipe.yaml entry or its hash/size check failed (both surface
+// in mismatches).
+func checkInventoryCaptureRecipe(
+	ctx context.Context,
+	mat *MaterializedBundle,
+	expectedManifestDigest string,
+) ([]byte, []KV, error) {
+
+	if mat == nil || mat.BundleDir == "" {
+		return nil, nil, errors.New(errors.ErrCodeInvalidRequest, "materialized bundle is required")
+	}
+	if expectedManifestDigest == "" {
+		return nil, nil, errors.New(errors.ErrCodeInvalidRequest,
+			"expected manifest digest is required (from predicate.manifest.digest)")
+	}
+	body, err := readBoundedFile(ctx,
+		filepath.Join(mat.BundleDir, attestation.ManifestFilename),
+		"manifest.json", defaults.MaxManifestFileBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	gotManifestDigest := attestation.HashBytesSHA256(body)
+	if gotManifestDigest != expectedManifestDigest {
+		return nil, []KV{{Key: attestation.ManifestFilename,
+				Value: "sha256 mismatch (got " + gotManifestDigest +
+					", want " + expectedManifestDigest + ")"}},
+			errors.New(errors.ErrCodeInvalidRequest,
+				"manifest.json digest does not match predicate.manifest.digest — "+
+					"the manifest has been tampered or the predicate is wrong for this bundle")
+	}
+
+	var manifest attestation.Manifest
+	if uErr := json.Unmarshal(body, &manifest); uErr != nil {
+		return nil, nil, errors.Wrap(errors.ErrCodeInvalidRequest, "manifest.json is not valid JSON", uErr)
+	}
+	if !isSupportedManifestSchema(manifest.SchemaVersion) {
+		return nil, nil, errors.New(errors.ErrCodeInvalidRequest,
+			"unsupported manifest schemaVersion "+manifest.SchemaVersion+" (verifier supports 1.0.x)")
+	}
+	if len(manifest.Files) == 0 {
+		return nil, nil, errors.New(errors.ErrCodeInvalidRequest, "manifest.json has no files")
+	}
+
+	var recipeYAML []byte
+	var mismatches []KV
+	for _, e := range manifest.Files {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, mismatches, abortError(ctxErr, "inventory check")
+		}
+		var got string
+		var captured []byte
+		var hashErr error
+		if e.Path == attestation.RecipeFilename {
+			// Read ONCE: the retained bytes are the hashed bytes by
+			// construction, closing the reread TOCTOU window.
+			captured, got, hashErr = hashAndCaptureFile(ctx, mat.BundleDir, e.Path, e.Size)
+		} else {
+			got, hashErr = hashFile(ctx, mat.BundleDir, e.Path, e.Size)
+		}
+		if hashErr != nil {
+			hashErr = normalizeInventoryHashError(ctx, hashErr)
+			if isInventoryAbortError(hashErr) {
+				return nil, mismatches, hashErr
+			}
+			mismatches = append(mismatches, KV{Key: e.Path, Value: hashErr.Error()})
+			continue
+		}
+		want := strings.TrimPrefix(e.SHA256, "sha256:")
+		if got != want {
+			mismatches = append(mismatches, KV{
+				Key:   e.Path,
+				Value: "sha256 mismatch (got " + got + ", want " + want + ")",
+			})
+			continue
+		}
+		if captured != nil {
+			recipeYAML = captured
+		}
+	}
+
+	extras, walkErr := findExtras(ctx, mat.BundleDir, manifest.Files)
+	if walkErr != nil {
+		if isInventoryAbortError(walkErr) {
+			return nil, mismatches, walkErr
+		}
+		mismatches = append(mismatches, KV{Key: "walk", Value: walkErr.Error()})
+	}
+	for _, p := range extras {
+		mismatches = append(mismatches, KV{Key: p, Value: "file not in manifest.json (unsigned)"})
+	}
+
+	if len(mismatches) > 0 {
+		return nil, mismatches, errors.New(errors.ErrCodeInvalidRequest,
+			"manifest inventory check failed for "+strconv.Itoa(len(mismatches))+" file(s)")
+	}
+	return recipeYAML, nil, nil
+}
+
+// hashAndCaptureFile is the capture variant of hashFile for the manifest's
+// recipe.yaml entry: it opens the file once, reads the bounded content, and
+// hashes the bytes it read — never restat-and-stream, which would hash a
+// different read than the one retained. The size check runs against the
+// bytes actually read (not a pre-read Stat) for the same reason. Returns
+// the captured bytes and the bare-hex sha256 (hashFile's format).
+func hashAndCaptureFile(ctx context.Context, bundleDir, rel string, expectedSize int64) ([]byte, string, error) {
+	localRel := filepath.FromSlash(rel)
+	if !filepath.IsLocal(localRel) {
+		return nil, "", errors.New(errors.ErrCodeInvalidRequest,
+			"manifest entry "+rel+" is not a local path (rejecting potential traversal)")
+	}
+	full := filepath.Join(bundleDir, localRel)
+	// boundedio.ReadFile preserves the read-once property this function exists
+	// for (the retained bytes are the hashed bytes, closing the reread TOCTOU
+	// window) while adding the time bound and the descriptor-first shape checks.
+	data, err := boundedio.ReadFile(ctx, full, "bundle "+rel, defaults.MaxRecipePOSTBytes)
+	if err != nil {
+		return nil, "", err
+	}
+	if expectedSize > 0 && int64(len(data)) != expectedSize {
+		return nil, "", errors.New(errors.ErrCodeInvalidRequest,
+			"size mismatch for "+rel+
+				" (got "+strconv.FormatInt(int64(len(data)), 10)+
+				", want "+strconv.FormatInt(expectedSize, 10)+")")
+	}
+	return data, strings.TrimPrefix(attestation.HashBytesSHA256(data), "sha256:"), nil
+}
+
+func normalizeInventoryHashError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return abortError(ctxErr, "inventory check")
+	}
+	return err
+}
+
+// abortError shapes a context abort so a deliberate operator cancellation stays
+// distinguishable from an environmental deadline: the former must never be
+// reported as a retryable condition.
+func abortError(cause error, what string) error {
+	if stderrors.Is(cause, context.Canceled) {
+		return errors.Wrap(errors.ErrCodeCanceled, what+" canceled", cause)
+	}
+	return errors.Wrap(errors.ErrCodeUnavailable, what+" timed out", cause)
+}
+
+func isInventoryAbortError(err error) bool {
+	return stderrors.Is(err, errors.New(errors.ErrCodeTimeout, "")) ||
+		stderrors.Is(err, errors.New(errors.ErrCodeUnavailable, "")) ||
+		boundedio.IsCanceled(err)
+}
+
+// CheckPhaseDigests verifies that each phase summary's CTRFDigest recorded in
+// the (signed) predicate matches the sha256 of the corresponding on-disk
+// ctrf/<phase>.json file.
+//
+// CheckInventory already binds every bundle file (including the CTRF reports)
+// to predicate.Manifest.Digest, but the predicate's per-phase CTRFDigest is an
+// independent claim that nothing else cross-checks. Without this step a
+// predicate could carry a CTRFDigest that disagrees with the committed report
+// and still pass verification. Fails closed on any mismatch or unreadable
+// phase file. Returns per-phase mismatch rows and a summarizing error; both
+// nil on success.
+//
+// Deprecated: prefer CheckPhaseDigestsContext. This form derives its own
+// defaults.FileReadTimeout-bounded context, so it cannot be aborted by the
+// caller; it is retained for source compatibility with out-of-tree callers.
+func CheckPhaseDigests(mat *MaterializedBundle, pred *attestation.Predicate) ([]KV, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaults.FileReadTimeout)
+	defer cancel()
+	return CheckPhaseDigestsContext(ctx, mat, pred)
+}
+
+// CheckPhaseDigestsContext is CheckPhaseDigests bounded by the caller's
+// context, so a wedged mount under ctrf/ surfaces as a timeout instead of
+// hanging the verifier.
+func CheckPhaseDigestsContext(
+	ctx context.Context,
+	mat *MaterializedBundle,
+	pred *attestation.Predicate,
+) ([]KV, error) {
+
+	if mat == nil || mat.BundleDir == "" {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "materialized bundle is required")
+	}
+	if pred == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "predicate is required")
+	}
+
+	allowed := make(map[attestation.Phase]struct{}, len(attestation.AllPhases))
+	for _, p := range attestation.AllPhases {
+		allowed[p] = struct{}{}
+	}
+
+	var mismatches []KV
+	// Iterate the predicate's own phases so an entry with an unknown/misspelled
+	// key cannot slip through unverified — that would leave a signed CTRFDigest
+	// claim unchecked and defeat the fail-closed guarantee.
+	for p, ps := range pred.Phases {
+		if _, ok := allowed[p]; !ok {
+			mismatches = append(mismatches, KV{Key: string(p),
+				Value: "predicate contains unknown phase"})
+			continue
+		}
+		if ps.CTRFDigest == "" {
+			mismatches = append(mismatches, KV{Key: string(p),
+				Value: "predicate phase summary has no ctrfDigest"})
+			continue
+		}
+		rel := attestation.CTRFRelPath(p)
+		body, err := readBoundedFile(ctx,
+			filepath.Join(mat.BundleDir, filepath.FromSlash(rel)),
+			rel, defaults.MaxAttestationFileBytes)
+		if err != nil {
+			// An aborted read is a storage/operator condition, not a digest
+			// disagreement. Recording it as a mismatch would launder a dead
+			// mount into "this bundle's phase digests are wrong" — the exact
+			// mis-diagnosis this bounding work exists to prevent.
+			if isInventoryAbortError(err) {
+				return mismatches, err
+			}
+			mismatches = append(mismatches, KV{Key: rel, Value: err.Error()})
+			continue
+		}
+		got := attestation.HashBytesSHA256(body)
+		if got != ps.CTRFDigest {
+			mismatches = append(mismatches, KV{Key: rel,
+				Value: "ctrfDigest mismatch (got " + got + ", want " + ps.CTRFDigest + ")"})
+		}
+	}
+
+	if len(mismatches) > 0 {
+		return mismatches, errors.New(errors.ErrCodeInvalidRequest,
+			"phase report digest check failed for "+strconv.Itoa(len(mismatches))+" phase(s)")
+	}
+	return nil, nil
+}
+
+func hashFile(ctx context.Context, bundleDir, rel string, expectedSize int64) (string, error) {
+	// Reject non-local manifest paths before touching the filesystem.
+	// A hostile manifest with rel="../../../etc/passwd" would otherwise
+	// let the verifier stat and hash files outside bundleDir.
+	localRel := filepath.FromSlash(rel)
+	if !filepath.IsLocal(localRel) {
+		return "", errors.New(errors.ErrCodeInvalidRequest,
+			"manifest entry "+rel+" is not a local path (rejecting potential traversal)")
+	}
+	full := filepath.Join(bundleDir, localRel)
+	// Bounded: an unbounded stat here wedges the whole inventory pass on a
+	// dead mount, before HashFileSHA256Context's own bound can apply.
+	var info os.FileInfo
+	var statErr error
+	if bErr := boundedio.Do(ctx, "bundle file "+rel, func() error {
+		info, statErr = os.Stat(full)
+		return nil
+	}); bErr != nil {
+		return "", bErr
+	}
+	if statErr != nil {
+		// Only a confirmed absence is "missing from bundle". A mount answering
+		// EIO/ESTALE/EACCES has not told us the file is absent, and reporting
+		// it as NotFound turns a storage fault into an inventory mismatch row
+		// and ultimately an "integrity" verdict.
+		if !os.IsNotExist(statErr) {
+			return "", errors.Wrap(errors.ErrCodeUnavailable,
+				"could not read bundle file (storage fault): "+rel, statErr)
+		}
+		return "", errors.Wrap(errors.ErrCodeNotFound, "file missing from bundle: "+rel, statErr)
+	}
+	if info.IsDir() {
+		return "", errors.New(errors.ErrCodeInvalidRequest, "manifest entry "+rel+" is a directory")
+	}
+	if expectedSize > 0 && info.Size() != expectedSize {
+		return "", errors.New(errors.ErrCodeInvalidRequest,
+			"size mismatch for "+rel+
+				" (got "+strconv.FormatInt(info.Size(), 10)+
+				", want "+strconv.FormatInt(expectedSize, 10)+")")
+	}
+	got, hashErr := attestation.HashFileSHA256Context(ctx, full)
+	if hashErr != nil {
+		return "", errors.PropagateOrWrap(hashErr, errors.ErrCodeInternal,
+			"failed to hash bundle file: "+rel)
+	}
+	return got, nil
+}
+
+// isSupportedManifestSchema accepts the 1.0.x family — same shape, the
+// patch component is reserved for clarifying-only updates.
+func isSupportedManifestSchema(v string) bool {
+	return strings.HasPrefix(v, "1.0.") || v == "1.0"
+}
+
+// findExtras returns bundle-relative paths of files present on disk
+// but not in manifest.Files, exempting the manifest itself and the
+// in-toto Statement files. Honors ctx cancellation between entries.
+func findExtras(ctx context.Context, bundleDir string, manifestFiles []attestation.ManifestFile) ([]string, error) {
+	want := make(map[string]struct{}, len(manifestFiles))
+	for _, f := range manifestFiles {
+		want[f.Path] = struct{}{}
+	}
+	exempt := map[string]struct{}{
+		attestation.ManifestFilename:    {},
+		attestation.AttestationFilename: {},
+		attestation.StatementFilename:   {},
+	}
+	var extras []string
+	// The whole walk goes behind the boundary, not just the callback: the
+	// ctx.Err() check below only runs between entries, while WalkDir's own
+	// ReadDir/Lstat syscalls are what block on a wedged mount.
+	var walkErr error
+	if bErr := boundedio.Do(ctx, "bundle directory "+bundleDir, func() error {
+		walkErr = filepath.WalkDir(bundleDir, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if d.IsDir() {
+				return nil
+			}
+			rel, relErr := filepath.Rel(bundleDir, path)
+			if relErr != nil {
+				return relErr
+			}
+			rel = filepath.ToSlash(rel)
+			if _, ok := want[rel]; ok {
+				return nil
+			}
+			if _, ok := exempt[rel]; ok {
+				return nil
+			}
+			extras = append(extras, rel)
+			return nil
+		})
+		return nil
+	}); bErr != nil {
+		return nil, bErr
+	}
+	if walkErr != nil {
+		// A canceled ctx surfaces here as context.Canceled / DeadlineExceeded
+		// from the callback. abortError splits the two the same way the
+		// per-file loop above does: a deliberate abort becomes ErrCodeCanceled
+		// (never retryable) and a deadline becomes ErrCodeUnavailable
+		// (transient). Both are aborts, so neither is folded into the
+		// mismatch rows as if it were a content failure.
+		if stderrors.Is(walkErr, context.Canceled) || stderrors.Is(walkErr, context.DeadlineExceeded) {
+			return nil, abortError(walkErr, "bundle walk")
+		}
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to walk bundle dir", walkErr)
+	}
+	return extras, nil
+}

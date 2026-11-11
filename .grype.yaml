@@ -1,0 +1,62 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+exclude:
+  - '**/.terraform/**'
+  - '**/node_modules/**'
+  # Exclude generated local binaries and release output from source scans.
+  - './bin/**'
+  - './aicr'
+  - './aicrd'
+  - './dist/**'
+  # Coding-agent git worktrees: full checkouts at older commits whose stale
+  # go.mod files resurface already-fixed module findings. Local-only (CI
+  # scans a fresh checkout, so this path never exists there).
+  - './.claude/worktrees/**'
+  # `make notices` scratch tree — same failure mode, new cause. Since #2374
+  # removed vendor/, go-licenses collects from the Go module cache, and those
+  # copies carry each upstream module's OWN go.mod (vendored copies did not:
+  # `go mod vendor` prunes them). Grype catalogs those manifests and reports
+  # dependency versions this repo does not build — golang.org/x/crypto v0.17.0
+  # and v0.45.0 surfaced this way while go.mod pins v0.55.0. Gitignored and
+  # local-only, like the worktrees above.
+  - './.licenses-cache/**'
+
+# CVE suppressions for the aiperf-bench image are managed in
+# `.openvex.json` and consumed by scan-action via the `vex:` input in
+# `.github/workflows/vuln-scan-images.yaml`. The OpenVEX document
+# carries the structured status + justification + per-CVE
+# reachability evidence and is self-sufficient for suppression.
+# The image builds on python:3.13-slim (Debian trixie) and ships on
+# nvcr.io/nvidia/distroless/python:3.13-v4.1.10 (CPython 3.13.18). A
+# base-package or interpreter finding is answered by bumping that pin; a
+# statement is reserved for a finding no available bump fixes.
+#
+# When scanning the aiperf-bench image locally, pass `--vex
+# .openvex.json` alongside `-c .grype.yaml`. Scans of the AICR Go
+# source tree (`make scan` → `grype dir:.`) don't need VEX, since its
+# statements target the aiperf-bench image and never Go source.
+# Reviewed: 2026-10-30
+
+# Go-source suppressions (accepted risk, not "not affected").
+#
+# Unlike the aiperf-bench image CVEs above, these Go-module findings are
+# REACHABLE in AICR source and are suppressed only because no fixed
+# release exists upstream yet. Each entry MUST record the reachable path,
+# the no-fix status, the target fixed version, and a review date. Drop the
+# entry the moment a fixed version is vendored — do not let it linger.
+# Currently empty. Last entry (GHSA-fxhp-mv3v-67qp, oras-go hardlink
+# traversal) was dropped 2026-07-22 when the upstream fix shipped in
+# oras.land/oras-go/v2 v2.6.2 (vendored; advisory range is <= 2.6.1).
+ignore: []

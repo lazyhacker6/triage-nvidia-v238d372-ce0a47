@@ -1,0 +1,40 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# NVIDIA DRA Driver GPU Helm values
+# OKE configuration overrides
+#
+# The driver root follows the selected gpuStack value (see oke-ol.yaml):
+# `/` where the image supplies the driver, `/run/nvidia/driver` where the
+# GPU Operator installs it.
+# Reference: https://github.com/oracle-quickstart/oci-hpc-oke/blob/grace-blackwell/manifests/dra/values.yaml
+#
+# GPU allocation defaults are inherited from values.yaml (this file is merged
+# on top of it): full-GPU DRA advertisement off, chart-guard waiver off, and
+# computeDomains pinned on — the production-default tuple. See the guidance
+# in values.yaml (issue #1327). Compute domains stay enabled for multi-node
+# training coordination.
+
+# See values.yaml for why both nameOverride and fullnameOverride are pinned.
+nameOverride: nvidia-dra-driver-gpu
+fullnameOverride: nvidia-dra-driver-gpu
+
+# nvidiaDriverRoot is profile-owned (gpuStack on oke-ol.yaml): / for the
+# image-supplied driver values, /run/nvidia/driver under operator-managed
+# (TestDriverRootLockstep, issue #1087). Deliberately absent here.
+
+controller:
+  priorityClassName: ""
+kubeletPlugin:
+  priorityClassName: ""

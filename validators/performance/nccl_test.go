@@ -1,0 +1,1784 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/recipe"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+)
+
+const testWorkerJobName = "node"
+
+func TestApplyNCCLWorkerScheduling_NodeSelector(t *testing.T) {
+	// Build a minimal TrainingRuntime-like unstructured object matching the real template structure.
+	workerPodSpec := map[string]any{
+		"nodeSelector": map[string]any{
+			"node.kubernetes.io/instance-type": "p5.48xlarge",
+		},
+		"tolerations": []any{
+			map[string]any{"operator": "Exists"},
+		},
+	}
+	obj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"spec": map[string]any{
+				"template": map[string]any{
+					"spec": map[string]any{
+						"replicatedJobs": []any{
+							map[string]any{"name": "launcher"},
+							map[string]any{
+								"name": testWorkerJobName,
+								"template": map[string]any{
+									"spec": map[string]any{
+										"template": map[string]any{
+											"spec": workerPodSpec,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	nodeSelector := map[string]string{"my-org/gpu-pool": "true"}
+	if err := applyNCCLWorkerScheduling(obj, nodeSelector, nil); err != nil {
+		t.Fatalf("applyNCCLWorkerScheduling() error = %v", err)
+	}
+
+	// Verify the nodeSelector was replaced in the worker spec.
+	jobs, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "replicatedJobs")
+	for _, j := range jobs {
+		jm, _ := j.(map[string]any)
+		name, _, _ := unstructured.NestedString(jm, "name")
+		if name != testWorkerJobName {
+			continue
+		}
+		ns, _, _ := unstructured.NestedStringMap(jm, "template", "spec", "template", "spec", "nodeSelector")
+		if ns["my-org/gpu-pool"] != "true" {
+			t.Errorf("worker nodeSelector = %v, want my-org/gpu-pool=true", ns)
+		}
+		if _, hasOld := ns["node.kubernetes.io/instance-type"]; hasOld {
+			t.Error("old instance-type selector should have been replaced")
+		}
+	}
+}
+
+func TestApplyNCCLWorkerScheduling_Tolerations(t *testing.T) {
+	obj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"spec": map[string]any{
+				"template": map[string]any{
+					"spec": map[string]any{
+						"replicatedJobs": []any{
+							map[string]any{"name": "launcher"},
+							map[string]any{
+								"name": testWorkerJobName,
+								"template": map[string]any{
+									"spec": map[string]any{
+										"template": map[string]any{
+											"spec": map[string]any{
+												"nodeSelector": map[string]any{
+													"cloud.google.com/gke-accelerator": "nvidia-h100-mega-80gb",
+												},
+												"tolerations": []any{
+													map[string]any{"operator": "Exists"},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	tolerations := []corev1.Toleration{
+		{Key: "gpu-type", Value: "h100", Effect: corev1.TaintEffectNoSchedule, Operator: corev1.TolerationOpEqual},
+	}
+	if err := applyNCCLWorkerScheduling(obj, nil, tolerations); err != nil {
+		t.Fatalf("applyNCCLWorkerScheduling() error = %v", err)
+	}
+
+	// nodeSelector should be unchanged (only tolerations overridden).
+	jobs, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "replicatedJobs")
+	for _, j := range jobs {
+		jm, _ := j.(map[string]any)
+		name, _, _ := unstructured.NestedString(jm, "name")
+		if name != testWorkerJobName {
+			continue
+		}
+		ns, _, _ := unstructured.NestedStringMap(jm, "template", "spec", "template", "spec", "nodeSelector")
+		if ns["cloud.google.com/gke-accelerator"] != "nvidia-h100-mega-80gb" {
+			t.Errorf("nodeSelector should be unchanged, got %v", ns)
+		}
+		tolsRaw, _, _ := unstructured.NestedSlice(jm, "template", "spec", "template", "spec", "tolerations")
+		if len(tolsRaw) != 1 {
+			t.Fatalf("tolerations count = %d, want 1", len(tolsRaw))
+		}
+		tol, _ := tolsRaw[0].(map[string]any)
+		if tol["key"] != "gpu-type" || tol["value"] != "h100" || tol["effect"] != "NoSchedule" || tol["operator"] != "Equal" {
+			t.Errorf("toleration = %v, want gpu-type=h100:NoSchedule operator=Equal", tol)
+		}
+	}
+}
+
+func TestApplyNCCLWorkerScheduling_Both(t *testing.T) {
+	obj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"spec": map[string]any{
+				"template": map[string]any{
+					"spec": map[string]any{
+						"replicatedJobs": []any{
+							map[string]any{"name": "launcher"},
+							map[string]any{
+								"name": testWorkerJobName,
+								"template": map[string]any{
+									"spec": map[string]any{
+										"template": map[string]any{
+											"spec": map[string]any{
+												"nodeSelector": map[string]any{
+													"node.kubernetes.io/instance-type": "p5.48xlarge",
+												},
+												"tolerations": []any{
+													map[string]any{"operator": "Exists"},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	nodeSelector := map[string]string{"custom-label/gpu": "a100"}
+	tolerations := []corev1.Toleration{
+		{Key: "custom-taint", Value: "true", Effect: corev1.TaintEffectNoSchedule, Operator: corev1.TolerationOpEqual},
+	}
+	if err := applyNCCLWorkerScheduling(obj, nodeSelector, tolerations); err != nil {
+		t.Fatalf("applyNCCLWorkerScheduling() error = %v", err)
+	}
+
+	jobs, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "replicatedJobs")
+	for _, j := range jobs {
+		jm, _ := j.(map[string]any)
+		name, _, _ := unstructured.NestedString(jm, "name")
+		if name != testWorkerJobName {
+			continue
+		}
+		// Verify nodeSelector was replaced.
+		ns, _, _ := unstructured.NestedStringMap(jm, "template", "spec", "template", "spec", "nodeSelector")
+		if ns["custom-label/gpu"] != "a100" {
+			t.Errorf("worker nodeSelector = %v, want custom-label/gpu=a100", ns)
+		}
+		if _, hasOld := ns["node.kubernetes.io/instance-type"]; hasOld {
+			t.Error("old instance-type selector should have been replaced")
+		}
+		// Verify tolerations were replaced.
+		tolsRaw, _, _ := unstructured.NestedSlice(jm, "template", "spec", "template", "spec", "tolerations")
+		if len(tolsRaw) != 1 {
+			t.Fatalf("tolerations count = %d, want 1", len(tolsRaw))
+		}
+		tol, _ := tolsRaw[0].(map[string]any)
+		if tol["key"] != "custom-taint" || tol["value"] != "true" || tol["effect"] != "NoSchedule" || tol["operator"] != "Equal" {
+			t.Errorf("toleration = %v, want custom-taint=true:NoSchedule operator=Equal", tol)
+		}
+	}
+}
+
+func ncclRuntimeWithJobs(jobs ...map[string]any) *unstructured.Unstructured {
+	raw := make([]any, 0, len(jobs))
+	for _, j := range jobs {
+		raw = append(raw, j)
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"template": map[string]any{"spec": map[string]any{"replicatedJobs": raw}}},
+	}}
+}
+
+func ncclReplicatedJob(name string, podSpec map[string]any) map[string]any {
+	return map[string]any{
+		"name":     name,
+		"template": map[string]any{"spec": map[string]any{"template": map[string]any{"spec": podSpec}}},
+	}
+}
+
+func ncclJobPodSpec(t *testing.T, obj *unstructured.Unstructured, name string) map[string]any {
+	t.Helper()
+	jobs, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "replicatedJobs")
+	for _, j := range jobs {
+		jm, _ := j.(map[string]any)
+		if jm["name"] != name {
+			continue
+		}
+		spec, found := nestedMap(jm, "template", "spec", "template", "spec")
+		if !found {
+			t.Fatalf("%s pod spec not found", name)
+		}
+		return spec
+	}
+	t.Fatalf("replicatedJob %q not found", name)
+	return nil
+}
+
+func TestPinNCCLLauncherToWorkers(t *testing.T) {
+	gpuTolerations := []any{
+		map[string]any{"key": "dedicated", "operator": "Equal", "value": "gpu-workload", "effect": "NoSchedule"},
+		map[string]any{"key": "nvidia.com/gpu", "operator": "Equal", "value": "present", "effect": "NoSchedule"},
+	}
+	tolerateAll := []any{map[string]any{"operator": "Exists"}}
+
+	tests := []struct {
+		name              string
+		jobs              []map[string]any
+		wantLauncherNS    map[string]any
+		wantLauncherTols  []any
+		wantErr           bool
+		skipLauncherCheck bool
+	}{
+		{
+			name: "launcher inherits worker nodeSelector and tolerations",
+			jobs: []map[string]any{
+				ncclReplicatedJob(testWorkerJobName, map[string]any{
+					"nodeSelector": map[string]any{"nodeGroup": "gpu-worker"},
+					"tolerations":  gpuTolerations,
+				}),
+				ncclReplicatedJob(benchmarkLauncherJob, map[string]any{"tolerations": tolerateAll}),
+			},
+			wantLauncherNS:   map[string]any{"nodeGroup": "gpu-worker"},
+			wantLauncherTols: gpuTolerations,
+		},
+		{
+			name: "worker without nodeSelector leaves launcher untouched",
+			jobs: []map[string]any{
+				ncclReplicatedJob(testWorkerJobName, map[string]any{"tolerations": gpuTolerations}),
+				ncclReplicatedJob(benchmarkLauncherJob, map[string]any{"tolerations": tolerateAll}),
+			},
+			wantLauncherNS:   nil,
+			wantLauncherTols: tolerateAll,
+		},
+		{
+			name: "worker without tolerations keeps launcher tolerations",
+			jobs: []map[string]any{
+				ncclReplicatedJob(testWorkerJobName, map[string]any{
+					"nodeSelector": map[string]any{"nodeGroup": "gpu-worker"},
+				}),
+				ncclReplicatedJob(benchmarkLauncherJob, map[string]any{"tolerations": tolerateAll}),
+			},
+			wantLauncherNS:   map[string]any{"nodeGroup": "gpu-worker"},
+			wantLauncherTols: tolerateAll,
+		},
+		{
+			name: "runtime without launcher is a no-op",
+			jobs: []map[string]any{
+				ncclReplicatedJob(testWorkerJobName, map[string]any{
+					"nodeSelector": map[string]any{"nodeGroup": "gpu-worker"},
+				}),
+			},
+			skipLauncherCheck: true,
+		},
+		{
+			name: "launcher without worker fails",
+			jobs: []map[string]any{
+				ncclReplicatedJob(benchmarkLauncherJob, map[string]any{"tolerations": tolerateAll}),
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := ncclRuntimeWithJobs(tt.jobs...)
+			err := pinNCCLLauncherToWorkers(obj)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("pinNCCLLauncherToWorkers() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr || tt.skipLauncherCheck {
+				return
+			}
+			launcher := ncclJobPodSpec(t, obj, benchmarkLauncherJob)
+			gotNS, _ := launcher["nodeSelector"].(map[string]any)
+			if tt.wantLauncherNS == nil {
+				if _, has := launcher["nodeSelector"]; has {
+					t.Errorf("launcher nodeSelector = %v, want absent", launcher["nodeSelector"])
+				}
+			} else if !reflect.DeepEqual(gotNS, tt.wantLauncherNS) {
+				t.Errorf("launcher nodeSelector = %v, want %v", gotNS, tt.wantLauncherNS)
+			}
+			if got := launcher["tolerations"]; !reflect.DeepEqual(got, tt.wantLauncherTols) {
+				t.Errorf("launcher tolerations = %v, want %v", got, tt.wantLauncherTols)
+			}
+		})
+	}
+}
+
+// TestPinNCCLLauncherToWorkers_DerivedGKERuntime covers the delivered-artifact
+// path that hung on GKE: the worker inherits its nodeSelector from the shipped
+// runtime, effectiveWorkerScheduling stamps none, and the skeleton launcher
+// carries no placement of its own.
+func TestPinNCCLLauncherToWorkers_DerivedGKERuntime(t *testing.T) {
+	plan := deliveredPlan(t)
+	obj, err := buildNCCLRuntimeObject(plan.carrier, recipe.CriteriaAcceleratorH100, recipe.CriteriaServiceGKE,
+		variantDefault, "ns", derivedTemplateData, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = applyNCCLWorkerScheduling(obj, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := ncclJobPodSpec(t, obj, benchmarkLauncherJob)["nodeSelector"]; has {
+		t.Fatal("control: the derived skeleton launcher must start without a nodeSelector")
+	}
+	if err = pinNCCLLauncherToWorkers(obj); err != nil {
+		t.Fatal(err)
+	}
+	want := ncclJobPodSpec(t, obj, testWorkerJobName)["nodeSelector"]
+	if want == nil {
+		t.Fatal("control: the derived worker must carry the shipped nodeSelector")
+	}
+	if got := ncclJobPodSpec(t, obj, benchmarkLauncherJob)["nodeSelector"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("launcher nodeSelector = %v, want worker's %v", got, want)
+	}
+}
+
+func TestResolveTargetGPUNodes(t *testing.T) {
+	mkNode := func(name string, labels map[string]string) corev1.Node {
+		return corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+		}
+	}
+	// GFD-labeled (gpu.product present)
+	gb200a := mkNode("gb200-a", map[string]string{"node.kubernetes.io/instance-type": "p6e-gb200.36xlarge", "nvidia.com/gpu.product": "NVIDIA-GB200", "gpu-pool": "gb200"})
+	gb200b := mkNode("gb200-b", map[string]string{"node.kubernetes.io/instance-type": "p6e-gb200.36xlarge", "nvidia.com/gpu.product": "NVIDIA-GB200", "gpu-pool": "gb200"})
+	h100a := mkNode("h100-a", map[string]string{"node.kubernetes.io/instance-type": "p5.48xlarge", "nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3", "gpu-pool": "h100"})
+	h100b := mkNode("h100-b", map[string]string{"node.kubernetes.io/instance-type": "p5.48xlarge", "nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3", "gpu-pool": "h100"})
+	h100pcie := mkNode("h100-pcie", map[string]string{"node.kubernetes.io/instance-type": "p5e.48xlarge", "nvidia.com/gpu.product": "NVIDIA-H100-PCIe", "gpu-pool": "h100"})
+	// Non-GFD: instance-type only, no gpu.product
+	gb200noGFD := mkNode("gb200-nogfd", map[string]string{"node.kubernetes.io/instance-type": "p6e-gb200.36xlarge"})
+	h100noGFD := mkNode("h100-nogfd", map[string]string{"node.kubernetes.io/instance-type": "p5.48xlarge"})
+	unlabeled := mkNode("bare", nil)
+
+	tests := []struct {
+		name        string
+		nodes       []corev1.Node
+		override    map[string]string
+		service     recipe.CriteriaServiceType
+		accelerator recipe.CriteriaAcceleratorType
+		wantNames   []string
+		wantErr     bool
+		wantErrSub  string // substring that must appear in err.Error() when wantErr
+	}{
+		{
+			name:        "mixed accelerators — gpu.product filter deterministically picks GB200 regardless of list order",
+			nodes:       []corev1.Node{h100a, gb200a, h100b, gb200b}, // H100 listed first
+			service:     recipe.CriteriaServiceEKS,
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			wantNames:   []string{"gb200-a", "gb200-b"},
+		},
+		{
+			name:        "H100 recipe on H100 cluster — GFD matches H100 family (prefix)",
+			nodes:       []corev1.Node{h100a, h100b},
+			service:     recipe.CriteriaServiceEKS,
+			accelerator: recipe.CriteriaAcceleratorH100,
+			wantNames:   []string{"h100-a", "h100-b"},
+		},
+		{
+			name:        "H100 SXM + H100 PCIe — gpu.product narrows to both, EKS instance-type narrow picks one",
+			nodes:       []corev1.Node{h100a, h100pcie, h100b},
+			service:     recipe.CriteriaServiceEKS,
+			accelerator: recipe.CriteriaAcceleratorH100,
+			wantNames:   []string{"h100-a", "h100-b"},
+		},
+		{
+			name:        "accelerator mismatch — zero match returns diagnostic error with products seen",
+			nodes:       []corev1.Node{h100a, h100b},
+			service:     recipe.CriteriaServiceEKS,
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			wantErr:     true,
+			wantErrSub:  `recipe accelerator "gb200"`,
+		},
+		{
+			name:        "non-GFD cluster — gpu.product absent, fall back to EKS instance-type heuristic",
+			nodes:       []corev1.Node{gb200noGFD, h100noGFD},
+			service:     recipe.CriteriaServiceEKS,
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			wantNames:   []string{"gb200-nogfd"},
+		},
+		{
+			name:        "user override wins over accelerator filter",
+			nodes:       []corev1.Node{gb200a, gb200b, h100a},
+			override:    map[string]string{"gpu-pool": "h100"},
+			service:     recipe.CriteriaServiceEKS,
+			accelerator: recipe.CriteriaAcceleratorGB200, // ignored due to override
+			wantNames:   []string{"h100-a"},
+		},
+		{
+			name:        "override matches zero — hard error naming the override",
+			nodes:       []corev1.Node{gb200a, gb200b},
+			override:    map[string]string{"gpu-pool": "h100"},
+			service:     recipe.CriteriaServiceEKS,
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			wantErr:     true,
+			wantErrSub:  "--node-selector",
+		},
+		{
+			name:        "accelerator=any — matcher skipped, EKS instance-type heuristic applies",
+			nodes:       []corev1.Node{gb200a, gb200b, h100a},
+			service:     recipe.CriteriaServiceEKS,
+			accelerator: recipe.CriteriaAcceleratorAny,
+			wantNames:   []string{"gb200-a", "gb200-b"},
+		},
+		{
+			name:        "non-EKS + GFD — accelerator filter applies, no further narrow",
+			nodes:       []corev1.Node{gb200a, h100a, gb200b},
+			service:     recipe.CriteriaServiceOKE,
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			wantNames:   []string{"gb200-a", "gb200-b"},
+		},
+		{
+			name:        "non-EKS + no GFD + no override — returns all",
+			nodes:       []corev1.Node{gb200noGFD, h100noGFD},
+			service:     recipe.CriteriaServiceOKE,
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			wantNames:   []string{"gb200-nogfd", "h100-nogfd"},
+		},
+		{
+			name:        "EKS first node missing instance-type label on non-GFD cluster — returns all",
+			nodes:       []corev1.Node{unlabeled, gb200noGFD},
+			service:     recipe.CriteriaServiceEKS,
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			wantNames:   []string{"bare", "gb200-nogfd"},
+		},
+		{
+			name:        "empty input",
+			nodes:       nil,
+			service:     recipe.CriteriaServiceEKS,
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			wantNames:   nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveTargetGPUNodes(tt.nodes, tt.override, tt.service, tt.accelerator)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("resolveTargetGPUNodes() err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				if tt.wantErrSub != "" && !strings.Contains(err.Error(), tt.wantErrSub) {
+					t.Errorf("err = %q, want substring %q", err.Error(), tt.wantErrSub)
+				}
+				return
+			}
+			var gotNames []string
+			for _, n := range got {
+				gotNames = append(gotNames, n.Name)
+			}
+			if !reflect.DeepEqual(gotNames, tt.wantNames) {
+				t.Errorf("nodes = %v, want %v", gotNames, tt.wantNames)
+			}
+		})
+	}
+}
+
+func TestAcceleratorProductMatchers(t *testing.T) {
+	cases := []struct {
+		accelerator recipe.CriteriaAcceleratorType
+		product     string
+		want        bool
+	}{
+		{recipe.CriteriaAcceleratorGB200, "NVIDIA-GB200", true},
+		{recipe.CriteriaAcceleratorGB200, "NVIDIA-GB200-96GB", false}, // exact-match guard
+		{recipe.CriteriaAcceleratorGB200, "NVIDIA-H100-80GB-HBM3", false},
+		{recipe.CriteriaAcceleratorGB300, "NVIDIA-GB300", true},
+		{recipe.CriteriaAcceleratorGB300, "NVIDIA-GB300-288GB", false}, // exact-match guard
+		{recipe.CriteriaAcceleratorGB300, "NVIDIA-GB200", false},
+		{recipe.CriteriaAcceleratorB200, "NVIDIA-B200", true},
+		{recipe.CriteriaAcceleratorB200, "NVIDIA-GB200", false},
+		{recipe.CriteriaAcceleratorH100, "NVIDIA-H100-80GB-HBM3", true},
+		{recipe.CriteriaAcceleratorH100, "NVIDIA-H100-PCIe", true},
+		{recipe.CriteriaAcceleratorH100, "NVIDIA-H100-NVL", true},
+		{recipe.CriteriaAcceleratorH100, "NVIDIA-H200-141GB-HBM3e", false},
+		{recipe.CriteriaAcceleratorH200, "NVIDIA-H200-141GB-HBM3e", true},
+		{recipe.CriteriaAcceleratorH200, "NVIDIA-H100-80GB-HBM3", false},
+		{recipe.CriteriaAcceleratorA100, "NVIDIA-A100-SXM4-80GB", true},
+		{recipe.CriteriaAcceleratorA100, "NVIDIA-A100-PCIe", true},
+		{recipe.CriteriaAcceleratorA100, "NVIDIA-A10G", false},
+		{recipe.CriteriaAcceleratorL40, "NVIDIA-L40", true},
+		{recipe.CriteriaAcceleratorL40, "NVIDIA-L40S", true},
+		{recipe.CriteriaAcceleratorL40, "NVIDIA-L4", false},
+		{recipe.CriteriaAcceleratorRTXPro6000, "NVIDIA-RTX-PRO-6000", true},
+		{recipe.CriteriaAcceleratorRTXPro6000, "NVIDIA-RTX-6000-Ada", false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.accelerator)+"/"+tc.product, func(t *testing.T) {
+			matcher, ok := acceleratorProductMatchers[tc.accelerator]
+			if !ok {
+				t.Fatalf("no matcher for accelerator %q", tc.accelerator)
+			}
+			if got := matcher(tc.product); got != tc.want {
+				t.Errorf("%q matches %q = %v, want %v", tc.accelerator, tc.product, got, tc.want)
+			}
+		})
+	}
+	if _, ok := acceleratorProductMatchers[recipe.CriteriaAcceleratorAny]; ok {
+		t.Errorf("accelerator=any must have no matcher (filter should be skipped)")
+	}
+}
+
+func TestPlatformWorkerScheduling(t *testing.T) {
+	t.Run("EKS returns instance-type selector", func(t *testing.T) {
+		ns, tols, err := platformWorkerScheduling(recipe.CriteriaServiceEKS, "p5.48xlarge", nil)
+		if err != nil {
+			t.Fatalf("platformWorkerScheduling() error = %v", err)
+		}
+		if ns["node.kubernetes.io/instance-type"] != "p5.48xlarge" {
+			t.Errorf("EKS nodeSelector = %v, want instance-type=p5.48xlarge", ns)
+		}
+		if len(tols) != 1 || tols[0].Operator != corev1.TolerationOpExists {
+			t.Errorf("EKS tolerations = %v, want tolerate-all", tols)
+		}
+	})
+	t.Run("GKE uses discovered gke-accelerator label (a3-megagpu-8g)", func(t *testing.T) {
+		nodes := []corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gkeAcceleratorLabel: "nvidia-h100-mega-80gb"}}},
+		}
+		ns, tols, err := platformWorkerScheduling(recipe.CriteriaServiceGKE, "", nodes)
+		if err != nil {
+			t.Fatalf("platformWorkerScheduling() error = %v", err)
+		}
+		if ns[gkeAcceleratorLabel] != "nvidia-h100-mega-80gb" {
+			t.Errorf("GKE nodeSelector = %v, want gke-accelerator=nvidia-h100-mega-80gb", ns)
+		}
+		if len(tols) != 2 {
+			t.Errorf("GKE tolerations count = %d, want 2", len(tols))
+		}
+	})
+	t.Run("GKE uses discovered gke-accelerator label (a3-highgpu-1g)", func(t *testing.T) {
+		nodes := []corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gkeAcceleratorLabel: "nvidia-h100-80gb"}}},
+		}
+		ns, tols, err := platformWorkerScheduling(recipe.CriteriaServiceGKE, "", nodes)
+		if err != nil {
+			t.Fatalf("platformWorkerScheduling() error = %v", err)
+		}
+		if ns[gkeAcceleratorLabel] != "nvidia-h100-80gb" {
+			t.Errorf("GKE nodeSelector = %v, want gke-accelerator=nvidia-h100-80gb", ns)
+		}
+		if len(tols) != 2 {
+			t.Errorf("GKE tolerations count = %d, want 2", len(tols))
+		}
+	})
+	t.Run("GKE on cluster with missing label returns error", func(t *testing.T) {
+		nodes := []corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}},
+		}
+		_, _, err := platformWorkerScheduling(recipe.CriteriaServiceGKE, "", nodes)
+		if err == nil {
+			t.Errorf("GKE with missing labels should return error, got nil")
+		}
+		if !strings.Contains(err.Error(), gkeAcceleratorLabel) {
+			t.Errorf("Error should mention %s, got: %v", gkeAcceleratorLabel, err)
+		}
+	})
+	t.Run("GKE on mixed-SKU pool returns error to prevent WorkerCount divergence", func(t *testing.T) {
+		nodes := []corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gkeAcceleratorLabel: "nvidia-h100-mega-80gb"}}},
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gkeAcceleratorLabel: "nvidia-h100-80gb"}}},
+		}
+		_, _, err := platformWorkerScheduling(recipe.CriteriaServiceGKE, "", nodes)
+		if err == nil {
+			t.Errorf("GKE with mixed labels should return error, got nil")
+		}
+		if !strings.Contains(err.Error(), gkeAcceleratorLabel) {
+			t.Errorf("Error should mention %s, got: %v", gkeAcceleratorLabel, err)
+		}
+	})
+	t.Run("OKE pins to shared gpu.product and tolerates taints", func(t *testing.T) {
+		nodes := []corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gpuProductLabel: "NVIDIA-GB200"}}},
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gpuProductLabel: "NVIDIA-GB200"}}},
+		}
+		ns, tols, err := platformWorkerScheduling(recipe.CriteriaServiceOKE, "", nodes)
+		if err != nil {
+			t.Fatalf("platformWorkerScheduling() error = %v", err)
+		}
+		if ns[gpuProductLabel] != "NVIDIA-GB200" {
+			t.Errorf("OKE nodeSelector = %v, want %s=NVIDIA-GB200", ns, gpuProductLabel)
+		}
+		if len(tols) != 1 || tols[0].Operator != corev1.TolerationOpExists {
+			t.Errorf("OKE tolerations = %v, want tolerate-all", tols)
+		}
+	})
+	t.Run("OKE on non-GFD cluster omits selector but still tolerates taints", func(t *testing.T) {
+		nodes := []corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}},
+		}
+		ns, tols, err := platformWorkerScheduling(recipe.CriteriaServiceOKE, "", nodes)
+		if err != nil {
+			t.Fatalf("platformWorkerScheduling() error = %v", err)
+		}
+		if ns != nil {
+			t.Errorf("OKE non-GFD nodeSelector = %v, want nil", ns)
+		}
+		if len(tols) != 1 || tols[0].Operator != corev1.TolerationOpExists {
+			t.Errorf("OKE non-GFD tolerations = %v, want tolerate-all", tols)
+		}
+	})
+	t.Run("AKS pins to shared gpu.product and tolerates taints", func(t *testing.T) {
+		nodes := []corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gpuProductLabel: "NVIDIA-H100-80GB-HBM3"}}},
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gpuProductLabel: "NVIDIA-H100-80GB-HBM3"}}},
+		}
+		ns, tols, err := platformWorkerScheduling(recipe.CriteriaServiceAKS, "", nodes)
+		if err != nil {
+			t.Fatalf("platformWorkerScheduling() error = %v", err)
+		}
+		if ns[gpuProductLabel] != "NVIDIA-H100-80GB-HBM3" {
+			t.Errorf("AKS nodeSelector = %v, want %s=NVIDIA-H100-80GB-HBM3", ns, gpuProductLabel)
+		}
+		if len(tols) != 1 || tols[0].Operator != corev1.TolerationOpExists {
+			t.Errorf("AKS tolerations = %v, want tolerate-all", tols)
+		}
+	})
+	t.Run("AKS on non-GFD cluster omits selector but still tolerates taints", func(t *testing.T) {
+		nodes := []corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}},
+		}
+		ns, tols, err := platformWorkerScheduling(recipe.CriteriaServiceAKS, "", nodes)
+		if err != nil {
+			t.Fatalf("platformWorkerScheduling() error = %v", err)
+		}
+		if ns != nil {
+			t.Errorf("AKS non-GFD nodeSelector = %v, want nil", ns)
+		}
+		if len(tols) != 1 || tols[0].Operator != corev1.TolerationOpExists {
+			t.Errorf("AKS non-GFD tolerations = %v, want tolerate-all", tols)
+		}
+	})
+	t.Run("NVKE pins to shared gpu.product and tolerates taints", func(t *testing.T) {
+		nodes := []corev1.Node{
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gpuProductLabel: "NVIDIA-GB200"}}},
+			{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gpuProductLabel: "NVIDIA-GB200"}}},
+		}
+		ns, tols, err := platformWorkerScheduling(recipe.CriteriaServiceNVKE, "", nodes)
+		if err != nil {
+			t.Fatalf("platformWorkerScheduling() error = %v", err)
+		}
+		if ns[gpuProductLabel] != "NVIDIA-GB200" {
+			t.Errorf("NVKE nodeSelector = %v, want %s=NVIDIA-GB200", ns, gpuProductLabel)
+		}
+		if len(tols) != 1 || tols[0].Operator != corev1.TolerationOpExists {
+			t.Errorf("NVKE tolerations = %v, want tolerate-all", tols)
+		}
+	})
+	t.Run("unknown service returns nil", func(t *testing.T) {
+		ns, tols, err := platformWorkerScheduling("unknown", "", nil)
+		if err != nil {
+			t.Fatalf("platformWorkerScheduling() error = %v", err)
+		}
+		if ns != nil || tols != nil {
+			t.Errorf("unknown service should return nil, got ns=%v tols=%v", ns, tols)
+		}
+	})
+	for _, service := range []recipe.CriteriaServiceType{recipe.CriteriaServiceAny, recipe.CriteriaServiceMK8s} {
+		t.Run(string(service)+" service returns nil", func(t *testing.T) {
+			ns, tols, err := platformWorkerScheduling(service, "", nil)
+			if err != nil {
+				t.Fatalf("platformWorkerScheduling() error = %v", err)
+			}
+			if ns != nil || tols != nil {
+				t.Errorf("%s service should return nil, got ns=%v tols=%v", service, ns, tols)
+			}
+		})
+	}
+}
+
+func TestCommonGPUProduct(t *testing.T) {
+	tests := []struct {
+		name  string
+		nodes []corev1.Node
+		want  string
+	}{
+		{"empty", nil, ""},
+		{
+			"all share product",
+			[]corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gpuProductLabel: "NVIDIA-GB200"}}},
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gpuProductLabel: "NVIDIA-GB200"}}},
+			},
+			"NVIDIA-GB200",
+		},
+		{
+			"mixed products",
+			[]corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gpuProductLabel: "NVIDIA-GB200"}}},
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gpuProductLabel: "NVIDIA-B200"}}},
+			},
+			"",
+		},
+		{
+			"one node missing label (non-GFD)",
+			[]corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gpuProductLabel: "NVIDIA-GB200"}}},
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}},
+			},
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := commonGPUProduct(tt.nodes); got != tt.want {
+				t.Errorf("commonGPUProduct() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCommonGKEAccelerator(t *testing.T) {
+	tests := []struct {
+		name  string
+		nodes []corev1.Node
+		want  string
+	}{
+		{
+			"all share accelerator label",
+			[]corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gkeAcceleratorLabel: "nvidia-h100-mega-80gb"}}},
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gkeAcceleratorLabel: "nvidia-h100-mega-80gb"}}},
+			},
+			"nvidia-h100-mega-80gb",
+		},
+		{
+			"mixed accelerators",
+			[]corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gkeAcceleratorLabel: "nvidia-h100-mega-80gb"}}},
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gkeAcceleratorLabel: "nvidia-h100-80gb"}}},
+			},
+			"",
+		},
+		{
+			"one node missing label",
+			[]corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{gkeAcceleratorLabel: "nvidia-h100-mega-80gb"}}},
+				{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}},
+			},
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := commonGKEAccelerator(tt.nodes); got != tt.want {
+				t.Errorf("commonGKEAccelerator() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTemplatePath(t *testing.T) {
+	tests := []struct {
+		name        string
+		accelerator recipe.CriteriaAcceleratorType
+		service     recipe.CriteriaServiceType
+		variant     ncclVariant
+		filename    string
+		expected    string
+	}{
+		{
+			name:        "eks h100 runtime default",
+			accelerator: recipe.CriteriaAcceleratorH100,
+			service:     recipe.CriteriaServiceEKS,
+			variant:     variantDefault,
+			filename:    "runtime.yaml",
+			expected:    filepath.Join("testdata", "h100", "eks", "runtime.yaml"),
+		},
+		{
+			name:        "eks h200 runtime default",
+			accelerator: recipe.CriteriaAcceleratorH200,
+			service:     recipe.CriteriaServiceEKS,
+			variant:     variantDefault,
+			filename:    "runtime.yaml",
+			expected:    filepath.Join("testdata", "h200", "eks", "runtime.yaml"),
+		},
+		{
+			name:        "eks h100 trainjob default",
+			accelerator: recipe.CriteriaAcceleratorH100,
+			service:     recipe.CriteriaServiceEKS,
+			variant:     variantDefault,
+			filename:    "trainjob.yaml",
+			expected:    filepath.Join("testdata", "h100", "eks", "trainjob.yaml"),
+		},
+		{
+			name:        "gke gb200 default",
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			service:     recipe.CriteriaServiceGKE,
+			variant:     variantDefault,
+			filename:    "runtime.yaml",
+			expected:    filepath.Join("testdata", "gb200", "gke", "runtime.yaml"),
+		},
+		{
+			name:        "b200 any runtime default",
+			accelerator: recipe.CriteriaAcceleratorB200,
+			service:     recipe.CriteriaServiceAny,
+			variant:     variantDefault,
+			filename:    "runtime.yaml",
+			expected:    filepath.Join("testdata", "b200", "any", "runtime.yaml"),
+		},
+		{
+			name:        "gb200 any runtime default",
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			service:     recipe.CriteriaServiceAny,
+			variant:     variantDefault,
+			filename:    "runtime.yaml",
+			expected:    filepath.Join("testdata", "gb200", "any", "runtime.yaml"),
+		},
+		{
+			name:        "gb200 eks NET variant",
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			service:     recipe.CriteriaServiceEKS,
+			variant:     variantNET,
+			filename:    "runtime.yaml",
+			expected:    filepath.Join("testdata", "gb200", "eks", "runtime-net.yaml"),
+		},
+		{
+			name:        "gb200 eks NVLS variant",
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			service:     recipe.CriteriaServiceEKS,
+			variant:     variantNVLS,
+			filename:    "runtime.yaml",
+			expected:    filepath.Join("testdata", "gb200", "eks", "runtime-nvls.yaml"),
+		},
+		{
+			name:        "gb200 oke NVLS variant",
+			accelerator: recipe.CriteriaAcceleratorGB200,
+			service:     recipe.CriteriaServiceOKE,
+			variant:     variantNVLS,
+			filename:    "runtime.yaml",
+			expected:    filepath.Join("testdata", "gb200", "oke", "runtime-nvls.yaml"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := templatePath(tt.accelerator, tt.service, tt.variant, tt.filename)
+			if got != tt.expected {
+				t.Errorf("templatePath() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestVerifyTransportFromLogs(t *testing.T) {
+	// Representative NCCL 2.27 outputs captured from real GB200/EKS and
+	// EKS H100 runs. Format note: NCCL 2.27 no longer emits per-channel
+	// "[send] via NVLS" lines; the authoritative transport signals are
+	// "NCCL INFO Using network <plugin>" for NET, and "NVLS comm 0x<addr>"
+	// + "NVLS multicast support is available" for NVLS.
+	const netLog = `NCCL INFO NET/OFI Selected Provider is efa
+NCCL INFO NET/Plugin: Loaded net plugin Libfabric (v10)
+NCCL INFO Using network AWS Libfabric`
+
+	const nvlsLog = `NCCL INFO MNNVL 1 cliqueId 2 cliqueSize 8 cliqueRank 0
+NCCL INFO NVLS multicast support is available on dev 0 (NVLS_NCHANNELS 24)
+NCCL INFO comm 0xabc123 rank 0 nRanks 8 nNodes 1 localRanks 8 localRank 0 MNNVL 1
+NCCL INFO NVLS comm 0xabc123 headRank 0 nHeads 8 nvlsRanks 8 buffSize 1048576`
+
+	const socketOnlyLog = `NCCL INFO Using network Socket`
+
+	const silentLog = `no transport banners here`
+
+	const nvlsAvailableOnlyLog = `NCCL INFO NVLS multicast support is available on dev 0 (NVLS_NCHANNELS 24)
+NCCL INFO Using network Socket`
+
+	tests := []struct {
+		name    string
+		logs    string
+		variant ncclVariant
+		wantErr bool
+	}{
+		{
+			name:    "default variant never asserts",
+			logs:    silentLog,
+			variant: variantDefault,
+			wantErr: false,
+		},
+		{
+			name:    "NET variant with AWS Libfabric passes",
+			logs:    netLog,
+			variant: variantNET,
+			wantErr: false,
+		},
+		{
+			name:    "NET variant with Socket-only fails (provider plugin didn't load)",
+			logs:    socketOnlyLog,
+			variant: variantNET,
+			wantErr: true,
+		},
+		{
+			name:    "NET variant with no Using-network banner fails",
+			logs:    nvlsLog,
+			variant: variantNET,
+			wantErr: true,
+		},
+		{
+			name:    "NVLS variant with comm-init + availability passes",
+			logs:    nvlsLog,
+			variant: variantNVLS,
+			wantErr: false,
+		},
+		{
+			name:    "NVLS variant when NCCL only sees NET fails (no availability banner)",
+			logs:    netLog,
+			variant: variantNVLS,
+			wantErr: true,
+		},
+		{
+			name:    "NVLS variant with availability but no comm init fails (detected, not used)",
+			logs:    nvlsAvailableOnlyLog,
+			variant: variantNVLS,
+			wantErr: true,
+		},
+		{
+			name:    "NVLS variant with silent logs fails",
+			logs:    silentLog,
+			variant: variantNVLS,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := verifyTransportFromLogs(tt.logs, tt.variant)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("verifyTransportFromLogs() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestBuildComputeDomain(t *testing.T) {
+	const ns = "aicr-validation-test"
+	cd := buildComputeDomain(ns)
+
+	if got := cd.GetAPIVersion(); got != "resource.nvidia.com/v1beta1" {
+		t.Errorf("apiVersion = %q, want resource.nvidia.com/v1beta1", got)
+	}
+	if got := cd.GetKind(); got != "ComputeDomain" {
+		t.Errorf("kind = %q, want ComputeDomain", got)
+	}
+	if got := cd.GetName(); got != ncclComputeDomainName {
+		t.Errorf("name = %q, want %q", got, ncclComputeDomainName)
+	}
+	if got := cd.GetNamespace(); got != ns {
+		t.Errorf("namespace = %q, want %q", got, ns)
+	}
+
+	numNodes, found, err := unstructured.NestedInt64(cd.Object, "spec", "numNodes")
+	if err != nil || !found {
+		t.Fatalf("spec.numNodes lookup failed: err=%v found=%v", err, found)
+	}
+	if numNodes != 0 {
+		t.Errorf("numNodes = %d, want 0 (IMEXDaemonsWithDNSNames=true default)", numNodes)
+	}
+
+	mode, found, err := unstructured.NestedString(cd.Object, "spec", "channel", "allocationMode")
+	if err != nil || !found {
+		t.Fatalf("spec.channel.allocationMode lookup failed: err=%v found=%v", err, found)
+	}
+	if mode != "Single" {
+		t.Errorf("allocationMode = %q, want Single", mode)
+	}
+
+	rctName, found, err := unstructured.NestedString(cd.Object, "spec", "channel", "resourceClaimTemplate", "name")
+	if err != nil || !found {
+		t.Fatalf("spec.channel.resourceClaimTemplate.name lookup failed: err=%v found=%v", err, found)
+	}
+	if rctName != ncclIMEXClaimTemplateName {
+		t.Errorf("resourceClaimTemplate.name = %q, want %q", rctName, ncclIMEXClaimTemplateName)
+	}
+}
+
+func TestNVLSRuntimeYAMLReferencesIMEXClaim(t *testing.T) {
+	// The runtime-nvls templates hardcode the same RCT name the Go code
+	// creates via buildComputeDomain. If these drift, the DRA driver
+	// generates one name and the worker pods reference another, and
+	// pod admission fails with an opaque "claim not found" error.
+	// Derived by globbing rather than listed, so a new accelerator/service
+	// runtime is covered the moment its template lands. An explicit list
+	// silently excludes anything added later, which is how vr200/rke2 was
+	// left uncovered when it was introduced.
+	paths, err := filepath.Glob(filepath.Join("testdata", "*", "*", "runtime-nvls.yaml"))
+	if err != nil {
+		t.Fatalf("glob runtime-nvls templates: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no runtime-nvls.yaml templates found — the glob matched nothing, " +
+			"so this guard would pass without checking anything")
+	}
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("failed to read %s: %v", path, err)
+			}
+			s := string(data)
+			if !strings.Contains(s, "resourceClaimTemplateName: "+ncclIMEXClaimTemplateName) {
+				t.Errorf("%s missing resourceClaimTemplateName: %s", path, ncclIMEXClaimTemplateName)
+			}
+			if !strings.Contains(s, "- name: imex-channel") {
+				t.Errorf("%s missing 'name: imex-channel' in resourceClaims / claims blocks", path)
+			}
+		})
+	}
+}
+
+func TestSupportedNCCLCombinations_Variants(t *testing.T) {
+	tests := []struct {
+		name    string
+		variant ncclVariant
+		service recipe.CriteriaServiceType
+		want    []recipe.CriteriaAcceleratorType
+	}{
+		{
+			name:    "NET EKS GB200",
+			variant: variantNET,
+			service: recipe.CriteriaServiceEKS,
+			want:    []recipe.CriteriaAcceleratorType{recipe.CriteriaAcceleratorGB200, recipe.CriteriaAcceleratorGB300},
+		},
+		{
+			name:    "NVLS EKS GB200",
+			variant: variantNVLS,
+			service: recipe.CriteriaServiceEKS,
+			want:    []recipe.CriteriaAcceleratorType{recipe.CriteriaAcceleratorGB200, recipe.CriteriaAcceleratorGB300},
+		},
+		{
+			name:    "NET OKE GB200 and GB300",
+			variant: variantNET,
+			service: recipe.CriteriaServiceOKE,
+			want:    []recipe.CriteriaAcceleratorType{recipe.CriteriaAcceleratorGB200, recipe.CriteriaAcceleratorGB300},
+		},
+		{
+			name:    "NVLS OKE GB200 and GB300",
+			variant: variantNVLS,
+			service: recipe.CriteriaServiceOKE,
+			want:    []recipe.CriteriaAcceleratorType{recipe.CriteriaAcceleratorGB200, recipe.CriteriaAcceleratorGB300},
+		},
+		{
+			// NVKE carries both NVL72 generations on the NET variant too:
+			// GB200 over IB rails, VR200 over RoCE rails.
+			name:    "NET NVKE",
+			variant: variantNET,
+			service: recipe.CriteriaServiceNVKE,
+			want:    []recipe.CriteriaAcceleratorType{recipe.CriteriaAcceleratorGB200, recipe.CriteriaAcceleratorVR200},
+		},
+		{
+			// NVKE carries three NVL72 generations on the NVLS variant.
+			name:    "NVLS NVKE",
+			variant: variantNVLS,
+			service: recipe.CriteriaServiceNVKE,
+			want:    []recipe.CriteriaAcceleratorType{recipe.CriteriaAcceleratorGB200, recipe.CriteriaAcceleratorGB300, recipe.CriteriaAcceleratorVR200},
+		},
+		{
+			name:    "NVLS GKE GB200",
+			variant: variantNVLS,
+			service: recipe.CriteriaServiceGKE,
+			want:    []recipe.CriteriaAcceleratorType{recipe.CriteriaAcceleratorGB200},
+		},
+		{
+			// This table asserts only on explicitly listed service keys, so a
+			// new matrix entry passes silently unless a case is added here.
+			name:    "NVLS RKE2 VR200",
+			variant: variantNVLS,
+			service: recipe.CriteriaServiceRKE2,
+			want:    []recipe.CriteriaAcceleratorType{recipe.CriteriaAcceleratorVR200},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			accels, ok := supportedNCCLCombinations[tt.variant][tt.service]
+			if !ok {
+				t.Fatalf("%s should support %s", tt.variant, tt.service)
+			}
+			if !reflect.DeepEqual(accels, tt.want) {
+				t.Errorf("%s %s accelerators = %v, want %v", tt.variant, tt.service, accels, tt.want)
+			}
+		})
+	}
+
+	// Legacy default variant must still list the original combinations
+	// so existing recipes that reference "nccl-all-reduce-bw" keep working.
+	// EKS default carries H100 and H200 (Hopper on EFA, shared template).
+	wantEKS := []recipe.CriteriaAcceleratorType{recipe.CriteriaAcceleratorH100, recipe.CriteriaAcceleratorH200}
+	if accels := supportedNCCLCombinations[variantDefault][recipe.CriteriaServiceEKS]; !reflect.DeepEqual(accels, wantEKS) {
+		t.Errorf("variantDefault EKS = %v, want %v", accels, wantEKS)
+	}
+	if accels := supportedNCCLCombinations[variantDefault][recipe.CriteriaServiceAny]; len(accels) != 2 {
+		t.Errorf("variantDefault Any count = %d, want 2 (B200, GB200)", len(accels))
+	}
+	wantGKE := []recipe.CriteriaAcceleratorType{recipe.CriteriaAcceleratorH100}
+	if accels := supportedNCCLCombinations[variantDefault][recipe.CriteriaServiceGKE]; !reflect.DeepEqual(accels, wantGKE) {
+		t.Errorf("variantDefault GKE = %v, want %v", accels, wantGKE)
+	}
+	// AKS ND-series H100 runs the default variant over NCCL's built-in
+	// IB/verbs transport (testdata/h100/aks/runtime.yaml).
+	wantAKS := []recipe.CriteriaAcceleratorType{recipe.CriteriaAcceleratorH100}
+	if accels := supportedNCCLCombinations[variantDefault][recipe.CriteriaServiceAKS]; !reflect.DeepEqual(accels, wantAKS) {
+		t.Errorf("variantDefault AKS = %v, want %v", accels, wantAKS)
+	}
+}
+
+func TestSupportedNCCLCombinationsHaveRuntimeTemplates(t *testing.T) {
+	// This is a wiring guard: every tuple advertised by
+	// supportedNCCLCombinations must have a syntactically valid runtime
+	// template. Transport viability is enforced by verifyTransportFromLogs
+	// against real NCCL logs during validation.
+	const efaIndent = "                      "
+	data := map[string]string{
+		"NAMESPACE":              "aicr-validation",
+		"WORKER_COUNT":           "2",
+		"GPU_COUNT_PER_NODE":     "8",
+		"GPU_COUNT":              "16",
+		"TEST_TYPE":              testType,
+		"MIN_MESSAGE_SIZE":       minMessageSize,
+		"MAX_MESSAGE_SIZE":       maxMessageSize,
+		"EFA_RESOURCE_LIMITS":    buildEFAResourceLine(1, efaIndent),
+		"EFA_RESOURCE_REQUESTS":  buildEFAResourceLine(1, efaIndent),
+		"RDMA_RESOURCE_LIMITS":   buildAKSRdmaResourceLine(1000, efaIndent),
+		"RDMA_RESOURCE_REQUESTS": buildAKSRdmaResourceLine(1000, efaIndent),
+		"GKE_NETWORK_INTERFACES": buildGKENetworkInterfacesAnnotation([]string{
+			"gpu-nic-0",
+			"gpu-nic-1",
+			"gpu-nic-2",
+			"gpu-nic-3",
+			"gpu-nic-4",
+			"gpu-nic-5",
+			"gpu-nic-6",
+			"gpu-nic-7",
+		}),
+		"NRI_DEVICE_ANNOTATION": buildNRIDeviceAnnotation(8),
+	}
+
+	for variant, byService := range supportedNCCLCombinations {
+		for service, accelerators := range byService {
+			for _, accelerator := range accelerators {
+				name := strings.Join([]string{string(variant), string(service), string(accelerator)}, "/")
+				t.Run(name, func(t *testing.T) {
+					path := templatePath(accelerator, service, variant, "runtime.yaml")
+					if _, err := parseYAMLTemplate(path, data); err != nil {
+						t.Fatalf("supported NCCL combination has no parseable runtime template %s: %v", path, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestH200EKSRuntimeMatchesH100 enforces the "keep in sync with H100" contract
+// declared in the header of testdata/h200/eks/runtime.yaml. H200 is Hopper on
+// EFA — electrically identical to H100 for NCCL — so the two EKS runtime
+// templates must stay byte-identical apart from their leading comment/license
+// headers. This converts the comment-only guarantee into an enforced one: an
+// EFA-related edit to one template that is not mirrored in the other fails here
+// instead of silently diverging. If the transport setup ever legitimately
+// diverges by SKU, fork the templates and delete this test.
+func TestH200EKSRuntimeMatchesH100(t *testing.T) {
+	h100 := readTemplateBody(t, filepath.Join("testdata", "h100", "eks", "runtime.yaml"))
+	h200 := readTemplateBody(t, filepath.Join("testdata", "h200", "eks", "runtime.yaml"))
+	if h100 != h200 {
+		t.Errorf("testdata/h200/eks/runtime.yaml diverged from the H100 EKS template "+
+			"(comparing bodies after stripping leading comment headers).\nH100:\n%s\nH200:\n%s", h100, h200)
+	}
+}
+
+// TestNVKENVLSRuntimeMatchesOKE enforces the "identical to OKE" contract in the
+// header of testdata/gb200/nvke/runtime-nvls.yaml: NVLS uses only the GPUs and
+// the validator-managed IMEX channel, so the two templates differ only in their
+// comment headers.
+func TestNVKENVLSRuntimeMatchesOKE(t *testing.T) {
+	oke := readTemplateBody(t, filepath.Join("testdata", "gb200", "oke", "runtime-nvls.yaml"))
+	nvke := readTemplateBody(t, filepath.Join("testdata", "gb200", "nvke", "runtime-nvls.yaml"))
+	if oke != nvke {
+		t.Errorf("testdata/gb200/nvke/runtime-nvls.yaml diverged from the OKE NVLS template "+
+			"(comparing bodies after stripping leading comment headers).\nOKE:\n%s\nNVKE:\n%s", oke, nvke)
+	}
+}
+
+// TestGB300NVKENVLSRuntimeMatchesGB200 enforces the "identical to
+// gb200/nvke" contract in the header of testdata/gb300/nvke/runtime-nvls.yaml,
+// the wiring the gb300-nvke training floor was measured with.
+func TestGB300NVKENVLSRuntimeMatchesGB200(t *testing.T) {
+	gb200 := readTemplateBody(t, filepath.Join("testdata", "gb200", "nvke", "runtime-nvls.yaml"))
+	gb300 := readTemplateBody(t, filepath.Join("testdata", "gb300", "nvke", "runtime-nvls.yaml"))
+	if gb200 != gb300 {
+		t.Errorf("testdata/gb300/nvke/runtime-nvls.yaml diverged from the GB200 NVKE NVLS template "+
+			"(comparing bodies after stripping leading comment headers).\nGB200:\n%s\nGB300:\n%s", gb200, gb300)
+	}
+}
+
+// TestNVKENetRuntimeRequestsEveryRail pins the NVKE NET runtime to the fabric
+// the gb200-nvke leaves build: each worker requests one VF on every rail and
+// attaches the matching SriovIBNetwork, in rail order, so multus names them
+// net1..net4 as the rank precheck expects.
+func TestNVKENetRuntimeRequestsEveryRail(t *testing.T) {
+	data := map[string]string{
+		"NAMESPACE":          "aicr-validation",
+		"GPU_COUNT_PER_NODE": "4",
+		"GPU_COUNT":          "8",
+		"TEST_TYPE":          testType,
+		"MIN_MESSAGE_SIZE":   minMessageSize,
+		"MAX_MESSAGE_SIZE":   maxMessageSize,
+	}
+	obj, err := parseYAMLTemplate(templatePath(recipe.CriteriaAcceleratorGB200, recipe.CriteriaServiceNVKE, variantNET, "runtime.yaml"), data)
+	if err != nil {
+		t.Fatalf("parse NVKE NET runtime: %v", err)
+	}
+	jobs, _, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "replicatedJobs")
+	if err != nil {
+		t.Fatalf("replicatedJobs: %v", err)
+	}
+	var node map[string]any
+	for _, j := range jobs {
+		if m, ok := j.(map[string]any); ok && m["name"] == nodeJobName {
+			node = m
+		}
+	}
+	if node == nil {
+		t.Fatalf("no %q replicatedJob", nodeJobName)
+	}
+	networks, _, _ := unstructured.NestedString(node, "template", "spec", "template", "metadata", "annotations", "k8s.v1.cni.cncf.io/networks")
+	wantNetworks := "default/sriov-network-rail-0,default/sriov-network-rail-1,default/sriov-network-rail-2,default/sriov-network-rail-3"
+	if networks != wantNetworks {
+		t.Errorf("networks annotation = %q, want %q", networks, wantNetworks)
+	}
+	containers, _, _ := unstructured.NestedSlice(node, "template", "spec", "template", "spec", "containers")
+	if len(containers) != 1 {
+		t.Fatalf("worker containers = %d, want 1", len(containers))
+	}
+	container, _ := containers[0].(map[string]any)
+	for _, kind := range []string{"requests", "limits"} {
+		res, _, _ := unstructured.NestedMap(container, "resources", kind)
+		for rail := range 4 {
+			key := fmt.Sprintf("nvidia.com/sriov_resource_rail_%d", rail)
+			if got := fmt.Sprint(res[key]); got != "1" {
+				t.Errorf("worker %s[%s] = %q, want \"1\"", kind, key, got)
+			}
+		}
+		if _, ok := res["nvidia.com/mlnxnics"]; ok {
+			t.Errorf("worker %s requests nvidia.com/mlnxnics, which NVKE does not expose", kind)
+		}
+	}
+
+	// A failed precheck must fail the launcher pod once, keeping its logs for the
+	// validator, rather than restarting it until the Job deletes the pod.
+	for _, j := range jobs {
+		job, _ := j.(map[string]any)
+		if job["name"] != "launcher" {
+			continue
+		}
+		policy, _, _ := unstructured.NestedString(job, "template", "spec", "template", "spec", "restartPolicy")
+		if policy != "Never" {
+			t.Errorf("launcher restartPolicy = %q, want \"Never\"", policy)
+		}
+		containers, _, _ := unstructured.NestedSlice(job, "template", "spec", "template", "spec", "containers")
+		c, _ := containers[0].(map[string]any)
+		if got, _, _ := unstructured.NestedString(c, "terminationMessagePolicy"); got != "FallbackToLogsOnError" {
+			t.Errorf("launcher terminationMessagePolicy = %q, want \"FallbackToLogsOnError\"", got)
+		}
+	}
+}
+
+// TestNVKENetRuntimePrecheckMarkerMatchesRegex ties the marker the NVKE NET
+// runtime's rank wrapper prints to the regex the validator extracts the failure
+// reason with, so the two cannot drift apart silently.
+func TestNVKENetRuntimePrecheckMarkerMatchesRegex(t *testing.T) {
+	path := templatePath(recipe.CriteriaAcceleratorGB200, recipe.CriteriaServiceNVKE, variantNET, "runtime.yaml")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	const echoMarker = `echo "AICR_PRECHECK_FAILED: `
+	var checks int
+	for _, line := range strings.Split(string(content), "\n") {
+		_, after, found := strings.Cut(line, echoMarker)
+		if !found {
+			continue
+		}
+		checks++
+		printed, _, _ := strings.Cut(after, `"`)
+		out := "AICR_PRECHECK_FAILED: " + printed + "\n"
+		if got := runtimePrecheckFailure(out); got != printed {
+			t.Errorf("runtimePrecheckFailure(%q) = %q, want %q", out, got, printed)
+		}
+	}
+	if checks != 4 {
+		t.Errorf("found %d %q lines in %s, want 4 (missing address, missing RDMA device, limited P_Key membership, mismatched P_Key index)", checks, echoMarker, path)
+	}
+}
+
+// nvkeNetRankScript returns the per-rank shell script from the rendered NVKE
+// NET runtime's launcher command: the argument after "/bin/sh", "-c".
+func nvkeNetRankScript(t *testing.T) string {
+	t.Helper()
+	data := map[string]string{
+		"NAMESPACE": "aicr-validation", "GPU_COUNT_PER_NODE": "4", "GPU_COUNT": "8",
+		"TEST_TYPE": testType, "MIN_MESSAGE_SIZE": minMessageSize, "MAX_MESSAGE_SIZE": maxMessageSize,
+	}
+	obj, err := parseYAMLTemplate(templatePath(recipe.CriteriaAcceleratorGB200, recipe.CriteriaServiceNVKE, variantNET, "runtime.yaml"), data)
+	if err != nil {
+		t.Fatalf("parse NVKE NET runtime: %v", err)
+	}
+	jobs, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "replicatedJobs")
+	for _, j := range jobs {
+		job, _ := j.(map[string]any)
+		if job["name"] != "launcher" {
+			continue
+		}
+		containers, _, _ := unstructured.NestedSlice(job, "template", "spec", "template", "spec", "containers")
+		container, _ := containers[0].(map[string]any)
+		args, _, _ := unstructured.NestedStringSlice(container, "args")
+		for i := 0; i+2 < len(args); i++ {
+			if args[i] == "/bin/sh" && args[i+1] == "-c" {
+				return args[i+2]
+			}
+		}
+	}
+	t.Fatal("no /bin/sh -c rank script in the launcher args")
+	return ""
+}
+
+// TestNVKENetRankPrecheck runs the NVKE NET runtime's rank script against a
+// stub ip and a fake /sys/class/net and /sys/class/infiniband: a rail missing
+// its IPoIB address, its RDMA device, or full P_Key membership must exit
+// non-zero with a marker naming that rail, as must rails whose full-member keys
+// sit at different table indexes. Four good rails must pin NCCL_IB_HCA to
+// exactly their VFs, in rail order, and NCCL_IB_PKEY to the full-member index
+// rather than NCCL's default index 0.
+func TestNVKENetRankPrecheck(t *testing.T) {
+	script := nvkeNetRankScript(t)
+	hcas := []string{"mlx5_9", "mlx5_30", "mlx5_49", "mlx5_61"}
+
+	tests := []struct {
+		name       string
+		noAddr     string
+		noRDMA     string
+		limited    string
+		otherIndex string
+		wantErr    string
+		wantEnv    string
+	}{
+		{name: "four rails attached", wantEnv: "=mlx5_9,mlx5_30,mlx5_49,mlx5_61 1"},
+		{name: "rail without IPoIB address", noAddr: "net3", wantErr: "AICR_PRECHECK_FAILED: rail attachment net3 has no IPoIB address"},
+		{name: "rail without RDMA device", noRDMA: "net2", wantErr: "AICR_PRECHECK_FAILED: rail attachment net2 has no RDMA device"},
+		{name: "rail with only limited P_Key membership", limited: "net4", wantErr: "AICR_PRECHECK_FAILED: rail attachment net4 (mlx5_61) holds only limited P_Key membership"},
+		{name: "rails with full-member keys at different indexes", otherIndex: "net3", wantErr: "AICR_PRECHECK_FAILED: rail attachment net3 (mlx5_49) has its full-member P_Key at index 2, other rails at 1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			sysNet := filepath.Join(root, "sys-class-net")
+			sysIB := filepath.Join(root, "sys-class-infiniband")
+			bin := filepath.Join(root, "bin")
+			if err := os.MkdirAll(bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// Stub ip: "ip -o -4 addr show dev netN" prints an inet line unless netN has no address.
+			stub := "#!/bin/sh\nfor a; do dev=$a; done\n[ \"$dev\" = \"" + tt.noAddr + "\" ] && exit 1\necho \"1: $dev    inet 10.255.0.7/22 scope global $dev\"\n"
+			if err := os.WriteFile(filepath.Join(bin, "ip"), []byte(stub), 0o755); err != nil { //nolint:gosec // test stub must be executable
+				t.Fatal(err)
+			}
+			for i, hca := range hcas {
+				dev := fmt.Sprintf("net%d", i+1)
+				dir := filepath.Join(sysNet, dev, "device", "infiniband")
+				if dev != tt.noRDMA {
+					dir = filepath.Join(dir, hca)
+				}
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				// Index 0 holds the limited default and the full-member tenant key
+				// sits at index 1, as on tenants with a UFM-assigned partition, so
+				// NCCL must be pointed at index 1 rather than its default 0.
+				pkeys := map[string]string{"0": "0x7fff", "1": "0x8001", "2": "0x0000"}
+				switch dev {
+				case tt.limited:
+					pkeys["1"] = "0x0000"
+				case tt.otherIndex:
+					pkeys["1"], pkeys["2"] = "0x0000", "0x8001"
+				}
+				pkeyDir := filepath.Join(sysIB, hca, "ports", "1", "pkeys")
+				if err := os.MkdirAll(pkeyDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				for idx, v := range pkeys {
+					if err := os.WriteFile(filepath.Join(pkeyDir, idx), []byte(v+"\n"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			body := strings.ReplaceAll(script, "/sys/class/net/", sysNet+"/")
+			body = strings.ReplaceAll(body, "/sys/class/infiniband/", sysIB+"/")
+			cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", body, "nccl-rank", "/bin/sh", "-c", `printf '%s %s' "$NCCL_IB_HCA" "$NCCL_IB_PKEY"`)
+			cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			err := cmd.Run()
+
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("precheck exited 0, want failure naming %q", tt.wantErr)
+				}
+				if !strings.Contains(stderr.String(), tt.wantErr) {
+					t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tt.wantErr)
+				}
+				if got := runtimePrecheckFailure(stderr.String()); !strings.HasPrefix("AICR_PRECHECK_FAILED: "+got, tt.wantErr) {
+					t.Errorf("runtimePrecheckFailure(stderr) = %q, does not carry %q", got, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("precheck failed: %v, stderr %q", err, stderr.String())
+			}
+			if stdout.String() != tt.wantEnv {
+				t.Errorf("NCCL_IB_HCA NCCL_IB_PKEY = %q, want %q", stdout.String(), tt.wantEnv)
+			}
+		})
+	}
+}
+
+func TestRuntimePrecheckFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		logs string
+		want string
+	}{
+		{"no marker", "NCCL INFO Using network IB\n", ""},
+		{
+			"marker names the attachment",
+			"Warning: Permanently added 'w-0'\nAICR_PRECHECK_FAILED: rail attachment net2 has no IPoIB address on w-0\r\nmpirun detected...\n",
+			"rail attachment net2 has no IPoIB address on w-0",
+		},
+		{
+			"first marker wins",
+			"AICR_PRECHECK_FAILED: net1 missing\nAICR_PRECHECK_FAILED: net3 missing\n",
+			"net1 missing",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := runtimePrecheckFailure(tt.logs); got != tt.want {
+				t.Errorf("runtimePrecheckFailure() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// readTemplateBody returns the file contents with the leading run of blank and
+// comment (#-prefixed) lines removed, i.e. everything from the first YAML line
+// onward. Lets header comments (license, per-file notes) differ while the
+// template body is compared exactly.
+func readTemplateBody(t *testing.T, path string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	lines := strings.Split(string(content), "\n")
+	start := 0
+	for start < len(lines) {
+		trimmed := strings.TrimSpace(lines[start])
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			start++
+			continue
+		}
+		break
+	}
+	return strings.Join(lines[start:], "\n")
+}
+
+func TestParseThreshold(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    float64
+		wantErr bool
+	}{
+		{
+			name:    "simple integer",
+			value:   "450",
+			want:    450,
+			wantErr: false,
+		},
+		{
+			name:    "float with units",
+			value:   "100.5 GB/s",
+			want:    100.5,
+			wantErr: false,
+		},
+		{
+			name:    "with leading whitespace",
+			value:   "  200 GB/s",
+			want:    200,
+			wantErr: false,
+		},
+		{
+			name:    "invalid format",
+			value:   "abc GB/s",
+			wantErr: true,
+		},
+		{
+			name:    "empty string",
+			value:   "",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseThreshold(tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseThreshold(%q) error = %v, wantErr %v", tt.value, err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("parseThreshold(%q) = %v, want %v", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseBandwidthFromLogs(t *testing.T) {
+	// Realistic NCCL all-reduce output snippet with 16G row (EKS).
+	eksLogs := `# nThread 1 nGpus 1 minBytes 1024 maxBytes 17179869184 step: 2(factor) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid 123 on node1 device  0 [0x00] NVIDIA H100 80GB HBM3
+#
+#                                                              out-of-place                       in-place
+#       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)
+        1024           256     float     sum      -1    28.50    0.04    0.07      0    28.20    0.04    0.07      0
+ 17179869184    4294967296     float     sum      -1  123456   139.20  450.30      0  123456   139.20  450.30      0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 225.15`
+
+	// Realistic NCCL all-reduce output with 8G max (GKE TCPXO).
+	gkeLogs := `# nccl-tests version 2.17.6 nccl-headers=22807 nccl-library=22807
+#                                                              out-of-place                       in-place
+#       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)
+  4294967296    1073741824     float     sum      -1  24547.5  174.97  328.06      0  24635.5  174.34  326.89      0
+  8589934592    2147483648     float     sum      -1  48292.9  177.87  333.51      0  48298.2  177.85  333.47      0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 87.0675`
+
+	noMatchLogs := `some random output
+no bandwidth data here
+completed successfully`
+
+	tests := []struct {
+		name    string
+		logs    string
+		want    float64
+		wantErr bool
+	}{
+		{
+			name: "EKS 16G max message size",
+			logs: eksLogs,
+			want: 450.30,
+		},
+		{
+			name: "GKE 8G max message size",
+			logs: gkeLogs,
+			want: 333.51,
+		},
+		{
+			name:    "no match in logs",
+			logs:    noMatchLogs,
+			wantErr: true,
+		},
+		{
+			name:    "empty logs",
+			logs:    "",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseBandwidthFromLogs(tt.logs)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseBandwidthFromLogs() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("parseBandwidthFromLogs() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsCRDEstablished(t *testing.T) {
+	tests := []struct {
+		name string
+		obj  *unstructured.Unstructured
+		want bool
+	}{
+		{
+			name: "established true",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"status": map[string]any{
+						"conditions": []any{
+							map[string]any{
+								"type":   "Established",
+								"status": "True",
+							},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "established false",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"status": map[string]any{
+						"conditions": []any{
+							map[string]any{
+								"type":   "Established",
+								"status": "False",
+							},
+						},
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "no established condition",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"status": map[string]any{
+						"conditions": []any{
+							map[string]any{
+								"type":   "NamesAccepted",
+								"status": "True",
+							},
+						},
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "missing conditions",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"status": map[string]any{},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "empty object",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isCRDEstablished(tt.obj)
+			if got != tt.want {
+				t.Errorf("isCRDEstablished() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSanitizeTarPath(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	tests := []struct {
+		name      string
+		targetDir string
+		entryPath string
+		wantErr   bool
+		wantSub   string
+	}{
+		{
+			name:      "valid relative path",
+			targetDir: tmpDir,
+			entryPath: "trainer-2.1.0/manifests/base/kustomization.yaml",
+			wantErr:   false,
+		},
+		{
+			name:      "path traversal with dot-dot",
+			targetDir: tmpDir,
+			entryPath: "../../../etc/passwd",
+			wantErr:   true,
+			wantSub:   "path traversal",
+		},
+		{
+			name:      "dot-dot mid-path traversal",
+			targetDir: tmpDir,
+			entryPath: "legit/../../../../../../etc/shadow",
+			wantErr:   true,
+			wantSub:   "path traversal",
+		},
+		{
+			name:      "nested valid path",
+			targetDir: tmpDir,
+			entryPath: "a/b/c/d.txt",
+			wantErr:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := sanitizeTarPath(tt.targetDir, tt.entryPath)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("sanitizeTarPath() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.wantSub != "" {
+				if !strings.Contains(err.Error(), tt.wantSub) {
+					t.Errorf("sanitizeTarPath() error = %q, want substring %q", err.Error(), tt.wantSub)
+				}
+			}
+			if !tt.wantErr {
+				if !strings.HasPrefix(got, filepath.Clean(tt.targetDir)+string(os.PathSeparator)) {
+					t.Errorf("sanitizeTarPath() = %q, want prefix %q", got, tt.targetDir)
+				}
+			}
+		})
+	}
+}

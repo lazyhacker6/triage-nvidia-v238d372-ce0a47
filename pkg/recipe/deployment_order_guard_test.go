@@ -1,0 +1,514 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package recipe
+
+import (
+	"context"
+	"slices"
+	"testing"
+)
+
+func TestDeploymentOrderGuards(t *testing.T) {
+	tests := []struct {
+		name             string
+		criteria         func() *Criteria
+		requiredDeps     map[string][]string
+		requiredOrdering [][2]string
+	}{
+		{
+			name: "h100-eks-inference",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentInference
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"gpu-operator": {"cert-manager", "prometheus-operator-crds", "nodewright-customizations"},
+			},
+			requiredOrdering: [][2]string{
+				{"nodewright-customizations", "gpu-operator"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "h100-eks-training",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentTraining
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"gpu-operator": {"cert-manager", "prometheus-operator-crds", "nodewright-customizations"},
+			},
+			requiredOrdering: [][2]string{
+				{"nodewright-customizations", "gpu-operator"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "h100-eks-ubuntu-inference-dynamo",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentInference
+				c.OS = CriteriaOSUbuntu
+				c.Platform = CriteriaPlatformDynamo
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"dynamo-platform": {"grove", "cert-manager", "prometheus-operator-crds", "gpu-operator", "kai-scheduler"},
+			},
+			requiredOrdering: [][2]string{
+				{"gpu-operator", "dynamo-platform"},
+				{"kai-scheduler", "dynamo-platform"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "gb200-eks-ubuntu-inference-dynamo",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorGB200
+				c.Intent = CriteriaIntentInference
+				c.OS = CriteriaOSUbuntu
+				c.Platform = CriteriaPlatformDynamo
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"dynamo-platform": {"grove", "cert-manager", "prometheus-operator-crds", "gpu-operator", "kai-scheduler"},
+			},
+			requiredOrdering: [][2]string{
+				{"gpu-operator", "dynamo-platform"},
+				{"kai-scheduler", "dynamo-platform"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "h100-eks-ubuntu-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentTraining
+				c.OS = CriteriaOSUbuntu
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"kubeflow-trainer": {"cert-manager", "prometheus-operator-crds", "gpu-operator"},
+			},
+			requiredOrdering: [][2]string{
+				{"gpu-operator", "kubeflow-trainer"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "gb200-eks-ubuntu-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorGB200
+				c.Intent = CriteriaIntentTraining
+				c.OS = CriteriaOSUbuntu
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"kubeflow-trainer": {"cert-manager", "prometheus-operator-crds", "gpu-operator"},
+			},
+			requiredOrdering: [][2]string{
+				{"gpu-operator", "kubeflow-trainer"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "h100-kind-inference-dynamo",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceKind
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentInference
+				c.Platform = CriteriaPlatformDynamo
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"dynamo-platform": {"grove", "cert-manager", "prometheus-operator-crds", "kai-scheduler"},
+			},
+			requiredOrdering: [][2]string{
+				{"kai-scheduler", "dynamo-platform"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "h100-kind-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceKind
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"kubeflow-trainer": {"cert-manager", "prometheus-operator-crds", "gpu-operator"},
+			},
+			requiredOrdering: [][2]string{
+				{"gpu-operator", "kubeflow-trainer"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		// The two Run:ai leaves disable the base chain's kai-scheduler (the
+		// chart bundles its own) but keep the ref, so the resolver still sees
+		// the component and the preflight mixin's edge still resolves.
+		// runai-cluster's own edges order it after the GPU and monitoring
+		// stack its operator checks in DependenciesFulfilled.
+		{
+			name: "h100-eks-ubuntu-training-runai",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorH100
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformRunai
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"runai-cluster": {"gpu-operator", "kube-prometheus-stack", "prometheus-operator-crds", "cert-manager"},
+			},
+			requiredOrdering: [][2]string{
+				{"gpu-operator", "runai-cluster"},
+				{"kube-prometheus-stack", "runai-cluster"},
+				{"cert-manager", "runai-cluster"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "h100-gke-cos-training-runai",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceGKE
+				c.Accelerator = CriteriaAcceleratorH100
+				c.OS = CriteriaOSCOS
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformRunai
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"runai-cluster": {"gpu-operator", "kube-prometheus-stack", "prometheus-operator-crds", "cert-manager"},
+			},
+			requiredOrdering: [][2]string{
+				{"gpu-operator", "runai-cluster"},
+				{"kube-prometheus-stack", "runai-cluster"},
+				{"cert-manager", "runai-cluster"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		// The two IMEX-capable Slurm leaves below carry identical dependency
+		// and ordering expectations; only the accelerator differs. The
+		// load-bearing edge in both is nvidia-dra-driver-gpu -> slinky-slurm:
+		// the IMEX ComputeDomain pre-manifest rides with slinky-slurm and
+		// consumes the DRA driver's ResourceClaimTemplate, so the driver must
+		// land first or the NodeSet pods stay Pending. Do not prune it from
+		// either case.
+		{
+			name: "gb200-eks-ubuntu-training-slurm",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorGB200
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformSlurm
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"slinky-slurm-operator": {"cert-manager", "slinky-slurm-operator-crds"},
+				"slinky-slurm":          {"nvidia-dra-driver-gpu", "slinky-slurm-operator", "slinky-slurm-operator-crds"},
+			},
+			requiredOrdering: [][2]string{
+				{"nvidia-dra-driver-gpu", "slinky-slurm"},
+				{"cert-manager", "slinky-slurm-operator"},
+				{"slinky-slurm-operator-crds", "slinky-slurm-operator"},
+				{"slinky-slurm-operator", "slinky-slurm"},
+				{"slinky-slurm-operator-crds", "slinky-slurm"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "gb300-eks-ubuntu-training-slurm",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorGB300
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformSlurm
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"slinky-slurm-operator": {"cert-manager", "slinky-slurm-operator-crds"},
+				"slinky-slurm":          {"nvidia-dra-driver-gpu", "slinky-slurm-operator", "slinky-slurm-operator-crds"},
+			},
+			requiredOrdering: [][2]string{
+				{"nvidia-dra-driver-gpu", "slinky-slurm"},
+				{"cert-manager", "slinky-slurm-operator"},
+				{"slinky-slurm-operator-crds", "slinky-slurm-operator"},
+				{"slinky-slurm-operator", "slinky-slurm"},
+				{"slinky-slurm-operator-crds", "slinky-slurm"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "h100-aks-ubuntu-training-slurm",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceAKS
+				c.Accelerator = CriteriaAcceleratorH100
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformSlurm
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"slinky-slurm-operator": {"cert-manager", "slinky-slurm-operator-crds"},
+				"slinky-slurm":          {"slinky-slurm-operator", "slinky-slurm-operator-crds"},
+			},
+			requiredOrdering: [][2]string{
+				{"cert-manager", "slinky-slurm-operator"},
+				{"slinky-slurm-operator-crds", "slinky-slurm-operator"},
+				{"slinky-slurm-operator", "slinky-slurm"},
+				{"slinky-slurm-operator-crds", "slinky-slurm"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "h100-eks-ubuntu-training-slurm",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorH100
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformSlurm
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"slinky-slurm-operator": {"cert-manager", "slinky-slurm-operator-crds"},
+				"slinky-slurm":          {"slinky-slurm-operator", "slinky-slurm-operator-crds"},
+			},
+			requiredOrdering: [][2]string{
+				{"cert-manager", "slinky-slurm-operator"},
+				{"slinky-slurm-operator-crds", "slinky-slurm-operator"},
+				{"slinky-slurm-operator", "slinky-slurm"},
+				{"slinky-slurm-operator-crds", "slinky-slurm"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "h100-gke-cos-training-slurm",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceGKE
+				c.Accelerator = CriteriaAcceleratorH100
+				c.OS = CriteriaOSCOS
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformSlurm
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"slinky-slurm-operator": {"cert-manager", "slinky-slurm-operator-crds"},
+				"slinky-slurm":          {"slinky-slurm-operator", "slinky-slurm-operator-crds"},
+				"slinky-topograph":      {"slinky-slurm-operator", "slinky-slurm-operator-crds", "slinky-slurm"},
+			},
+			requiredOrdering: [][2]string{
+				{"cert-manager", "slinky-slurm-operator"},
+				{"slinky-slurm-operator-crds", "slinky-slurm-operator"},
+				{"slinky-slurm-operator", "slinky-slurm"},
+				{"slinky-slurm-operator-crds", "slinky-slurm"},
+				// slinky-topograph deploys AFTER slinky-slurm: topograph's slinky
+				// engine create-or-updates the ConfigMap named by
+				// topologyConfigmapName (slinky-slurm-config-extra). The slurm
+				// chart must create that CM first or Helm install fails on
+				// ownership metadata. Topograph then patches only the
+				// topology.conf key (maps.Copy), preserving chart-owned keys.
+				{"slinky-slurm", "slinky-topograph"},
+				{"gpu-operator", "nvsentinel"},
+			},
+		},
+		{
+			name: "h100-kind-training-slurm",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceKind
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformSlurm
+				return c
+			},
+			requiredDeps: map[string][]string{
+				"slinky-slurm-operator": {"cert-manager", "slinky-slurm-operator-crds"},
+				"slinky-slurm":          {"slinky-slurm-operator", "slinky-slurm-operator-crds"},
+				"slinky-topograph":      {"slinky-slurm-operator", "slinky-slurm-operator-crds", "slinky-slurm"},
+			},
+			requiredOrdering: [][2]string{
+				{"cert-manager", "slinky-slurm-operator"},
+				{"slinky-slurm-operator-crds", "slinky-slurm-operator"},
+				{"slinky-slurm-operator", "slinky-slurm"},
+				{"slinky-slurm-operator-crds", "slinky-slurm"},
+				// slinky-topograph deploys AFTER slinky-slurm: topograph's slinky
+				// engine create-or-updates the ConfigMap named by
+				// topologyConfigmapName (slinky-slurm-config-extra). The slurm
+				// chart must create that CM first or Helm install fails on
+				// ownership metadata. Topograph then patches only the
+				// topology.conf key (maps.Copy), preserving chart-owned keys.
+				{"slinky-slurm", "slinky-topograph"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := NewBuilder()
+			result, err := builder.BuildFromCriteria(context.Background(), tt.criteria())
+			if err != nil {
+				t.Fatalf("BuildFromCriteria failed: %v", err)
+			}
+
+			orderIndex := make(map[string]int, len(result.DeploymentOrder))
+			for i, name := range result.DeploymentOrder {
+				orderIndex[name] = i
+			}
+
+			for compName, deps := range tt.requiredDeps {
+				comp := result.GetComponentRef(compName)
+				if comp == nil {
+					t.Fatalf("required component %q not found", compName)
+				}
+				for _, dep := range deps {
+					if !slices.Contains(comp.DependencyRefs, dep) {
+						t.Errorf("component %q missing dependency %q (got %v)", compName, dep, comp.DependencyRefs)
+					}
+				}
+			}
+
+			for _, pair := range tt.requiredOrdering {
+				before, after := pair[0], pair[1]
+				beforeIdx, ok := orderIndex[before]
+				if !ok {
+					t.Fatalf("component %q not found in deploymentOrder (%v)", before, result.DeploymentOrder)
+				}
+				afterIdx, ok := orderIndex[after]
+				if !ok {
+					t.Fatalf("component %q not found in deploymentOrder (%v)", after, result.DeploymentOrder)
+				}
+				if beforeIdx >= afterIdx {
+					t.Errorf("deployment order regression: %q (idx=%d) must be before %q (idx=%d); order=%v",
+						before, beforeIdx, after, afterIdx, result.DeploymentOrder)
+				}
+			}
+		})
+	}
+}
+
+// TestPeermemRecipesDeclareNetworkOperatorDependency guards the ordering half
+// of the legacy nvidia-peermem mitigation. When GPU Operator manages the driver
+// with driver.rdma.enabled=true, its driver pod needs MOFED kernel symbols from
+// Network Operator. dependencyRefs orders those deployment units; an emitted
+// readiness gate is still required to wait for NicClusterPolicy reconciliation.
+func TestPeermemRecipesDeclareNetworkOperatorDependency(t *testing.T) {
+	tests := []struct {
+		name            string
+		criteria        func() *Criteria
+		profile         string
+		gpuOperator     string
+		networkOperator string
+	}{
+		{
+			name: "aks operator-managed",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceAKS
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentTraining
+				return c
+			},
+			profile:         "gpuStack=operator-managed",
+			gpuOperator:     "gpu-operator",
+			networkOperator: "network-operator",
+		},
+		{
+			name: "ocp",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceOCP
+				c.Intent = CriteriaIntentTraining
+				return c
+			},
+			gpuOperator:     "gpu-operator-ocp",
+			networkOperator: "network-operator-ocp",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			result, err := NewBuilder().BuildFromCriteriaWithProfile(ctx, tt.criteria(), tt.profile)
+			if err != nil {
+				t.Fatalf("BuildFromCriteriaWithProfile failed: %v", err)
+			}
+
+			values, err := result.GetValuesForComponentWithContext(ctx, tt.gpuOperator)
+			if err != nil {
+				t.Fatalf("GetValuesForComponentWithContext(%q) failed: %v", tt.gpuOperator, err)
+			}
+			if !valueAtPath[bool](t, values, "driver", "enabled") {
+				t.Fatal("test fixture no longer exercises a GPU Operator-managed driver")
+			}
+			if !valueAtPath[bool](t, values, "driver", "rdma", "enabled") {
+				t.Fatal("test fixture no longer exercises the nvidia-peermem route")
+			}
+
+			gpuOperator := result.GetComponentRef(tt.gpuOperator)
+			if gpuOperator == nil {
+				t.Fatalf("required component %q not found", tt.gpuOperator)
+			}
+			if !slices.Contains(gpuOperator.DependencyRefs, tt.networkOperator) {
+				t.Errorf("component %q missing OFED dependency %q (got %v)",
+					tt.gpuOperator, tt.networkOperator, gpuOperator.DependencyRefs)
+			}
+
+			orderIndex := make(map[string]int, len(result.DeploymentOrder))
+			for i, name := range result.DeploymentOrder {
+				orderIndex[name] = i
+			}
+			networkIdx, networkOK := orderIndex[tt.networkOperator]
+			gpuIdx, gpuOK := orderIndex[tt.gpuOperator]
+			if !networkOK || !gpuOK {
+				t.Fatalf("required components missing from deploymentOrder: %v", result.DeploymentOrder)
+			}
+			if networkIdx >= gpuIdx {
+				t.Errorf("deployment order regression: %q (idx=%d) must be before %q (idx=%d); order=%v",
+					tt.networkOperator, networkIdx, tt.gpuOperator, gpuIdx, result.DeploymentOrder)
+			}
+		})
+	}
+}

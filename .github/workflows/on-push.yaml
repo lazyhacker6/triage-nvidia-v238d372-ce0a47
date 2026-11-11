@@ -1,0 +1,236 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: On Push Qualification
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+  workflow_dispatch: {}  # Allow manual runs
+
+permissions:
+  contents: read
+
+env:
+  VALIDATOR_IMAGE_PREFIX: ghcr.io/nvidia/aicr-validators
+  # Keep in sync with build-docker matrix.phase. `aiperf-bench` is an ancillary
+  # image (Python-based, not a Go validator) required by the inference-perf
+  # check; it uses an alternate Dockerfile via matrix overrides.
+  VALIDATOR_PHASES: "deployment performance conformance aiperf-bench"
+  EXPECTED_PLATFORMS: "linux/amd64 linux/arm64"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Serialize main pushes so a run that starts is never interrupted mid-build
+  # and its sha-<commit> image tag is published whole.
+  #
+  # This does NOT mean every merge gets a run. One ref-keyed group holds at most
+  # one queued run, so when merges land faster than a run takes, a pending one is
+  # cancelled by the next arrival and that commit is never qualified or tagged.
+  # Observed 2026-09-10: c6d8a5533 and 5b0e3727b merged 36 seconds apart, the
+  # first was cancelled while queued, and ghcr.io/nvidia/aicr-validators/*
+  # carries no sha-c6d8a5533... tag. Do not assume a merged commit has an image.
+  #
+  # Keeping it this way is deliberate. Keying the group by github.sha would give
+  # every commit its own run, but concurrent runs also push the mutable
+  # edge-<arch> tags, so a slower older run could clobber a newer commit's edge.
+  # Losing an intermediate sha- tag is the cheaper failure.
+  cancel-in-progress: false
+
+jobs:
+
+  tests:
+    uses: ./.github/workflows/qualification.yaml
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      security-events: write
+    with:
+      coverage_report: true
+
+  # =============================================================================
+  # Validator Image Build: publish :edge and sha-<commit> on merge to main
+  # Keeps validator images testable from main without requiring a release.
+  # :latest is reserved for the on-tag release pipeline (vuln scan + attestation).
+  # Skipped for pull requests — only runs on push to main.
+  # =============================================================================
+
+  build-docker:
+    name: Docker Validator (${{ matrix.phase }}/${{ matrix.arch }})
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    needs: [tests]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        phase: [deployment, performance, conformance, aiperf-bench]  # keep in sync with VALIDATOR_PHASES
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          # Ancillary (non-Go-validator) images override the default
+          # validators/<phase>/Dockerfile path and image title.
+          - phase: aiperf-bench
+            dockerfile: validators/performance/aiperf-bench.Dockerfile
+            image_title: aicr-aiperf-bench
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load versions
+        id: versions
+        uses: ./.github/actions/load-versions
+
+      # Docker Hub rate-limits anonymous pulls per runner IP and its token
+      # endpoint timed out for this matrix (main red 2026-10-09). Pull the
+      # BuildKit image, and resolve docker.io FROM images (aiperf-bench's
+      # python:3.13-slim builder), through the Docker Hub mirror; BuildKit
+      # falls back to Docker Hub on a mirror miss.
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003  # v4.4.0
+        with:
+          driver-opts: image=${{ steps.versions.outputs.dockerhub_mirror_host }}/moby/buildkit:buildx-stable-1
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["${{ steps.versions.outputs.dockerhub_mirror_host }}"]
+
+      - name: Authenticate to registry
+        uses: ./.github/actions/ghcr-login
+
+      - name: Setup Go
+        if: matrix.phase != 'aiperf-bench'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+
+      - name: Build validator binary
+        if: matrix.phase != 'aiperf-bench'
+        shell: bash
+        env:
+          VALIDATOR_ARCHES: ${{ matrix.arch }}
+          VALIDATOR_PHASES: ${{ matrix.phase }}
+        run: ./tools/build-validator-binaries
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile || format('validators/{0}/Dockerfile', matrix.phase) }}
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ${{ env.VALIDATOR_IMAGE_PREFIX }}/${{ matrix.phase }}:sha-${{ github.sha }}-${{ matrix.arch }}
+            ${{ env.VALIDATOR_IMAGE_PREFIX }}/${{ matrix.phase }}:edge-${{ matrix.arch }}
+          provenance: false
+          # aiperf-bench builds without the layer cache on purpose (#2086).
+          # Its requirements.txt is deliberately unpinned so each rebuild
+          # resolves patched transitive versions, but `pip install` is opaque
+          # to BuildKit: neither the base image nor the COPY'd requirements.txt
+          # changes between releases, so a cache hit replays the old closure
+          # verbatim and the image silently stops picking up CVE fixes. The Go
+          # validators have no resolution step, so they keep the cache.
+          cache-from: ${{ matrix.phase != 'aiperf-bench' && 'type=gha' || '' }}
+          cache-to: ${{ matrix.phase != 'aiperf-bench' && 'type=gha,mode=max' || '' }}
+          labels: |
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.title=${{ matrix.image_title || format('aicr-validator-{0}', matrix.phase) }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=main-${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+  docker-manifest:
+    name: Docker Manifest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    needs: [build-docker]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to registry
+        uses: ./.github/actions/ghcr-login
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003  # v4.4.0
+
+      - name: Create multi-arch manifests for validator images
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for phase in ${VALIDATOR_PHASES}; do
+            IMAGE="${VALIDATOR_IMAGE_PREFIX}/${phase}"
+
+            # Immutable per-commit tag for rollback and provenance
+            docker buildx imagetools create \
+              -t "${IMAGE}:sha-${SHA}" \
+              "${IMAGE}:sha-${SHA}-amd64" \
+              "${IMAGE}:sha-${SHA}-arm64"
+
+            # Mutable :edge tag (tracks latest main, recreated fresh)
+            docker buildx imagetools create \
+              -t "${IMAGE}:edge" \
+              "${IMAGE}:sha-${SHA}-amd64" \
+              "${IMAGE}:sha-${SHA}-arm64"
+          done
+
+      - name: Verify multi-arch manifests
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for phase in ${VALIDATOR_PHASES}; do
+            IMAGE="${VALIDATOR_IMAGE_PREFIX}/${phase}"
+            for alias in "sha-${SHA}" "edge"; do
+              MANIFEST=$(docker buildx imagetools inspect --raw "${IMAGE}:${alias}")
+
+              PLATFORMS=$(echo "${MANIFEST}" | jq -r \
+                '[.manifests[] | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture)"] | sort | .[]')
+
+              for expected in ${EXPECTED_PLATFORMS}; do
+                if ! echo "${PLATFORMS}" | grep -qx "${expected}"; then
+                  echo "::error::${IMAGE}:${alias} missing platform ${expected}"
+                  exit 1
+                fi
+              done
+
+              if echo "${MANIFEST}" | jq -e '.manifests[] | select(.platform.os == "unknown")' >/dev/null 2>&1; then
+                echo "::error::${IMAGE}:${alias} contains unknown/unknown descriptor"
+                exit 1
+              fi
+            done
+          done

@@ -1,0 +1,2222 @@
+// Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package aicr
+
+import (
+	"context"
+	stderrors "errors"
+	"fmt"
+	"io/fs"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+	"github.com/NVIDIA/aicr/pkg/recipe/providertest"
+	"github.com/NVIDIA/aicr/pkg/validator"
+)
+
+// blockingDataProvider wraps an underlying DataProvider but holds
+// WalkDir on a signal channel until the test releases it. Used by
+// the Close-drains-inflight test to deterministically pin a resolve
+// inside metadata-store loading while a second goroutine calls
+// Client.Close, so the test can assert Close waits rather than
+// racing the resolve's storeCache repopulation.
+type blockingDataProvider struct {
+	underlying  recipe.DataProvider
+	walkStarted chan struct{}
+	walkUnblock chan struct{}
+}
+
+func (b *blockingDataProvider) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	return b.underlying.ReadFile(ctx, path)
+}
+
+func (b *blockingDataProvider) WalkDir(ctx context.Context, root string, fn fs.WalkDirFunc) error {
+	// Signal exactly once that WalkDir entered; tolerate multiple
+	// calls so a retry inside the same test wouldn't deadlock.
+	select {
+	case <-b.walkStarted:
+	default:
+		close(b.walkStarted)
+	}
+	<-b.walkUnblock
+	return b.underlying.WalkDir(ctx, root, fn)
+}
+
+func (b *blockingDataProvider) Source(path string) string {
+	return b.underlying.Source(path)
+}
+
+// mutatingValuesProvider models a LayeredDataProvider whose backing file
+// changes underfoot: reads of watchPath return contents[0], contents[1], ...
+// in order (the last entry repeating once exhausted), and every other path
+// delegates to the embedded FS so the component registry still loads.
+//
+// It exists to make the read-once guarantee observable. An operation that
+// resolves a component's values twice — once to validate, once to emit —
+// sees two DIFFERENT value sets here, which is exactly the window issue
+// #1873 item A describes.
+type mutatingValuesProvider struct {
+	underlying recipe.DataProvider
+	watchPath  string
+	contents   [][]byte
+	reads      atomic.Int64
+}
+
+func (p *mutatingValuesProvider) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	if path != p.watchPath {
+		return p.underlying.ReadFile(ctx, path)
+	}
+	n := p.reads.Add(1)
+	index := int(n) - 1
+	if index >= len(p.contents) {
+		index = len(p.contents) - 1
+	}
+	return p.contents[index], nil
+}
+
+func (p *mutatingValuesProvider) WalkDir(ctx context.Context, root string, fn fs.WalkDirFunc) error {
+	return p.underlying.WalkDir(ctx, root, fn)
+}
+
+func (p *mutatingValuesProvider) Source(path string) string {
+	return p.underlying.Source(path)
+}
+
+// newRecipeResultForBundleTest builds a facade RecipeResult with its
+// unexported internal field populated, side-stepping the requirement
+// that callers obtain RecipeResults via ResolveRecipe. This is
+// internal-only because the internal field is unexported on purpose;
+// the production contract only allows the facade itself to set it.
+//
+// owner stamps the unexported owner pointer that BundleComponents /
+// ValidateState check against. Pass the same *Client the test will
+// invoke BundleComponents on so the cross-client guard accepts the
+// result; pass a different (or nil) *Client to deliberately exercise
+// the rejection path.
+func newRecipeResultForBundleTest(owner *Client, refs []recipe.ComponentRef, facadeComponents []ComponentRef) *RecipeResult {
+	internal := &recipe.RecipeResult{
+		Kind:          "RecipeResult",
+		APIVersion:    recipe.RecipeResultAPIVersion,
+		ComponentRefs: refs,
+	}
+	return &RecipeResult{
+		Name:       "test",
+		Components: facadeComponents,
+		internal:   internal,
+		owner:      owner,
+	}
+}
+
+// newClientForBundleTest builds a Client whose builder is non-nil so
+// BundleComponents passes the closed-Client guard. Only the closed-
+// Client check looks at builder; the bundling path itself doesn't,
+// so a placeholder Builder is enough.
+//
+// dp binds to the embedded recipe FS so the per-Client DataProvider
+// snapshot in BundleComponents has a non-nil provider for values +
+// manifest reads. Without an explicit dp, those reads fall back to
+// recipe.GetDataProvider() — the package-global singleton — which
+// races against any other test that touches it under -race.
+func newClientForBundleTest(t *testing.T) *Client {
+	t.Helper()
+	return &Client{
+		builder: recipe.NewBuilder(),
+		dp:      recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), "."),
+	}
+}
+
+type concurrencyTrackingProvider struct {
+	active  atomic.Int64
+	maximum atomic.Int64
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *concurrencyTrackingProvider) ReadFile(ctx context.Context, _ string) ([]byte, error) {
+	active := p.active.Add(1)
+	defer p.active.Add(-1)
+	for {
+		maximum := p.maximum.Load()
+		if active <= maximum || p.maximum.CompareAndSwap(maximum, active) {
+			break
+		}
+	}
+	select {
+	case p.started <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-p.release:
+		return []byte("value: true\n"), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (p *concurrencyTrackingProvider) WalkDir(
+	ctx context.Context,
+	_ string,
+	_ fs.WalkDirFunc,
+) error {
+
+	return ctx.Err()
+}
+
+func (p *concurrencyTrackingProvider) Source(path string) string { return path }
+
+func TestResolveHelmComponentValuesBoundsConcurrency(t *testing.T) {
+	t.Parallel()
+
+	const settleTimeout = 100 * time.Millisecond
+	componentCount := defaults.HelmValueResolutionConcurrency + 2
+	provider := &concurrencyTrackingProvider{
+		started: make(chan struct{}, componentCount),
+		release: make(chan struct{}),
+	}
+	refs := make([]recipe.ComponentRef, componentCount)
+	components := make([]ComponentRef, componentCount)
+	for index := range componentCount {
+		name := fmt.Sprintf("component-%d", index)
+		refs[index] = recipe.ComponentRef{
+			Name:       name,
+			ValuesFile: fmt.Sprintf("components/%s/values.yaml", name),
+		}
+		components[index] = ComponentRef{Name: name, Kind: "Helm"}
+	}
+	internal := &recipe.RecipeResult{ComponentRefs: refs}
+	internal.BindDataProvider(provider)
+	result := &RecipeResult{Components: components, internal: internal}
+
+	ctx, cancel := context.WithTimeout(t.Context(), defaults.FileReadTimeout)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := resolveHelmComponentValues(ctx, result)
+		done <- err
+	}()
+
+	for range defaults.HelmValueResolutionConcurrency {
+		select {
+		case <-provider.started:
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for value-resolution workers: %v", ctx.Err())
+		}
+	}
+	select {
+	case <-provider.started:
+		t.Fatal("value resolution exceeded its concurrency limit before workers were released")
+	case <-time.After(settleTimeout):
+	}
+	close(provider.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("resolveHelmComponentValues() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("resolveHelmComponentValues() did not finish: %v", ctx.Err())
+	}
+	if got := provider.maximum.Load(); got != defaults.HelmValueResolutionConcurrency {
+		t.Errorf("maximum concurrent reads = %d, want %d", got, defaults.HelmValueResolutionConcurrency)
+	}
+}
+
+// TestWithVersionStored locks in that WithVersion threads the supplied
+// version string onto the Client so the builder can stamp it into recipe
+// metadata.
+func TestWithVersionStored(t *testing.T) {
+	c, err := NewClient(WithRecipeSource(EmbeddedSource()), WithVersion("v9.9.9"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer c.Close()
+	if c.version != "v9.9.9" {
+		t.Fatalf("version = %q, want v9.9.9", c.version)
+	}
+}
+
+// TestEnforceAllowLists exercises the shared allowlist guard directly:
+// a nil allowlist is a no-op (all criteria pass); a configured allowlist
+// rejects out-of-list accelerators while accepting in-list ones. The
+// resolve-path integration is covered end-to-end in aicr_test.go once
+// ResolveRecipeFromCriteria exists.
+func TestEnforceAllowLists(t *testing.T) {
+	t.Parallel()
+
+	h100, err := recipe.BuildCriteriaWithRegistry(nil,
+		recipe.WithAcceleratorRegistry("h100"),
+		recipe.WithIntentRegistry("training"),
+	)
+	if err != nil {
+		t.Fatalf("BuildCriteria h100: %v", err)
+	}
+	b200, err := recipe.BuildCriteriaWithRegistry(nil,
+		recipe.WithAcceleratorRegistry("b200"),
+		recipe.WithIntentRegistry("training"),
+	)
+	if err != nil {
+		t.Fatalf("BuildCriteria b200: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		allowLists *AllowLists
+		criteria   *recipe.Criteria
+		wantErr    bool
+	}{
+		{"nil allowlist allows anything", nil, b200, false},
+		{
+			"in-list accelerator passes",
+			&AllowLists{Accelerators: []string{string(recipe.CriteriaAcceleratorH100)}},
+			h100,
+			false,
+		},
+		{
+			"out-of-list accelerator rejected",
+			&AllowLists{Accelerators: []string{string(recipe.CriteriaAcceleratorH100)}},
+			b200,
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := &Client{allowLists: tt.allowLists}
+			err := c.enforceAllowLists(tt.criteria)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("enforceAllowLists() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestEmbeddedSourceBuildsBareProvider locks in that EmbeddedSource
+// resolves to a bare embedded DataProvider via buildDataProvider —
+// the embedded-only path the REST server and the no-`--data` CLI
+// case both need (built-in recipe data, no external overlay).
+func TestEmbeddedSourceBuildsBareProvider(t *testing.T) {
+	dp, err := buildDataProvider(
+		t.Context(),
+		recipeSource{kind: sourceKindEmbedded},
+		ociSourceConfig{},
+		defaultClientDependencies(),
+	)
+	if err != nil {
+		t.Fatalf("buildDataProvider(embedded): %v", err)
+	}
+	if dp == nil {
+		t.Fatal("expected non-nil embedded data provider")
+	}
+}
+
+// TestBundleComponents_RejectsUnknownKind locks in the change from
+// silent empty bundle (pre-fix) to a clear ErrCodeInvalidRequest
+// (post-fix) when a recipe's component carries a Kind that doesn't
+// normalise to "helm" or "kustomize" — typo bait at the recipe-emit
+// boundary.
+func TestBundleComponents_RejectsUnknownKind(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		kind string
+	}{
+		{"empty kind", ""},
+		{"typo kind", "Hlem"},
+		{"trailing space", "Helm "},
+		{"truncation", "kustom"},
+	}
+
+	client := newClientForBundleTest(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := newRecipeResultForBundleTest(client,
+				[]recipe.ComponentRef{{Name: "c1"}},
+				[]ComponentRef{{Name: "c1", Kind: tt.kind}},
+			)
+			_, err := client.BundleComponents(context.Background(), r)
+			if err == nil {
+				t.Fatalf("expected error for unknown kind %q, got nil", tt.kind)
+			}
+			var se *aicrerrors.StructuredError
+			if !stderrors.As(err, &se) {
+				t.Fatalf("expected *aicrerrors.StructuredError, got %T: %v", err, err)
+			}
+			if se.Code != aicrerrors.ErrCodeInvalidRequest {
+				t.Errorf("expected ErrCodeInvalidRequest, got %s", se.Code)
+			}
+		})
+	}
+}
+
+// TestBundleComponents_AcceptsLowercasedKind locks in the case-
+// insensitive normalisation. Downstream deployment code typically
+// accepts both forms; the AICR contract should match. A pure
+// lowercase "helm" Kind with no values must produce a successful
+// bundle (HelmValues nil, no error).
+func TestBundleComponents_AcceptsLowercasedKind(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		kind string
+	}{
+		{"canonical Helm", "Helm"},
+		{"lowercased helm", "helm"},
+		{"mixed-case Helm", "HELM"},
+	}
+
+	client := newClientForBundleTest(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := newRecipeResultForBundleTest(client,
+				// No ValuesFile, no Overrides → GetValuesForComponent
+				// returns an empty map and never touches the global
+				// DataProvider. Keeps the test hermetic.
+				[]recipe.ComponentRef{{Name: "c1", Type: recipe.ComponentTypeHelm}},
+				[]ComponentRef{{Name: "c1", Kind: tt.kind}},
+			)
+			bundles, err := client.BundleComponents(context.Background(), r)
+			if err != nil {
+				t.Fatalf("unexpected error for kind %q: %v", tt.kind, err)
+			}
+			if len(bundles) != 1 {
+				t.Fatalf("expected 1 bundle, got %d", len(bundles))
+			}
+			if bundles[0].HelmValues != nil {
+				t.Errorf("expected nil HelmValues for empty values map, got %q",
+					bundles[0].HelmValues)
+			}
+		})
+	}
+}
+
+// TestBundleComponents_HelmComponentLoadsManifestFiles locks in the
+// "Helm components carry supplemental manifests too" contract. Recipes
+// like h100-gke-cos-training and the base gpu-operator overlay attach
+// extra raw manifests to a Helm component (gke-nccl-tcpxo installer +
+// nri-device-injector; gpu-operator's dcgm-exporter overlay). Pre-fix
+// the switch in BundleComponents only loaded ManifestFiles for the
+// "Kustomize" branch, so these supplemental resources fell on the
+// floor — bundle.Manifests was nil and the deployer had no way to
+// know they should be applied.
+//
+// Post-fix: a Helm component with non-empty ManifestFiles produces a
+// bundle whose Manifests is the multi-doc concatenation of those
+// files (and HelmValues remains populated independently). A Helm
+// component WITHOUT ManifestFiles still produces Manifests == nil so
+// the existing one-Release-per-component path is unchanged.
+//
+// The test reads from the embedded recipe FS (the same
+// components/gpu-operator/manifests/dcgm-exporter.yaml the existing
+// TestGetManifestContent uses), keeping the hermetic-fixture style
+// consistent with the rest of this file.
+func TestBundleComponents_HelmComponentLoadsManifestFiles(t *testing.T) {
+	t.Parallel()
+
+	// Real embedded manifest on github/main. The specific manifest doesn't
+	// matter for this test — we're verifying that BundleComponents reads
+	// ANY supplemental manifest a recipe attaches to a Helm component. The
+	// kernel-module-params overlay is small and stable.
+	const manifestPath = "components/gpu-operator/manifests/kernel-module-params.yaml"
+
+	tests := []struct {
+		name           string
+		manifestFiles  []string
+		wantNilOutput  bool
+		mustContainAll []string // substrings expected in the joined manifest blob
+	}{
+		{
+			name:          "Helm component with no manifestFiles → Manifests nil",
+			manifestFiles: nil,
+			wantNilOutput: true,
+		},
+		{
+			name:           "Helm component with one manifestFile → Manifests populated",
+			manifestFiles:  []string{manifestPath},
+			wantNilOutput:  false,
+			mustContainAll: []string{"apiVersion", "kind"},
+		},
+		{
+			name:           "Helm component with multiple manifestFiles → multi-doc joined with ---",
+			manifestFiles:  []string{manifestPath, manifestPath},
+			wantNilOutput:  false,
+			mustContainAll: []string{"\n---\n"},
+		},
+	}
+
+	client := newClientForBundleTest(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := newRecipeResultForBundleTest(client,
+				[]recipe.ComponentRef{{
+					Name:          "gpu-operator",
+					Type:          recipe.ComponentTypeHelm,
+					ManifestFiles: tt.manifestFiles,
+				}},
+				[]ComponentRef{{Name: "gpu-operator", Kind: "Helm"}},
+			)
+			bundles, err := client.BundleComponents(context.Background(), r)
+			if err != nil {
+				t.Fatalf("BundleComponents: %v", err)
+			}
+			if len(bundles) != 1 {
+				t.Fatalf("expected 1 bundle, got %d", len(bundles))
+			}
+			got := bundles[0]
+			if tt.wantNilOutput {
+				if got.Manifests != nil {
+					t.Errorf("expected nil Manifests for Helm component without manifestFiles, got %d bytes",
+						len(got.Manifests))
+				}
+				return
+			}
+			if len(got.Manifests) == 0 {
+				t.Fatalf("expected non-empty Manifests for Helm component with manifestFiles, got nil/empty")
+			}
+			for _, sub := range tt.mustContainAll {
+				if !strings.Contains(string(got.Manifests), sub) {
+					t.Errorf("Manifests missing expected substring %q; full content (%d bytes):\n%s",
+						sub, len(got.Manifests), got.Manifests)
+				}
+			}
+		})
+	}
+}
+
+// TestBundleComponents_RejectsAllDisabled locks in that an all-disabled
+// recipe is rejected the same way DefaultBundler.Make rejects it
+// (bundler.go), rather than silently returning an empty, successful
+// bundle list. See #1917.
+func TestBundleComponents_RejectsAllDisabled(t *testing.T) {
+	t.Parallel()
+
+	client := newClientForBundleTest(t)
+	r := newRecipeResultForBundleTest(client,
+		[]recipe.ComponentRef{
+			{
+				Name:      "disabled-a",
+				Type:      recipe.ComponentTypeHelm,
+				Overrides: map[string]any{"enabled": false},
+			},
+		},
+		nil, // facade Components is empty because the only ref is disabled
+	)
+	_, err := client.BundleComponents(context.Background(), r)
+	if err == nil {
+		t.Fatal("expected error for all-disabled recipe, got nil")
+	}
+	var se *aicrerrors.StructuredError
+	if !stderrors.As(err, &se) {
+		t.Fatalf("expected *aicrerrors.StructuredError, got %T: %v", err, err)
+	}
+	if se.Code != aicrerrors.ErrCodeInvalidRequest {
+		t.Errorf("expected ErrCodeInvalidRequest, got %s", se.Code)
+	}
+}
+
+// TestBundleComponents_RejectsZeroComponentRefs locks in that a recipe
+// with no componentRefs at all is rejected the same way as an all-
+// disabled recipe — the zero-ref divergence from DefaultBundler.Make
+// that the dropped r.internal.ComponentRefs conjunct used to miss.
+// See #1917.
+func TestBundleComponents_RejectsZeroComponentRefs(t *testing.T) {
+	t.Parallel()
+
+	client := newClientForBundleTest(t)
+	r := newRecipeResultForBundleTest(client, nil, nil)
+	_, err := client.BundleComponents(context.Background(), r)
+	if err == nil {
+		t.Fatal("expected error for zero-componentRef recipe, got nil")
+	}
+	var se *aicrerrors.StructuredError
+	if !stderrors.As(err, &se) {
+		t.Fatalf("expected *aicrerrors.StructuredError, got %T: %v", err, err)
+	}
+	if se.Code != aicrerrors.ErrCodeInvalidRequest {
+		t.Errorf("expected ErrCodeInvalidRequest, got %s", se.Code)
+	}
+}
+
+// TestBundleComponents_ResolvesValuesOnce is the regression guard for the
+// values TOCTOU (#1873 item A, closed for the SDK path by #2021).
+//
+// gpu-operator carries a severity:error CheckDriverOwnershipCoherence
+// validation in recipes/registry.yaml, so BundleComponents runs a gate that
+// needs the component's effective values AND returns those values to the
+// caller. Before the fix those were two independent reads: the gate resolved
+// its own copy and the emit path resolved another. Against a provider whose
+// backing file changes between reads — the LayeredDataProvider behavior, which
+// re-reads external --data files on every call — the gate could therefore
+// approve one set of values while a different set was handed back.
+//
+// The provider below returns a different document on every read of the
+// component's values file, which makes the divergence directly observable:
+//
+//   - exactly one read means gate and emit share a single resolution;
+//   - the emitted values must be the FIRST document, i.e. the one the gate saw.
+//
+// Pre-fix this test fails on both assertions (2 reads, "second" emitted).
+func TestBundleComponents_ResolvesValuesOnce(t *testing.T) {
+	t.Parallel()
+
+	const valuesPath = "components/gpu-operator/values.yaml"
+
+	provider := &mutatingValuesProvider{
+		underlying: recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), "."),
+		watchPath:  valuesPath,
+		contents: [][]byte{
+			[]byte("driver:\n  version: first\n"),
+			[]byte("driver:\n  version: second\n"),
+		},
+	}
+
+	client := newClientForBundleTest(t)
+	r := newRecipeResultForBundleTest(client,
+		[]recipe.ComponentRef{{
+			Name:       "gpu-operator",
+			Type:       recipe.ComponentTypeHelm,
+			ValuesFile: valuesPath,
+		}},
+		[]ComponentRef{{Name: "gpu-operator", Kind: "Helm"}},
+	)
+	r.internal.BindDataProvider(provider)
+
+	bundles, err := client.BundleComponents(context.Background(), r)
+	if err != nil {
+		t.Fatalf("BundleComponents: %v", err)
+	}
+	if len(bundles) != 1 {
+		t.Fatalf("BundleComponents() returned %d bundles, want 1", len(bundles))
+	}
+
+	if got := provider.reads.Load(); got != 1 {
+		t.Errorf("values file read %d times, want exactly 1 — the coherence gate and the "+
+			"emitted bundle must share a single resolution, or a provider mutation between "+
+			"reads can slip different values past the gate", got)
+	}
+
+	emitted := string(bundles[0].HelmValues)
+	if !strings.Contains(emitted, "first") {
+		t.Errorf("emitted HelmValues = %q, want the values the gate validated (driver.version=first)", emitted)
+	}
+	if strings.Contains(emitted, "second") {
+		t.Errorf("emitted HelmValues = %q carry a post-gate re-read; the returned values "+
+			"must be exactly the ones validated", emitted)
+	}
+}
+
+// TestBundleComponents_PinnedValuesSurviveGateMutation proves the pinned
+// snapshot is not corrupted by a gate that mutates the map it receives.
+// CheckDriverOwnershipCoherence layers bundle-time --set overrides onto the
+// values map it resolves, so serving the gate a shared reference would let
+// those overrides leak into the emitted bundle. The pin hands out deep
+// copies; a second BundleComponents call must therefore see the same values.
+func TestBundleComponents_PinnedValuesSurviveGateMutation(t *testing.T) {
+	t.Parallel()
+
+	const valuesPath = "components/gpu-operator/values.yaml"
+
+	client := newClientForBundleTest(t)
+	newResult := func() *RecipeResult {
+		r := newRecipeResultForBundleTest(client,
+			[]recipe.ComponentRef{{
+				Name:       "gpu-operator",
+				Type:       recipe.ComponentTypeHelm,
+				ValuesFile: valuesPath,
+			}},
+			[]ComponentRef{{Name: "gpu-operator", Kind: "Helm"}},
+		)
+		r.internal.BindDataProvider(recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), "."))
+		return r
+	}
+
+	first, err := client.BundleComponents(context.Background(), newResult())
+	if err != nil {
+		t.Fatalf("BundleComponents (first): %v", err)
+	}
+	second, err := client.BundleComponents(context.Background(), newResult())
+	if err != nil {
+		t.Fatalf("BundleComponents (second): %v", err)
+	}
+	if string(first[0].HelmValues) != string(second[0].HelmValues) {
+		t.Errorf("HelmValues drifted between calls:\nfirst:\n%s\nsecond:\n%s",
+			first[0].HelmValues, second[0].HelmValues)
+	}
+}
+
+// TestRecipeResultFromInternal_PlumbsHelmFields locks in that the
+// translation from pkg/recipe.ComponentRef into the facade's
+// ComponentRef carries Source, Chart, and Namespace through. Without
+// these, downstream consumers can't build a usable Helm Release —
+// chart.repository, chart.name, and forProvider.namespace all come
+// from this triplet.
+func TestRecipeResultFromInternal_PlumbsHelmFields(t *testing.T) {
+	t.Parallel()
+
+	internal := &recipe.RecipeResult{
+		Kind:       "RecipeResult",
+		APIVersion: "v1",
+		Criteria:   &recipe.Criteria{},
+		ComponentRefs: []recipe.ComponentRef{
+			{
+				Name:      "nfd",
+				Type:      recipe.ComponentTypeHelm,
+				Version:   "0.15.5",
+				Source:    "https://kubernetes-sigs.github.io/node-feature-discovery/charts",
+				Chart:     "node-feature-discovery",
+				Namespace: "node-feature-discovery",
+			},
+			{
+				Name:      "gpu-operator",
+				Type:      recipe.ComponentTypeHelm,
+				Version:   "v25.10.0",
+				Source:    "https://helm.ngc.nvidia.com/nvidia",
+				Chart:     "gpu-operator",
+				Namespace: "gpu-operator",
+			},
+		},
+	}
+
+	out, err := recipeResultFromInternal(internal)
+	if err != nil {
+		t.Fatalf("recipeResultFromInternal: %v", err)
+	}
+	if len(out.Components) != 2 {
+		t.Fatalf("expected 2 components, got %d", len(out.Components))
+	}
+
+	for i, want := range internal.ComponentRefs {
+		got := out.Components[i]
+		if got.Source != want.Source {
+			t.Errorf("Components[%d].Source = %q, want %q", i, got.Source, want.Source)
+		}
+		if got.Chart != want.Chart {
+			t.Errorf("Components[%d].Chart = %q, want %q", i, got.Chart, want.Chart)
+		}
+		if got.Namespace != want.Namespace {
+			t.Errorf("Components[%d].Namespace = %q, want %q", i, got.Namespace, want.Namespace)
+		}
+	}
+}
+
+// TestCollectSnapshot_RejectsNilClient locks in the nil-receiver
+// guard that mirrors ResolveRecipe / BundleComponents. Calling on
+// a nil Client must return ErrCodeInvalidRequest, not panic.
+func TestCollectSnapshot_RejectsNilClient(t *testing.T) {
+	t.Parallel()
+
+	var c *Client
+	_, err := c.CollectSnapshot(context.Background(), &AgentConfig{Namespace: "x"})
+	if err == nil {
+		t.Fatalf("expected error from nil Client, got nil")
+	}
+	var se *aicrerrors.StructuredError
+	if !stderrors.As(err, &se) {
+		t.Fatalf("expected *aicrerrors.StructuredError, got %T: %v", err, err)
+	}
+	if se.Code != aicrerrors.ErrCodeInvalidRequest {
+		t.Errorf("expected ErrCodeInvalidRequest, got %s", se.Code)
+	}
+}
+
+// TestCollectSnapshot_RejectsNilConfig locks in that an explicit
+// nil AgentConfig surfaces as ErrCodeInvalidRequest at the facade
+// before any K8s deployment is attempted. The underlying snapshotter
+// rejects nil too, but doing it at the facade keeps the error code
+// consistent across paths.
+func TestCollectSnapshot_RejectsNilConfig(t *testing.T) {
+	t.Parallel()
+
+	c := newClientForBundleTest(t)
+	_, err := c.CollectSnapshot(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("expected error from nil config, got nil")
+	}
+	var se *aicrerrors.StructuredError
+	if !stderrors.As(err, &se) {
+		t.Fatalf("expected *aicrerrors.StructuredError, got %T: %v", err, err)
+	}
+	if se.Code != aicrerrors.ErrCodeInvalidRequest {
+		t.Errorf("expected ErrCodeInvalidRequest, got %s", se.Code)
+	}
+}
+
+// TestCollectSnapshot_RejectsClosedClient locks in the closed-Client
+// guard. After Close() clears the builder, CollectSnapshot must
+// surface that as ErrCodeInvalidRequest rather than calling through
+// to snapshotter.DeployAndCollect with stale state.
+func TestCollectSnapshot_RejectsClosedClient(t *testing.T) {
+	t.Parallel()
+
+	c := newClientForBundleTest(t)
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	got, err := c.CollectSnapshot(context.Background(), &AgentConfig{Namespace: "x"})
+	if err == nil {
+		t.Fatalf("expected error from closed Client, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil Snapshot on error, got %v", got)
+	}
+	var se *aicrerrors.StructuredError
+	if !stderrors.As(err, &se) {
+		t.Fatalf("expected *aicrerrors.StructuredError, got %T: %v", err, err)
+	}
+	if se.Code != aicrerrors.ErrCodeInvalidRequest {
+		t.Errorf("expected ErrCodeInvalidRequest, got %s", se.Code)
+	}
+}
+
+// TestValidateState_RejectsBadInput locks in every facade-side guard
+// that runs before the validator is even constructed. Each row
+// triggers a different path (nil client, nil recipe, recipe missing
+// internal state, nil snapshot) and asserts the same outer error
+// code so callers can rely on a uniform branch.
+func TestValidateState_RejectsBadInput(t *testing.T) {
+	t.Parallel()
+
+	validClient := newClientForBundleTest(t)
+	validRecipe := newRecipeResultForBundleTest(validClient,
+		[]recipe.ComponentRef{{Name: "c1", Type: recipe.ComponentTypeHelm}},
+		[]ComponentRef{{Name: "c1", Kind: "Helm"}},
+	)
+	validSnap := &Snapshot{}
+
+	tests := []struct {
+		name   string
+		client *Client
+		recipe *RecipeResult
+		snap   *Snapshot
+	}{
+		{"nil client", nil, validRecipe, validSnap},
+		{"nil recipe", validClient, nil, validSnap},
+		{"recipe missing internal", validClient, &RecipeResult{Name: "no-internal"}, validSnap},
+		{"nil snapshot", validClient, validRecipe, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := tt.client.ValidateState(context.Background(), tt.recipe, tt.snap)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			var se *aicrerrors.StructuredError
+			if !stderrors.As(err, &se) {
+				t.Fatalf("expected *aicrerrors.StructuredError, got %T: %v", err, err)
+			}
+			if se.Code != aicrerrors.ErrCodeInvalidRequest {
+				t.Errorf("expected ErrCodeInvalidRequest, got %s", se.Code)
+			}
+		})
+	}
+}
+
+// TestValidateState_RejectsClosedClient locks in the closed-Client
+// guard. After Close() clears the builder, ValidateState must surface
+// that as ErrCodeInvalidRequest rather than constructing a Validator
+// from a half-torn-down Client.
+func TestValidateState_RejectsClosedClient(t *testing.T) {
+	t.Parallel()
+
+	c := newClientForBundleTest(t)
+	r := newRecipeResultForBundleTest(c,
+		[]recipe.ComponentRef{{Name: "c1", Type: recipe.ComponentTypeHelm}},
+		[]ComponentRef{{Name: "c1", Kind: "Helm"}},
+	)
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	got, err := c.ValidateState(context.Background(), r, &Snapshot{})
+	if err == nil {
+		t.Fatalf("expected error from closed Client, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil PhaseResult slice on error, got %v", got)
+	}
+	var se *aicrerrors.StructuredError
+	if !stderrors.As(err, &se) {
+		t.Fatalf("expected *aicrerrors.StructuredError, got %T: %v", err, err)
+	}
+	if se.Code != aicrerrors.ErrCodeInvalidRequest {
+		t.Errorf("expected ErrCodeInvalidRequest, got %s", se.Code)
+	}
+}
+
+// TestWithValidationTolerations_ExplicitNilOverrides pins FIX C: calling
+// WithValidationTolerations (even with nil/empty) marks tolerationsSet and
+// emits validator.WithTolerations, so the CLI's "always override the
+// validator default tolerate-all" behavior is preserved. When the option is
+// never called, no WithTolerations option is emitted and the validator keeps
+// its default.
+func TestWithValidationTolerations_ExplicitNilOverrides(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		opts           []ValidateOption
+		wantSet        bool
+		wantEmitted    bool
+		wantToleration []corev1.Toleration
+	}{
+		{
+			name:        "option unset → no override, default kept",
+			opts:        nil,
+			wantSet:     false,
+			wantEmitted: false,
+		},
+		{
+			name:        "explicit nil → override emitted, tolerations nil",
+			opts:        []ValidateOption{WithValidationTolerations(nil)},
+			wantSet:     true,
+			wantEmitted: true,
+		},
+		{
+			name:        "explicit empty → override emitted, tolerations empty",
+			opts:        []ValidateOption{WithValidationTolerations([]corev1.Toleration{})},
+			wantSet:     true,
+			wantEmitted: true,
+		},
+		{
+			name: "explicit value → override emitted, tolerations carried",
+			opts: []ValidateOption{WithValidationTolerations([]corev1.Toleration{
+				{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists},
+			})},
+			wantSet:     true,
+			wantEmitted: true,
+			wantToleration: []corev1.Toleration{
+				{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := buildValidateConfig(tt.opts)
+			if cfg.tolerationsSet != tt.wantSet {
+				t.Errorf("tolerationsSet = %v, want %v", cfg.tolerationsSet, tt.wantSet)
+			}
+
+			// A sentinel non-nil default so an emitted override clearing to
+			// nil/empty is observable: the option overwrites whatever the
+			// validator already held.
+			v := &validator.Validator{
+				Tolerations: []corev1.Toleration{{Key: "*", Operator: corev1.TolerationOpExists}},
+			}
+			for _, o := range validateOptionsFromConfig(cfg) {
+				o(v)
+			}
+
+			if !tt.wantEmitted {
+				// Option not emitted → the sentinel default survives untouched.
+				if len(v.Tolerations) != 1 || v.Tolerations[0].Key != "*" {
+					t.Errorf("expected default tolerations preserved, got %+v", v.Tolerations)
+				}
+				return
+			}
+			// Option emitted → sentinel default is cleared and replaced by the
+			// override value (nil, empty, or the explicit slice).
+			if len(v.Tolerations) != len(tt.wantToleration) {
+				t.Fatalf("Tolerations len = %d, want %d (%+v)",
+					len(v.Tolerations), len(tt.wantToleration), v.Tolerations)
+			}
+			for i := range tt.wantToleration {
+				if v.Tolerations[i].Key != tt.wantToleration[i].Key {
+					t.Errorf("Tolerations[%d].Key = %q, want %q",
+						i, v.Tolerations[i].Key, tt.wantToleration[i].Key)
+				}
+			}
+		})
+	}
+}
+
+// TestWithValidationKubeconfig_RoundTrip proves the facade-owned option is
+// translated to validator.WithKubeconfig without relying on process-global
+// KUBECONFIG state.
+func TestWithValidationKubeconfig_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	const path = "/path/to/target-kubeconfig"
+	cfg := buildValidateConfig([]ValidateOption{WithValidationKubeconfig(path)})
+	if cfg.kubeconfig != path {
+		t.Fatalf("kubeconfig = %q, want %q", cfg.kubeconfig, path)
+	}
+
+	v := validator.New(validateOptionsFromConfig(cfg)...)
+	if v.Kubeconfig != path {
+		t.Errorf("validator.Kubeconfig = %q, want %q", v.Kubeconfig, path)
+	}
+}
+
+// TestWithValidationTimeout_OptIn pins FIX D: WithValidationTimeout captures
+// a pointer-wrapped duration so the ValidateState switch can distinguish
+// unset (nil → default 60m), explicit 0 (no facade cap), and explicit >0.
+func TestWithValidationTimeout_OptIn(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		opts        []ValidateOption
+		wantNil     bool
+		wantValue   time.Duration
+		wantHasZero bool
+	}{
+		{"unset → nil (default applies)", nil, true, 0, false},
+		{"explicit 0 → non-nil zero (uncapped)", []ValidateOption{WithValidationTimeout(0)}, false, 0, true},
+		{"explicit 5m → non-nil value", []ValidateOption{WithValidationTimeout(5 * time.Minute)}, false, 5 * time.Minute, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := buildValidateConfig(tt.opts)
+			if tt.wantNil {
+				if cfg.timeout != nil {
+					t.Errorf("timeout = %v, want nil (default path)", *cfg.timeout)
+				}
+				return
+			}
+			if cfg.timeout == nil {
+				t.Fatal("timeout = nil, want non-nil")
+			}
+			if *cfg.timeout != tt.wantValue {
+				t.Errorf("timeout = %v, want %v", *cfg.timeout, tt.wantValue)
+			}
+			if tt.wantHasZero && *cfg.timeout != 0 {
+				t.Errorf("expected explicit zero (no facade cap), got %v", *cfg.timeout)
+			}
+		})
+	}
+}
+
+// TestWithValidationFailFast_RoundTrip pins that WithValidationFailFast captures
+// the bool into validateConfig.failFast (nil when unset, non-nil when set) and
+// that validateOptionsFromConfig emits validator.WithFailFast when the field is
+// non-nil, landing the value on the Validator.
+func TestWithValidationFailFast_RoundTrip(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    []ValidateOption
+		wantNil bool
+		wantVal bool
+	}{
+		{"unset", nil, true, false},
+		{"set true", []ValidateOption{WithValidationFailFast(true)}, false, true},
+		{"set false", []ValidateOption{WithValidationFailFast(false)}, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := buildValidateConfig(tt.opts)
+			if tt.wantNil {
+				if cfg.failFast != nil {
+					t.Fatalf("failFast = %v, want nil", *cfg.failFast)
+				}
+				// An unset failFast must emit NO validator option. Pre-seed a
+				// validator with FailFast=true, apply the translated options,
+				// and confirm none flipped it back: a regression that dropped
+				// the nil-guard and always emitted validator.WithFailFast(false)
+				// would fail here (the "set false" case alone can't catch it,
+				// since false is also the validator's zero value).
+				valOpts := validateOptionsFromConfig(cfg)
+				v := validator.New(append([]validator.Option{validator.WithFailFast(true)}, valOpts...)...)
+				if !v.FailFast {
+					t.Error("validateOptionsFromConfig emitted a WithFailFast option for unset failFast; want none")
+				}
+				return
+			}
+			if cfg.failFast == nil {
+				t.Fatal("failFast is nil, want set")
+			}
+			if *cfg.failFast != tt.wantVal {
+				t.Errorf("failFast = %v, want %v", *cfg.failFast, tt.wantVal)
+			}
+
+			// Verify validateOptionsFromConfig emits the validator option.
+			valOpts := validateOptionsFromConfig(cfg)
+			v := validator.New(valOpts...)
+			if v.FailFast != tt.wantVal {
+				t.Errorf("validator.FailFast = %v after options, want %v", v.FailFast, tt.wantVal)
+			}
+		})
+	}
+}
+
+// TestWithValidationSkipChecks_RoundTrip pins that WithValidationSkipChecks
+// captures the names into validateConfig and that validateOptionsFromConfig
+// lands them on the Validator, so a lane-config skip list reaches the preflight
+// that acts on it. An unset list must emit no option at all: pre-seeding a
+// validator and confirming the translation leaves it alone is what catches a
+// regression that always emitted WithSkipChecks(nil) and quietly cleared a
+// caller-supplied list.
+func TestWithValidationSkipChecks_RoundTrip(t *testing.T) {
+	t.Run("set", func(t *testing.T) {
+		cfg := buildValidateConfig([]ValidateOption{
+			WithValidationSkipChecks("gpu-operator-health", "dra-support"),
+		})
+		v := validator.New(validateOptionsFromConfig(cfg)...)
+		if !slices.Equal(v.SkipChecks, []string{"gpu-operator-health", "dra-support"}) {
+			t.Errorf("validator.SkipChecks = %v, want [gpu-operator-health dra-support]", v.SkipChecks)
+		}
+	})
+
+	t.Run("unset emits no option", func(t *testing.T) {
+		cfg := buildValidateConfig(nil)
+		v := validator.New(append(
+			[]validator.Option{validator.WithSkipChecks("pre-seeded")},
+			validateOptionsFromConfig(cfg)...)...)
+		if !slices.Equal(v.SkipChecks, []string{"pre-seeded"}) {
+			t.Errorf("validator.SkipChecks = %v; an unset list must emit no option", v.SkipChecks)
+		}
+	})
+
+	t.Run("the slice is copied", func(t *testing.T) {
+		names := []string{"gpu-operator-health"}
+		cfg := buildValidateConfig([]ValidateOption{WithValidationSkipChecks(names...)})
+		names[0] = "mutated-after-handoff"
+		v := validator.New(validateOptionsFromConfig(cfg)...)
+		if !slices.Equal(v.SkipChecks, []string{"gpu-operator-health"}) {
+			t.Errorf("validator.SkipChecks = %v; the caller mutated the facade's copy", v.SkipChecks)
+		}
+	})
+}
+
+// TestValidateState_ThreadsClientVersion pins FIX B: ValidateState threads
+// the Client's version into the validator (it rewrites :latest images and
+// populates AICR_CLI_VERSION). Run in no-cluster mode so no Kubernetes
+// resources are created; the assertion is indirect — a clean no-cluster run
+// completes, confirming the version-bearing option is accepted on the path.
+// The direct option translation (WithVersion → Validator.Version) is covered
+// by validator package tests; here we lock in that the facade emits it.
+func TestValidateState_ThreadsClientVersion(t *testing.T) {
+	t.Parallel()
+
+	// The translation helper proves WithVersion lands on the Validator. Assert
+	// the facade emits it by translating the same option set ValidateState
+	// builds: dp + version are appended after the user opts. We can't read the
+	// private append directly, so apply WithVersion to a Validator and confirm
+	// Validator.Version is set — the exact line ValidateState now executes.
+	v := &validator.Validator{}
+	validator.WithVersion("v9.9.9")(v)
+	if v.Version != "v9.9.9" {
+		t.Fatalf("validator.WithVersion did not set Version (got %q)", v.Version)
+	}
+
+	// End-to-end: a client built WithVersion runs ValidateState in no-cluster
+	// mode without error, exercising the path that now appends
+	// validator.WithVersion(c.version).
+	client := newClientForBundleTest(t)
+	client.version = "v9.9.9"
+	// gpu-operator is included so GPU allocation-policy resolution (#1327)
+	// finds a whole-GPU advertiser — a recipe with neither gpu-operator[-ocp]
+	// nor the DRA opt-in fails ValidateState at conversion by design (row 6).
+	rec := newRecipeResultForBundleTest(client,
+		[]recipe.ComponentRef{
+			{Name: "c1", Type: recipe.ComponentTypeHelm},
+			{Name: "gpu-operator", Type: recipe.ComponentTypeHelm},
+		},
+		[]ComponentRef{{Name: "c1", Kind: "Helm"}, {Name: "gpu-operator", Kind: "Helm"}},
+	)
+	results, err := client.ValidateState(t.Context(), rec, &Snapshot{},
+		WithValidationNoCluster(true))
+	if err != nil {
+		t.Fatalf("ValidateState (no-cluster) with version: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected at least one phase result in no-cluster mode")
+	}
+}
+
+// TestAdoptRecipe_DeepCopiesForClientIsolation pins FIX A: adopting the
+// SAME caller-owned pkg/recipe.RecipeResult into two different Clients must
+// not let the second adopt overwrite the first's provider binding, and must
+// not mutate the caller's original recipe pointer. adoptRecipe deep-copies
+// before BindDataProvider, so each adopted result carries its own Client's
+// DataProvider and the input recipe's provider stays nil.
+func TestAdoptRecipe_DeepCopiesForClientIsolation(t *testing.T) {
+	t.Parallel()
+
+	// Two Clients with distinct DataProviders. Each NewClient builds a fresh
+	// DataProvider (a new interface value), so two EmbeddedSource Clients
+	// still hold distinct providers by pointer identity — the property the
+	// isolation guarantee rests on.
+	clientA, err := NewClient(WithRecipeSource(EmbeddedSource()))
+	if err != nil {
+		t.Fatalf("NewClient A: %v", err)
+	}
+	t.Cleanup(func() { _ = clientA.Close() })
+	clientB, err := NewClient(WithRecipeSource(EmbeddedSource()))
+	if err != nil {
+		t.Fatalf("NewClient B: %v", err)
+	}
+	t.Cleanup(func() { _ = clientB.Close() })
+
+	if clientA.dp == clientB.dp {
+		t.Fatal("test precondition failed: both Clients share a DataProvider")
+	}
+
+	// One caller-owned raw recipe reused across both adopts.
+	input := &recipe.RecipeResult{
+		Kind:       recipe.RecipeResultKind,
+		APIVersion: recipe.RecipeResultAPIVersion,
+		Criteria:   &recipe.Criteria{Service: recipe.CriteriaServiceEKS},
+		ComponentRefs: []recipe.ComponentRef{
+			{Name: "c1", Type: recipe.ComponentTypeHelm, Source: "https://charts.example.com", Chart: "c1", Version: "1.0.0"},
+		},
+	}
+	if input.DataProvider() != nil {
+		t.Fatal("test precondition failed: input recipe already has a provider")
+	}
+
+	resA, err := clientA.adoptRecipe(t.Context(), input)
+	if err != nil {
+		t.Fatalf("adoptRecipe A: %v", err)
+	}
+	resB, err := clientB.adoptRecipe(t.Context(), input)
+	if err != nil {
+		t.Fatalf("adoptRecipe B: %v", err)
+	}
+
+	// Each result must carry its OWN Client's provider — no cross-contamination.
+	if resA.internal.DataProvider() != clientA.dp {
+		t.Errorf("adopted A provider = %p, want clientA.dp %p",
+			resA.internal.DataProvider(), clientA.dp)
+	}
+	if resB.internal.DataProvider() != clientB.dp {
+		t.Errorf("adopted B provider = %p, want clientB.dp %p",
+			resB.internal.DataProvider(), clientB.dp)
+	}
+	// The second adopt must not have mutated the first result's binding.
+	if resA.internal.DataProvider() == resB.internal.DataProvider() {
+		t.Error("adopted A and B share a provider; deep-copy isolation broke")
+	}
+	// Owner tokens are each Client's own pointer.
+	if resA.owner != clientA || resB.owner != clientB {
+		t.Errorf("owner mismatch: A=%p (want %p) B=%p (want %p)",
+			resA.owner, clientA, resB.owner, clientB)
+	}
+
+	// The caller-owned input must be unchanged: adoptRecipe deep-copies, so
+	// its provider was never bound and its internal pointer is distinct from
+	// both adopted copies.
+	if input.DataProvider() != nil {
+		t.Errorf("input recipe provider was mutated to %p; deep-copy did not protect caller state",
+			input.DataProvider())
+	}
+	if resA.internal == input || resB.internal == input {
+		t.Error("adopted result aliases the caller's input recipe; deep-copy did not allocate a fresh result")
+	}
+}
+
+func TestAdoptRecipe_RejectsCyclicProfileOverridesBeforeDeepCopy(t *testing.T) {
+	client := newClientForBundleTest(t)
+	overrides := map[string]any{}
+	overrides["driver"] = overrides
+	input := &recipe.RecipeResult{
+		Kind:       recipe.RecipeResultKind,
+		APIVersion: recipe.RecipeProfileAPIVersion,
+		ComponentRefs: []recipe.ComponentRef{{
+			Name:      "gpu-operator",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://charts.example.com",
+			Chart:     "gpu-operator",
+			Version:   "1.0.0",
+			Overrides: overrides,
+		}},
+		Metadata: recipe.RecipeResultMetadata{
+			SelectedProfile: &recipe.SelectedProfile{
+				Name:  "gpuStack",
+				Value: "driver-installed",
+				OwnedPaths: map[string][]string{
+					"gpu-operator": {"driver.enabled", "enabled"},
+				},
+			},
+		},
+	}
+
+	_, err := client.AdoptRecipe(t.Context(), input)
+	if err == nil || !strings.Contains(err.Error(), "cyclic reference") {
+		t.Fatalf("AdoptRecipe() error = %v, want cyclic-reference rejection", err)
+	}
+	if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
+		t.Fatalf("AdoptRecipe() error = %v, want ErrCodeInvalidRequest", err)
+	}
+}
+
+// TestClient_CloseDrainsInflightResolve is the deterministic race
+// test for the inflight-drain pattern. Without the drain, this
+// sequence races storeCache repopulation against eviction:
+//
+//  1. ResolveRecipe (goroutine A) RLock-snapshots builder, releases
+//     mu, enters builder.BuildFromCriteria → LoadMetadataStoreFor →
+//     blocked here inside provider.WalkDir.
+//  2. Close (goroutine B) takes write-lock, nils builder/dp,
+//     releases, evicts storeCache[dp] / registryCache[dp].
+//  3. Goroutine A's WalkDir returns, buildMetadataStore finishes,
+//     LoadMetadataStoreFor stores into storeCache[dp] AFTER Close
+//     already evicted — leaking a stray entry.
+//
+// The drain in Close (c.inflight.Wait()) closes that window. This
+// test pauses the resolve mid-walk via a blockingDataProvider, then
+// confirms Close blocks until the resolve completes and that both
+// caches return to their pre-test baseline.
+//
+// Constructed in-package because the dependency injection point
+// (Client.dp/builder.dp) is unexported; the public NewClient API
+// only takes a FilesystemSource and there's no way to thread a
+// blocking provider through it.
+func TestClient_CloseDrainsInflightResolve(t *testing.T) {
+	t.Parallel()
+
+	embedded := recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), ".")
+	blockedDP := &blockingDataProvider{
+		underlying:  embedded,
+		walkStarted: make(chan struct{}),
+		walkUnblock: make(chan struct{}),
+	}
+	builder := recipe.NewBuilder(recipe.WithDataProvider(blockedDP))
+	c := &Client{
+		builder: builder,
+		dp:      blockedDP,
+	}
+
+	// Goroutine A: ResolveRecipe parks inside WalkDir on the unblock
+	// channel. The criteria here are intentionally minimal; the
+	// resolve may eventually error after unblock (the blocking
+	// provider's underlying embedded data may not match every
+	// overlay), but the assertions below don't care about the
+	// resolve's correctness — only that it drains before Close
+	// finishes and that it doesn't repopulate caches afterward.
+	resolveDone := make(chan struct{})
+	go func() {
+		defer close(resolveDone)
+		_, _ = c.ResolveRecipe(context.Background(), RecipeRequest{
+			Service:     "eks",
+			Accelerator: "h100",
+			Intent:      "training",
+		})
+	}()
+
+	// Wait for the resolve to actually enter WalkDir, so the
+	// subsequent Close races a known-in-flight operation.
+	select {
+	case <-blockedDP.walkStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ResolveRecipe never entered WalkDir within 5s")
+	}
+
+	// Goroutine B: Close should block here on inflight.Wait.
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		_ = c.Close()
+	}()
+
+	// Give Close a deliberate window to (incorrectly) complete
+	// early. If the drain is missing, Close returns immediately and
+	// then the unblocked resolve repopulates the caches. 100ms is
+	// large enough that a non-draining Close would have completed
+	// many times over.
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned before in-flight ResolveRecipe completed; drain is missing")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: Close is parked on inflight.Wait().
+	}
+
+	// Release WalkDir; resolve and Close both finish.
+	close(blockedDP.walkUnblock)
+	select {
+	case <-resolveDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("ResolveRecipe did not complete within 10s after unblock")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not complete within 10s after resolve drained")
+	}
+
+	// Cache invariant: the entry the resolve populated for OUR
+	// blockedDP must have been evicted by Close. Scope-by-provider
+	// (Contains, not Count) so concurrent tests in other packages
+	// that touch their own DataProvider don't perturb the signal.
+	// If the inflight-drain regresses, the resolve's
+	// LoadMetadataStoreFor stores a fresh storeCache[blockedDP] entry
+	// AFTER Close's eviction, and this assertion catches the leak.
+	if recipe.CachedStoreContainsForTesting(blockedDP) {
+		t.Error("storeCache leaked: blockedDP entry still present after Close (cache repopulated post-Close)")
+	}
+	if recipe.CachedRegistryContainsForTesting(blockedDP) {
+		t.Error("registryCache leaked: blockedDP entry still present after Close (cache repopulated post-Close)")
+	}
+}
+
+// TestClient_NoCacheGrowthAcrossManyCloseCycles is the acceptance-
+// criterion test for the "memory does not grow when N clients are
+// created and released in a loop" requirement.
+//
+// Each NewClient call constructs a fresh LayeredDataProvider (unique
+// pointer identity), so the recipe package's sync.Map caches —
+// storeCache and registryCache, keyed by DataProvider — would
+// accumulate N entries if Close didn't evict them. After each
+// Close, the assertion is scoped to THAT iteration's DataProvider
+// (Contains, not Count), so concurrent sibling tests touching their
+// own DataProvider don't perturb the signal.
+//
+// The DataProvider is captured before Close because Close zeros
+// Client.dp (see Close in aicr.go).
+//
+// N is intentionally large (50) so a regression that leaks a single
+// entry per Close cycle fails on the very first iteration but
+// still exercises the eviction path under sustained load when
+// running with -race.
+//
+// Lives in the internal test package so it can read Client.dp; an
+// external test cannot.
+func TestClient_NoCacheGrowthAcrossManyCloseCycles(t *testing.T) {
+	const N = 50
+
+	tmp := providertest.WriteDir(t, map[string][]byte{"registry.yaml": []byte(providertest.EmptyRegistryYAML)})
+
+	for i := range N {
+		c, err := NewClient(WithRecipeSource(FilesystemSource(tmp)))
+		if err != nil {
+			t.Fatalf("iteration %d: NewClient: %v", i, err)
+		}
+
+		// ResolveRecipe forces both caches to populate for this
+		// Client's DataProvider. Without this, only registryCache
+		// would gain an entry (from buildDataProvider's construction
+		// path); storeCache wouldn't, and the test would miss the
+		// store-side leak.
+		result, err := c.ResolveRecipe(t.Context(), RecipeRequest{
+			Service:     "eks",
+			Accelerator: "h100",
+			Intent:      "training",
+		})
+		if err != nil {
+			t.Fatalf("iteration %d: ResolveRecipe: %v", i, err)
+		}
+		if result == nil {
+			t.Fatalf("iteration %d: ResolveRecipe returned nil result without error", i)
+		}
+
+		dp := c.dp // capture before Close zeros it
+		if err := c.Close(); err != nil {
+			t.Fatalf("iteration %d: Close: %v", i, err)
+		}
+
+		if recipe.CachedStoreContainsForTesting(dp) {
+			t.Errorf("iteration %d: storeCache not evicted after Close", i)
+		}
+		if recipe.CachedRegistryContainsForTesting(dp) {
+			t.Errorf("iteration %d: registryCache not evicted after Close", i)
+		}
+	}
+}
+
+// TestAdoptRecipe_RejectsIncoherentRef pins issue #1584 at the REST/adopt
+// boundary: POST /v1/bundle decodes a RecipeResult and calls adoptRecipe,
+// which never runs the resolver — so coherence must be enforced here. An
+// incoherent ref (Helm carrying a Kustomize tag) is rejected, and a coherent
+// lowercase-typed ref (the OpenAPI wire form) is accepted case-insensitively.
+func TestAdoptRecipe_RejectsIncoherentRef(t *testing.T) {
+	t.Parallel()
+
+	client, err := NewClient(WithRecipeSource(EmbeddedSource()))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	base := func(refs []recipe.ComponentRef) *recipe.RecipeResult {
+		return &recipe.RecipeResult{
+			Kind:          recipe.RecipeResultKind,
+			APIVersion:    recipe.RecipeResultAPIVersion,
+			Criteria:      &recipe.Criteria{Service: recipe.CriteriaServiceEKS},
+			ComponentRefs: refs,
+		}
+	}
+
+	// Incoherent: Helm ref carrying a Kustomize tag -> rejected.
+	_, err = client.adoptRecipe(t.Context(), base([]recipe.ComponentRef{
+		{Name: "gpu-operator", Type: recipe.ComponentTypeHelm, Version: "v1", Tag: "v2"},
+	}))
+	if err == nil {
+		t.Fatal("adoptRecipe accepted an incoherent Helm+tag ref; want ErrCodeInvalidRequest")
+	}
+	var se *aicrerrors.StructuredError
+	if !stderrors.As(err, &se) {
+		t.Fatalf("expected *aicrerrors.StructuredError, got %T: %v", err, err)
+	}
+	if se.Code != aicrerrors.ErrCodeInvalidRequest {
+		t.Errorf("expected ErrCodeInvalidRequest, got %s", se.Code)
+	}
+
+	// Coherent, lowercase type (OpenAPI wire form) -> accepted AND canonicalized
+	// so downstream deployers see the canonical constant.
+	res, err := client.adoptRecipe(t.Context(), base([]recipe.ComponentRef{
+		{Name: "gpu-operator", Type: recipe.ComponentType("helm"), Source: "https://charts.example.com", Chart: "gpu-operator", Version: "v1"},
+	}))
+	if err != nil {
+		t.Fatalf("adoptRecipe rejected a coherent lowercase-typed ref: %v", err)
+	}
+	if got := res.internal.ComponentRefs[0].Type; got != recipe.ComponentTypeHelm {
+		t.Errorf("adopted lowercase type not canonicalized: got %q, want %q", got, recipe.ComponentTypeHelm)
+	}
+
+	// A type-less ref for a registry component (valid before #1584 — the
+	// deployers derive the type from fields) must be back-filled from the
+	// registry, not rejected.
+	res2, err := client.adoptRecipe(t.Context(), base([]recipe.ComponentRef{
+		{Name: "gpu-operator", Source: "https://charts.example.com", Chart: "gpu-operator", Version: "v1"},
+	}))
+	if err != nil {
+		t.Fatalf("adoptRecipe rejected a type-less registry ref instead of back-filling: %v", err)
+	}
+	if got := res2.internal.ComponentRefs[0].Type; got != recipe.ComponentTypeHelm {
+		t.Errorf("type-less registry ref not back-filled: got %q, want %q", got, recipe.ComponentTypeHelm)
+	}
+}
+
+// TestAdoptRecipe_NormalizesKind pins issue #1953 at the adopt boundary: a
+// decoded body may carry an absent, empty, or legacy "Recipe" kind (all three
+// accepted by the /v1/bundle contract), and the adopted copy must be stamped
+// with the canonical kind so the emitted bundle recipe.yaml reloads through
+// the CLI file loader. An off-contract kind is rejected instead of echoed.
+func TestAdoptRecipe_NormalizesKind(t *testing.T) {
+	t.Parallel()
+
+	client, err := NewClient(WithRecipeSource(EmbeddedSource()))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	tests := []struct {
+		name    string
+		kind    string
+		wantErr bool
+	}{
+		{name: "canonical kind (control)", kind: recipe.RecipeResultKind},
+		{name: "empty kind", kind: ""},
+		{name: "legacy Recipe kind", kind: "Recipe"},
+		{name: "off-contract kind", kind: "RecipeMetadata", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			input := &recipe.RecipeResult{
+				Kind:       tt.kind,
+				APIVersion: recipe.RecipeResultAPIVersion,
+				Criteria:   &recipe.Criteria{Service: recipe.CriteriaServiceEKS},
+				ComponentRefs: []recipe.ComponentRef{
+					{
+						Name:    "gpu-operator",
+						Type:    recipe.ComponentTypeHelm,
+						Source:  "https://charts.example.com",
+						Chart:   "gpu-operator",
+						Version: "v1",
+					},
+				},
+			}
+
+			res, adoptErr := client.adoptRecipe(t.Context(), input)
+			if tt.wantErr {
+				if adoptErr == nil {
+					t.Fatalf("adoptRecipe accepted kind %q; want ErrCodeInvalidRequest", tt.kind)
+				}
+				var se *aicrerrors.StructuredError
+				if !stderrors.As(adoptErr, &se) {
+					t.Fatalf("expected *aicrerrors.StructuredError, got %T: %v", adoptErr, adoptErr)
+				}
+				if se.Code != aicrerrors.ErrCodeInvalidRequest {
+					t.Errorf("expected ErrCodeInvalidRequest, got %s", se.Code)
+				}
+				return
+			}
+			if adoptErr != nil {
+				t.Fatalf("adoptRecipe(kind=%q): %v", tt.kind, adoptErr)
+			}
+			if got := res.internal.Kind; got != recipe.RecipeResultKind {
+				t.Errorf("adopted kind = %q, want %q", got, recipe.RecipeResultKind)
+			}
+			// The caller-supplied recipe is never mutated (adoption deep-copies).
+			if input.Kind != tt.kind {
+				t.Errorf("input kind mutated to %q, want %q", input.Kind, tt.kind)
+			}
+		})
+	}
+}
+
+// blockingReadFileProvider parks ReadFile of a target file (e.g. registry.yaml)
+// on a signal, so a test can deterministically pin adoptRecipe inside its
+// registry-backed type back-fill while a second goroutine calls Close.
+type blockingReadFileProvider struct {
+	underlying  recipe.DataProvider
+	target      string
+	readStarted chan struct{}
+	readUnblock chan struct{}
+}
+
+func (b *blockingReadFileProvider) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	if strings.HasSuffix(path, b.target) {
+		select {
+		case <-b.readStarted:
+		default:
+			close(b.readStarted)
+		}
+		// Honor the DataProvider contract: return the context error if canceled
+		// rather than parking forever.
+		select {
+		case <-b.readUnblock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return b.underlying.ReadFile(ctx, path)
+}
+
+func (b *blockingReadFileProvider) WalkDir(ctx context.Context, root string, fn fs.WalkDirFunc) error {
+	return b.underlying.WalkDir(ctx, root, fn)
+}
+
+func (b *blockingReadFileProvider) Source(path string) string { return b.underlying.Source(path) }
+
+type deadlineRequiredProvider struct {
+	underlying recipe.DataProvider
+	calls      atomic.Int64
+}
+
+func (d *deadlineRequiredProvider) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	d.calls.Add(1)
+	if _, ok := ctx.Deadline(); !ok {
+		return nil, aicrerrors.New(
+			aicrerrors.ErrCodeInternal, "provider read did not receive a deadline")
+	}
+	return d.underlying.ReadFile(ctx, path)
+}
+
+func (d *deadlineRequiredProvider) WalkDir(
+	ctx context.Context,
+	root string,
+	fn fs.WalkDirFunc,
+) error {
+
+	d.calls.Add(1)
+	if _, ok := ctx.Deadline(); !ok {
+		return aicrerrors.New(
+			aicrerrors.ErrCodeInternal, "provider walk did not receive a deadline")
+	}
+	return d.underlying.WalkDir(ctx, root, fn)
+}
+
+func (d *deadlineRequiredProvider) Source(path string) string {
+	return d.underlying.Source(path)
+}
+
+func TestAdoptRecipe_BoundsProviderIO(t *testing.T) {
+	t.Parallel()
+
+	embedded := recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), ".")
+	dp := &deadlineRequiredProvider{underlying: embedded}
+	c := &Client{
+		builder: recipe.NewBuilder(recipe.WithDataProvider(dp)),
+		dp:      dp,
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err := c.AdoptRecipe(context.Background(), &recipe.RecipeResult{
+		Kind:       recipe.RecipeResultKind,
+		APIVersion: recipe.RecipeResultAPIVersion,
+		Criteria:   &recipe.Criteria{Service: recipe.CriteriaServiceEKS},
+		ComponentRefs: []recipe.ComponentRef{
+			{
+				Name:    "gpu-operator",
+				Source:  "https://charts.example.com",
+				Chart:   "gpu-operator",
+				Version: "v1",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AdoptRecipe(context.Background()) error = %v", err)
+	}
+	if dp.calls.Load() == 0 {
+		t.Fatal("AdoptRecipe() did not exercise provider I/O")
+	}
+}
+
+// TestClient_CloseDrainsInflightAdopt pins the inflight registration added for
+// adoptRecipe (issue #1584): PrepareAndValidate reads the component registry to
+// back-fill a missing type, so a concurrent Close must drain the adopt before
+// evicting caches. A type-less gpu-operator ref forces the registry ReadFile,
+// which parks; Close must block on inflight.Wait until the adopt completes.
+func TestClient_CloseDrainsInflightAdopt(t *testing.T) {
+	t.Parallel()
+
+	embedded := recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), ".")
+	blockedDP := &blockingReadFileProvider{
+		underlying:  embedded,
+		target:      "registry.yaml",
+		readStarted: make(chan struct{}),
+		readUnblock: make(chan struct{}),
+	}
+	c := &Client{
+		builder: recipe.NewBuilder(recipe.WithDataProvider(blockedDP)),
+		dp:      blockedDP,
+	}
+
+	adoptDone := make(chan struct{})
+	go func() {
+		defer close(adoptDone)
+		_, _ = c.adoptRecipe(context.Background(), &recipe.RecipeResult{
+			Kind:       recipe.RecipeResultKind,
+			APIVersion: recipe.RecipeResultAPIVersion,
+			Criteria:   &recipe.Criteria{Service: recipe.CriteriaServiceEKS},
+			ComponentRefs: []recipe.ComponentRef{
+				{Name: "gpu-operator", Version: "v1"}, // type-less -> forces registry back-fill
+			},
+		})
+	}()
+
+	select {
+	case <-blockedDP.readStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("adoptRecipe never read registry.yaml within 5s")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		_ = c.Close()
+	}()
+
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned before in-flight adoptRecipe drained; inflight registration is missing")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: Close parked on inflight.Wait().
+	}
+
+	close(blockedDP.readUnblock)
+	select {
+	case <-adoptDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("adoptRecipe did not complete within 10s after unblock")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not complete within 10s after adopt drained")
+	}
+}
+
+// TestAdoptRecipe_RejectsVersionlessHelmRef pins the #1615 invariant at the
+// CLIENT boundary (not just recipe.PrepareAndValidate, which adoptRecipe
+// delegates to): an externally-supplied RecipeResult whose enabled Helm ref
+// references a chart source without a version must be rejected by
+// adoptRecipe with ErrCodeInvalidRequest naming the component.
+func TestAdoptRecipe_RejectsVersionlessHelmRef(t *testing.T) {
+	t.Parallel()
+
+	client, err := NewClient(WithRecipeSource(EmbeddedSource()))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	input := &recipe.RecipeResult{
+		Kind:       recipe.RecipeResultKind,
+		APIVersion: recipe.RecipeResultAPIVersion,
+		Criteria:   &recipe.Criteria{Service: recipe.CriteriaServiceEKS},
+		ComponentRefs: []recipe.ComponentRef{
+			{
+				Name:   "versionless-helm",
+				Type:   recipe.ComponentTypeHelm,
+				Source: "https://charts.example.com",
+				Chart:  "versionless-helm",
+			},
+		},
+	}
+	_, err = client.adoptRecipe(t.Context(), input)
+	if err == nil {
+		t.Fatal("adoptRecipe accepted an enabled Helm ref without a chart version")
+	}
+	if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
+		t.Errorf("error code = %v, want %v", err, aicrerrors.ErrCodeInvalidRequest)
+	}
+	for _, want := range []string{"versionless-helm", "chart version"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err.Error(), want)
+		}
+	}
+
+	// The exported facade must reject with the identical shape.
+	_, err = client.AdoptRecipe(t.Context(), input)
+	if err == nil {
+		t.Fatal("AdoptRecipe accepted an enabled Helm ref without a chart version")
+	}
+	if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
+		t.Errorf("AdoptRecipe error code = %v, want %v", err, aicrerrors.ErrCodeInvalidRequest)
+	}
+	for _, want := range []string{"versionless-helm", "chart version"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("AdoptRecipe error %q does not contain %q", err.Error(), want)
+		}
+	}
+
+	// Whitespace-only versions are equally rejected at this boundary (Helm
+	// trims the argument and installs latest).
+	wsInput := &recipe.RecipeResult{
+		Kind:       recipe.RecipeResultKind,
+		APIVersion: recipe.RecipeResultAPIVersion,
+		Criteria:   &recipe.Criteria{Service: recipe.CriteriaServiceEKS},
+		ComponentRefs: []recipe.ComponentRef{
+			{
+				Name:    "versionless-helm",
+				Type:    recipe.ComponentTypeHelm,
+				Source:  "https://charts.example.com",
+				Chart:   "versionless-helm",
+				Version: "   ",
+			},
+		},
+	}
+	if _, err := client.adoptRecipe(t.Context(), wsInput); err == nil ||
+		errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
+
+		t.Errorf("adoptRecipe(whitespace version) error = %v, want %v", err, aicrerrors.ErrCodeInvalidRequest)
+	}
+}
+
+// TestFacadeResultFromInternal_ChartProjection pins the facade's chart
+// projection against the deployers' EffectiveChart rule (and the facade
+// ComponentRef.Chart contract in types.go): a source-only Helm ref exposes
+// the component-name fallback the deployers actually install, while
+// manifest-only Helm refs and Kustomize refs stay chartless.
+func TestFacadeResultFromInternal_ChartProjection(t *testing.T) {
+	t.Parallel()
+
+	internal := &recipe.RecipeResult{
+		ComponentRefs: []recipe.ComponentRef{
+			{
+				Name:    "explicit-chart",
+				Type:    recipe.ComponentTypeHelm,
+				Source:  "https://charts.example.com",
+				Chart:   "the-chart",
+				Version: "1.0.0",
+			},
+			{
+				Name:    "source-only",
+				Type:    recipe.ComponentTypeHelm,
+				Source:  "https://charts.example.com",
+				Version: "1.0.0",
+			},
+			{
+				Name:          "manifest-only",
+				Type:          recipe.ComponentTypeHelm,
+				ManifestFiles: []string{"components/manifest-only/manifests/a.yaml"},
+			},
+			{
+				Name: "kustomize-comp",
+				Type: recipe.ComponentTypeKustomize,
+				Path: "deploy",
+			},
+		},
+	}
+
+	out := facadeResultFromInternal(internal, "test")
+	if len(out.Components) != len(internal.ComponentRefs) {
+		t.Fatalf("components = %d, want %d", len(out.Components), len(internal.ComponentRefs))
+	}
+	wantCharts := map[string]string{
+		"explicit-chart": "the-chart",
+		"source-only":    "source-only", // EffectiveChart fallback, not ""
+		"manifest-only":  "",
+		"kustomize-comp": "",
+	}
+	for _, comp := range out.Components {
+		want, ok := wantCharts[comp.Name]
+		if !ok {
+			t.Errorf("unexpected component %q", comp.Name)
+			continue
+		}
+		if comp.Chart != want {
+			t.Errorf("component %q Chart = %q, want %q", comp.Name, comp.Chart, want)
+		}
+	}
+}
+
+// TestFacadeResultFromInternal_OmitsDisabledComponents pins the facade
+// contract: only deployable (enabled) components appear in the SDK
+// facade result. See #1874.
+func TestFacadeResultFromInternal_OmitsDisabledComponents(t *testing.T) {
+	t.Parallel()
+
+	internal := &recipe.RecipeResult{
+		ComponentRefs: []recipe.ComponentRef{
+			{Name: "enabled-a", Type: recipe.ComponentTypeHelm, Source: "https://charts.example.com", Version: "1.0.0"},
+			{
+				Name:      "disabled-b",
+				Type:      recipe.ComponentTypeHelm,
+				Source:    "https://charts.example.com",
+				Version:   "1.0.0",
+				Overrides: map[string]any{"enabled": false},
+			},
+		},
+	}
+
+	out := facadeResultFromInternal(internal, "test")
+	if len(out.Components) != 1 {
+		t.Fatalf("components = %d, want 1", len(out.Components))
+	}
+	if out.Components[0].Name != "enabled-a" {
+		t.Errorf("got component %q, want enabled-a", out.Components[0].Name)
+	}
+}
+
+// TestCollectSnapshot_RejectsBeforeClusterAccess pins the facade half of the
+// fail-before-mutate contract documented on CollectSnapshot. Both inputs are
+// rejectable without a cluster, and both must be rejected BEFORE the
+// Kubernetes client is built — otherwise a caller with an unusable kubeconfig
+// sees a connection error instead of the documented ErrCodeInvalidRequest,
+// and a caller with a REACHABLE cluster gets RBAC and a Job created before the
+// input is ever examined. With AgentConfig.Cleanup false (the zero value SDK
+// callers get unless they opt in) those resources — including a cluster-admin
+// binding — are left behind.
+func TestCollectSnapshot_RejectsBeforeClusterAccess(t *testing.T) {
+	t.Parallel()
+
+	badKubeconfig := filepath.Join(t.TempDir(), "does-not-exist.kubeconfig")
+
+	tests := []struct {
+		name    string
+		cfg     *AgentConfig
+		wantMsg string
+	}{
+		{
+			name: "malformed ConfigMap output URI",
+			cfg: &AgentConfig{
+				Namespace:  "default",
+				Kubeconfig: badKubeconfig,
+				Output:     "cm://aicr-snapshot", // name without namespace
+			},
+			wantMsg: "invalid ConfigMap output URI",
+		},
+		{
+			name: "cluster-config path is Job-mode unsupported",
+			cfg: &AgentConfig{
+				Namespace:         "default",
+				Kubeconfig:        badKubeconfig,
+				ClusterConfigPath: "/host/cluster-config.yaml",
+			},
+			wantMsg: "--cluster-config is not supported in agent Job mode",
+		},
+		{
+			// The Job, its RBAC, and the result ConfigMap all land in
+			// Namespace; empty would only fail once the internal
+			// "cm:///aicr-snapshot" URI was parsed, after those exist.
+			name: "empty namespace",
+			cfg: &AgentConfig{
+				Kubeconfig: badKubeconfig,
+			},
+			wantMsg: "Namespace is required",
+		},
+	}
+
+	client := newClientForBundleTest(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := client.CollectSnapshot(context.Background(), tt.cfg)
+			if err == nil {
+				t.Fatal("CollectSnapshot() = nil error, want rejection")
+			}
+			if got != nil {
+				t.Errorf("expected nil Snapshot on error, got %v", got)
+			}
+			var se *aicrerrors.StructuredError
+			if !stderrors.As(err, &se) {
+				t.Fatalf("expected *aicrerrors.StructuredError, got %T: %v", err, err)
+			}
+			if se.Code != aicrerrors.ErrCodeInvalidRequest {
+				t.Errorf("code = %s, want %s", se.Code, aicrerrors.ErrCodeInvalidRequest)
+			}
+			if !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Errorf("error = %v, want it to mention %q (a kubeconfig failure here means "+
+					"the input check ran after the cluster client was built)", err, tt.wantMsg)
+			}
+		})
+	}
+}
+
+// TestRejectUnverifiableCatalogSigning covers both directions of the
+// sign/verify symmetry invariant SignCatalog enforces.
+//
+// This is an internal test on purpose. The "accepted" cases cannot be asserted
+// through SignCatalog: an accepted setting by definition reaches the attester,
+// and with no OIDC token available that falls through to the interactive
+// browser flow — which opens a browser locally and hangs in CI, where there is
+// none. Calling the guard directly asserts the invariant with no signing,
+// no network, and no token.
+func TestRejectUnverifiableCatalogSigning(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		resolve    OIDCResolveOptions
+		wantReject bool
+	}{
+		{
+			name:       "KMS key has no catalog verification path",
+			resolve:    OIDCResolveOptions{SigningKey: "awskms://alias/aicr-catalog"},
+			wantReject: true,
+		},
+		{
+			name:       "local PEM key has no catalog verification path",
+			resolve:    OIDCResolveOptions{SigningKey: "./catalog-signer.key"},
+			wantReject: true,
+		},
+		{
+			name:       "private Fulcio does not chain to the public-good root",
+			resolve:    OIDCResolveOptions{FulcioURL: "https://fulcio.internal.example"},
+			wantReject: true,
+		},
+		{
+			name:       "no transparency-log entry to verify",
+			resolve:    OIDCResolveOptions{DisableTLogUpload: true},
+			wantReject: true,
+		},
+		{
+			// Fails closed: a public-good v1 URL would verify, but it is
+			// indistinguishable from a private log by URL alone.
+			name:       "explicit Rekor URL may name a private log",
+			resolve:    OIDCResolveOptions{RekorURL: "https://rekor.internal.example"},
+			wantReject: true,
+		},
+		{
+			name:       "public-good Rekor URL is rejected too",
+			resolve:    OIDCResolveOptions{RekorURL: "https://rekor.sigstore.dev"},
+			wantReject: true,
+		},
+		// Accepted: verification handles both, and the release path passes a
+		// signing config, so neither may be swept up by the rejection.
+		{name: "zero value", resolve: OIDCResolveOptions{}},
+		{
+			// A real fixture, not a placeholder path: the guard now reads the
+			// file, so a nonexistent path would exercise the open error rather
+			// than the public-good check this case is named for. This is the
+			// config shape the release hook passes.
+			name: "signing config selects a public-good target",
+			resolve: OIDCResolveOptions{
+				SigningConfigPath: "../../bundler/attestation/testdata/signing_config_v2.json",
+			},
+		},
+		{
+			name:    "token sources are orthogonal to verifiability",
+			resolve: OIDCResolveOptions{IdentityToken: "token", DeviceFlow: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			sc, err := rejectUnverifiableCatalogSigning(tt.resolve)
+			if tt.wantReject && err == nil {
+				t.Fatal("setting was accepted, but VerifyCatalog cannot verify what it produces")
+			}
+			if !tt.wantReject && err != nil {
+				t.Fatalf("setting was rejected, but it is symmetric with VerifyCatalog: %v", err)
+			}
+
+			// The parsed config must come back whenever a path was supplied:
+			// SignCatalog passes it to the signing path so the validated bytes
+			// are the signed bytes. Returning nil here would silently restore
+			// the check-then-reload gap.
+			if err == nil && tt.resolve.SigningConfigPath != "" && sc == nil {
+				t.Error("accepted a SigningConfigPath but returned no parsed config; " +
+					"the signing path would re-read the file instead of using the validated one")
+			}
+			if tt.resolve.SigningConfigPath == "" && sc != nil {
+				t.Error("returned a config for a request that named no signing config")
+			}
+		})
+	}
+}
+
+// TestResolveRecipeInheritFromRestoresRegistryIdentity proves chart, source and
+// both manifest sets survive a resolve. The manifest sets are not public
+// ComponentRef fields, so the result is read back through the internal recipe.
+func TestResolveRecipeInheritFromRestoresRegistryIdentity(t *testing.T) {
+	t.Parallel()
+
+	client, err := NewClient(WithRecipeSource(EmbeddedSource()))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	req := RecipeRequest{Service: "eks", Accelerator: "h100", OS: "ubuntu", Intent: "training"}
+
+	baseline, err := client.ResolveRecipe(t.Context(), req)
+	if err != nil {
+		t.Fatalf("baseline ResolveRecipe: %v", err)
+	}
+	var name string
+	for _, c := range baseline.Components {
+		if c.Kind == "Helm" {
+			name = c.Name
+			break
+		}
+	}
+	if name == "" {
+		t.Fatal("setup: baseline resolved no Helm component")
+	}
+
+	prior := filepath.Join(t.TempDir(), "prior.yaml")
+	doc := "kind: RecipeResult\napiVersion: aicr.run/v1\nmetadata:\n  version: test\ncomponentRefs:\n" +
+		"  - name: " + name + "\n    type: Helm\n    chart: prior-chart\n    source: https://charts.invalid/prior\n" +
+		"    version: 1.0.0\n    namespace: prior-ns\n    manifestFiles:\n      - components/prior/a.yaml\n" +
+		"    preManifestFiles:\n      - components/prior/pre.yaml\n"
+	if writeErr := os.WriteFile(prior, []byte(doc), 0o600); writeErr != nil {
+		t.Fatalf("setup: write prior: %v", writeErr)
+	}
+	req.InheritFrom = prior
+
+	result, err := client.ResolveRecipe(t.Context(), req)
+	if err != nil {
+		t.Fatalf("ResolveRecipe: %v", err)
+	}
+	ref := result.internal.GetComponentRef(name)
+	if ref == nil {
+		t.Fatalf("resolved recipe has no component %q", name)
+	}
+	if ref.Chart != "prior-chart" || ref.Source != "https://charts.invalid/prior" || ref.Namespace != "prior-ns" {
+		t.Errorf("chart/source/namespace = %q/%q/%q, want the inherited prior-chart/https://charts.invalid/prior/prior-ns",
+			ref.Chart, ref.Source, ref.Namespace)
+	}
+	if !slices.Equal(ref.ManifestFiles, []string{"components/prior/a.yaml"}) {
+		t.Errorf("ManifestFiles = %v, want the inherited set", ref.ManifestFiles)
+	}
+	if !slices.Equal(ref.PreManifestFiles, []string{"components/prior/pre.yaml"}) {
+		t.Errorf("PreManifestFiles = %v, want the inherited set", ref.PreManifestFiles)
+	}
+}
+
+// TestBundleComponents_NVSentinelDrainScope keeps the SDK's values in step
+// with DefaultBundler.Make: with node-drainer on, the nvsentinel values carry
+// the generated drain scope, and the drain scope gate runs on them.
+func TestBundleComponents_NVSentinelDrainScope(t *testing.T) {
+	t.Parallel()
+
+	sentinel := func(drainer bool, nodeDrainer map[string]any) map[string]any {
+		nd := map[string]any{
+			"deleteAfterTimeoutMinutes": 300, "evictionTimeoutInSeconds": "60",
+			"drainGPUPods": false, "partialDrainEnabled": false,
+		}
+		maps.Copy(nd, nodeDrainer)
+		return map[string]any{
+			"global": map[string]any{
+				"faultQuarantine": map[string]any{"enabled": true},
+				"nodeDrainer":     map[string]any{"enabled": drainer},
+				"datastore":       map[string]any{"provider": "postgresql"},
+			},
+			"node-drainer": nd,
+		}
+	}
+	tests := []struct {
+		name     string
+		values   map[string]any
+		want     []string
+		wantNot  []string
+		wantCode aicrerrors.ErrorCode
+	}{
+		{name: "node-drainer on gets the generated scope and mode",
+			values: sentinel(true, nil), want: []string{"cert-manager", "DeleteAfterTimeout"}},
+		{name: "node-drainer off is left alone",
+			values: sentinel(false, nil), wantNot: []string{"systemNamespaces", "DeleteAfterTimeout"}},
+		{name: "an operator pattern in the recipe is kept beside the generated one",
+			values: sentinel(true, map[string]any{"systemNamespaces": "^(team-infra)$"}),
+			want:   []string{"cert-manager", "|(?:^(team-infra)$)"}},
+		{name: "an operator pattern that does not compile fails",
+			values: sentinel(true, map[string]any{"systemNamespaces": "^("}), wantCode: aicrerrors.ErrCodeInvalidRequest},
+		{name: "both drain lists set fails the gate",
+			values: sentinel(true, map[string]any{
+				"userNamespaces":   []any{map[string]any{"name": "*", "mode": "DeleteAfterTimeout"}},
+				"podDrainPolicies": []any{map[string]any{"name": "w", "podSelector": "role=w", "mode": "Immediate"}},
+			}),
+			wantCode: aicrerrors.ErrCodeInvalidRequest},
+	}
+	client := newClientForBundleTest(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := newRecipeResultForBundleTest(client,
+				[]recipe.ComponentRef{
+					{Name: "cert-manager", Namespace: "cert-manager", Type: recipe.ComponentTypeHelm},
+					{Name: "nvsentinel", Namespace: "nvsentinel", Type: recipe.ComponentTypeHelm, Overrides: tt.values},
+				},
+				[]ComponentRef{{Name: "cert-manager", Kind: "Helm"}, {Name: "nvsentinel", Kind: "Helm"}},
+			)
+			bundles, err := client.BundleComponents(context.Background(), r)
+			if tt.wantCode != "" {
+				errorstest.WantReportedCode(t, err, tt.wantCode)
+				return
+			}
+			if err != nil {
+				t.Fatalf("BundleComponents: %v", err)
+			}
+			for _, b := range bundles {
+				if b.Component.Name != "nvsentinel" {
+					continue
+				}
+				values := string(b.HelmValues)
+				for _, want := range tt.want {
+					if !strings.Contains(values, want) {
+						t.Errorf("nvsentinel values lack %q:\n%s", want, values)
+					}
+				}
+				for _, not := range tt.wantNot {
+					if strings.Contains(values, not) {
+						t.Errorf("nvsentinel values carry %q with node-drainer off:\n%s", not, values)
+					}
+				}
+				return
+			}
+			t.Fatal("no nvsentinel bundle")
+		})
+	}
+}

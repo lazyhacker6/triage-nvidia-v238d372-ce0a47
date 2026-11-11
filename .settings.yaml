@@ -1,0 +1,414 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Language Versions
+# Go toolchain version is owned by .go-version (single source of truth).
+# Makefile, CI workflows, and validator Dockerfiles all read from there.
+
+# Build Tools
+build_tools:
+  # renovate: datasource=github-releases depName=goreleaser/goreleaser depType=build_tools
+  goreleaser: 'v2.20.0'
+  # renovate: datasource=github-releases depName=ko-build/ko depType=build_tools
+  ko: 'v0.19.1'
+  # renovate: datasource=github-releases depName=google/go-containerregistry depType=build_tools
+  crane: 'v0.22.1'
+  # renovate: datasource=github-releases depName=orhun/git-cliff depType=build_tools
+  git_cliff: '2.14.2'
+
+# Linting
+linting:
+  # The annotation must stay on the line directly above the value: the
+  # customManagers regexes in .github/renovate.json5 match `# renovate: ...`
+  # followed immediately by `key: 'value'`, so any comment between them silently
+  # drops this pin from Renovate's scan (#2657).
+  # renovate: datasource=github-releases depName=oasdiff/oasdiff depType=linting
+  oasdiff: 'v1.35.0'
+  # Refreshed automatically by tools/update-oasdiff-checksums via Renovate
+  # postUpgradeTasks whenever the version above is bumped. Same reasoning as the
+  # oras pin in security_tools: the checksums.txt served beside the tarball
+  # comes from the same release, so it detects corruption but not a compromise
+  # of the release itself. A digest committed and reviewed at this SHA does.
+  #
+  # This one matters specifically because #2663 moved oasdiff off `go install`,
+  # which authenticated every dependency against sum.golang.org -- a public
+  # transparency log. Dropping to an unpinned binary would have traded that for
+  # nothing; the pin is what keeps the integrity story from regressing.
+  #
+  # Flat, uniquely-named key rather than a nested `<tool>_checksums:` mapping,
+  # for the reason spelled out on oras_sha256_linux_amd64: the nested blocks all
+  # share sub-key names and the refresh scripts rewrite by sub-key.
+  #
+  # linux/amd64 only: this feeds the setup-build-tools action, which runs on
+  # ubuntu runners. tools/setup-tools handles local dev on other platforms.
+  oasdiff_sha256_linux_amd64: 'a8023002fcb2eaa7f5758148a9303cb63d33b939886df312268bc0fc7b939140'
+  # renovate: datasource=github-releases depName=golangci/golangci-lint depType=linting
+  golangci_lint: 'v2.15.0'
+  # renovate: datasource=pypi depName=yamllint depType=linting
+  yamllint: '1.38.0'
+  # renovate: datasource=github-releases depName=google/addlicense depType=linting
+  addlicense: 'v1.2.0'
+  # Same move off `go install` as setup_envtest in testing_tools (#2667).
+  # addlicense does publish a checksums.txt and this value was cross-checked
+  # against it, but the pin is still what the install step verifies: a manifest
+  # served beside the archive comes from the same release, so it catches
+  # corruption in transit and not a compromise of the release itself.
+  #
+  # A version bump must refresh this or the install step fails closed on the
+  # mismatch. tools/update-addlicense-checksums does it, wired to Renovate's
+  # postUpgradeTasks. That matters more here than elsewhere: addlicense is on
+  # the auto-merge list, so a stale pin would leave a PR that can never merge.
+  #
+  # Note the asset name is version-specific -- v1.1.1 published
+  # addlicense_1.1.1_..., v1.2.0 publishes addlicense_v1.2.0_... -- so a bump
+  # that changes the naming shows up as a refresher failure, not a silent skip.
+  addlicense_sha256_linux_amd64: '6924296771234b1ba6c969e109b4459cff75e15b259676b61df874a92734b242'
+  # The shared MDX and fenced-YAML documentation parser toolchain is owned by
+  # tools/mdx/package.json + package-lock.json, not listed here. The lockfile
+  # freezes the full transitive tree, which a version string cannot; these gates
+  # decide which docs merge, so their verdicts must be reproducible. Renovate
+  # updates it natively via the npm manager. Same single-source-of-truth split as
+  # the Go toolchain living in .go-version.
+
+# Security Tools
+security_tools:
+  # renovate: datasource=github-releases depName=anchore/grype depType=security_tools
+  grype: 'v0.121.1'
+  # renovate: datasource=github-releases depName=sigstore/cosign depType=security_tools
+  cosign: 'v3.1.4'
+  # renovate: datasource=github-releases depName=anchore/syft depType=security_tools
+  syft: 'v1.57.0'
+  # Attaches the aiperf-bench third-party source archive as an OCI 1.1 referrer
+  # (tools/generate-aiperf-source). Cosign cannot attach arbitrary artifacts, so
+  # this is a separate dependency from the signing/attestation path.
+  #
+  # Stored WITHOUT the leading 'v', unlike cosign/syft/grype above. Both
+  # consumers — tools/setup-tools and the setup-build-tools action — re-add the
+  # prefix for the download URL, and the bare form is what the release asset
+  # names embed (oras_1.3.4_linux_amd64.tar.gz).
+  #
+  # This is the only oras pin. It was previously paired with a separately pinned
+  # oras-project/setup-oras action that validated it against a bundled release
+  # list, which meant two bots owned two artifacts that had to stay compatible
+  # and nothing checked that they did (#2648).
+  #
+  # The annotation below must stay on the line directly above the value: the
+  # customManagers regexes in .github/renovate.json5 match `# renovate: ...`
+  # followed immediately by `key: 'value'`, so any comment between them silently
+  # drops this pin from Renovate's scan.
+  # renovate: datasource=github-releases depName=oras-project/oras depType=security_tools
+  oras: '1.3.6'
+  # Refreshed automatically by tools/update-oras-checksums via Renovate
+  # postUpgradeTasks whenever the version above is bumped. Pinning the digest
+  # here — rather than trusting the checksums.txt served beside the tarball —
+  # is what makes a later compromise of the upstream release assets detectable:
+  # an attacker who replaces both the archive and its checksum still fails
+  # against a value committed and reviewed at this SHA.
+  #
+  # Deliberately a flat, uniquely-named key rather than the nested
+  # `<tool>_checksums:` mapping the other pinned tools use. Those blocks all
+  # share the sub-keys linux_amd64/linux_arm64/..., and the existing refresh
+  # scripts rewrite by sub-key with no block scoping, so a nested block here
+  # would be corrupted by every sibling tool's script (#2658).
+  #
+  # linux/amd64 only: this pin feeds the setup-build-tools action, which runs on
+  # ubuntu runners. tools/setup-tools handles local dev on other platforms.
+  oras_sha256_linux_amd64: '66fb0ad7206f3f6fa77ed5b552049d364ccf4b50b1684554f731f76302b52ca0'
+
+# E2E Testing Tools
+testing_tools:
+  # renovate: datasource=github-releases depName=kubernetes/kubernetes depType=testing_tools
+  kubectl: 'v1.37.2'
+  # kubelogin: Entra exec-plugin for AKS kubeconfigs, installed by uat-azure.yaml
+  # via `az aks install-cli` (which defaults to latest without an explicit pin).
+  # renovate: datasource=github-releases depName=Azure/kubelogin depType=testing_tools
+  kubelogin: 'v0.2.22'
+  # renovate: datasource=github-releases depName=kubernetes-sigs/kind depType=testing_tools
+  kind: '0.33.0'
+  # renovate-digest: datasource=git-refs depName=nvkind packageName=https://github.com/NVIDIA/nvkind branch=main depType=testing_tools
+  nvkind: 'c57050497cffee36f10c8b918d2727c4f26d886e'
+  # renovate: datasource=github-releases depName=tilt-dev/ctlptl depType=testing_tools
+  ctlptl: '0.9.6'
+  # renovate: datasource=github-releases depName=tilt-dev/tilt depType=testing_tools
+  tilt: '0.37.8'
+  # Keep in step with sigs.k8s.io/controller-runtime in go.mod: setup-envtest is
+  # released from that repo under the tools/setup-envtest/vX.Y.Z tag series, and
+  # the envtest control-plane binaries it fetches are matched to the
+  # controller-runtime the tests link against.
+  # renovate: datasource=go depName=sigs.k8s.io/controller-runtime/tools/setup-envtest depType=testing_tools
+  setup_envtest: 'v0.25.2'
+  # CI installs the released linux/amd64 binary rather than `go install`ing the
+  # module, so the gate no longer depends on sum.golang.org being up (#2667).
+  # The two are the same code: `tools/setup-envtest/v0.25.0` and `v0.25.0` are
+  # the same commit (e8f9455), and the release asset is built from it.
+  #
+  # controller-runtime publishes no checksums.txt beside the binary, so unlike
+  # oasdiff and oras there is nothing to cross-check this against -- it is the
+  # only integrity check on the download, computed from the asset and reviewed
+  # at this SHA. A version bump must refresh it or the install step fails
+  # closed on the mismatch; tools/update-setup-envtest-checksums does that,
+  # wired to Renovate's postUpgradeTasks. Because there is no upstream manifest,
+  # that script hashes whatever the release serves at refresh time -- review the
+  # resulting diff as a new trust-on-first-use record, not a corroboration.
+  #
+  # linux/amd64 only, for the reason on oasdiff_sha256_linux_amd64: this feeds
+  # the setup-build-tools action, which runs on ubuntu runners, while
+  # tools/setup-tools covers local dev on other platforms.
+  setup_envtest_sha256_linux_amd64: '94534f83896f3b09934d9570b213fbda04aa5c17457942270928cdca0317bf9b'
+  # renovate: datasource=github-releases depName=helm/helm depType=testing_tools
+  helm: 'v4.3.1'
+  # renovate: datasource=github-releases depName=databus23/helm-diff depType=testing_tools
+  helm_diff: 'v3.15.15'
+  # helm_diff_checksums are refreshed automatically by tools/update-helm-diff-checksums
+  # via Renovate postUpgradeTasks whenever the helm-diff version above is bumped.
+  # The darwin_* keys name GOOS (matching the sibling blocks); upstream labels
+  # those release assets "macos".
+  helm_diff_checksums:
+    linux_amd64: '504e99410611daa70702362e1b10dc74929df8a912cb3f6b5d21d1ee9d0cb7d9'
+    linux_arm64: 'fc046bf3c3f63a435741fe8c37a9d740dfa17ea7f5f0c2a9da2c0222bb4384e6'
+    darwin_amd64: '214d890745b45679400442552ad4554fb4df622b92d031931536eff85bdb46c2'
+    darwin_arm64: 'af2834052ba32fe8006a44a31db16cad30baf1c46f6b59160b092974578d7798'
+  # renovate: datasource=github-releases depName=helmfile/helmfile depType=testing_tools
+  helmfile: 'v1.8.3'
+  # helmfile_checksums are refreshed automatically by tools/update-helmfile-checksums
+  # via Renovate postUpgradeTasks whenever the helmfile version above is bumped.
+  helmfile_checksums:
+    linux_amd64: '7d79c6d2099a4819213873164eda23bdbd32f1404fec7a7104d934e5d102596f'
+    linux_arm64: 'e035c0338e31e0a8054ae798280532d32edcfbb7d6c4993e3b2efa2dc40647ce'
+    darwin_amd64: '043c4139987ad0009416575a0d52480af45b651f4dc85a90133199e8f9d6a71c'
+    darwin_arm64: 'a80eda044f1b73adc9ca051d34c787444203f31c3b9d5328a6b27c3ff02520ff'
+  # renovate: datasource=github-releases depName=kubernetes-sigs/kwok depType=testing_tools
+  kwok: 'v0.8.0'
+  # renovate: datasource=github-releases depName=kyverno/chainsaw depType=testing_tools
+  chainsaw: 'v0.2.15'
+  # chainsaw_checksums are refreshed automatically by tools/update-chainsaw-checksums
+  # via Renovate postUpgradeTasks whenever the chainsaw version above is bumped.
+  chainsaw_checksums:
+    linux_amd64: '295d226c89f126c0a97775d364be149f47a810c8a3f9829ee410583d0c1abe3c'
+    linux_arm64: 'fecf5f3ea74d11da2cd5d95a4c016d5d2543cbc4844ce21adf5e727e7ffd9e44'
+    darwin_amd64: 'ddb56002ff8c6265f55ec40c82eb0ef0dddec5127dd12d4fc5e7953453481f4b'
+    darwin_arm64: '502bef17dd822217e82590e9ccf01c1e26a56b3fa34a835789b9af73e82a169a'
+  # renovate: datasource=github-releases depName=mikefarah/yq depType=testing_tools
+  yq: 'v4.54.1'
+  # AWS CLI used by the KMS e2e to provision keys against the MiniStack emulator.
+  # renovate: datasource=pypi depName=awscli depType=testing_tools
+  awscli: '1.46.3'
+  # MiniStack: MIT-licensed, token-free AWS emulator (https://ministack.org) used
+  # by the KMS e2e in place of LocalStack, whose latest/stable images now refuse
+  # to boot without a paid license token. Pinned (never :latest) for reproducibility.
+  # Run with USE_SSL=1: sigstore's awskms signer hardcodes https://, so the e2e
+  # serves TLS with a mkcert cert (see mkcert below).
+  # renovate: datasource=docker depName=ministackorg/ministack depType=testing_tools
+  ministack_image: 'ministackorg/ministack:1.5.38'
+  # OpenBAO: the Linux Foundation Apache-2.0 fork of HashiCorp Vault, used by the
+  # Vault KMS e2e to exercise the hashivault:// signing/verification path against
+  # a real Transit secrets engine. API-identical to Vault; the sigstore hashivault
+  # provider drives it over plain HTTP in dev mode (no TLS needed). Pinned (never
+  # :latest) for reproducibility.
+  # renovate: datasource=docker depName=openbao/openbao depType=testing_tools
+  openbao_image: 'openbao/openbao:2.7.2'
+  # mkcert issues a trusted localhost cert for MiniStack's TLS and installs its CA
+  # into the system trust store, so the Go AWS SDK accepts the awskms:// endpoint.
+  # renovate: datasource=github-releases depName=FiloSottile/mkcert depType=testing_tools
+  mkcert: 'v1.4.4'
+  # SHA256 of the mkcert release binaries (Linux only; macOS installs via brew).
+  # Update alongside the mkcert version above.
+  mkcert_checksums:
+    linux_amd64: '6d31c65b03972c6dc4a14ab429f2928300518b26503f58723e532d1b0a3bbb52'
+    linux_arm64: 'b98f2cc69fd9147fe4d405d859c57504571adec0d3611c3eefd04107c7ac00d0'
+  # renovate: datasource=github-releases depName=kubernetes-sigs/karpenter depType=testing_tools
+  karpenter: 'v1.15.1'
+  # OCI registry for KWOK deployer-matrix CI (issue #843) and the ctlptl
+  # registry `make cluster-create` starts.
+  # Pulled from ECR Public (AWS's first-party mirror of Docker official
+  # images): anonymous Docker Hub pulls rate-limit on shared CI runners
+  # (main red 4 consecutive KWOK runs, 2026-07-09). Do not regress to a
+  # bare Docker Hub pin on bump.
+  # renovate: datasource=docker depName=public.ecr.aws/docker/library/registry depType=testing_tools
+  registry_image: 'public.ecr.aws/docker/library/registry:3.1.1'
+  # Argo CD Helm chart for KWOK deployer-matrix CI. v9.5.x pins app v3.4.x,
+  # the first stable line with native OCI artifact source (issue #843).
+  # renovate: datasource=helm depName=argo-cd registryUrl=https://argoproj.github.io/argo-helm depType=testing_tools
+  argocd_chart: '9.5.14'
+  # Redis as rendered by argocd_chart above, cached so the KWOK lanes do not
+  # pull it anonymously at job time (issue #2501). The ECR Public namespace
+  # shares the throttle bucket registry_image already hit: in run
+  # 36290149406 six argocd lanes died on `429 Too Many Requests` for this ref.
+  #
+  # NOT independently versioned, and deliberately carries no `renovate:`
+  # annotation: its only correct value is whatever argocd_chart renders. A bot
+  # bumping it to the newest redis would cache an image the chart never pulls
+  # and quietly restore the 429. On an argocd_chart bump, re-derive it with
+  #   helm template argo/argo-cd --version <chart> | grep -oE 'image: .*redis.*'
+  # and update this line in the same PR.
+  argocd_redis_image: 'ecr-public.aws.com/docker/library/redis:8.2.3-alpine'
+  # sigstore scaffold umbrella chart for the private-Sigstore signing e2e
+  # (Fulcio + Rekor + CTLog + Trillian). Deploys plain Deployment + ClusterIP
+  # Services reachable via port-forward on macOS and Linux (issue #1215).
+  # renovate: datasource=helm depName=scaffold registryUrl=https://sigstore.github.io/helm-charts depType=testing_tools
+  scaffold_chart: '0.6.109'
+  # Flux 2 release for KWOK deployer-matrix CI flux-oci lane (issue #843).
+  # install.yaml is downloaded from the GitHub release; source-controller,
+  # kustomize-controller and helm-controller are the only controllers the
+  # bundle consumes (OCIRepository -> Kustomization -> HelmRelease).
+  # renovate: datasource=github-releases depName=fluxcd/flux2 depType=testing_tools
+  flux_version: 'v2.10.0'
+  # In-cluster Git server for the KWOK flux-git deployer lane (issue #963).
+  # Rootless variant so the admin-user bootstrap can `kubectl exec gitea
+  # admin user create` directly without su gymnastics.
+  # Pulled from docker.gitea.com (Gitea's first-party registry): anonymous
+  # Docker Hub pulls rate-limit on shared CI runners. Do not regress to a
+  # Docker Hub pin on bump.
+  # renovate: datasource=docker depName=docker.gitea.com/gitea depType=testing_tools
+  gitea_image: 'docker.gitea.com/gitea:1.27.0-rootless'
+  # renovate: datasource=github-releases depName=hauler-dev/hauler depType=testing_tools
+  hauler: 'v2.1.2'
+  # renovate: datasource=github-releases depName=zarf-dev/zarf depType=testing_tools
+  zarf: 'v0.89.0'
+# Quality Thresholds
+quality:
+  coverage_threshold: '83'
+  lint_timeout: '10m'
+  test_timeout: '10m'
+
+# Build Configuration
+build:
+  image_registry: 'ghcr.io/nvidia'
+  # Docker Hub pull-through mirror for CI and `make cluster-create`: anonymous
+  # Docker Hub pulls rate-limit on shared runner IPs (main red 2026-10-09).
+  # Must be an https:// host that serves Docker Hub's repository paths and
+  # works as a dockerd registry-mirrors entry, so not ECR Public (its paths
+  # carry a docker/ prefix) and not dockerhub.nvidia.com (no public DNS).
+  dockerhub_mirror: 'https://mirror.gcr.io'
+
+# Testing Configuration
+testing:
+  # renovate: datasource=docker depName=kindest/node depType=testing
+  kind_node_image: 'kindest/node:v1.37.0'
+  # renovate: datasource=docker depName=kindest/node depType=testing
+  h100_kind_node_image: 'kindest/node:v1.37.0'
+
+  # Kind node image published by Mokka (NVIDIA/k8s-test-infra) with the nvidia
+  # containerd runtime handler registered and CDI enabled. A stock kindest/node
+  # carries only runc and test-handler, so every GPU Operator operand, which
+  # sets runtimeClassName: nvidia, fails with "no runtime for nvidia is
+  # configured". Used only by the GPU-free gpu-operator lane; the nvkind lanes
+  # on real silicon keep h100_kind_node_image above.
+  #
+  # Pinned by digest: Mokka publishes no version tag for this image, only a
+  # floating `latest`, so the digest is the only reproducible reference and a
+  # bare tag would silently change the lane's cluster under it. Upstream
+  # issue: the node image should carry release tags like the chart does.
+  # renovate: datasource=docker depName=ghcr.io/nvidia/mokka-kind-node depType=testing
+  mokka_kind_node_image: 'ghcr.io/nvidia/mokka-kind-node:latest@sha256:6e92b27038b253fb37e28aad34b0eb0acc41900a2e0ab21b44c0d523fc961a1c'
+
+  # GPU CI runtime pins consumed through .github/actions/load-versions.
+  # renovate: datasource=helm depName=gpu-operator depType=testing
+  gpu_operator_chart_version: 'v26.7.2'
+  # Base image for the CI smoke-test snapshot-agent image. The agent binary is
+  # static Go and detects GPUs driver-free via NFD/PCI, so it no longer needs a
+  # CUDA base / nvidia-smi. Matches the NVIDIA static distroless base used for
+  # the aicr image (see .ko.yaml).
+  snapshot_agent_base_image: 'nvcr.io/nvidia/distroless/static:v4.1.3@sha256:e6eb65cecc405fabfdfd69f95d4e090baa696c97ab3759151f4160c97aa8ecb7'
+
+  # Component test harness configuration
+  # Used by tools/component-test/ scripts to validate individual components
+  component_test:
+    # Mokka (NVIDIA/k8s-test-infra) publishes the chart and the image at
+    # DIFFERENT paths. They are pinned separately because conflating them is
+    # what broke the Helm path: setup-gpu-mock.sh built its chart reference as
+    # "oci://$nvml_mock_image", which resolves to an image repository, not a
+    # chart, so `helm install` failed with "could not load config with
+    # mediatype application/vnd.cncf.helm.config.v1+json" on every run. The
+    # error was discarded and the script fell through to its manifest
+    # fallback, so the Helm path had never once succeeded.
+    #
+    # COUPLED to the bundle overrides in
+    # .github/workflows/gpu-operator-mokka-test.yaml ("Generate the Kind
+    # recipe and bundle it for Mokka"). Measured on 0.4.0-rc2: the mock driver
+    # tree is readable at BOTH /var/lib/nvml-mock/driver and
+    # /run/nvidia/driver, so the overrides' explicit driver root still
+    # resolves. Mokka main has since moved to bind-mounting onto
+    # /run/nvidia/driver only and dropped the NVIDIA_DRIVER_ROOT overrides from
+    # its own GPU Operator guide (k8s-test-infra e8e49aeb). Advancing this pin
+    # past that change means revisiting the overrides: the three
+    # NVIDIA_DRIVER_ROOT entries become unnecessary and should be removed
+    # rather than repointed.
+    nvml_mock_chart: 'ghcr.io/nvidia/k8s-test-infra/chart/nvml-mock'
+    nvml_mock_chart_version: '0.4.0-rc2'
+    # The chart and the image are installed by DIGEST; the two version keys
+    # are the human labels for the release each digest came from and resolve
+    # nothing while a digest is set. Upstream has re-pushed a chart version
+    # tag under a new digest before (0.3.0, recorded in
+    # tests/uat/kind/setup-gpu-sim.sh), so a tag alone would let the lane's
+    # cluster change with no diff here. The image digest is the multi-arch OCI
+    # image INDEX (linux/amd64 and linux/arm64), valid on CI runners and arm64
+    # developer machines alike. To re-resolve after a pin bump:
+    #   helm show chart oci://<nvml_mock_chart> --version <v>   (the Digest: line)
+    #   regctl manifest digest <nvml_mock_image>:<v>            (the index digest)
+    nvml_mock_chart_digest: 'sha256:341389c379afea8dfe53e7af46ad8199a6588d3629d2005985ccbdcde35511ce'
+    nvml_mock_image: 'ghcr.io/nvidia/nvml-mock'
+    nvml_mock_image_digest: 'sha256:95457da0db0718cbbc6bf6b02e14dbc9b88f9d1eba5b85562bcaeccff2a98d34'
+    # The chart's image.tag defaults to the FLOATING `latest`, so pinning the
+    # chart alone does not pin what runs. Measured 2026-09-22: `latest` was
+    # rebuilt mid-session (sha256:00c8e31a -> sha256:9bfbbb69) and the new
+    # build needs a privileged container with Bidirectional mount propagation
+    # that chart 0.3.0 does not grant, so the node agent failed its bind mount
+    # with "operation not permitted" and never became Ready. Both ends are
+    # pinned here for that reason.
+    #
+    # Tested combinations, to READY:
+    #   chart 0.3.0     + image 0.3.0      CrashLoopBackOff (image ships no node-agent)
+    #   chart 0.3.0     + image 0.4.0-rc1  works
+    #   chart 0.4.0-rc2 + image 0.4.0-rc2  works  <- used here, matched pair
+    # There is currently no stable-release pair that works, which is why a
+    # release candidate is pinned for this test-only dependency.
+    nvml_mock_version: '0.4.0-rc2'
+    default_gpu_profile: 'a100'
+    default_gpu_count: 8
+    cluster_name: 'aicr-component-test'
+    helm_timeout: '300s'
+    health_check_timeout: '5m'
+
+operator:
+  # Supported AICR range; the chart and the operator enforce it.
+  aicr_version_range: '>=1.0.0, <2.0.0'
+  # AICR release the operator is built and qualified against outside a
+  # release; a release tag's chart defaults to that tag's own AICR. Digests resolved
+  # from ghcr.io on 2026-11-03; v1.2.0 is commit 935e0746dc54da890a23c1ecca998244b3a25de7.
+  aicr_version: 'v1.2.0'
+  aicr_image: 'ghcr.io/nvidia/aicr:v1.2.0@sha256:5ef145efe98ede9f4da7be3a66304f5fdc95dd31f825295d6a608a39feb0cac9'
+  aicr_validator_images:
+    deployment: 'ghcr.io/nvidia/aicr-validators/deployment:v1.2.0@sha256:0e697d829916b20698488666d44ecde9429c7d1c6063c5ade425d2f27845ca95'
+    conformance: 'ghcr.io/nvidia/aicr-validators/conformance:v1.2.0@sha256:8930d96f5bf6cd72058d4496558963a9b67383d4ceb776f44cafd1a7f3259913'
+    performance: 'ghcr.io/nvidia/aicr-validators/performance:v1.2.0@sha256:35f45febe754141b3f9154fc0af3273c5de6c4a9d68da154d4477ef3dd2f4722'
+  # AICR releases `make operator-e2e` runs against in CI: the lowest and the
+  # newest supported.
+  aicr_e2e:
+    - version: 'v1.0.0'
+      image: 'ghcr.io/nvidia/aicr:v1.0.0@sha256:e91ba6f4916a5bfcd19d05933b5b4d07a4dd05a738a1ffebfab243a32cbff433'
+      validator_images: 'ghcr.io/nvidia/aicr-validators/deployment:v1.0.0@sha256:3c0a8553a346e6ba5a273a10f0b91574945b8b23cffc9d83db3107701e467790,ghcr.io/nvidia/aicr-validators/conformance:v1.0.0@sha256:e091d51f600255c2166e5c1b42afd556880d498f2a9bb913a32da38fa28e038b,ghcr.io/nvidia/aicr-validators/performance:v1.0.0@sha256:96af7b9e4362917e081d7152efd063d10ba6a213825aae44a4b6fd826da4c4fe'
+    - version: 'v1.2.0'
+      image: 'ghcr.io/nvidia/aicr:v1.2.0@sha256:5ef145efe98ede9f4da7be3a66304f5fdc95dd31f825295d6a608a39feb0cac9'
+      validator_images: 'ghcr.io/nvidia/aicr-validators/deployment:v1.2.0@sha256:0e697d829916b20698488666d44ecde9429c7d1c6063c5ade425d2f27845ca95,ghcr.io/nvidia/aicr-validators/conformance:v1.2.0@sha256:8930d96f5bf6cd72058d4496558963a9b67383d4ceb776f44cafd1a7f3259913,ghcr.io/nvidia/aicr-validators/performance:v1.2.0@sha256:35f45febe754141b3f9154fc0af3273c5de6c4a9d68da154d4477ef3dd2f4722'
+  # Kubernetes floor (support policy): newest 1.34 patch in kind v0.33.0.
+  kind_node_image_floor: 'kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d'
+  # Generates deep copies and CRDs (`make generate`). Run with `go run
+  # pkg@version` so its dependencies stay out of go.mod; v0.23.0 is built on
+  # k8s.io v0.37.0, the same minor as the API machinery in go.mod.
+  # renovate: datasource=github-releases depName=kubernetes-sigs/controller-tools depType=build_tools
+  controller_gen: 'v0.23.0'
+  # Kubernetes floor `make operator-envtest-floor` runs the CRD tests against;
+  # `make test` runs them on the newest envtest release.
+  envtest_kubernetes_floor: '1.34.x'

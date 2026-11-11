@@ -1,0 +1,124 @@
+# Validator Catalog
+
+The validator catalog (`catalog.yaml`) defines which validation checks are available, what phase they belong to, and how they run as Kubernetes Jobs.
+
+## Catalog Structure
+
+```yaml
+apiVersion: validator.nvidia.com/v1alpha1
+kind: ValidatorCatalog
+metadata:
+  name: aicr-validators
+  version: "1.0.0"
+validators:
+  - name: operator-health           # Unique identifier, used in Job names
+    phase: deployment               # deployment | performance | conformance
+    description: "Human-readable"   # Shown in CTRF report
+    image: ghcr.io/.../img:latest   # OCI image reference
+    timeout: 2m                     # Check's own budget (AICR_CHECK_TIMEOUT); activeDeadlineSeconds adds headroom
+    args: ["operator-health"]       # Container arguments
+    env: []                         # Optional environment variables
+    resources:                      # Optional (omit for defaults)
+      cpu: "100m"
+      memory: "128Mi"
+```
+
+## Image Tag Resolution
+
+Applied by `catalog.Load` (`pkg/validator/catalog/catalog.go`) in order:
+
+1. `:latest` is replaced with the CLI version (e.g., `:v0.9.5`) for release builds — locks validators to the CLI version. Dev builds with a known commit get `:sha-<commit>` instead (matching the `on-push.yaml` image tags).
+2. Explicit version tags (e.g., `:v1.2.3`) are never modified — use these to pin a validator independently.
+3. `AICR_VALIDATOR_IMAGE_REGISTRY` overrides the registry prefix (e.g., `localhost:5001` replaces `ghcr.io/nvidia`).
+
+## Validators
+
+### Deployment Phase
+
+| Name | Description | Timeout |
+|------|-------------|---------|
+| `operator-health` | Verify GPU operator pods are running and healthy | 2m |
+| `expected-resources` | Verify expected Kubernetes resources exist and are healthy (runs ExpectedResources + Chainsaw assert paths side-by-side) | 8m |
+| `gpu-operator-version` | Validate GPU Operator version against recipe constraints | 2m |
+| `check-nvidia-smi` | Verify nvidia-smi works on every schedulable GPU node that is not busy (busy and cordoned nodes are reported as skipped, per node) | 10m |
+| `gke-gpu-nic-networks` | Verify the GKE cluster has the GPU NIC networks GPUDirect TCPXO requires, and that each is Ready with an intact GKENetworkParamSet binding (skipped unless the recipe declares `gke-nccl-tcpxo`) | 2m |
+| `gke-gpu-nic-topology` | Verify each a3 GPU node maps all 8 GPU NIC PCI slots to eth1..eth8 with no gVNIC displacement (skipped unless the recipe declares `gke-nccl-tcpxo`) | 2m |
+
+### Performance Phase
+
+| Name | Description | Timeout |
+|------|-------------|---------|
+| `nccl-all-reduce-bw` | Verify NCCL All Reduce Bus Bandwidth meets threshold (TrainJob path) | 30m |
+| `nccl-all-reduce-bw-net` | Verify NCCL All Reduce Bus Bandwidth on the NET transport (EFA on EKS) | 30m |
+| `nccl-all-reduce-bw-nvls` | Verify NCCL All Reduce Bus Bandwidth on the NVLS transport (MNNVL across an NVL72 IMEX domain) | 30m |
+| `inference-perf` | Verify inference throughput and TTFT p99 meet thresholds using AIPerf | 65m |
+| `nccl-cre-all-reduce-bw` | NCCL bus bandwidth via a CRE `Certification` (opt-in). Qualified on EKS H100 — live UAT 2026-10-23 on the pinned CRE v0.8.2, 2× p5.48xlarge: 489.70 GB/s vs `>= 300` (passes at 90%, like `nccl-all-reduce-bw`). | 50m |
+| `cre-training-goodput` | Training goodput via a CRE `Certification` (opt-in). Qualified on EKS H100 — live UAT 2026-10-23 on the pinned CRE v0.8.2 and a NodeWright-tuned cluster, 2× p5.48xlarge: goodput 0.5723, 462.05 TFLOPS per GPU. | 50m |
+
+The TrainJob-path NCCL checks (`nccl-all-reduce-bw`, `-net`, `-nvls`) derive
+applicability from the recipe's `criteria` by default;
+a recipe outside the embedded service + accelerator matrix (e.g. registered
+via `--data`) opts in with the `nccl-benchmark-profile` performance constraint
+(borrow an embedded template — see
+[Opting external recipes into a benchmark profile](../../docs/user/validation.md#opting-external-recipes-into-a-benchmark-profile))
+or, when its fabric matches no embedded template, with the
+`nccl-benchmark-runtime-ref` constraint (ship a Kubeflow `TrainingRuntime` as a
+`--data` file and reference it — see
+[Supplying a benchmark runtime for a private service](../../docs/user/validation.md#supplying-a-benchmark-runtime-for-a-private-service)).
+Neither constraint applies to `nccl-cre-all-reduce-bw` or
+`cre-training-goodput`, which build a CRE `Certification` instead of a
+`TrainJob` and are gated only by `creQualifiedEntries`.
+
+### Conformance Phase
+
+| Name | Description | Timeout |
+|------|-------------|---------|
+| `dra-support` | Verify Dynamic Resource Allocation support | 5m |
+| `gang-scheduling` | Verify gang scheduling with KAI scheduler using CPU-only workers | 10m |
+| `accelerator-metrics` | Verify accelerator metrics from DCGM exporter | 5m |
+| `ai-service-metrics` | Verify AI service metrics via Prometheus | 10m |
+| `inference-gateway` | Verify the recipe's inference gateway (Gateway API + Inference Extension) is operational, then drive header-routed and weighted traffic through it from a probe pod | 15m |
+| `pod-autoscaling` | Verify HPA-driven pod autoscaling of accelerator-requesting pods on a per-pod custom metric served by prometheus-adapter (needs two allocatable accelerators) | 15m |
+| `cluster-autoscaling` | Verify cluster autoscaling with Karpenter | 10m |
+| `robust-controller` | Verify AI operator controller, webhooks and CR reconciliation (Kubeflow Trainer reconciles a TrainJob to Complete; Dynamo records observations) | 8m |
+| `secure-accelerator-access` | Verify secure GPU access via DRA or device plugin (no host device mounts); skips on Slinky Slurm recipes, where on GPU-backed leaves slinky-slurm-gpu-access verifies the Slurm path | 10m |
+| `driver-runtime-management` | Verify the accelerator driver and container runtime configuration from a vanilla-image (`ubuntu:22.04`) pod granted one GPU: injected `nvidia-smi`, a functional driver, and a reported version matching the one the platform advertises (DRA `driverVersion` attribute, else the GFD `nvidia.com/cuda.driver-version.full` label; none advertised is a recorded warning); skips on Slinky Slurm recipes | 10m |
+| `slinky-slurm-health` | Verify Slinky Slurm controller, node inventory, job submission, GPU execution, and enabled accounting health | 8m |
+| `slinky-slurm-imex-channel` | Verify fixed IMEX resources and distinct channels for concurrent Slinky Slurm jobs | 5m |
+| `slinky-slurm-gpu-access` | Verify a Slinky Slurm job allocated one GPU can use exactly that GPU, and a job with no GPU allocation on the same node cannot open any GPU device | 5m |
+| `workload-sandboxing` | Verify a sandboxed `RuntimeClass` (gVisor, Kata; or the one `AICR_SANDBOX_RUNTIME_CLASS` names) isolates a CPU-only `ubuntu:22.04` probe pod from the host: no host daemon in `/proc`, no readable `/dev/mem` or `/dev/kmem`, no `/etc/kubernetes`, `/var/lib/kubelet` or `/var/log/pods`, no host bridge interface, and a kernel identity distinct from an unsandboxed control pod on the same node; fails with `unmet prerequisite: no sandboxed RuntimeClass` when none exists (never skips) | 10m |
+| `gpu-operator-health` | Verify GPU operator health (conformance diagnostic) | 2m |
+| `platform-health` | Verify platform component health (conformance diagnostic) | 5m |
+
+ `slinky-slurm-health` expects a GPU-requesting NodeSet and fails
+if none is present; for `kind` or CPU-only recipes it runs CPU-only checks and
+skips the GPU container check.
+
+When accounting is enabled, `slinky-slurm-health` also submits a bounded batch
+job and polls `sacct` until the completed `0:0` allocation record appears.
+Recipes with disabled or legacy unspecified accounting retain the original
+health commands without this probe.
+
+On GPU-backed NodeSets, `slinky-slurm-health` launches
+`docker.io/library/alpine:3.23.3` through Pyxis. The check rewrites only the
+registry prefix when `AICR_VALIDATOR_IMAGE_REGISTRY` is set, preserving the
+explicit Alpine tag. This is the same Alpine tag the slinky-slurm chart's
+initconf/logfile sidecars pin, so it is already covered by `aicr mirror list`
+via chart rendering. Mirroring alone does not redirect the dynamic `srun` pull,
+though — set `AICR_VALIDATOR_IMAGE_REGISTRY` so the runtime pull resolves from
+your mirror in air-gapped validation.
+
+`slinky-slurm-gpu-access` runs two bounded `srun` jobs from the login pod: one
+with `--gpus=1`, which must list exactly one GPU through `nvidia-smi` and open
+exactly one `/dev/nvidiaN`, and one with no GPU request pinned to the same Slurm
+node, which must open none. Slurm's cgroup device controller leaves every GPU
+node listed and refuses the open with EPERM, so the check classifies the errno of
+a read-only open; any other errno fails as inconclusive. It runs no container
+image, so it needs no mirror entry. It needs `perl` in the slurmd image (the
+pinned `slurmd-pyxis` image ships it) and fails with
+`PROBE_ERROR=perl not found`, never passes, on an image without it. It skips on
+`kind` recipes, which run without `task/cgroup`.
+
+## Extending the Catalog
+
+Use the `--data` flag to add custom validators or override embedded ones. See the [Validator Extension Guide](../../docs/integrator/validator-extension.md).

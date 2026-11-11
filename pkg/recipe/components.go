@@ -1,0 +1,1182 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package recipe
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/header"
+	"gopkg.in/yaml.v3"
+)
+
+// ComponentRegistryKind is the wire kind for component registry documents.
+const ComponentRegistryKind = "ComponentRegistry"
+
+// ComponentRegistryAPIVersion is the apiVersion expected on a registry.yaml.
+// ComponentRegistry is on the ADR-022 authoring track, so this aliases
+// header.AuthoringGroupVersion; the track's target is
+// header.GroupVersionV1Beta1.
+const ComponentRegistryAPIVersion = header.AuthoringGroupVersion
+
+// ComponentRegistry holds the declarative configuration for all components.
+// This is loaded from embedded recipe data (recipes/registry.yaml) at startup.
+type ComponentRegistry struct {
+	APIVersion string            `yaml:"apiVersion"`
+	Kind       string            `yaml:"kind"`
+	Components []ComponentConfig `yaml:"components"`
+
+	// Index for fast lookup by name (populated after loading)
+	byName map[string]*ComponentConfig
+}
+
+// ComponentClass is the bundle class a registry component belongs to
+// (ADR-018). The classes are totally ordered core < ops, the order of
+// ComponentClasses: a component may depend only on components of
+// its own class or an earlier one, a split set installs the classes in that
+// order, and core alone is a complete install. The zero value means core, so
+// a registry that predates the field loads unchanged; the embedded registry
+// declares the class on every entry.
+type ComponentClass string
+
+const (
+	// ComponentClassCore is platform-independent GPU execution: what a plain
+	// GPU pod needs to be scheduled and run correctly, including the
+	// accelerator fabric, and the prerequisites those components declare.
+	ComponentClassCore ComponentClass = "core"
+	// ComponentClassOps is everything the GPU runtime does not need:
+	// operational services (scheduling, node health, observability, policy,
+	// inventory) and workload platforms with the components that exist only
+	// to serve them.
+	ComponentClassOps ComponentClass = "ops"
+)
+
+// ComponentClasses lists every class in install order. It is the single
+// source of the class ordering.
+var ComponentClasses = []ComponentClass{ComponentClassCore, ComponentClassOps}
+
+// Rank is the class's position in ComponentClasses; a lower rank installs
+// first. The second result is false for a name that is not a class.
+func (c ComponentClass) Rank() (int, bool) {
+	i := slices.Index(ComponentClasses, c)
+	return i, i >= 0
+}
+
+// ComponentConfig defines the bundler configuration for a component.
+// This replaces the per-component Go packages with declarative YAML.
+type ComponentConfig struct {
+	// Name is the component identifier used in recipes (e.g., "gpu-operator").
+	Name string `yaml:"name"`
+
+	// DisplayName is the human-readable name used in templates and output.
+	DisplayName string `yaml:"displayName"`
+
+	// Class is the component's bundle class; read it through GetClass, which
+	// applies the core default.
+	Class ComponentClass `yaml:"class,omitempty"`
+
+	// ValueOverrideKeys are alternative keys for --set flag matching.
+	// Example: ["gpuoperator"] allows --set gpuoperator:key=value
+	ValueOverrideKeys []string `yaml:"valueOverrideKeys,omitempty"`
+
+	// Helm contains default Helm chart settings.
+	Helm HelmConfig `yaml:"helm,omitempty"`
+
+	// Kustomize contains default Kustomize settings.
+	Kustomize KustomizeConfig `yaml:"kustomize,omitempty"`
+
+	// NodeScheduling defines paths for injecting node selectors and tolerations.
+	NodeScheduling NodeSchedulingConfig `yaml:"nodeScheduling,omitempty"`
+
+	PodScheduling PodSchedulingConfig `yaml:"podScheduling,omitempty"`
+
+	// StorageClassPaths are Helm value paths where the storage class name is injected.
+	// When --storage-class is provided at bundle time, the value is written to each path.
+	StorageClassPaths []string `yaml:"storageClassPaths,omitempty"`
+
+	// SharedStorageClassPaths are Helm value paths for shared filesystem PVCs.
+	// When --shared-storage-class is provided at bundle time, the value is
+	// written to each path without affecting the generic storageClassPaths.
+	SharedStorageClassPaths []string `yaml:"sharedStorageClassPaths,omitempty"`
+
+	// RequiredValues lists value paths a bundle of this component must
+	// supply: each must hold a non-empty value once every override has
+	// been applied, or be declared with --dynamic so it is filled at
+	// install time. The bundler rejects the bundle otherwise, naming the
+	// paths, so a chart that cannot work without a per-cluster input
+	// fails at bundle time rather than at install (ADR-029).
+	RequiredValues []string `yaml:"requiredValues,omitempty"`
+
+	// InstallTimeSecretPaths lists value paths that carry a credential.
+	// The bundler rejects a non-empty value at one of them from any source
+	// (values file, overlay, --set, --set-json, --set-file), so no
+	// generated artifact carries the secret; --dynamic is the only way to
+	// supply it, and only the helm deployer may, because the other
+	// deployers persist the filled value (ADR-029).
+	InstallTimeSecretPaths []string `yaml:"installTimeSecretPaths,omitempty"`
+
+	// Validations defines component-specific validation checks.
+	Validations []ComponentValidationConfig `yaml:"validations,omitempty"`
+
+	// HealthCheck defines custom health check configuration for this component.
+	HealthCheck HealthCheckConfig `yaml:"healthCheck,omitempty"`
+
+	// Upgrades references this component's transition records (ADR-021).
+	Upgrades UpgradesConfig `yaml:"upgrades,omitempty"`
+
+	// ManifestFiles lists manifest files (relative to the recipes data
+	// root, e.g. "components/kueue/manifests/cluster-queue.yaml") bundled
+	// with the component whenever a recipe references it and the
+	// componentRef does not declare its own manifestFiles. A ref-declared
+	// (overlay/mixin) manifestFiles list takes precedence — these defaults
+	// are not merged into it. Consumers cannot opt out of the defaults
+	// except by declaring their own list: an empty ref-declared list is
+	// indistinguishable from an absent one after YAML decoding (len == 0
+	// → defaults filled), so `manifestFiles: []` silently receives the
+	// defaults back.
+	ManifestFiles []string `yaml:"manifestFiles,omitempty"`
+
+	// GKECriticalPriority signals that the component's default chart manifests
+	// include pods with `priorityClassName: system-node-critical` or
+	// `system-cluster-critical`. When true and the recipe's
+	// `criteria.service` is "gke", the bundler synthesizes a permissive
+	// ResourceQuota into the component's namespace (PreManifestFiles phase)
+	// so GKE Standard's ResourceQuota admission plugin admits the pods.
+	//
+	// GKE Standard ships a kube-system ResourceQuota scoped to
+	// `system-*-critical` PriorityClasses; per the Kubernetes spec, once
+	// any quota in the cluster scopes by PriorityClass for those values,
+	// pods that request a matching priority class can only be created in
+	// namespaces that have a matching quota. Other services (EKS, AKS,
+	// OKE, bare-metal) do not ship this default and are unaffected.
+	//
+	// See https://github.com/NVIDIA/aicr/issues/915.
+	GKECriticalPriority bool `yaml:"gkeCriticalPriority,omitempty"`
+
+	// HasSelfRefCRDs signals that the component's chart contains both
+	// a CRD (shipped under `crds/` or via a CRDs subchart) AND a
+	// template that creates a CR of that kind in the SAME release.
+	// helm-diff's render pass fails on such charts on a fresh cluster:
+	// it renders templates and validates against the live REST mapper,
+	// but the mapper does not yet know the CRD because helm only
+	// applies `crds/` resources during `helm install` (not during
+	// render). This flag instructs the helmfile deployer to emit
+	// `disableValidation: true` on the release, telling helm-diff to
+	// skip the mapper check for that release only.
+	//
+	// Cross-chart CRD ordering — where one chart ships CRDs that
+	// another chart's templates reference — is handled separately by
+	// the helmfile bundler's DAG-stratified sub-helmfile layout (one
+	// sub-helmfile per dependency level, processed sequentially). That
+	// machinery reads ComponentRef.DependencyRefs and needs no
+	// registry flag; correct dependencyRefs encode the ordering.
+	// gpu-operator is the canonical example for self-reference: its
+	// templates create a ClusterPolicy CR of the ClusterPolicy CRD it
+	// ships in `crds/`. See https://github.com/NVIDIA/aicr/issues/914.
+	HasSelfRefCRDs bool `yaml:"hasSelfRefCRDs,omitempty"`
+
+	// OwnsCRDs signals that this component is the ONLY chart in the
+	// registry that ships its CRDs, so a deployer may replace those CRDs
+	// on upgrade instead of leaving them at the schema installed on day
+	// one. Helm installs a chart's `crds/` directory on first install and
+	// never touches it again, and Flux's helm-controller inherits that via
+	// its `spec.upgrade.crds: Skip` default, so a chart bump whose CRDs
+	// changed otherwise runs a new controller against the previous schema.
+	// Flux, helm, and helmfile consume this through
+	// deployer.ResolveCRDOwners. Argo CD does not: it applies a chart's CRDs
+	// on every sync regardless, so it needs no opt-in and honors none.
+	//
+	// This is opt-in, and deliberately so. An audit of every Helm
+	// component in the registry found 15 ship CRDs under `crds/`, and 11
+	// of those share at least one CRD with another component: nfd,
+	// gpu-operator, and network-operator all ship the NodeFeature CRDs,
+	// and nfd plus gpu-operator plus kai-scheduler all appear together in
+	// `base.yaml`. Replacing unconditionally would have two or three
+	// releases rewrite the same CRD on every reconcile or redeploy, each
+	// with the schema its own chart pins. Requiring the opt-in is what
+	// keeps that from happening.
+	//
+	// Set this only for a component that both (a) solely owns every CRD it
+	// ships — including against charts that ship CRDs through `templates/`
+	// rather than `crds/`, which `helm show crds` does not report — and
+	// (b) ships no CRD using `spec.conversion.strategy: Webhook`, because
+	// replace discards a `caBundle` injected at runtime.
+	//
+	// See https://github.com/NVIDIA/aicr/issues/2264.
+	OwnsCRDs bool `yaml:"ownsCRDs,omitempty"`
+
+	// OwnsCRDsExcludeSubcharts names subcharts, by chart name, whose CRDs an
+	// OwnsCRDs component does not own. Its CRD step collects every crds/
+	// directory in the archive, disabled subcharts included, so a bundled
+	// dependency that another registry component owns would otherwise be
+	// re-applied at the parent's pinned schema. Valid only with OwnsCRDs.
+	OwnsCRDsExcludeSubcharts []string `yaml:"ownsCRDsExcludeSubcharts,omitempty"`
+
+	// ManifestsUseChartCRDs signals that the component's attached
+	// manifestFiles (wrapped by the bundler into an injected -post
+	// local-helm release) instantiate CRs whose CRDs this component's
+	// own chart installs at apply time. The -post wrapper shares the
+	// parent's DAG level, so the stratified sub-helmfile layout (see
+	// HasSelfRefCRDs above) does not help: helmfile diffs every
+	// release in a level before applying any of them, and the `needs:`
+	// edge orders apply, not diff — on a fresh cluster the wrapper's
+	// helm-diff REST-mapper check can therefore never pass. This flag
+	// instructs the helmfile deployer to emit `disableValidation: true`
+	// on the release whose folder carries the post-phase manifests —
+	// the injected -post wrapper under both vendored and non-vendored
+	// layouts (#1835). Releases without post manifests and -pre
+	// wrappers keep the mapper check; see issue #929. Canonical
+	// examples: network-operator (the AKS overlay attaches a
+	// NicClusterPolicy CR whose CRD the chart installs) and
+	// kubeflow-trainer (platform-kubeflow attaches a
+	// ClusterTrainingRuntime CR of the CRD shipped in the chart's
+	// crds/).
+	ManifestsUseChartCRDs bool `yaml:"manifestsUseChartCRDs,omitempty"`
+
+	// MixinSafeOverridePaths declares the exact dotted value paths (e.g.
+	// "global.tracing.enabled") a RecipeMixin may set on THIS component
+	// via ComponentRef.Overrides. Declared by the component owner, not the
+	// mixin author: a mixin cannot self-grant access to a component it
+	// doesn't own. Paths match exactly, never as a prefix -- list each
+	// leaf path, not an ancestor of it. Empty (the default) means the
+	// component has not opted in.
+	//
+	// Enforcement (allowlist matching, collision rules, and how an
+	// unopted-in component is treated): mixinOverridesSafeForMerge in
+	// metadata_store.go. Rationale: ADR-005's "Silent constraint override"
+	// mitigation, docs/design/005-overlay-refactoring.md.
+	MixinSafeOverridePaths []string `yaml:"mixinSafeOverridePaths,omitempty"`
+
+	Telemetry TelemetryConfig `yaml:"telemetry,omitempty"`
+}
+
+// TelemetryConfig is a component's part in the runtime metrics contract
+// (ADR-026): a consumer of the runtime Prometheus server declares PromQL, and
+// the server declares PromQLServer. The bundler writes the enabled
+// consumers' union at the server's paths.
+type TelemetryConfig struct {
+	PromQL       PromQLConsumerConfig `yaml:"promql,omitempty"`
+	PromQLServer PromQLServerConfig   `yaml:"promqlServer,omitempty"`
+}
+
+// PromQLConsumerConfig is what one consumer queries from the server.
+type PromQLConsumerConfig struct {
+	// MonitorsFrom names components whose namespaces, as resolved in the
+	// recipe, hold the ServiceMonitors and PodMonitors exposing Series. Those
+	// monitors must not set spec.scrapeClass.
+	MonitorsFrom []string `yaml:"monitorsFrom,omitempty"`
+
+	// Series are RE2 patterns matched against the whole metric name as
+	// scraped, before monitor relabeling, so a histogram matches by its _sum,
+	// _count, or _bucket name.
+	Series []string `yaml:"series,omitempty"`
+}
+
+// PromQLServerConfig names the server's Helm value paths the bundler owns:
+// the server's values may not set them and bundle-time overrides may not
+// target them. NamespaceSelectorPaths receive a selector naming exactly the
+// consumers' namespaces, MonitorSelectorPaths one matching every monitor,
+// and ScrapeClassesPath a default scrape class keeping only their Series.
+type PromQLServerConfig struct {
+	NamespaceSelectorPaths []string `yaml:"namespaceSelectorPaths,omitempty"`
+	MonitorSelectorPaths   []string `yaml:"monitorSelectorPaths,omitempty"`
+	ScrapeClassesPath      string   `yaml:"scrapeClassesPath,omitempty"`
+}
+
+// IsDeclared reports whether the component declares itself a PromQL
+// consumer.
+func (c PromQLConsumerConfig) IsDeclared() bool {
+	return len(c.MonitorsFrom) > 0 || len(c.Series) > 0
+}
+
+// IsDeclared reports whether the component declares itself the PromQL
+// server.
+func (c PromQLServerConfig) IsDeclared() bool {
+	return len(c.NamespaceSelectorPaths) > 0 || len(c.MonitorSelectorPaths) > 0 || c.ScrapeClassesPath != ""
+}
+
+// OwnedPaths returns every path in c.
+func (c PromQLServerConfig) OwnedPaths() []string {
+	paths := slices.Concat(c.NamespaceSelectorPaths, c.MonitorSelectorPaths)
+	if c.ScrapeClassesPath != "" {
+		paths = append(paths, c.ScrapeClassesPath)
+	}
+	return paths
+}
+
+// HealthCheckConfig defines custom health check settings for a component.
+type HealthCheckConfig struct {
+	// AssertFile is the path to a Chainsaw-style assert YAML file (relative to data directory).
+	// When set, the expected-resources check uses Chainsaw CLI to evaluate assertions
+	// instead of the default auto-discovery + typed replica checks.
+	AssertFile string `yaml:"assertFile,omitempty"`
+}
+
+// UpgradesConfig references a component's ComponentUpgrades document.
+type UpgradesConfig struct {
+	// File is the path to a ComponentUpgrades YAML file, relative to the
+	// data directory (e.g. "components/nodewright-operator/upgrades.yaml").
+	// Empty means the component has no transition records.
+	File string `yaml:"file,omitempty"`
+}
+
+// HelmConfig contains default Helm chart settings for a component.
+type HelmConfig struct {
+	// DefaultRepository is the default Helm repository URL.
+	DefaultRepository string `yaml:"defaultRepository,omitempty"`
+
+	// DefaultChart is the chart name (e.g., "nvidia/gpu-operator").
+	DefaultChart string `yaml:"defaultChart,omitempty"`
+
+	// DefaultVersion is the default chart version if not specified in recipe.
+	DefaultVersion string `yaml:"defaultVersion,omitempty"`
+
+	// DefaultDigest is the SHA-256 of the chart archive that DefaultRepository,
+	// DefaultChart and DefaultVersion resolve to, written sha256:<hex>. It is
+	// the digest of the .tgz for OCI charts too, not of the OCI manifest. When
+	// set, `aicr bundle --vendor-charts` refuses a pulled chart whose bytes
+	// differ, for refs that still use this exact chart.
+	DefaultDigest string `yaml:"defaultDigest,omitempty"`
+
+	// DefaultNamespace is the Kubernetes namespace for deploying this component.
+	DefaultNamespace string `yaml:"defaultNamespace,omitempty"`
+}
+
+// KustomizeConfig contains default Kustomize settings for a component.
+type KustomizeConfig struct {
+	// DefaultSource is the default Git repository or OCI reference.
+	DefaultSource string `yaml:"defaultSource,omitempty"`
+
+	// DefaultPath is the path within the repository to the kustomization.
+	DefaultPath string `yaml:"defaultPath,omitempty"`
+
+	// DefaultTag is the default Git tag, branch, or commit.
+	DefaultTag string `yaml:"defaultTag,omitempty"`
+}
+
+// NodeSchedulingConfig defines paths for node scheduling injection.
+type NodeSchedulingConfig struct {
+	// System defines paths for system component scheduling.
+	System SchedulingPaths `yaml:"system,omitempty"`
+
+	// Accelerated defines paths for GPU/accelerated node scheduling.
+	Accelerated SchedulingPaths `yaml:"accelerated,omitempty"`
+
+	// NodeCountPaths are Helm value paths where the bundle-time node count is injected (e.g. estimatedNodeCount for nodewright-operator).
+	NodeCountPaths []string `yaml:"nodeCountPaths,omitempty"`
+}
+
+// SchedulingPaths holds the Helm value paths for node scheduling.
+type SchedulingPaths struct {
+	// NodeSelectorPaths are paths where node selectors are injected.
+	NodeSelectorPaths []string `yaml:"nodeSelectorPaths,omitempty"`
+
+	// RequireNodeSelector fails the bundle, instead of silently skipping
+	// injection, when NodeSelectorPaths is non-empty but no selector is
+	// available: the --system-node-selector/--accelerated-node-selector
+	// flag was omitted and no overlay opted the path out with an explicit
+	// empty value. Leave false unless landing on the wrong node class
+	// silently breaks the component (e.g. a StatefulSet whose PVC pins it
+	// to a node's zone).
+	RequireNodeSelector bool `yaml:"requireNodeSelector,omitempty"`
+
+	// RequireNodeSelectorIfStorageClassSet is RequireNodeSelector's
+	// conditional counterpart, applying only once a storage class is
+	// configured (ComponentConfig's StorageClassPaths or
+	// SharedStorageClassPaths resolve non-empty) and leaving a chart that
+	// still defaults to ephemeral storage unenforced. Mutually exclusive
+	// with RequireNodeSelector.
+	RequireNodeSelectorIfStorageClassSet bool `yaml:"requireNodeSelectorIfStorageClassSet,omitempty"`
+
+	// TolerationPaths are paths where tolerations are injected.
+	TolerationPaths []string `yaml:"tolerationPaths,omitempty"`
+
+	// TaintPaths are paths where taints are injected as structured objects.
+	// Intended to be used instea of TaintStrPaths for components that need to set specific parts of taints
+	// and can't process the string format.
+	TaintPaths []string `yaml:"taintPaths,omitempty"`
+
+	// TaintStrPaths are paths where taints are injected as strings (format: key=value:effect or key:effect).
+	TaintStrPaths []string `yaml:"taintStrPaths,omitempty"`
+}
+
+// PodSchedulingConfig defines paths for pod scheduling injection.
+type PodSchedulingConfig struct {
+	// Workload defines paths for workload pod scheduling.
+	Workload WorkloadSchedulingPaths `yaml:"workload,omitempty"`
+}
+
+// WorkloadSchedulingPaths holds the Helm value paths for workload scheduling.
+type WorkloadSchedulingPaths struct {
+	// WorkloadSelectorPaths are paths where workload selectors are injected.
+	WorkloadSelectorPaths []string `yaml:"workloadSelectorPaths,omitempty"`
+}
+
+// ComponentValidationConfig defines a component-specific validation check.
+type ComponentValidationConfig struct {
+	// Function is the name of the validation function to execute (e.g., "CheckWorkloadSelectorMissing").
+	Function string `yaml:"function"`
+
+	// Severity determines whether failures are warnings or errors ("warning" or "error").
+	Severity string `yaml:"severity"`
+
+	// Conditions are optional conditions that must be met for the validation to run.
+	// Values are arrays of strings for OR matching (single element arrays are equivalent to single values).
+	// Example: {"intent": ["training"]} or {"intent": ["training", "inference"]}
+	Conditions map[string][]string `yaml:"conditions,omitempty"`
+
+	// Message is an optional detail message to append to validation failures/warnings.
+	Message string `yaml:"message,omitempty"`
+}
+
+// ReservedDeployerKey is the --set component prefix reserved for
+// deployer-level Argo Application options (see #1625). Must stay equal
+// to pkg/bundler/config.DeployerOverrideKey — pkg/recipe cannot import
+// pkg/bundler/config (layering), so a test in pkg/bundler/config asserts
+// the two constants match. Registry loads fail closed when a component
+// declares this value as its name or as a valueOverrideKeys entry.
+const ReservedDeployerKey = "deployer"
+
+// registryCacheEntry holds the lazily-built ComponentRegistry for a single
+// DataProvider identity. sync.Once gates concurrent first-load callers onto
+// the same registry and the same error.
+type registryCacheEntry struct {
+	once     sync.Once
+	registry *ComponentRegistry
+	err      error
+}
+
+// registryCache holds registryCacheEntry pointers keyed by DataProvider
+// identity. Two callers bound to different DataProvider values populate
+// distinct entries; a single provider value yields a single shared registry
+// regardless of caller goroutine count. EvictCachedRegistry drops a single
+// entry so callers can force a refetch after rotating provider content
+// without disturbing other providers.
+var registryCache sync.Map // map[DataProvider]*registryCacheEntry
+
+// GetComponentRegistryFor returns the component registry for the supplied
+// DataProvider. Concurrent callers with the same provider observe the same
+// singleton; distinct providers populate distinct cache entries and never
+// share state. A nil provider falls back to the package-level
+// embedded-data singleton so legacy entry points continue to work
+// transparently.
+//
+// A first-load *deterministic* error (file missing, schema invalid) is
+// preserved by sync.Once and returned to every subsequent caller for the
+// same provider until EvictCachedRegistry drops the entry — concurrent
+// callers don't all re-run the same broken load. A first-load *transient*
+// error (context.Canceled / DeadlineExceeded) is NOT cached: the entry is
+// CompareAndDelete'd before returning so a follow-up call with a healthy
+// ctx rebuilds from scratch, mirroring LoadMetadataStoreFor.
+func GetComponentRegistryFor(dp DataProvider) (*ComponentRegistry, error) {
+	if dp == nil {
+		dp = defaultEmbeddedProvider
+	}
+	e, _ := registryCache.LoadOrStore(dp, &registryCacheEntry{})
+	entry := e.(*registryCacheEntry)
+	entry.once.Do(func() {
+		entry.registry, entry.err = loadComponentRegistryFor(dp)
+	})
+	if entry.err != nil && isTransientLoadError(entry.err) {
+		// Drop the poisoned entry so the next caller rebuilds rather
+		// than serving the cancellation forever. CompareAndDelete is
+		// safe under concurrent retries — a fresh entry stored by a
+		// parallel caller is left undisturbed.
+		registryCache.CompareAndDelete(dp, e)
+	}
+	return entry.registry, entry.err
+}
+
+// GetComponentRegistry returns the component registry for the embedded
+// catalog (defaultEmbeddedProvider). New callers — especially those that
+// need per-tenant isolation — should use GetComponentRegistryFor directly
+// with a caller-supplied provider.
+func GetComponentRegistry() (*ComponentRegistry, error) {
+	return GetComponentRegistryFor(defaultEmbeddedProvider)
+}
+
+// EvictCachedRegistry drops the cached registry for the supplied provider
+// so the next GetComponentRegistryFor call rebuilds from source. Passing a
+// nil provider is a no-op (callers handle that case explicitly to avoid
+// silently evicting the embedded-default registry).
+func EvictCachedRegistry(dp DataProvider) {
+	if dp == nil {
+		return
+	}
+	registryCache.Delete(dp)
+}
+
+// CachedRegistryCountForTesting returns the number of distinct
+// DataProvider entries currently held in the registry cache. Exposed
+// for tests in the aicr facade that assert Client.Close evicts the
+// cached registry — without this, the only way to observe eviction
+// from outside the recipe package would be to reach into unexported
+// state via reflection.
+//
+// Test-only by convention (the _ForTesting suffix); never call from
+// production code.
+//
+// NOTE: global count across every DataProvider. Tests that need a
+// stable signal scoped to a specific DataProvider should prefer
+// CachedRegistryContainsForTesting.
+func CachedRegistryCountForTesting() int {
+	n := 0
+	registryCache.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+// CachedRegistryContainsForTesting reports whether the registry cache
+// has an entry for the supplied DataProvider. Pair with
+// CachedStoreContainsForTesting in pkg/recipe/metadata_store.go to
+// verify a single Client's caches are released. Scoped per-provider so
+// it is robust under parallel test execution.
+//
+// Test-only by convention (the _ForTesting suffix); never call from
+// production code.
+func CachedRegistryContainsForTesting(dp DataProvider) bool {
+	_, ok := registryCache.Load(dp)
+	return ok
+}
+
+// ResetComponentRegistryForTesting drops every cached registry so the next
+// GetComponentRegistryFor call rebuilds from source. This must only be
+// called from tests.
+func ResetComponentRegistryForTesting() {
+	registryCache.Range(func(k, _ any) bool {
+		registryCache.Delete(k)
+		return true
+	})
+}
+
+// loadComponentRegistryFor loads the component registry from the supplied
+// provider. It is pure with respect to shared package state — callers that
+// need the embedded default route through GetComponentRegistry, which
+// resolves to defaultEmbeddedProvider at the entry point.
+//
+// First-load I/O is bounded with defaults.FileReadTimeout so a hung
+// backing store (e.g., a stalled --data NFS mount) cannot park the
+// sync.Once first-load goroutine indefinitely; cancellation only takes
+// effect at the open-file boundary (see DataProvider interface doc), not
+// mid-syscall on an in-flight read. Each call gets its own context so
+// concurrent callers do not share a deadline.
+//
+// Threading a caller-supplied ctx would require a public-API parameter
+// change to GetComponentRegistryFor and every transitive caller in the
+// bundler / mirror / deployer chains; the bounded internal ctx + the
+// transient-error eviction guard in GetComponentRegistryFor is the
+// acceptable tradeoff until that cascade is taken on as a separate
+// follow-up (tracked alongside #1109's out-of-scope items).
+//
+//nolint:contextcheck // see comment above.
+func loadComponentRegistryFor(provider DataProvider) (*ComponentRegistry, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaults.FileReadTimeout)
+	defer cancel()
+	data, err := provider.ReadFile(ctx, "registry.yaml")
+	if err != nil {
+		return nil, errors.PropagateOrWrap(err, errors.ErrCodeInternal, "failed to read registry.yaml")
+	}
+
+	var registry ComponentRegistry
+	if err := yaml.Unmarshal(data, &registry); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to parse registry.yaml", err)
+	}
+	if err := validateComponentRegistryHeader(&registry, "registry.yaml"); err != nil {
+		return nil, err
+	}
+
+	// Fail closed on the reserved deployer key for EVERY loaded registry
+	// (embedded and external --data alike): a component named "deployer"
+	// or aliasing it via valueOverrideKeys would make `--set deployer:...`
+	// ambiguous between component Helm values and deployer-level Argo
+	// Application options. See #1625.
+	for i := range registry.Components {
+		comp := &registry.Components[i]
+		if comp.Name == ReservedDeployerKey {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("registry component %q uses the reserved deployer override key as its name; %q is reserved for --set deployer:<key> Argo deployer options", comp.Name, ReservedDeployerKey))
+		}
+		if slices.Contains(comp.ValueOverrideKeys, ReservedDeployerKey) {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("registry component %q declares the reserved override key %q; it is reserved for --set deployer:<key> Argo deployer options", comp.Name, ReservedDeployerKey))
+		}
+		// Fail closed on Kustomize components declaring manifestFiles
+		// defaults: validateComponentRef rejects Kustomize refs that carry
+		// manifestFiles, so ApplyRegistryDefaults would clone-fill this
+		// list into every referencing recipe and fail resolution in every
+		// consumer at once. Surface the config mistake here, at load time.
+		if comp.GetType() == ComponentTypeKustomize && len(comp.ManifestFiles) > 0 {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("registry component %q is Kustomize but declares manifestFiles; a component may declare either Kustomize (tag/path) or raw manifest files, not both — manifestFiles defaults apply only to Helm components", comp.Name))
+		}
+		if err := validateMixinSafeOverridePaths(comp); err != nil {
+			return nil, err
+		}
+		if err := validateHelmDefaultDigest(comp); err != nil {
+			return nil, err
+		}
+		if err := validateComponentClass(comp); err != nil {
+			return nil, err
+		}
+	}
+
+	if errs := registry.validateTelemetry(); len(errs) > 0 {
+		return nil, errs[0]
+	}
+
+	// Build index for fast lookup
+	registry.byName = make(map[string]*ComponentConfig, len(registry.Components))
+	for i := range registry.Components {
+		comp := &registry.Components[i]
+		registry.byName[comp.Name] = comp
+	}
+
+	return &registry, nil
+}
+
+// validateComponentClass rejects a class name outside ComponentClasses. An
+// absent class is the core default and passes.
+func validateComponentClass(comp *ComponentConfig) error {
+	if comp.Class == "" {
+		return nil
+	}
+	if _, ok := comp.Class.Rank(); !ok {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("registry component %q declares class %q; it must be one of %v", comp.Name, comp.Class, ComponentClasses))
+	}
+	return nil
+}
+
+// helmDigestPattern is the only accepted spelling of helm.defaultDigest.
+var helmDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// validateHelmDefaultDigest rejects a malformed helm.defaultDigest, and one on
+// an entry that pins no repository, chart or version, since such a digest
+// names no single archive to verify against.
+func validateHelmDefaultDigest(comp *ComponentConfig) error {
+	digest := comp.Helm.DefaultDigest
+	if digest == "" {
+		return nil
+	}
+	if !helmDigestPattern.MatchString(digest) {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("registry component %q declares helm.defaultDigest %q; it must be sha256:<64 lowercase hex>, the SHA-256 of the chart archive", comp.Name, digest))
+	}
+	if comp.Helm.DefaultRepository == "" {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("registry component %q declares helm.defaultDigest but pins no chart repository (helm.defaultRepository)", comp.Name))
+	}
+	if comp.Helm.DefaultChart == "" {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("registry component %q declares helm.defaultDigest but pins no chart (helm.defaultChart)", comp.Name))
+	}
+	if comp.Helm.DefaultVersion == "" {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("registry component %q declares helm.defaultDigest but pins no chart version (helm.defaultVersion)", comp.Name))
+	}
+	return nil
+}
+
+// validateMixinSafeOverridePaths rejects a malformed mixinSafeOverridePaths
+// declaration at registry load time rather than letting it silently
+// misbehave the first time a mixin actually collides with it: an empty or
+// dot-malformed entry can never match a real leaf path flattened by
+// overrideLeafPaths (so it would be dead, misleading configuration); a
+// literal duplicate is always redundant; and one entry that is an ancestor
+// or descendant of another (e.g. declaring both "global.tracing" and
+// "global.tracing.enabled") is ambiguous: overrideLeafPaths matches exact
+// paths, so the ancestor entry grants access only to a mixin override that
+// stops exactly there (a scalar or list at that key -- an empty map never
+// reaches allowlist matching, rejectEmptyMapValues errors on it first) --
+// not to the whole subtree a reader would reasonably assume from seeing
+// both entries together. Rejecting the pair forces one unambiguous
+// declaration.
+func validateMixinSafeOverridePaths(comp *ComponentConfig) error {
+	seen := make(map[string]bool, len(comp.MixinSafeOverridePaths))
+	for _, p := range comp.MixinSafeOverridePaths {
+		if p == "" || strings.HasPrefix(p, ".") || strings.HasSuffix(p, ".") || strings.Contains(p, "..") {
+			return errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("registry component %q declares mixinSafeOverridePaths entry %q, which is not a well-formed dotted path", comp.Name, p))
+		}
+		if seen[p] {
+			return errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("registry component %q declares mixinSafeOverridePaths entry %q more than once", comp.Name, p))
+		}
+		seen[p] = true
+	}
+	for i, a := range comp.MixinSafeOverridePaths {
+		for _, b := range comp.MixinSafeOverridePaths[i+1:] {
+			if a != b && pathsIntersect(a, b) {
+				return errors.New(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("registry component %q declares mixinSafeOverridePaths entries %q and %q, one an ancestor of the other -- list only exact leaf paths; declaring both is ambiguous about whether the ancestor grants the whole subtree or just an exact-match override at that key", comp.Name, a, b))
+			}
+		}
+	}
+	return nil
+}
+
+func validateComponentRegistryHeader(registry *ComponentRegistry, source string) error {
+	if registry == nil {
+		return errors.New(errors.ErrCodeInvalidRequest, source+" is empty")
+	}
+	if registry.Kind != ComponentRegistryKind {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("%s has kind %q, expected %q; use a ComponentRegistry document compatible with this aicr release",
+				source, registry.Kind, ComponentRegistryKind))
+	}
+	if !header.IsSupportedAuthoringAPIVersion(registry.APIVersion) {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("%s has apiVersion %q%s, expected %q for %s; update the registry header for this aicr release",
+				source, registry.APIVersion, header.RetirementNote(registry.APIVersion),
+				header.GroupVersionV1Beta1, ComponentRegistryKind))
+	}
+	return nil
+}
+
+// Get returns the component configuration by name.
+// Returns nil if the component is not found.
+func (r *ComponentRegistry) Get(name string) *ComponentConfig {
+	if r == nil || r.byName == nil {
+		return nil
+	}
+	return r.byName[name]
+}
+
+// GetByOverrideKey returns the component configuration by value override key.
+// This is used for matching --set flags like --set gpuoperator:key=value.
+// Returns nil if no component matches the key.
+func (r *ComponentRegistry) GetByOverrideKey(key string) *ComponentConfig {
+	if r == nil {
+		return nil
+	}
+	for i := range r.Components {
+		comp := &r.Components[i]
+		// Check the component name first
+		if comp.Name == key {
+			return comp
+		}
+		// Check alternative override keys
+		if slices.Contains(comp.ValueOverrideKeys, key) {
+			return comp
+		}
+	}
+	return nil
+}
+
+// Names returns all component names in the registry.
+func (r *ComponentRegistry) Names() []string {
+	if r == nil {
+		return nil
+	}
+	names := make([]string, len(r.Components))
+	for i, comp := range r.Components {
+		names[i] = comp.Name
+	}
+	return names
+}
+
+// Count returns the number of components in the registry.
+func (r *ComponentRegistry) Count() int {
+	if r == nil {
+		return 0
+	}
+	return len(r.Components)
+}
+
+// Validate checks the component registry for errors.
+// Returns a slice of validation errors (empty if valid).
+func (r *ComponentRegistry) Validate() []error {
+	if r == nil {
+		return []error{errors.New(errors.ErrCodeInvalidRequest, "registry is nil")}
+	}
+
+	var errs []error
+
+	// Check for required fields
+	for i, comp := range r.Components {
+		if comp.Name == "" {
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("component[%d]: name is required", i)))
+		}
+		if comp.DisplayName == "" {
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("component[%d] (%s): displayName is required", i, comp.Name)))
+		}
+	}
+
+	// Check for duplicate names
+	seen := make(map[string]bool)
+	for _, comp := range r.Components {
+		if comp.Name != "" {
+			if seen[comp.Name] {
+				errs = append(errs, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("duplicate component name: %s", comp.Name)))
+			}
+			seen[comp.Name] = true
+		}
+	}
+
+	// Check for duplicate override keys
+	overrideKeys := make(map[string]string) // key -> component name
+	for _, comp := range r.Components {
+		for _, key := range comp.ValueOverrideKeys {
+			if existing, ok := overrideKeys[key]; ok {
+				errs = append(errs, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("duplicate valueOverrideKey %q: used by both %s and %s", key, existing, comp.Name)))
+			}
+			overrideKeys[key] = comp.Name
+		}
+	}
+
+	for _, comp := range r.Components {
+		if len(comp.OwnsCRDsExcludeSubcharts) > 0 && !comp.OwnsCRDs {
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: ownsCRDsExcludeSubcharts is set without ownsCRDs", comp.Name)))
+		}
+		for _, name := range comp.OwnsCRDsExcludeSubcharts {
+			if name == "" || strings.ContainsAny(name, "/*?[] ") || name == "." || name == ".." {
+				errs = append(errs, errors.New(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("component %q: ownsCRDsExcludeSubcharts entry %q must be a bare subchart name", comp.Name, name)))
+			}
+		}
+	}
+
+	// requiredValues and installTimeSecretPaths name value paths, so an
+	// empty or repeated entry is a typo, never a meaningful declaration.
+	for _, comp := range r.Components {
+		errs = append(errs, validateValuePathList(comp.Name, "requiredValues", comp.RequiredValues)...)
+		errs = append(errs, validateValuePathList(comp.Name, "installTimeSecretPaths", comp.InstallTimeSecretPaths)...)
+	}
+
+	// requireNodeSelector (or its requireNodeSelectorIfStorageClassSet
+	// counterpart) with no paths to enforce is always a config mistake, a
+	// typo'd path list, or the flag left on after paths were removed. The
+	// two are also mutually exclusive, since a group is either
+	// unconditionally required or conditional on storage, never both.
+	for _, comp := range r.Components {
+		if comp.NodeScheduling.System.RequireNodeSelector && comp.NodeScheduling.System.RequireNodeSelectorIfStorageClassSet {
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: nodeScheduling.system.requireNodeSelector and requireNodeSelectorIfStorageClassSet are mutually exclusive", comp.Name)))
+		}
+		if (comp.NodeScheduling.System.RequireNodeSelector || comp.NodeScheduling.System.RequireNodeSelectorIfStorageClassSet) &&
+			len(comp.NodeScheduling.System.NodeSelectorPaths) == 0 {
+
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: nodeScheduling.system requires a node selector but nodeSelectorPaths is empty", comp.Name)))
+		}
+		if comp.NodeScheduling.System.RequireNodeSelectorIfStorageClassSet &&
+			len(comp.StorageClassPaths) == 0 && len(comp.SharedStorageClassPaths) == 0 {
+
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: nodeScheduling.system.requireNodeSelectorIfStorageClassSet is true but the component has no storageClassPaths or sharedStorageClassPaths to condition on", comp.Name)))
+		}
+		if comp.NodeScheduling.Accelerated.RequireNodeSelector && comp.NodeScheduling.Accelerated.RequireNodeSelectorIfStorageClassSet {
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: nodeScheduling.accelerated.requireNodeSelector and requireNodeSelectorIfStorageClassSet are mutually exclusive", comp.Name)))
+		}
+		if (comp.NodeScheduling.Accelerated.RequireNodeSelector || comp.NodeScheduling.Accelerated.RequireNodeSelectorIfStorageClassSet) &&
+			len(comp.NodeScheduling.Accelerated.NodeSelectorPaths) == 0 {
+
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: nodeScheduling.accelerated requires a node selector but nodeSelectorPaths is empty", comp.Name)))
+		}
+		if comp.NodeScheduling.Accelerated.RequireNodeSelectorIfStorageClassSet &&
+			len(comp.StorageClassPaths) == 0 && len(comp.SharedStorageClassPaths) == 0 {
+
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: nodeScheduling.accelerated.requireNodeSelectorIfStorageClassSet is true but the component has no storageClassPaths or sharedStorageClassPaths to condition on", comp.Name)))
+		}
+	}
+
+	// Check for mutually exclusive helm/kustomize configuration
+	for i, comp := range r.Components {
+		hasHelm := comp.Helm.DefaultRepository != "" || comp.Helm.DefaultChart != ""
+		hasKustomize := comp.Kustomize.DefaultSource != ""
+
+		if hasHelm && hasKustomize {
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("component[%d] (%s): cannot have both helm and kustomize configuration", i, comp.Name)))
+		}
+	}
+
+	// Same mixinSafeOverridePaths rules loadComponentRegistryFor enforces at
+	// load time, so a registry constructed directly through the exported API
+	// is held to the identical contract rather than only the file-loaded path.
+	for i := range r.Components {
+		if err := validateMixinSafeOverridePaths(&r.Components[i]); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	errs = append(errs, r.validateTelemetry()...)
+
+	return errs
+}
+
+// validateTelemetry leaves to the bundler what depends on the recipe: whether
+// a monitorsFrom component is enabled, and how many servers are.
+func (r *ComponentRegistry) validateTelemetry() []error {
+	known := make(map[string]bool, len(r.Components))
+	for _, comp := range r.Components {
+		known[comp.Name] = true
+	}
+
+	var errs []error
+	for _, comp := range r.Components {
+		consumer := comp.Telemetry.PromQL
+		if consumer.IsDeclared() {
+			if len(consumer.MonitorsFrom) == 0 {
+				errs = append(errs, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+					"component %q: telemetry.promql.monitorsFrom is required when series are declared", comp.Name)))
+			}
+			if len(consumer.Series) == 0 {
+				errs = append(errs, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+					"component %q: telemetry.promql.series is required when monitorsFrom is declared", comp.Name)))
+			}
+			for _, source := range consumer.MonitorsFrom {
+				if !known[source] {
+					errs = append(errs, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+						"component %q: telemetry.promql.monitorsFrom names %q, which is not a registry component",
+						comp.Name, source)))
+				}
+			}
+			for _, pattern := range consumer.Series {
+				if err := ValidatePromQLSeriesPattern(pattern); err != nil {
+					errs = append(errs, errors.Wrap(errors.ErrCodeInvalidRequest,
+						fmt.Sprintf("component %q: invalid telemetry.promql.series entry", comp.Name), err))
+				}
+			}
+		}
+
+		server := comp.Telemetry.PromQLServer
+		if !server.IsDeclared() {
+			continue
+		}
+		if len(server.NamespaceSelectorPaths) == 0 || len(server.MonitorSelectorPaths) == 0 || server.ScrapeClassesPath == "" {
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+				"component %q: telemetry.promqlServer needs namespaceSelectorPaths, monitorSelectorPaths and scrapeClassesPath",
+				comp.Name)))
+		}
+		owned := server.OwnedPaths()
+		for i, path := range owned {
+			if !isWellFormedValuePath(path) {
+				errs = append(errs, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+					"component %q: telemetry.promqlServer path %q is not a well-formed dotted path", comp.Name, path)))
+				continue
+			}
+			for _, other := range owned[i+1:] {
+				if PathsIntersect(path, other) {
+					errs = append(errs, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+						"component %q: telemetry.promqlServer paths %q and %q overlap", comp.Name, path, other)))
+				}
+			}
+		}
+	}
+	return errs
+}
+
+// ValidatePromQLSeriesPattern checks one telemetry.promql.series entry. Helm
+// template delimiters are rejected because a chart may render the scrape
+// class through tpl.
+func ValidatePromQLSeriesPattern(pattern string) error {
+	if strings.TrimSpace(pattern) == "" {
+		return errors.New(errors.ErrCodeInvalidRequest, "series pattern is empty")
+	}
+	if strings.Contains(pattern, "{{") || strings.Contains(pattern, "}}") {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("series pattern %q contains a Helm template delimiter", pattern))
+	}
+	// The union wraps each pattern as (?:p). An unterminated \Q compiles alone
+	// but quotes that closing paren, and a stray ) can escape the group, so
+	// both forms must compile.
+	for _, form := range []string{pattern, "(?:" + pattern + ")"} {
+		if _, err := regexp.Compile(form); err != nil {
+			return errors.Wrap(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("series pattern %q is not valid RE2", pattern), err)
+		}
+	}
+	return nil
+}
+
+func isWellFormedValuePath(path string) bool {
+	return path != "" && !strings.HasPrefix(path, ".") && !strings.HasSuffix(path, ".") && !strings.Contains(path, "..")
+}
+
+// GetSystemNodeSelectorPaths returns all system node selector paths for a component.
+func (c *ComponentConfig) GetSystemNodeSelectorPaths() []string {
+	if c == nil {
+		return nil
+	}
+	return c.NodeScheduling.System.NodeSelectorPaths
+}
+
+// RequireSystemNodeSelector reports whether the component requires a
+// non-empty --system-node-selector at bundle time
+// (SchedulingPaths.RequireNodeSelector).
+func (c *ComponentConfig) RequireSystemNodeSelector() bool {
+	if c == nil {
+		return false
+	}
+	return c.NodeScheduling.System.RequireNodeSelector
+}
+
+// RequireSystemNodeSelectorIfStorageClassSet reports whether the component
+// requires a non-empty --system-node-selector once a storage class is
+// configured (SchedulingPaths.RequireNodeSelectorIfStorageClassSet).
+func (c *ComponentConfig) RequireSystemNodeSelectorIfStorageClassSet() bool {
+	if c == nil {
+		return false
+	}
+	return c.NodeScheduling.System.RequireNodeSelectorIfStorageClassSet
+}
+
+// GetSystemTolerationPaths returns all system toleration paths for a component.
+func (c *ComponentConfig) GetSystemTolerationPaths() []string {
+	if c == nil {
+		return nil
+	}
+	return c.NodeScheduling.System.TolerationPaths
+}
+
+// GetAcceleratedNodeSelectorPaths returns all accelerated node selector paths for a component.
+func (c *ComponentConfig) GetAcceleratedNodeSelectorPaths() []string {
+	if c == nil {
+		return nil
+	}
+	return c.NodeScheduling.Accelerated.NodeSelectorPaths
+}
+
+// RequireAcceleratedNodeSelector reports whether the component requires a
+// non-empty --accelerated-node-selector at bundle time
+// (SchedulingPaths.RequireNodeSelector).
+func (c *ComponentConfig) RequireAcceleratedNodeSelector() bool {
+	if c == nil {
+		return false
+	}
+	return c.NodeScheduling.Accelerated.RequireNodeSelector
+}
+
+// RequireAcceleratedNodeSelectorIfStorageClassSet reports whether the
+// component requires a non-empty --accelerated-node-selector once a
+// storage class is configured
+// (SchedulingPaths.RequireNodeSelectorIfStorageClassSet).
+func (c *ComponentConfig) RequireAcceleratedNodeSelectorIfStorageClassSet() bool {
+	if c == nil {
+		return false
+	}
+	return c.NodeScheduling.Accelerated.RequireNodeSelectorIfStorageClassSet
+}
+
+// GetAcceleratedTolerationPaths returns all accelerated toleration paths for a component.
+func (c *ComponentConfig) GetAcceleratedTolerationPaths() []string {
+	if c == nil {
+		return nil
+	}
+	return c.NodeScheduling.Accelerated.TolerationPaths
+}
+
+// GetWorkloadSelectorPaths returns all workload selector paths for a component.
+func (c *ComponentConfig) GetWorkloadSelectorPaths() []string {
+	if c == nil {
+		return nil
+	}
+	return c.PodScheduling.Workload.WorkloadSelectorPaths
+}
+
+// GetAcceleratedTaintStrPaths returns all accelerated taint string paths for a component.
+func (c *ComponentConfig) GetAcceleratedTaintStrPaths() []string {
+	if c == nil {
+		return nil
+	}
+	return c.NodeScheduling.Accelerated.TaintStrPaths
+}
+
+// GetNodeCountPaths returns Helm value paths where the node count is injected.
+func (c *ComponentConfig) GetNodeCountPaths() []string {
+	if c == nil {
+		return nil
+	}
+	return c.NodeScheduling.NodeCountPaths
+}
+
+// GetStorageClassPaths returns Helm value paths where the storage class name is injected.
+func (c *ComponentConfig) GetStorageClassPaths() []string {
+	if c == nil {
+		return nil
+	}
+	return c.StorageClassPaths
+}
+
+// GetSharedStorageClassPaths returns Helm value paths where the shared
+// filesystem storage class name is injected.
+func (c *ComponentConfig) GetSharedStorageClassPaths() []string {
+	if c == nil {
+		return nil
+	}
+	return c.SharedStorageClassPaths
+}
+
+// GetValidations returns all validation configurations for a component.
+func (c *ComponentConfig) GetValidations() []ComponentValidationConfig {
+	if c == nil {
+		return nil
+	}
+	return c.Validations
+}
+
+// GetClass returns the component's bundle class, ComponentClassCore when the
+// registry entry declares none.
+func (c *ComponentConfig) GetClass() ComponentClass {
+	if c == nil || c.Class == "" {
+		return ComponentClassCore
+	}
+	return c.Class
+}
+
+// GetType returns the component deployment type based on which config is present.
+// Returns ComponentTypeKustomize if Kustomize.DefaultSource is set,
+// otherwise returns ComponentTypeHelm (the default).
+func (c *ComponentConfig) GetType() ComponentType {
+	if c == nil {
+		return ComponentTypeHelm
+	}
+	if c.Kustomize.DefaultSource != "" {
+		return ComponentTypeKustomize
+	}
+	return ComponentTypeHelm
+}
+
+// validateValuePathList rejects empty and repeated entries in one of a
+// component's value-path lists (requiredValues, installTimeSecretPaths).
+func validateValuePathList(component, field string, paths []string) []error {
+	var errs []error
+	seen := make(map[string]struct{}, len(paths))
+	for i, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: %s[%d] is empty", component, field, i)))
+			continue
+		}
+		if _, dup := seen[path]; dup {
+			errs = append(errs, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q: %s repeats %q", component, field, path)))
+		}
+		seen[path] = struct{}{}
+	}
+	return errs
+}

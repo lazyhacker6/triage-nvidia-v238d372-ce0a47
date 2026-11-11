@@ -1,0 +1,301 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package pod_test
+
+import (
+	"context"
+	stderrors "errors"
+	"testing"
+	"time"
+
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/k8s/pod"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+)
+
+func TestWaitForPodSucceeded(t *testing.T) {
+	tests := []struct {
+		name     string
+		pod      corev1.Pod
+		cancel   bool
+		timeout  time.Duration
+		wantErr  bool
+		wantCode aicrerrors.ErrorCode // checked only when wantErr and non-empty
+	}{
+		{
+			name: "already succeeded",
+			pod: corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"},
+				Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+			},
+			timeout: 5 * time.Second,
+			wantErr: false,
+		},
+		{
+			name: "pod failed",
+			pod: corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"},
+				Status: corev1.PodStatus{
+					Phase:   corev1.PodFailed,
+					Reason:  "OOMKilled",
+					Message: "container ran out of memory",
+				},
+			},
+			timeout: 2 * time.Second,
+			wantErr: true,
+		},
+		{
+			// Deliberately not canceled: a real deadline must classify as
+			// ErrCodeTimeout, distinct from the "context canceled" case below
+			// which classifies as ErrCodeCanceled — pinning both directions of
+			// the wait-loop split (pkg/k8s/pod/wait.go's timeoutCtx.Done() case).
+			name:     "timeout on pending",
+			pod:      corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"}, Status: corev1.PodStatus{Phase: corev1.PodPending}},
+			timeout:  200 * time.Millisecond,
+			wantErr:  true,
+			wantCode: aicrerrors.ErrCodeTimeout,
+		},
+		{
+			name: "context canceled",
+			pod: corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"},
+				Status:     corev1.PodStatus{Phase: corev1.PodPending},
+			},
+			cancel:   true,
+			timeout:  5 * time.Second,
+			wantErr:  true,
+			wantCode: aicrerrors.ErrCodeCanceled,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			//nolint:staticcheck // SA1019: fake.NewSimpleClientset is sufficient for tests
+			client := fake.NewSimpleClientset(&tt.pod)
+
+			ctx := context.Background()
+			if tt.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+
+			err := pod.WaitForPodSucceeded(ctx, client, "default", "test-pod", tt.timeout)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("WaitForPodSucceeded() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr && tt.wantCode != "" {
+				var se *aicrerrors.StructuredError
+				if !stderrors.As(err, &se) {
+					t.Fatalf("expected *errors.StructuredError, got %T", err)
+				}
+				if se.Code != tt.wantCode {
+					t.Errorf("code = %q, want %q", se.Code, tt.wantCode)
+				}
+			}
+		})
+	}
+}
+
+func TestWaitForPodReady(t *testing.T) {
+	tests := []struct {
+		name     string
+		pod      corev1.Pod
+		cancel   bool
+		timeout  time.Duration
+		wantErr  bool
+		wantCode aicrerrors.ErrorCode // checked only when wantErr and non-empty
+	}{
+		{
+			name: "already ready",
+			pod: corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"},
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+					},
+				},
+			},
+			timeout: 5 * time.Second,
+			wantErr: false,
+		},
+		{
+			name: "pod failed",
+			pod: corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"},
+				Status: corev1.PodStatus{
+					Phase:   corev1.PodFailed,
+					Reason:  "OOMKilled",
+					Message: "container ran out of memory",
+				},
+			},
+			timeout: 2 * time.Second,
+			wantErr: true,
+		},
+		{
+			// Deliberately not canceled: pins the ErrCodeTimeout side of the
+			// wait-loop split, distinct from "context canceled" below.
+			name: "timeout on pending",
+			pod: corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"},
+				Status:     corev1.PodStatus{Phase: corev1.PodPending},
+			},
+			timeout:  500 * time.Millisecond,
+			wantErr:  true,
+			wantCode: aicrerrors.ErrCodeTimeout,
+		},
+		{
+			name: "context canceled",
+			pod: corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"},
+				Status:     corev1.PodStatus{Phase: corev1.PodPending},
+			},
+			cancel:   true,
+			timeout:  5 * time.Second,
+			wantErr:  true,
+			wantCode: aicrerrors.ErrCodeCanceled,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			//nolint:staticcheck // SA1019: fake.NewSimpleClientset is sufficient for tests
+			client := fake.NewSimpleClientset(&tt.pod)
+
+			ctx := context.Background()
+			if tt.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+
+			err := pod.WaitForPodReady(ctx, client, "default", "test-pod", tt.timeout)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("WaitForPodReady() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr && tt.wantCode != "" {
+				var se *aicrerrors.StructuredError
+				if !stderrors.As(err, &se) {
+					t.Fatalf("expected *errors.StructuredError, got %T", err)
+				}
+				if se.Code != tt.wantCode {
+					t.Errorf("code = %q, want %q", se.Code, tt.wantCode)
+				}
+			}
+		})
+	}
+}
+
+// TestWaitForPodSucceeded_WatchClosedReGet exercises the watch-channel-close
+// re-Get branch: the watcher closes without emitting a terminal event, and
+// the re-Get observes the pod has since reached Succeeded. The wait must
+// return nil (success) rather than treating the watch close as a failure.
+func TestWaitForPodSucceeded_WatchClosedReGet(t *testing.T) {
+	t.Parallel()
+
+	pendingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+	//nolint:staticcheck // SA1019: fake.NewSimpleClientset is sufficient for tests
+	client := fake.NewSimpleClientset(pendingPod)
+
+	watcher := watch.NewFake()
+	client.PrependWatchReactor("pods", k8stesting.DefaultWatchReactor(watcher, nil))
+
+	// Mutate the underlying store so the re-Get sees a Succeeded pod, then
+	// close the watch channel without emitting a watch event.
+	go func() {
+		_, _ = client.CoreV1().Pods("default").Update(context.Background(),
+			&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"},
+				Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+			}, metav1.UpdateOptions{})
+		watcher.Stop()
+	}()
+
+	if err := pod.WaitForPodSucceeded(context.Background(), client, "default", "p", 5*time.Second); err != nil {
+		t.Fatalf("expected nil error after watch-close re-Get observes Succeeded, got %v", err)
+	}
+}
+
+// TestWaitForPodSucceeded_WatchClosedReGetStillPending covers the
+// watch-close re-Get branch when the pod has NOT yet reached terminal state:
+// the wait must surface ErrCodeUnavailable so the caller can decide whether
+// to retry or bail.
+func TestWaitForPodSucceeded_WatchClosedReGetStillPending(t *testing.T) {
+	t.Parallel()
+
+	pendingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+	//nolint:staticcheck // SA1019: fake.NewSimpleClientset is sufficient for tests
+	client := fake.NewSimpleClientset(pendingPod)
+
+	watcher := watch.NewFake()
+	client.PrependWatchReactor("pods", k8stesting.DefaultWatchReactor(watcher, nil))
+	go watcher.Stop()
+
+	err := pod.WaitForPodSucceeded(context.Background(), client, "default", "p", 5*time.Second)
+	if err == nil {
+		t.Fatal("expected error from watch close while pod is still pending")
+	}
+	var sErr *aicrerrors.StructuredError
+	if !stderrors.As(err, &sErr) {
+		t.Fatalf("expected *errors.StructuredError, got %T", err)
+	}
+	if sErr.Code != aicrerrors.ErrCodeUnavailable {
+		t.Errorf("code = %v, want %v", sErr.Code, aicrerrors.ErrCodeUnavailable)
+	}
+}
+
+// TestWaitForPodReady_WatchClosedReGet covers the readiness watch-close
+// re-Get branch: when the watcher closes and the re-Get observes a Ready
+// pod, the wait returns success.
+func TestWaitForPodReady_WatchClosedReGet(t *testing.T) {
+	t.Parallel()
+
+	pendingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+	//nolint:staticcheck // SA1019: fake.NewSimpleClientset is sufficient for tests
+	client := fake.NewSimpleClientset(pendingPod)
+
+	watcher := watch.NewFake()
+	client.PrependWatchReactor("pods", k8stesting.DefaultWatchReactor(watcher, nil))
+
+	go func() {
+		_, _ = client.CoreV1().Pods("default").Update(context.Background(),
+			&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"},
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+					},
+				},
+			}, metav1.UpdateOptions{})
+		watcher.Stop()
+	}()
+
+	if err := pod.WaitForPodReady(context.Background(), client, "default", "p", 5*time.Second); err != nil {
+		t.Fatalf("expected nil error after watch-close re-Get observes Ready, got %v", err)
+	}
+}

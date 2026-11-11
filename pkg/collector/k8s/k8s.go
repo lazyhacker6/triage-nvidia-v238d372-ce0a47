@@ -1,0 +1,325 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package k8s
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/k8s/client"
+	"github.com/NVIDIA/aicr/pkg/measurement"
+	"golang.org/x/sync/errgroup"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+)
+
+// Collector collects information about the Kubernetes cluster.
+//
+// The dynamic client used by collectClusterPolicies is initialized lazily on
+// first use and cached for subsequent calls. ClientSet and RestConfig may be
+// injected by tests; production code populates them via getClient.
+type Collector struct {
+	ClientSet  kubernetes.Interface
+	RestConfig *rest.Config
+
+	// DynamicClient may be set by tests to inject a fake. When nil, it is
+	// constructed lazily from RestConfig on first use.
+	DynamicClient dynamic.Interface
+
+	// slinkyDiscovery is the narrow test seam used by Slinky API discovery.
+	// Production falls back to ClientSet.Discovery().
+	slinkyDiscovery slinkyDiscovery
+	// mariaDBDiscovery is the narrow test seam used by official MariaDB
+	// Operator API discovery. Production falls back to ClientSet.Discovery().
+	mariaDBDiscovery apiResourceDiscovery
+	// perconaDiscovery is the narrow test seam used by Percona Operator for
+	// MongoDB API discovery. Production falls back to ClientSet.Discovery().
+	perconaDiscovery apiResourceDiscovery
+
+	dynamicOnce sync.Once
+	dynamicErr  error
+}
+
+// Collect retrieves Kubernetes cluster information from the API server.
+// Individual sub-collectors degrade gracefully — if any sub-collector fails,
+// a warning is logged and that subtype is populated with empty data.
+//
+// Sub-collectors run concurrently under an errgroup. Each writes to its own
+// local result variable; the final measurement is assembled after Wait. Each
+// sub-collector's failure is logged and swallowed (returning nil to errgroup),
+// matching the prior sequential collectSafe semantics so the snapshot
+// continues on partial failure.
+func (k *Collector) Collect(ctx context.Context) (*measurement.Measurement, error) {
+	slog.Info("collecting Kubernetes cluster information")
+
+	// Held before the shadowing below so the cancellation checks in the Slinky
+	// and other custom-resource branches can consult the caller's context directly. See
+	// cancellationErr for why the derived contexts are not sufficient.
+	callerCtx := ctx
+
+	ctx, cancel := context.WithTimeout(ctx, defaults.CollectorK8sTimeout)
+	defer cancel()
+
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeTimeout, "K8s collector context cancelled", err)
+	}
+
+	if err := k.getClient(); err != nil {
+		slog.Warn("kubernetes client unavailable - returning empty K8s measurement",
+			slog.String("error", err.Error()))
+		return emptyK8sMeasurement(), nil
+	}
+
+	var (
+		versions  map[string]measurement.Reading
+		images    map[string]measurement.Reading
+		policies  map[string]measurement.Reading
+		node      map[string]measurement.Reading
+		slinky    measurement.Subtype
+		mariaDB   measurement.Subtype
+		okeLegacy measurement.Subtype
+		okeGPU    measurement.Subtype
+		storage   measurement.Subtype
+		percona   measurement.Subtype
+	)
+
+	g, gctx := errgroup.WithContext(ctx)
+	discoveryClient, err := collectorDiscovery(gctx, k.ClientSet.Discovery(), k.RestConfig)
+	if err != nil {
+		if errors.IsTransient(err) {
+			return nil, err
+		}
+		slog.Warn("Kubernetes discovery client unavailable - returning empty K8s measurement",
+			slog.String("error", err.Error()))
+		return emptyK8sMeasurement(), nil
+	}
+
+	g.Go(func() error {
+		var err error
+		versions, err = collectSafe("server", func() (map[string]measurement.Reading, error) {
+			return k.collectServer(gctx, discoveryClient)
+		})
+		return err
+	})
+
+	g.Go(func() error {
+		var err error
+		images, err = collectSafe(SubtypeImage, func() (map[string]measurement.Reading, error) {
+			return k.collectContainerImages(gctx)
+		})
+		return err
+	})
+
+	g.Go(func() error {
+		var err error
+		policies, err = collectSafe("policy", func() (map[string]measurement.Reading, error) {
+			return k.collectClusterPolicies(gctx, discoveryClient)
+		})
+		return err
+	})
+
+	g.Go(func() error {
+		var err error
+		node, err = collectSafe("node", func() (map[string]measurement.Reading, error) {
+			return k.collectNode(gctx)
+		})
+		return err
+	})
+
+	g.Go(func() error {
+		slinky = k.collectSlinkySlurm(gctx, discoveryClient)
+		if err := cancellationErr(gctx, ctx, callerCtx); err != nil {
+			return errors.Wrap(errors.ErrCodeTimeout, "Slinky Slurm collection cancelled", err)
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		mariaDB = k.collectMariaDBOperator(gctx, discoveryClient)
+		if err := cancellationErr(gctx, ctx, callerCtx); err != nil {
+			return errors.Wrap(errors.ErrCodeTimeout, "MariaDB Operator collection cancelled", err)
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		okeLegacy = k.collectOKELegacyPlugin(gctx)
+		if err := cancellationErr(gctx, ctx, callerCtx); err != nil {
+			return errors.Wrap(errors.ErrCodeTimeout, "OKE legacy device-plugin collection cancelled", err)
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		okeGPU = k.collectOKEGPUPlugin(gctx)
+		if err := cancellationErr(gctx, ctx, callerCtx); err != nil {
+			return errors.Wrap(errors.ErrCodeTimeout, "OKE GPU plugin collection cancelled", err)
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		storage = k.collectDefaultStorageClass(gctx)
+		if err := cancellationErr(gctx, ctx, callerCtx); err != nil {
+			return errors.Wrap(errors.ErrCodeTimeout, "default StorageClass collection cancelled", err)
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		percona = k.collectPerconaServerMongoDB(gctx, discoveryClient)
+		if err := cancellationErr(gctx, ctx, callerCtx); err != nil {
+			return errors.Wrap(errors.ErrCodeTimeout, "Percona Operator for MongoDB collection cancelled", err)
+		}
+		return nil
+	})
+
+	// A timeout/cancellation surfaces here; deterministic sub-collector failures
+	// are swallowed inside collectSafe so the snapshot continues on partial failure.
+	if err := g.Wait(); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeTimeout, "K8s collection cancelled", err)
+	}
+
+	res := measurement.NewMeasurement(measurement.TypeK8s).
+		WithSubtypeBuilder(
+			measurement.NewSubtypeBuilder("server").Set(measurement.KeyVersion, versions[measurement.KeyVersion]).
+				Set("platform", versions["platform"]).
+				Set("goVersion", versions["goVersion"]),
+		).
+		WithSubtype(measurement.Subtype{Name: SubtypeImage, Data: images}).
+		WithSubtype(measurement.Subtype{Name: "policy", Data: policies}).
+		WithSubtype(measurement.Subtype{Name: "node", Data: node}).
+		WithSubtype(slinky).
+		WithSubtype(mariaDB).
+		WithSubtype(okeLegacy).
+		WithSubtype(okeGPU).
+		WithSubtype(storage).
+		WithSubtype(percona).
+		Build()
+
+	return res, nil
+}
+
+// cancellationErr returns the first cancellation observed across a chain of
+// related contexts, outermost check last.
+//
+// Checking more than one is deliberate, not defensive clutter. Cancellation
+// propagates parent -> child only *after* the parent has recorded its own error
+// and closed its own Done channel; the walk over children happens next. A
+// goroutine parked on an ancestor's Done channel therefore becomes runnable
+// while propagation is still in flight, and on a multi-core machine it can read
+// a descendant's Err() before that descendant has been canceled at all.
+//
+// The Slinky and MariaDB sub-collectors surface cancellation as data rather
+// than as a Go error (see collectSlinkySlurm), so the caller's check below is
+// the *only* thing that converts a canceled collection into a loud failure.
+// Losing that race meant Collect returned a fully-assembled measurement with a
+// nil error -- a partial snapshot indistinguishable from a healthy one, which
+// is precisely the failure mode collectSafe exists to prevent.
+//
+// Measured over 200k iterations against the real context chain in Collect
+// (caller -> WithTimeout -> errgroup): the errgroup context read nil 14 times
+// and the WithTimeout context 9, while the caller's context read nil 0 times.
+// Only the context whose Done channel actually woke the goroutine is reliable,
+// so the whole chain is consulted. Each context is still checked in its own
+// right: the errgroup context also carries sibling-failure cancellation, which
+// never reaches the outer two.
+func cancellationErr(ctxs ...context.Context) error {
+	for _, c := range ctxs {
+		if err := c.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// collectSafe calls a sub-collector function and returns its result.
+// A deterministic failure is logged and swallowed (empty map, nil error) so the
+// snapshot continues on partial failure. A timeout/cancellation is returned so
+// the caller can fail loud instead of reporting an empty-but-"successful"
+// measurement that is byte-identical to a healthy collection.
+func collectSafe(name string, fn func() (map[string]measurement.Reading, error)) (map[string]measurement.Reading, error) {
+	data, err := fn()
+	if err != nil {
+		if errors.IsTransient(err) {
+			return nil, err
+		}
+		slog.Warn("failed to collect "+name+" - skipping",
+			slog.String("collector", name),
+			slog.String("error", err.Error()))
+		return make(map[string]measurement.Reading), nil
+	}
+	return data, nil
+}
+
+// emptyK8sMeasurement returns a K8s measurement with the standard subtypes
+// empty and custom-resource detection explicitly unknown because no API
+// inspection occurred.
+func emptyK8sMeasurement() *measurement.Measurement {
+	empty := make(map[string]measurement.Reading)
+	return measurement.NewMeasurement(measurement.TypeK8s).
+		WithSubtype(measurement.Subtype{Name: "server", Data: empty}).
+		WithSubtype(measurement.Subtype{Name: SubtypeImage, Data: empty}).
+		WithSubtype(measurement.Subtype{Name: "policy", Data: empty}).
+		WithSubtype(measurement.Subtype{Name: "node", Data: empty}).
+		WithSubtype(unknownSlinkySubtype()).
+		WithSubtype(unknownMariaDBSubtype()).
+		WithSubtype(unknownOKELegacyPluginSubtype()).
+		WithSubtype(unknownOKEGPUPluginSubtype()).
+		WithSubtype(unknownDefaultStorageClassSubtype()).
+		WithSubtype(unknownPerconaSubtype()).
+		Build()
+}
+
+func (k *Collector) getClient() error {
+	if k.ClientSet != nil && k.RestConfig != nil {
+		return nil
+	}
+	var err error
+	k.ClientSet, k.RestConfig, err = client.GetKubeClient()
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to get kubernetes client", err)
+	}
+	return nil
+}
+
+// getDynamicClient returns the cached dynamic client, constructing it lazily
+// on first use from RestConfig. Safe for concurrent callers via sync.Once.
+// Tests may pre-populate Collector.DynamicClient to skip construction.
+func (k *Collector) getDynamicClient() (dynamic.Interface, error) {
+	k.dynamicOnce.Do(func() {
+		if k.DynamicClient != nil {
+			return
+		}
+		if k.RestConfig == nil {
+			k.dynamicErr = errors.New(errors.ErrCodeInternal, "rest config is nil")
+			return
+		}
+		dc, err := dynamic.NewForConfig(k.RestConfig)
+		if err != nil {
+			k.dynamicErr = errors.Wrap(errors.ErrCodeInternal, "failed to create dynamic client", err)
+			return
+		}
+		k.DynamicClient = dc
+	})
+	if k.dynamicErr != nil {
+		return nil, k.dynamicErr
+	}
+	return k.DynamicClient, nil
+}

@@ -1,0 +1,614 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package flux
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer"
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer/localformat"
+	"github.com/NVIDIA/aicr/pkg/component"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+	"github.com/NVIDIA/aicr/pkg/serializer"
+)
+
+// disableWaitAnnotation marks a recipe manifest whose controller holds the
+// resource at Ready=False for longer than helm-controller's install timeout
+// (a NicClusterPolicy stays there until OFED is built), and whose release
+// must therefore not wait on it: helm-controller remediates a timed-out
+// install only by uninstalling, which would delete the resource. A generated
+// chart holding such a manifest is released with install.disableWait and
+// upgrade.disableWait; every other generated chart keeps the wait (#2585).
+// Follows the aicr/skip-hook-validation opt-out convention.
+const disableWaitAnnotation = "aicr/disable-wait"
+
+// disableWaitPattern matches the annotation as a YAML line. Manifests are Helm
+// templates, so they are matched as text rather than parsed.
+var disableWaitPattern = regexp.MustCompile(`(?m)^\s*["']?` + regexp.QuoteMeta(disableWaitAnnotation) + `["']?:\s*["']?true["']?\s*$`)
+
+// manifestsDisableWait reports whether any manifest carries disableWaitAnnotation.
+func manifestsDisableWait(manifests map[string][]byte) bool {
+	for _, content := range manifests {
+		if disableWaitPattern.Match(content) {
+			return true
+		}
+	}
+	return false
+}
+
+// HelmReleaseData carries per-component data for the helmrelease.yaml template.
+type HelmReleaseData struct {
+	Name            string
+	Namespace       string // Flux install namespace (e.g. "flux-system")
+	TargetNamespace string
+	Chart           string
+	Version         string
+	SourceKind      string // "HelmRepository" or "GitRepository"
+	SourceName      string
+	DependsOn       []DependsOnRef
+	ValuesFrom      []ValuesFromRef // ConfigMap references for dynamic values
+	ValuesYAML      string          // Pre-rendered, indented YAML for spec.values
+	// UpgradeCRDs emits spec.upgrade.crds: CreateReplace. Set only for
+	// components the registry marks ownsCRDs. See NVIDIA/aicr#2264.
+	UpgradeCRDs bool
+	// DisableWait emits spec.install.disableWait and spec.upgrade.disableWait.
+	// Set only for charts generated from recipe manifests. See NVIDIA/aicr#2585.
+	DisableWait bool
+}
+
+// ChartRefHelmReleaseData carries per-component data for the
+// helmrelease-chartref.yaml template. Used when OCISourceName is set,
+// causing HelmReleases to reference an ExternalArtifact via spec.chartRef
+// instead of a GitRepository/HelmRepository via spec.chart.spec.sourceRef.
+type ChartRefHelmReleaseData struct {
+	Name            string
+	Namespace       string // Flux install namespace (e.g. "flux-system")
+	TargetNamespace string
+	ChartRefName    string // ExternalArtifact name for spec.chartRef
+	DependsOn       []DependsOnRef
+	ValuesFrom      []ValuesFromRef // ConfigMap references for dynamic values
+	ValuesYAML      string          // Pre-rendered, indented YAML for spec.values
+	// UpgradeCRDs emits spec.upgrade.crds: CreateReplace. Set only for
+	// components the registry marks ownsCRDs. See NVIDIA/aicr#2264.
+	UpgradeCRDs bool
+	// DisableWait emits spec.install.disableWait and spec.upgrade.disableWait.
+	// Set only for charts generated from recipe manifests. See NVIDIA/aicr#2585.
+	DisableWait bool
+}
+
+// ArtifactGeneratorData carries per-component data for the
+// artifactgenerator.yaml template. Each local-chart component emits one
+// ArtifactGenerator that extracts its chart directory from the outer
+// OCIRepository into an ExternalArtifact.
+type ArtifactGeneratorData struct {
+	Name          string // ArtifactGenerator CR name
+	Namespace     string // Flux install namespace (e.g. "flux-system")
+	OCISourceName string // outer OCIRepository name (e.g. "aicr-bundle")
+	ArtifactName  string // ExternalArtifact name that source-watcher will create
+	ChartPath     string // sub-directory within the OCI artifact (e.g. "gpu-operator-pre")
+}
+
+// ValuesFromRef is a Flux valuesFrom reference to a ConfigMap.
+type ValuesFromRef struct {
+	Name string
+}
+
+// ConfigMapData carries data for the configmap-values.yaml template.
+type ConfigMapData struct {
+	Name       string
+	Namespace  string // Flux install namespace (e.g. "flux-system")
+	ValuesYAML string // Indented YAML for the data.values.yaml field
+}
+
+// valueSplit carries the results of splitting component values into static
+// (inline spec.values) and dynamic (ConfigMap) maps.
+type valueSplit struct {
+	static  map[string]any
+	dynamic map[string]any
+}
+
+// splitDynamicPaths deep-copies values and moves the named dot-paths into a
+// separate dynamic map. Paths not present in values are still added to the
+// dynamic map with an empty-string value so the ConfigMap carries the full set
+// of dynamic keys for operators to fill in at install time.
+//
+// This is the same algorithm as localformat/writer.go's splitDynamicPaths,
+// duplicated here to avoid an import cycle (deployer → component → checksum → deployer).
+func splitDynamicPaths(values map[string]any, dynamicPaths []string) valueSplit {
+	static := component.DeepCopyMap(values)
+	dynamic := make(map[string]any)
+	for _, path := range dynamicPaths {
+		val, found := component.GetValueByPath(static, path)
+		if found {
+			component.RemoveValueByPath(static, path)
+		} else {
+			val = ""
+		}
+		component.SetValueByPath(dynamic, path, val)
+	}
+	return valueSplit{static: static, dynamic: dynamic}
+}
+
+// HelmRepoSourceData carries data for HelmRepository source CRs.
+type HelmRepoSourceData struct {
+	Name      string
+	Namespace string // Flux install namespace (e.g. "flux-system")
+	URL       string
+	IsOCI     bool
+}
+
+// generateHelmComponent writes the HelmRelease with inline values for a Helm
+// component. When dynamic paths are configured, it splits values into static
+// (inline) and dynamic (ConfigMap) and returns true to signal a ConfigMap was
+// written alongside the HelmRelease.
+func (g *Generator) generateHelmComponent(ref recipe.ComponentRef, compDir string,
+	dependsOn []DependsOnRef, helmSources map[string]*HelmRepoSourceData, output *deployer.Output) (bool, error) {
+
+	sName := helmSourceName(ref.Source, helmSources)
+	values := g.ComponentValues[ref.Name]
+	dynamicPaths := g.DynamicValues[ref.Name]
+
+	var valuesFrom []ValuesFromRef
+	var wroteConfigMap bool
+
+	// Split dynamic paths into a ConfigMap when configured.
+	if len(dynamicPaths) > 0 {
+		split := splitDynamicPaths(values, dynamicPaths)
+		values = split.static
+
+		cmName, cmErr := writeConfigMap(ref.Name, g.resolveNamespace(), split.dynamic, compDir, output)
+		if cmErr != nil {
+			return false, cmErr
+		}
+		valuesFrom = []ValuesFromRef{{Name: cmName}}
+		wroteConfigMap = true
+	}
+
+	// Marshal values to YAML (2-space indent) and indent 4 spaces for embedding under spec.values.
+	var valuesYAML string
+	if len(values) > 0 {
+		yamlBytes, marshalErr := serializer.MarshalYAMLDeterministic(values)
+		if marshalErr != nil {
+			return false, errors.Wrap(errors.ErrCodeInternal,
+				fmt.Sprintf("failed to marshal values for %s", ref.Name), marshalErr)
+		}
+		valuesYAML = "    " + strings.ReplaceAll(strings.TrimRight(string(yamlBytes), "\n"), "\n", "\n    ")
+	}
+
+	// OCI tags are literal — helm push preserves the recipe's "v1.3.0"
+	// verbatim, so stripping the v prefix produces a tag that does not
+	// exist in the registry. HTTPS Helm repos use index.yaml with SemVer
+	// matching, so normalize only there.
+	version := ref.Version
+	if !strings.HasPrefix(ref.Source, "oci://") {
+		version = deployer.NormalizeVersion(version)
+	}
+
+	// Parity with localformat's renderInputFor: the chart name falls back
+	// to the component name so a source-only ref (a long-standing deployable
+	// shape) does not emit a HelmRelease with an empty chart reference.
+	chart := ref.EffectiveChart()
+
+	data := HelmReleaseData{
+		Name:            ref.Name,
+		Namespace:       g.resolveNamespace(),
+		TargetNamespace: ref.Namespace,
+		Chart:           chart,
+		UpgradeCRDs:     g.ownsCRDs(ref.Name),
+		Version:         version,
+		SourceKind:      "HelmRepository",
+		SourceName:      sName,
+		DependsOn:       dependsOn,
+		ValuesFrom:      valuesFrom,
+		ValuesYAML:      valuesYAML,
+	}
+
+	if err := writeTemplate(output, helmReleaseTemplate, data, compDir, fileHelmRelease,
+		fmt.Sprintf("failed to write %s for %s", fileHelmRelease, ref.Name)); err != nil {
+		return false, err
+	}
+	return wroteConfigMap, nil
+}
+
+// ChartData carries data for generating a local Chart.yaml.
+type ChartData struct {
+	Name string
+	// AICRVersion is the AICR build that produced the chart; it lands in
+	// `version:` and the aicr.run/generated-by annotation. Set it through
+	// deployer.NormalizeChartVersion — Helm validates `version:` as SemVer 2
+	// and rejects the "dev" an unstamped build reports.
+	AICRVersion string
+	// ComponentVersion is the free-form version of the payload the chart
+	// carries; it lands in `appVersion:` and the aicr.run/component-version
+	// annotation. See ADR-021 Decision 7 for why the two are separate.
+	ComponentVersion string
+}
+
+// chartDataFor builds the Chart.yaml stamp for a generated chart named
+// dirName that carries content pinned at payloadVersion.
+//
+// Mirrors localformat's stampFor, which does the same job for the other four
+// deployers: `version:` tracks the AICR build that generated the wrapper,
+// while appVersion and the aicr.run/component-version annotation track the
+// payload. A chart whose component has no upstream pin — a manifest-only
+// component, or a -pre / -post wrapper of one — carries only AICR-authored
+// recipe content, so AICR's version is the honest answer for both.
+func (g *Generator) chartDataFor(dirName, payloadVersion string) ChartData {
+	aicrVersion := deployer.NormalizeChartVersion(g.Version)
+	if payloadVersion == "" {
+		payloadVersion = aicrVersion
+	}
+	return ChartData{
+		Name:             dirName,
+		AICRVersion:      aicrVersion,
+		ComponentVersion: payloadVersion,
+	}
+}
+
+// generateManifestHelmChart packages manifest templates as a local Helm chart
+// and writes a HelmRelease CR pointing to it. When OCISourceName is empty, the
+// HelmRelease references a GitRepository source (existing behavior). When set,
+// it emits an ArtifactGenerator + ExternalArtifact pair and uses spec.chartRef.
+// Returns (wroteConfigMap, extraResourcePaths, error). extraResourcePaths
+// contains the ArtifactGenerator file path when in OCI mode, nil otherwise.
+//
+// payloadVersion is the originating component's upstream pin, stamped into
+// the generated chart's appVersion and aicr.run/component-version. Empty for
+// a manifest-only component, which has no upstream pin — see chartDataFor.
+func (g *Generator) generateManifestHelmChart(compName, dirName, namespace, compDir, payloadVersion string,
+	manifests map[string][]byte, gitSources map[string]*GitRepoSourceData,
+	dependsOn []DependsOnRef, output *deployer.Output) (bool, []string, error) {
+
+	// Create templates/ subdirectory for manifest files.
+	templatesDir, err := deployer.SafeJoin(compDir, "templates")
+	if err != nil {
+		return false, nil, err
+	}
+	if err := os.MkdirAll(templatesDir, 0750); err != nil {
+		return false, nil, errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("failed to create templates directory for %s", compName), err)
+	}
+
+	// Write manifest files into templates/ in sorted order for determinism.
+	manifestNames := make([]string, 0, len(manifests))
+	for name := range manifests {
+		manifestNames = append(manifestNames, name)
+	}
+	sort.Strings(manifestNames)
+
+	for _, name := range manifestNames {
+		content := manifests[name]
+		safeName := filepath.Clean(name)
+		filePath, joinErr := deployer.SafeJoin(templatesDir, safeName)
+		if joinErr != nil {
+			return false, nil, joinErr
+		}
+		if err := os.MkdirAll(filepath.Dir(filePath), 0750); err != nil {
+			return false, nil, errors.Wrap(errors.ErrCodeInternal,
+				fmt.Sprintf("failed to create manifest subdirectory for %s/%s", compName, safeName), err)
+		}
+		if err := os.WriteFile(filePath, content, 0600); err != nil {
+			return false, nil, errors.Wrap(errors.ErrCodeInternal,
+				fmt.Sprintf("failed to write template %s for %s", safeName, compName), err)
+		}
+		output.Files = append(output.Files, filePath)
+		output.TotalSize += int64(len(content))
+	}
+
+	// Write Chart.yaml.
+	if err := writeTemplate(output, chartTemplate, g.chartDataFor(dirName, payloadVersion),
+		compDir, fileChart,
+		fmt.Sprintf("failed to write %s for %s", fileChart, compName)); err != nil {
+		return false, nil, err
+	}
+
+	// Marshal values for inline embedding in HelmRelease.
+	// Manifest templates access values via `index .Values "<compName>"`, so wrap
+	// the flat values map under the component name key to match that expectation.
+	values := g.ComponentValues[compName]
+	dynamicPaths := g.DynamicValues[compName]
+
+	var valuesFrom []ValuesFromRef
+	var wroteConfigMap bool
+
+	// Split dynamic paths into a ConfigMap when configured.
+	// Dynamic paths are split before wrapping under the component name key,
+	// then both halves are wrapped to match the template expectation.
+	if len(dynamicPaths) > 0 {
+		split := splitDynamicPaths(values, dynamicPaths)
+		values = split.static
+
+		// Wrap dynamic values under the component name key for manifest template compatibility.
+		wrappedDynamic := map[string]any{compName: split.dynamic}
+		cmName, cmErr := writeConfigMap(dirName, g.resolveNamespace(), wrappedDynamic, compDir, output)
+		if cmErr != nil {
+			return false, nil, cmErr
+		}
+		valuesFrom = []ValuesFromRef{{Name: cmName}}
+		wroteConfigMap = true
+	}
+
+	var valuesYAML string
+	if len(values) > 0 {
+		wrapped := map[string]any{compName: values}
+		yamlBytes, marshalErr := serializer.MarshalYAMLDeterministic(wrapped)
+		if marshalErr != nil {
+			return false, nil, errors.Wrap(errors.ErrCodeInternal,
+				fmt.Sprintf("failed to marshal values for %s", compName), marshalErr)
+		}
+		valuesYAML = "    " + strings.ReplaceAll(strings.TrimRight(string(yamlBytes), "\n"), "\n", "\n    ")
+	}
+
+	// OCI mode: emit ArtifactGenerator + chartRef HelmRelease. The
+	// ArtifactGenerator extracts this chart's directory from the outer
+	// OCIRepository into an ExternalArtifact that helm-controller can
+	// consume via spec.chartRef.
+	disableWait := manifestsDisableWait(manifests)
+	if g.OCISourceName != "" {
+		extraResources, ociErr := g.writeOCIArtifactPair(dirName, namespace, disableWait, dependsOn, valuesFrom, valuesYAML, compDir, output)
+		if ociErr != nil {
+			return false, nil, ociErr
+		}
+		return wroteConfigMap, extraResources, nil
+	}
+
+	// Git mode (default): HelmRelease references GitRepository source.
+	sName := gitSourceName(g.resolveRepoURL(), gitSources)
+	data := HelmReleaseData{
+		Name:            dirName,
+		Namespace:       g.resolveNamespace(),
+		TargetNamespace: namespace,
+		Chart:           "./" + dirName,
+		UpgradeCRDs:     g.ownsCRDs(dirName),
+		DisableWait:     disableWait,
+		SourceKind:      "GitRepository",
+		SourceName:      sName,
+		DependsOn:       dependsOn,
+		ValuesFrom:      valuesFrom,
+		ValuesYAML:      valuesYAML,
+	}
+
+	if err := writeTemplate(output, helmReleaseTemplate, data, compDir, fileHelmRelease,
+		fmt.Sprintf("failed to write %s for %s", fileHelmRelease, compName)); err != nil {
+		return false, nil, err
+	}
+	return wroteConfigMap, nil, nil
+}
+
+// generateVendoredHelmComponent writes a vendored wrapper chart folder for a
+// Helm component and generates a HelmRelease CR pointing to it. When
+// OCISourceName is empty, the HelmRelease references a GitRepository source
+// (existing behavior). When set, it emits an ArtifactGenerator +
+// ExternalArtifact pair and uses spec.chartRef.
+// Returns (wroteConfigMap, vendorRecord, extraResourcePaths, error).
+func (g *Generator) generateVendoredHelmComponent(ctx context.Context, ref recipe.ComponentRef,
+	compDir string, dependsOn []DependsOnRef,
+	gitSources map[string]*GitRepoSourceData,
+	puller localformat.ChartPuller,
+	chartDigest string,
+	output *deployer.Output) (bool, localformat.VendorRecord, []string, error) {
+
+	chartName := ref.EffectiveChart()
+
+	// Build localformat.Component for the puller.
+	lfc := localformat.Component{
+		Name:        ref.Name,
+		Repository:  ref.Source,
+		ChartName:   chartName,
+		Version:     ref.Version,
+		IsOCI:       strings.HasPrefix(ref.Source, "oci://"),
+		ChartDigest: chartDigest,
+	}
+
+	// Pull upstream chart tarball.
+	tgz, rec, tarball, pullErr := puller.Pull(ctx, lfc)
+	if pullErr != nil {
+		return false, localformat.VendorRecord{}, nil, errors.PropagateOrWrap(
+			pullErr, errors.ErrCodeInternal,
+			fmt.Sprintf("pull vendored chart for component %q", ref.Name))
+	}
+	if digestErr := localformat.VerifyChartDigest(lfc, tgz); digestErr != nil {
+		return false, localformat.VendorRecord{}, nil, digestErr
+	}
+	// provenance.yaml must name the bytes written below, not whatever the
+	// puller reported.
+	rec.SHA256 = localformat.ArchiveSHA256(tgz)
+
+	// Write charts/<tarball>.tgz.
+	chartsDir, err := deployer.SafeJoin(compDir, "charts")
+	if err != nil {
+		return false, localformat.VendorRecord{}, nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+			"charts dir path unsafe", err)
+	}
+	if err = os.MkdirAll(chartsDir, 0750); err != nil {
+		return false, localformat.VendorRecord{}, nil, errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("create charts dir for %s", ref.Name), err)
+	}
+	tarballPath, err := deployer.SafeJoin(chartsDir, tarball)
+	if err != nil {
+		return false, localformat.VendorRecord{}, nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("tarball path unsafe: %s", tarball), err)
+	}
+	if err = os.WriteFile(tarballPath, tgz, 0600); err != nil {
+		return false, localformat.VendorRecord{}, nil, errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("write tarball for %s", ref.Name), err)
+	}
+	output.Files = append(output.Files, tarballPath)
+	output.TotalSize += int64(len(tgz))
+
+	// Write wrapper Chart.yaml declaring the upstream as a dependency.
+	version := deployer.NormalizeVersionWithDefault(ref.Version)
+	wrapperYAML, err := localformat.RenderWrapperChartYAML(localformat.WrapperChartInput{
+		Name:           ref.Name,
+		Parent:         ref.Name,
+		ChartName:      chartName,
+		ChartVersion:   version,
+		AICRVersion:    g.Version,
+		PayloadVersion: ref.Version,
+	})
+	if err != nil {
+		return false, localformat.VendorRecord{}, nil, err
+	}
+	chartPath, err := deployer.SafeJoin(compDir, fileChart)
+	if err != nil {
+		return false, localformat.VendorRecord{}, nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+			"Chart.yaml path unsafe", err)
+	}
+	if err = os.WriteFile(chartPath, wrapperYAML, 0600); err != nil {
+		return false, localformat.VendorRecord{}, nil, errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("write Chart.yaml for %s", ref.Name), err)
+	}
+	output.Files = append(output.Files, chartPath)
+	output.TotalSize += int64(len(wrapperYAML))
+
+	// Build values nested under the subchart name so the wrapper chart
+	// forwards them to the vendored dependency at install time.
+	values := g.ComponentValues[ref.Name]
+	dynamicPaths := g.DynamicValues[ref.Name]
+
+	var valuesFrom []ValuesFromRef
+	var wroteConfigMap bool
+
+	if len(dynamicPaths) > 0 {
+		split := splitDynamicPaths(values, dynamicPaths)
+		values = split.static
+
+		wrappedDynamic := localformat.NestUnderSubchart(split.dynamic, chartName)
+		cmName, cmErr := writeConfigMap(ref.Name, g.resolveNamespace(), wrappedDynamic, compDir, output)
+		if cmErr != nil {
+			return false, localformat.VendorRecord{}, nil, cmErr
+		}
+		valuesFrom = []ValuesFromRef{{Name: cmName}}
+		wroteConfigMap = true
+	}
+
+	var valuesYAML string
+	nestedValues := localformat.NestUnderSubchart(values, chartName)
+	if len(nestedValues) > 0 {
+		yamlBytes, marshalErr := serializer.MarshalYAMLDeterministic(nestedValues)
+		if marshalErr != nil {
+			return false, localformat.VendorRecord{}, nil, errors.Wrap(errors.ErrCodeInternal,
+				fmt.Sprintf("failed to marshal values for %s", ref.Name), marshalErr)
+		}
+		valuesYAML = "    " + strings.ReplaceAll(strings.TrimRight(string(yamlBytes), "\n"), "\n", "\n    ")
+	}
+
+	// OCI mode: emit ArtifactGenerator + chartRef HelmRelease.
+	if g.OCISourceName != "" {
+		extraResources, ociErr := g.writeOCIArtifactPair(ref.Name, ref.Namespace, false, dependsOn, valuesFrom, valuesYAML, compDir, output)
+		if ociErr != nil {
+			return false, localformat.VendorRecord{}, nil, ociErr
+		}
+		return wroteConfigMap, rec, extraResources, nil
+	}
+
+	// Git mode (default): HelmRelease references GitRepository source.
+	sName := gitSourceName(g.resolveRepoURL(), gitSources)
+	data := HelmReleaseData{
+		Name:            ref.Name,
+		Namespace:       g.resolveNamespace(),
+		TargetNamespace: ref.Namespace,
+		Chart:           "./" + ref.Name,
+		UpgradeCRDs:     g.ownsCRDs(ref.Name),
+		SourceKind:      "GitRepository",
+		SourceName:      sName,
+		DependsOn:       dependsOn,
+		ValuesFrom:      valuesFrom,
+		ValuesYAML:      valuesYAML,
+	}
+
+	if err := writeTemplate(output, helmReleaseTemplate, data, compDir, fileHelmRelease,
+		fmt.Sprintf("failed to write %s for %s", fileHelmRelease, ref.Name)); err != nil {
+		return false, localformat.VendorRecord{}, nil, err
+	}
+
+	return wroteConfigMap, rec, nil, nil
+}
+
+// writeOCIArtifactPair writes an ArtifactGenerator + chartRef HelmRelease pair
+// for OCI mode. It returns the extra resource paths to include in
+// kustomization.yaml. Both generateManifestHelmChart and
+// generateVendoredHelmComponent delegate to this helper to avoid drift.
+func (g *Generator) writeOCIArtifactPair(name, targetNamespace string, disableWait bool,
+	dependsOn []DependsOnRef, valuesFrom []ValuesFromRef, valuesYAML string,
+	compDir string, output *deployer.Output) ([]string, error) {
+
+	agName := name + "-chart"
+	agData := ArtifactGeneratorData{
+		Name:          agName,
+		Namespace:     g.resolveNamespace(),
+		OCISourceName: g.OCISourceName,
+		ArtifactName:  agName,
+		ChartPath:     name,
+	}
+	if err := writeTemplate(output, artifactGeneratorTemplate, agData, compDir, fileArtifactGenerator,
+		fmt.Sprintf("failed to write %s for %s", fileArtifactGenerator, name)); err != nil {
+		return nil, err
+	}
+
+	crData := ChartRefHelmReleaseData{
+		Name:            name,
+		Namespace:       g.resolveNamespace(),
+		TargetNamespace: targetNamespace,
+		ChartRefName:    agName,
+		UpgradeCRDs:     g.ownsCRDs(name),
+		DisableWait:     disableWait,
+		DependsOn:       dependsOn,
+		ValuesFrom:      valuesFrom,
+		ValuesYAML:      valuesYAML,
+	}
+	if err := writeTemplate(output, helmReleaseChartRefTemplate, crData, compDir, fileHelmRelease,
+		fmt.Sprintf("failed to write %s for %s", fileHelmRelease, name)); err != nil {
+		return nil, err
+	}
+
+	return []string{filepath.Join(name, fileArtifactGenerator)}, nil
+}
+
+// writeConfigMap writes a ConfigMap YAML file containing the given dynamic
+// values into compDir and returns the ConfigMap name for valuesFrom wiring.
+func writeConfigMap(compName, namespace string, dynamicValues map[string]any, compDir string, output *deployer.Output) (string, error) {
+	cmName := compName + "-values"
+
+	var valuesYAML string
+	if len(dynamicValues) > 0 {
+		yamlBytes, err := serializer.MarshalYAMLDeterministic(dynamicValues)
+		if err != nil {
+			return "", errors.Wrap(errors.ErrCodeInternal,
+				fmt.Sprintf("failed to marshal dynamic values for %s", compName), err)
+		}
+		valuesYAML = "    " + strings.ReplaceAll(strings.TrimRight(string(yamlBytes), "\n"), "\n", "\n    ")
+	}
+
+	data := ConfigMapData{
+		Name:       cmName,
+		Namespace:  namespace,
+		ValuesYAML: valuesYAML,
+	}
+
+	if err := writeTemplate(output, configMapTemplate, data, compDir, fileConfigMap,
+		fmt.Sprintf("failed to write %s for %s", fileConfigMap, compName)); err != nil {
+		return "", err
+	}
+
+	return cmName, nil
+}

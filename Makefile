@@ -1,0 +1,1691 @@
+# Makefile for the aicr project
+# Purpose: Build, lint, test, and manage releases for the aicr project.
+
+REPO_NAME          := aicr
+VERSION            ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+IMAGE_REGISTRY     ?= $(shell yq -r '.build.image_registry' .settings.yaml 2>/dev/null)
+ifeq ($(IMAGE_REGISTRY),)
+IMAGE_REGISTRY     := ghcr.io/nvidia
+endif
+IMAGE_TAG          ?= latest
+YAML_FILES         := $(shell find . -type f \( -iname "*.yml" -o -iname "*.yaml" \) ! -path "./examples/*" ! -path "./bundle/*" ! -path "./bundles/*" ! -path "*/testdata/*" ! -path "*/node_modules/*")
+COMMIT             := $(shell git rev-parse HEAD)
+BRANCH             := $(shell git rev-parse --abbrev-ref HEAD)
+GO_VERSION         := $(shell cat .go-version 2>/dev/null)
+export GOTOOLCHAIN  = go$(GO_VERSION)
+GOLINT_VERSION      = $(shell golangci-lint --version 2>/dev/null | awk '{print $$4}' | sed 's/golangci-lint version //' || echo "not installed")
+KO_VERSION          = $(shell ko version 2>/dev/null || echo "not installed")
+GORELEASER_VERSION  = $(shell goreleaser --version 2>/dev/null | sed -n 's/^GitVersion:[[:space:]]*//p' || echo "not installed")
+# No fallback on purpose: an unreadable threshold (missing yq, missing key)
+# must fail the gate in test-coverage rather than silently enforce a looser
+# floor than .settings.yaml declares.
+COVERAGE_THRESHOLD ?= $(shell yq -r '.quality.coverage_threshold' .settings.yaml 2>/dev/null)
+LINT_TIMEOUT       ?= $(shell yq -r '.quality.lint_timeout' .settings.yaml 2>/dev/null)
+ifeq ($(LINT_TIMEOUT),)
+LINT_TIMEOUT       := 5m
+endif
+TEST_TIMEOUT       ?= $(shell yq -r '.quality.test_timeout' .settings.yaml 2>/dev/null)
+ifeq ($(TEST_TIMEOUT),)
+TEST_TIMEOUT       := 10m
+endif
+
+# Tilt/ctlptl configuration
+CTLPTL_CONFIG_FILE = .ctlptl.yaml
+REGISTRY_PORT = 5001
+REGISTRY_NAME = ctlptl-registry
+
+# Kind node image (single source of truth: .settings.yaml testing.kind_node_image).
+# .ctlptl.yaml intentionally does not hardcode this — cluster-create injects it so
+# local dev and CI can never pin a second, drifting copy of the version. No
+# hardcoded fallback here: cluster-create fails closed on an empty read
+# instead of silently degrading to a stale image (see its yq-missing check).
+KIND_NODE_IMAGE ?= $(shell yq -r '.testing.kind_node_image' .settings.yaml 2>/dev/null)
+
+# ctlptl registry image (single source of truth: .settings.yaml
+# testing_tools.registry_image, an ECR Public mirror). Unset, ctlptl pulls
+# docker.io/library/registry:3 anonymously, which shared CI runners rate-limit.
+KIND_REGISTRY_IMAGE ?= $(shell yq -r '.testing_tools.registry_image' .settings.yaml 2>/dev/null)
+
+# Docker Hub pull-through mirror (single source of truth: .settings.yaml
+# build.dockerhub_mirror, an https:// URL). Image refs need the bare host.
+DOCKERHUB_MIRROR ?= $(shell yq -r '.build.dockerhub_mirror' .settings.yaml 2>/dev/null)
+DOCKERHUB_MIRROR_HOST = $(patsubst https://%,%,$(DOCKERHUB_MIRROR))
+# The same image on the Docker Hub mirror (identical index digest), the fallback
+# when ECR Public sheds an anonymous pull.
+KIND_REGISTRY_MIRROR_IMAGE = $(patsubst public.ecr.aws/docker/%,$(DOCKERHUB_MIRROR_HOST)/%,$(KIND_REGISTRY_IMAGE))
+
+# Default target
+all: help
+
+.PHONY: info
+info: ## Prints the current project info
+	@echo "version:        $(VERSION)"
+	@echo "commit:         $(COMMIT)"
+	@echo "branch:         $(BRANCH)"
+	@echo "repo:           $(REPO_NAME)"
+	@echo "go:             $(GO_VERSION)"
+	@echo "linter:         $(GOLINT_VERSION)"
+	@echo "ko:             $(KO_VERSION)"
+	@echo "goreleaser:     $(GORELEASER_VERSION)"
+
+# =============================================================================
+# Tools Management
+# =============================================================================
+
+.PHONY: tools-check
+tools-check: ## Verifies required tools are installed and shows version comparison
+	@bash tools/check-tools
+
+.PHONY: tools-setup
+tools-setup: ## Setup development environment (installs all required tools). Use AUTO_MODE=true to skip prompts
+	@echo "Setting up development environment..."
+	@AUTO_MODE=$(AUTO_MODE) bash tools/setup-tools
+
+.PHONY: tools-update
+tools-update: ## Reinstall/upgrade all tools to versions in .settings.yaml (non-interactive)
+	@echo "Updating tools to .settings.yaml..."
+	@AUTO_MODE=true bash tools/setup-tools --upgrade
+
+.PHONY: generate-validator
+generate-validator: ## Generate scaffolding for a new check or constraint validator
+	@python3 tools/generate-validator $(ARGS)
+
+# =============================================================================
+# Code Formatting & Dependencies
+# =============================================================================
+
+# Deliberately does NOT run `notices`. THIRD_PARTY_NOTICES.md is generated at
+# release time (see the `release` target) and is not tracked, so regenerating it
+# here would add ~2m20s to every tidy to produce an ignored file.
+.PHONY: tidy
+tidy: ## Formats code and updates Go module dependencies
+	@set -e; \
+	go fmt ./...; \
+	go mod tidy
+
+.PHONY: fmt-check
+fmt-check: ## Checks if code is formatted (CI-friendly, no modifications)
+	@test -z "$$(gofmt -l .)" || (echo "Code is not formatted. Run 'make tidy' to fix:" && gofmt -l . && exit 1)
+	@echo "Code formatting check passed"
+
+.PHONY: upgrade
+upgrade: ## Upgrades all dependencies to latest versions
+	@set -e; \
+	go get -u ./...; \
+	go mod tidy
+
+.PHONY: generate
+generate: ## Runs go generate for code generation
+	@echo "Running go generate..."
+	@GOFLAGS="-mod=readonly" go generate ./...
+	@echo "Code generation completed"
+
+.PHONY: lint
+lint: lint-go lint-yaml license check-agents-sync check-docs-filenames check-docs-mdx check-docs-mdx-parse check-docs-yaml check-docs-shell check-docs-links bom-pinning-check check-depproxy-kit check-runner-labels check-upgrade-records check-dynamo-runtime-image ## Lints the entire project (Go, YAML, license headers, docs, chart-version pins, Dynamo runtime image tag, vendored action digests, and runner labels)
+	@echo "Completed Go and YAML lints and ensured license headers"
+
+.PHONY: check-depproxy-kit
+check-depproxy-kit: ## Verifies the vendored Go proxy action matches upstream digests
+	@./tools/check-depproxy-kit
+
+.PHONY: check-runner-labels
+check-runner-labels: ## Rejects the floating ubuntu-latest runner label under .github/
+	@./tools/check-runner-labels
+
+# Standalone target — NOT part of `make lint` because it requires Docker
+# (the validator runs in the same image renovatebot/github-action wraps).
+# Invoked from CI via .github/workflows/merge-gate.yaml when
+# .github/renovate.json5 changes; run locally before merging changes to
+# the Renovate config.
+#
+# Image is digest-pinned for supply-chain consistency with the GitHub
+# Actions pinning policy. Keep the digest in lockstep with the
+# `renovate-version` input in .github/workflows/renovate.yaml — both
+# point at the same image and should be bumped together.
+RENOVATE_VALIDATOR_IMAGE := ghcr.io/renovatebot/renovate:43@sha256:00185c0d63462acec8331cc9a94dcd74a763f2765fca0edcc3ff568af1dc8104
+
+.PHONY: lint-renovate
+lint-renovate: ## Validates .github/renovate.json5 with the official Renovate config validator (requires Docker)
+	@echo "Validating .github/renovate.json5..."
+	@docker run --rm \
+		-v $(PWD)/.github/renovate.json5:/repo/.github/renovate.json5:ro \
+		-w /repo \
+		$(RENOVATE_VALIDATOR_IMAGE) \
+		renovate-config-validator .github/renovate.json5
+
+.PHONY: check-agents-sync
+check-agents-sync: ## Verifies AGENTS.md is in sync with .claude/CLAUDE.md
+	@./tools/check-agents-sync
+
+.PHONY: check-docs-filenames
+check-docs-filenames: ## Enforces lowercase kebab-case filenames in docs/
+	@./tools/check-docs-filenames
+
+.PHONY: check-dynamo-runtime-image
+check-dynamo-runtime-image: ## Verifies the inference-perf Dynamo runtime image tag matches the dynamo-platform chart version
+	@GOFLAGS="-mod=readonly" go run ./tools/check-dynamo-runtime-image
+
+.PHONY: check-upgrade-records
+check-upgrade-records: ## Verifies ComponentUpgrades records are well-formed and cover pins moved since the merge base (ADR-021; uses AICR_UPGRADE_BASE_REF, else a fetched upstream/main or origin/main)
+	@./tools/check-upgrade-records
+
+# Deliberately NOT in `lint` or `qualify`: it re-downloads each pinned tool's
+# upstream checksums, so it needs network and is the one gate here that can go
+# red without the tree changing. Merge Gate runs it on any change to
+# .settings.yaml or a refresh script, which is where a stale pin is introduced.
+.PHONY: check-settings-checksums
+check-settings-checksums: ## Verifies .settings.yaml checksum pins match their pinned versions (needs network)
+	@./tools/check-settings-checksums
+
+.PHONY: check-docs-mdx
+check-docs-mdx: ## Checks docs/ markdown for MDX compatibility (void elements, bare braces, HTML comments, autolinks, bare <tags>)
+	@./tools/check-docs-mdx
+
+# Parser-level docs gate — runs the SAME MDX parser Fern does over every
+# published doc, so a construct that would abort `fern generate --docs` at
+# publish time fails here instead. This is the authoritative check;
+# check-docs-mdx above is a fast, dependency-free approximation kept as a
+# strict subset of it.
+#
+# Part of `make lint` (and therefore `make qualify`). It needs Node 20+ and one
+# `npm ci` of the locked tree in tools/mdx. With Node installed, a local
+# `make qualify` predicts CI as usual; WITHOUT it this check warns and skips, so
+# a local pass no longer implies a CI pass and invalid MDX can still be rejected
+# by the merge-gate `docs-mdx` job, where a missing Node is a HARD FAILURE.
+.PHONY: check-docs-mdx-parse
+check-docs-mdx-parse: ## Validates docs/ with the real MDX parser (requires Node; CI-blocking)
+	@./tools/check-docs-mdx-parse
+
+.PHONY: check-docs-yaml
+check-docs-yaml: ## Validates YAML-labeled code blocks throughout docs/ (requires Node; CI-blocking)
+	@./tools/check-docs-yaml
+
+.PHONY: check-docs-shell
+check-docs-shell: ## Rejects unquoted <placeholder>s that bash reads as redirection in docs/ shell blocks (requires Node; CI-blocking)
+	@./tools/check-docs-shell
+
+.PHONY: check-docs-links
+check-docs-links: ## Verifies links on Fern-published docs reach a published page or an existing repo path (CI-blocking)
+	@GOFLAGS="-mod=readonly" go run ./tools/check-docs-links
+
+.PHONY: lint-go
+lint-go: ## Lints Go files with golangci-lint and go vet
+	@set -e; \
+	echo "Running go vet..."; \
+	GOFLAGS="-mod=readonly" go vet ./...; \
+	echo "Running golangci-lint..."; \
+	GOFLAGS="-mod=readonly" golangci-lint -c .golangci.yaml run --timeout=$(LINT_TIMEOUT)
+
+.PHONY: lint-yaml
+lint-yaml: ## Lints YAML files with yamllint
+	@if [ -n "$(YAML_FILES)" ]; then \
+		yamllint -c .yamllint.yaml $(YAML_FILES); \
+	else \
+		echo "No YAML files found to lint."; \
+	fi
+
+# License ignore patterns (reused by license target)
+LICENSE_IGNORES = \
+	-ignore '.git/**' \
+	-ignore '.venv/**' \
+	-ignore '**/__pycache__/**' \
+	-ignore '**/.venv/**' \
+	-ignore '**/site-packages/**' \
+	-ignore '*/.venv/**' \
+	-ignore '**/.idea/**' \
+	-ignore '**/*.csv' \
+	-ignore '**/*.pyc' \
+	-ignore '**/*.xml' \
+	-ignore '**/*lock.hcl' \
+	-ignore '**/*pb2*' \
+	-ignore 'bundles/**' \
+	-ignore 'dist/**' \
+	-ignore '**/testdata/**' \
+	-ignore 'pkg/evidence/cncf/schemas/*.yaml' \
+	-ignore 'recipes/evidence/*.yaml' \
+	-ignore 'recipes/evidence/*/*/*.yaml' \
+	-ignore 'THIRD_PARTY_NOTICES.md' \
+	-ignore 'validators/performance/licenses/**' \
+	-ignore '.licenses-cache/**' \
+	-ignore 'tools/mdx/node_modules/**' \
+	-ignore '.github/actions/setup-dgxc-goproxy/**'
+
+# pkg/evidence/cncf/schemas/ holds verbatim copies of the upstream CNCF AI
+# Conformance checklists (cncf/k8s-ai-conformance docs/AIConformance-*.yaml),
+# pinned by digest in pkg/evidence/cncf/checklist.go; a header would break the pin.
+# The two recipes/evidence patterns in LICENSE_IGNORES match exactly the
+# generated, header-less pointer shapes MarshalPointer emits — the transient
+# flat <recipe>.yaml pending state and the final <recipe>/<source>/sha256-*.yaml
+# (any committed header is stripped on the next publish/sign). They are kept
+# narrow (not a recursive **) so unrelated YAML added under the tree still gets
+# header enforcement. The flat glob also covers the hand-maintained
+# allowlist.yaml, so the license target headers it explicitly below.
+.PHONY: license
+license: ## Add/verify license headers in source files
+	@echo "Ensuring license headers..."
+	@addlicense -f .github/headers/LICENSE $(LICENSE_IGNORES) .
+	@addlicense -f .github/headers/LICENSE recipes/evidence/allowlist.yaml
+
+#### DO NOT CHANGE THE ALLOWED-LICENSE SET. Do not add ignores to work around
+#### the policy. The only sanctioned exceptions are specific MPL-2.0 packages
+#### whose use has been explicitly approved; each is listed by exact import path
+#### so unrelated MPL-2.0 deps still fail closed for review. The go-cleanhttp /
+#### go-retryablehttp pair, the HashiCorp Vault client subtree (#1577, the
+#### hashivault:// KMS signing provider), and the golang-lru v2 and arc/v2
+#### modules (#3494, the cache CNCF Distribution links into the AICR
+#### Operator's in-cluster registry, cmd/aicr-registry) are the approved
+#### exceptions.
+####
+#### go-licenses identifies standard library packages by matching their source
+#### path against go/build's GOROOT, which is empty in a binary linked with
+#### -trimpath. With an empty GOROOT the prefix collapses to "/", EVERY package
+#### looks like stdlib, and this gate inspects nothing yet still exits 0 — a
+#### silent false PASS. Resolve GOROOT explicitly below so the check cannot pass
+#### vacuously regardless of how go-licenses was installed.
+####
+#### STDLIB_IGNORE passes FULL stdlib package paths. It used to pipe through
+#### `cut -d'/' -f1`, keeping only the first path segment — which yields the bare
+#### token `go` (from `go/ast`, `go/build`, ...). `--ignore` matches by PREFIX, so
+#### that token also matched every third-party module under `go.opentelemetry.io`,
+#### `go.yaml.in` and `go.uber.org`: 32 packages silently exempt from this policy
+#### gate. Same bug #2384 fixed in tools/generate-notices; this is the other copy.
+#### Full paths cannot collide that way.
+####
+#### The three in-toto/json-canonicalization ignores below are the counterpart to
+#### that PR's LICENSE_OVERRIDES: go-licenses cannot classify their LICENSE files,
+#### and `check` has no override mechanism. They are NOT undisclosed — `make
+#### notices` emits all three from committed Apache-2.0 copies, and its
+#### completeness gate fails the build if any linked package is missing an entry.
+license-check: ## Check license is approved
+	@echo "Checking license headers..."
+	@set -e; \
+	GOROOT="$$(go env GOROOT)"; \
+	if [ -z "$$GOROOT" ] || [ ! -d "$$GOROOT" ]; then \
+	    echo "ERROR: could not resolve a usable GOROOT via 'go env GOROOT'." >&2; \
+	    exit 1; \
+	fi; \
+	export GOROOT; \
+	STDLIB_IGNORE=$$(go list std 2>/dev/null | sort -u | paste -sd ',' -) && \
+	go-licenses check ./... \
+        --allowed_licenses=MIT,BSD-2-Clause,BSD-3-Clause,Apache-2.0,ISC,Zlib \
+        --ignore=github.com/hashicorp/go-cleanhttp \
+        --ignore=github.com/hashicorp/go-retryablehttp \
+        --ignore=github.com/hashicorp/vault/api \
+        --ignore=github.com/hashicorp/errwrap \
+        --ignore=github.com/hashicorp/go-multierror \
+        --ignore=github.com/hashicorp/go-rootcerts \
+        --ignore=github.com/hashicorp/go-secure-stdlib/parseutil \
+        --ignore=github.com/hashicorp/go-secure-stdlib/strutil \
+        --ignore=github.com/hashicorp/go-sockaddr \
+        --ignore=github.com/hashicorp/golang-lru/arc/v2 \
+        --ignore=github.com/hashicorp/golang-lru/v2 \
+        --ignore=github.com/hashicorp/hcl \
+        --ignore=github.com/in-toto/attestation \
+        --ignore=github.com/in-toto/in-toto-golang \
+        --ignore=github.com/cyberphone/json-canonicalization \
+        --ignore=$$STDLIB_IGNORE
+
+# Ordered ahead of test-shell because a stale tool pin makes tools/api-diff exit
+# 17, which surfaces as nine unrelated-looking `want rc=16 got rc=17` shell
+# failures (#2741). This test names the stale file directly and runs in under a
+# second. Scoped to the one test: the rest of tests/architecture takes ~25s and
+# runs with the full suite below.
+.PHONY: test-tool-pins
+test-tool-pins: ## Checks go.mod is the only pin for tools built from this module
+	@GOFLAGS="-mod=readonly" go test -count=1 -run '^TestToolPinsLiveOnlyInGoMod$$' ./tests/architecture/
+
+.PHONY: test-shell
+test-shell: ## Runs shell unit tests (tools/*_test.sh, tools/component-test/*_test.sh, tests/uat/lib/*_test.sh, tests/uat/kind/*_test.sh; hermetic, no cluster)
+	@set -e; for t in tools/*_test.sh tools/component-test/*_test.sh tests/uat/lib/*_test.sh tests/uat/kind/*_test.sh; do [ -e "$$t" ] || continue; echo "Running $$t..."; bash "$$t"; done
+
+# validators/ tests run as part of `make test` but are excluded from the
+# coverage.out this target emits: per-package coverage there runs 41-92%
+# (see #1752), which would pull the project-wide gate from ~80% to ~75.8%.
+#
+# ---------------------------------------------------------------------------
+# Every `go` invocation in this file sets GOFLAGS explicitly. That looks
+# redundant — `-mod=readonly` is already Go's default — but it is not: assigning
+# GOFLAGS REPLACES whatever the developer has in their environment or in
+# `go env -w`.
+#
+# These recipes carried `GOFLAGS="-mod=vendor"` until #2374 for the vendor mode,
+# and were silently relying on that second effect. Removing the pins outright
+# exposed it: with an ambient `GOFLAGS=-trimpath`, `runtime.Caller` returns
+# trimmed paths, so the `repositoryPath` helper in tests/notices and
+# tests/releasepolicy resolves the repo root to the literal module path
+# "github.com/NVIDIA/aicr" and every file open fails. Reproduced and confirmed —
+# both suites fail with ambient -trimpath and pass with GOFLAGS assigned.
+#
+# So: keep the assignment. It pins the resolution mode AND makes these targets
+# independent of ambient Go configuration, which is what `make test` behaving
+# the same everywhere depends on.
+# ---------------------------------------------------------------------------
+.PHONY: test
+test: test-tool-pins test-shell ## Runs unit tests with race detector and coverage (use -short to skip integration tests)
+	@set -e; \
+	echo "Running tests with race detector..."; \
+	KUBEBUILDER_ASSETS=$$(setup-envtest use -p path 2>/dev/null || echo "") \
+	AICR_CRITERIA_STRICT=1 \
+	GOFLAGS="-mod=readonly" go test -short -count=1 -race -timeout=$(TEST_TIMEOUT) -covermode=atomic -coverprofile=coverage.full.out $$(go list ./... | grep -v -e /tests/chainsaw/) || exit 1; \
+	grep -v '^github.com/NVIDIA/aicr/validators/' coverage.full.out > coverage.out; \
+	echo "Test coverage:"; \
+	go tool cover -func=coverage.out | tail -1
+
+# Listed before `test` so an unreadable threshold fails in seconds rather than
+# after the full race-enabled suite. Fails closed on both an empty value (yq
+# missing) and the literal "null" (yq prints that for a missing key, exit 0) --
+# bc would resolve either to 0 and silently pass the check below with no floor.
+# Keep in sync with the matching guard in .github/actions/go-coverage.
+.PHONY: check-coverage-threshold
+check-coverage-threshold:
+	@if [ -z "$(COVERAGE_THRESHOLD)" ] || [ "$(COVERAGE_THRESHOLD)" = "null" ]; then \
+		echo "ERROR: coverage threshold unavailable from .settings.yaml (quality.coverage_threshold)"; \
+		echo "       Check that yq is installed ('make tools-setup') and that"; \
+		echo "       .settings.yaml defines quality.coverage_threshold."; \
+		exit 1; \
+	fi
+
+.PHONY: test-coverage
+test-coverage: check-coverage-threshold test ## Runs tests and enforces coverage threshold (from .settings.yaml quality.coverage_threshold)
+	@coverage=$$(go tool cover -func=coverage.out | grep total | awk '{print $$3}' | sed 's/%//'); \
+	echo "Coverage: $$coverage% (threshold: $(COVERAGE_THRESHOLD)%)"; \
+	if [ $$(echo "$$coverage < $(COVERAGE_THRESHOLD)" | bc) -eq 1 ]; then \
+		echo "ERROR: Coverage $$coverage% is below threshold $(COVERAGE_THRESHOLD)%"; \
+		exit 1; \
+	fi; \
+	echo "Coverage check passed"
+
+.PHONY: update-goldens
+update-goldens: ## Regenerates golden test fixtures (catalog/coverage/render parity); review with git diff before committing
+	@GOFLAGS="-mod=readonly" AICR_UPDATE_GOLDEN=1 go test -count=1 -run 'TestCatalogParityGolden|TestCoverageGoldenMatrix' ./pkg/recipe/
+	@GOFLAGS="-mod=readonly" AICR_UPDATE_GOLDEN=1 go test -count=1 -run 'TestStockRenderParityGolden' ./pkg/bundler/
+
+.PHONY: bench
+bench: ## Runs benchmarks
+	@echo "Running benchmarks..."
+	@GOFLAGS="-mod=readonly" go test -bench=. -benchmem ./...
+
+.PHONY: e2e
+e2e: ## Runs end-to-end integration tests (CLI only)
+	@set -e; \
+	echo "Running e2e integration tests..."; \
+	tools/e2e
+
+.PHONY: e2e-tilt
+e2e-tilt: ## Runs e2e tests with Tilt cluster (requires: make dev-env)
+	@set -e; \
+	echo "Running e2e tests with Tilt cluster..."; \
+	tests/e2e/run.sh
+
+.PHONY: mirror-e2e
+mirror-e2e: build ## Tests mirror list output with Hauler and Zarf against local registry
+	@set -e; \
+	echo "Running mirror list e2e tests..."; \
+	tools/mirror-e2e
+
+.PHONY: nvsentinel-object-monitor-e2e
+nvsentinel-object-monitor-e2e: ## Live Kind test: nvsentinel-object-monitor mixin emits a health event + node condition (#2612)
+	@set -e; \
+	echo "Running nvsentinel-object-monitor mixin e2e test..."; \
+	tests/e2e/nvsentinel-object-monitor/run.sh
+
+.PHONY: nvsentinel-slurm-drain-monitor-e2e
+nvsentinel-slurm-drain-monitor-e2e: ## Live Kind test: nvsentinel-slurm-drain-monitor mixin turns an [HC] Slurm drain into a STORE_ONLY health event (#2611)
+	@set -e; \
+	echo "Running nvsentinel-slurm-drain-monitor mixin e2e test..."; \
+	tests/e2e/nvsentinel-slurm-drain-monitor/run.sh
+
+.PHONY: nvsentinel-preflight-e2e
+nvsentinel-preflight-e2e: ## Live Kind test: nvsentinel-preflight mixin injects node checks into opted-in GPU pods (#2610)
+	@set -e; \
+	echo "Running nvsentinel-preflight mixin e2e test..."; \
+	tests/e2e/nvsentinel-preflight/run.sh
+
+.PHONY: nvsentinel-remediation-e2e
+nvsentinel-remediation-e2e: ## Live Kind test: nvsentinel-observe dry-run carries a GPU fault to a GPU-scoped reset without acting
+	@set -e; \
+	echo "Running nvsentinel-observe mixin dry-run e2e test..."; \
+	tests/e2e/nvsentinel-remediation/run.sh
+
+.PHONY: nvsentinel-slinky-drainer-e2e
+nvsentinel-slinky-drainer-e2e: ## Live Kind test: nvsentinel-slinky-drainer mixin drains a quarantined Slurm node through Slurm, not eviction (#2615)
+	@set -e; \
+	echo "Running nvsentinel-slinky-drainer mixin e2e test..."; \
+	tests/e2e/nvsentinel-slinky-drainer/run.sh
+
+.PHONY: nvsentinel-health-events-analyzer-e2e
+nvsentinel-health-events-analyzer-e2e: ## Live Kind test: nvsentinel-health-events-analyzer derives STORE_ONLY events named after the matching rule (#2618)
+	@set -e; \
+	echo "Running nvsentinel-health-events-analyzer mixin e2e test..."; \
+	tests/e2e/nvsentinel-health-events-analyzer/run.sh
+
+.PHONY: nvsentinel-event-exporter-e2e
+nvsentinel-event-exporter-e2e: ## Live Kind test: nvsentinel-event-exporter delivers filtered CloudEvents with an OIDC token to a mock sink (#2621)
+	@set -e; \
+	echo "Running nvsentinel-event-exporter mixin e2e test..."; \
+	tests/e2e/nvsentinel-event-exporter/run.sh
+
+.PHONY: nvsentinel-log-collector-e2e
+nvsentinel-log-collector-e2e: ## Live Kind test: nvsentinel-log-collector captures a node's diagnostics into the in-cluster file server before remediation (#2619)
+	@set -e; \
+	echo "Running nvsentinel-log-collector mixin e2e test..."; \
+	tests/e2e/nvsentinel-log-collector/run.sh
+
+.PHONY: nvsentinel-node-validation-e2e
+nvsentinel-node-validation-e2e: ## Live Kind test: nvsentinel-node-validation holds a cordoned new GPU node until a ValidationRequest passes (#3088)
+	@set -e; \
+	echo "Running nvsentinel-node-validation mixin e2e test..."; \
+	tests/e2e/nvsentinel-node-validation/run.sh
+
+.PHONY: nvsentinel-post-remediation-validation-e2e
+nvsentinel-post-remediation-validation-e2e: ## Live Kind test: a node drained for a reboot stays cordoned until its post-remediation ValidationRequest passes (#3089)
+	@set -e; \
+	echo "Running nvsentinel post-remediation validation e2e test..."; \
+	tests/e2e/nvsentinel-post-remediation-validation/run.sh
+
+.PHONY: nvsentinel-external-remediation-e2e
+nvsentinel-external-remediation-e2e: ## Live Kind test: nvsentinel-external-remediation hands a declared fault's node to an ExternalRemediationRequest and takes it back (#3091)
+	@set -e; \
+	echo "Running nvsentinel-external-remediation mixin e2e test..."; \
+	tests/e2e/nvsentinel-external-remediation/run.sh
+
+.PHONY: nvsentinel-maintenance-request-e2e
+nvsentinel-maintenance-request-e2e: ## Live Kind test: a MaintenanceRequest cordons and drains its node, and deleting it uncordons the node (#3092)
+	@set -e; \
+	echo "Running nvsentinel-maintenance-request mixin e2e test..."; \
+	tests/e2e/nvsentinel-maintenance-request/run.sh
+
+.PHONY: nvsentinel-csp-health-monitor-e2e
+nvsentinel-csp-health-monitor-e2e: ## Live Kind test: nvsentinel-csp-health-monitor-aws deploys STORE_ONLY with its IRSA annotation, a maintenance event is recorded without quarantining the node, and the gate refuses incomplete bundles and EXECUTE_REMEDIATION (#2620)
+	@set -e; \
+	echo "Running nvsentinel-csp-health-monitor mixins e2e test..."; \
+	tests/e2e/nvsentinel-csp-health-monitor/run.sh
+
+.PHONY: npd-nvsentinel-object-monitor-e2e
+npd-nvsentinel-object-monitor-e2e: ## Live Kind test: an NPD Node condition becomes an NVSentinel health event (#2614)
+	@set -e; \
+	echo "Running NPD -> nvsentinel-object-monitor e2e test..."; \
+	tests/e2e/npd-nvsentinel-object-monitor/run.sh
+
+.PHONY: scan
+scan: ## Scans for vulnerabilities with grype
+	@set -e; \
+	echo "Running vulnerability scan..."; \
+	grype dir:. --config .grype.yaml --fail-on high --quiet
+
+.PHONY: api-diff
+api-diff: ## Checks pkg/client/v1 and transparent-alias target compatibility against the latest stable release
+	@bash tools/api-diff
+
+.PHONY: bundle-layout-baseline
+bundle-layout-baseline: ## Accepts the current per-deployer bundle trees as the frozen layout
+	@printf '%s\n' "Regenerating pkg/bundler/testdata/layout/manifests/ from the fixture recipe." \
+		"A removed path is a broken promise to integrator automation -- read the diff."
+# Every manifest is rendered under $$tmp first and copied over the committed
+# files only after every deployer succeeds. Writing them in place meant a
+# failure partway left a mixed old/new baseline set, which is worse than no
+# refresh: the manifests would disagree with each other and with the bundler.
+#
+# The enumeration is deliberately not a pipeline. A shell pipeline exits with
+# the status of its LAST stage, so `find ... | sed | sort` reports success even
+# when find fails, and set -e never fires -- the target would commit a
+# truncated manifest. That fails open in the worst direction: paths missing
+# from a manifest read as additions, which this gate allows, so those paths
+# silently lose removal protection. pipefail would fix it but is not portable
+# to /bin/sh (dash lacks it), so each stage is a separate simple command that
+# set -e can catch.
+	@set -e; tmp=$$(mktemp -d); \
+	  trap 'rm -rf "$$tmp"' EXIT; \
+	  for d in helm argocd argocd-helm flux helmfile terraform fleet fleet-helmop; do \
+	    case "$$d" in \
+	      fleet-helmop) dep=fleet; extra="--fleet-mode helmop" ;; \
+	      *) dep="$$d"; extra="" ;; \
+	    esac; \
+	    GOFLAGS="-mod=readonly" go run ./cmd/aicr bundle \
+	      -r pkg/bundler/testdata/layout/recipe.yaml \
+	      --deployer "$$dep" $$extra -o "$$tmp/bundle-$$d" >/dev/null; \
+	    ( cd "$$tmp/bundle-$$d" && find . -type f > "$$tmp/raw-$$d.txt" ); \
+	    sed 's|^\./||' "$$tmp/raw-$$d.txt" > "$$tmp/rel-$$d.txt"; \
+	    LC_ALL=C sort "$$tmp/rel-$$d.txt" > "$$tmp/$$d.txt"; \
+	  done; \
+	  for d in helm argocd argocd-helm flux helmfile terraform fleet fleet-helmop; do \
+	    cp "$$tmp/$$d.txt" pkg/bundler/testdata/layout/manifests/"$$d".txt; \
+	  done
+	@echo "Bundle layout manifests updated."
+
+.PHONY: schemas
+schemas: ## Regenerates the committed artifact JSON Schemas from the Go types
+	@GOFLAGS="-mod=readonly" go run ./tools/schemagen
+	@echo "Artifact schemas regenerated. Review the diff before committing."
+
+.PHONY: schema-baseline
+schema-baseline: schemas ## Accepts the current artifact schemas as the frozen contract
+	@printf '%s\n' "Accepting the current artifact schemas as the frozen contract." \
+		"Every difference below becomes part of the v1 surface -- read the diff."
+	@rm -rf api/aicr/v1/schemas/baseline
+	@mkdir -p api/aicr/v1/schemas/baseline
+	@cp api/aicr/v1/schemas/*.schema.json api/aicr/v1/schemas/baseline/
+	@echo "Schema baseline updated."
+
+.PHONY: openapi-diff
+openapi-diff: ## Checks the REST contract in api/aicr/v1/server.yaml against its committed baseline
+	@bash tools/openapi-diff
+
+.PHONY: openapi-baseline
+openapi-baseline: ## Accepts the current REST spec as the frozen contract (regenerates the baseline)
+	@printf '%s\n' "Regenerating api/aicr/v1/server.baseline.yaml from api/aicr/v1/server.yaml." \
+		"This accepts every current difference into the frozen contract, so the" \
+		"resulting diff is the change under review -- read it before committing."
+# The header is taken from the existing baseline rather than a hardcoded line
+# count, so editing the explanatory comment cannot make regeneration lossy. The
+# spec's own license header is dropped because the baseline carries its own.
+	@awk '/^[^#]/ && NF {exit} {print}' api/aicr/v1/server.baseline.yaml \
+		> api/aicr/v1/server.baseline.yaml.tmp
+	@awk 'p {print} /^openapi:/ && !p {p=1; print} END {exit !p}' api/aicr/v1/server.yaml \
+		>> api/aicr/v1/server.baseline.yaml.tmp \
+		|| { rm -f api/aicr/v1/server.baseline.yaml.tmp; \
+		     echo "ERROR: no 'openapi:' key in api/aicr/v1/server.yaml; refusing to write a header-only baseline" >&2; \
+		     exit 1; }
+# The openapi: guard above proves a marker exists, not that the result is a
+# document oasdiff can read. Validate with the actual consumer -- a self-diff
+# loads and parses the file -- so a spec that is malformed below that line
+# cannot replace the committed baseline.
+	@oasdiff breaking api/aicr/v1/server.baseline.yaml.tmp \
+		api/aicr/v1/server.baseline.yaml.tmp >/dev/null 2>&1 \
+		|| { rm -f api/aicr/v1/server.baseline.yaml.tmp; \
+		     echo "ERROR: generated baseline is not a document oasdiff can load; refusing to replace the committed baseline" >&2; \
+		     exit 1; }
+	@mv api/aicr/v1/server.baseline.yaml.tmp api/aicr/v1/server.baseline.yaml
+	@echo "Baseline updated."
+
+.PHONY: qualify
+qualify: test-coverage lint tuning-check coverage-check e2e scan license-check api-diff openapi-diff ## Qualifies the codebase (test-coverage, lint, tuning-check, coverage-check, e2e, scan, SDK and REST API compatibility)
+	@echo "Codebase qualification completed"
+
+.PHONY: bom
+bom: ## Generates container image BOM (CycloneDX 1.6 + Markdown) at $(BOM_OUT_DIR)
+	@set -e; \
+	BOM_OUT_DIR="$${BOM_OUT_DIR:-dist/bom}"; \
+	AICR_VERSION="$${AICR_VERSION:-$$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"; \
+	mkdir -p "$${BOM_OUT_DIR}"; \
+	echo "Generating BOM into $${BOM_OUT_DIR}..."; \
+	GOFLAGS="-mod=readonly" go run ./tools/bom \
+	  -repo-root "$(CURDIR)" \
+	  -out-dir "$(CURDIR)/$${BOM_OUT_DIR}" \
+	  -aicr-version "$${AICR_VERSION}" \
+	  $${BOM_SKIP_HELM:+-skip-helm} \
+	  $${BOM_STRICT:+-strict}
+
+# Path of the committed BOM doc artifact. Regenerated by `make bom-docs`,
+# checked-fresh by `make bom-check`, and refreshed weekly by the
+# bom-refresh GitHub Action.
+BOM_DOC_PATH := docs/user/container-images.md
+
+.PHONY: bom-docs
+bom-docs: ## Regenerates the auto-generated section of $(BOM_DOC_PATH) from the live registry
+	@set -e; \
+	if [ ! -f $(BOM_DOC_PATH) ]; then \
+	   echo "ERROR: $(BOM_DOC_PATH) does not exist; cannot splice." >&2; exit 1; \
+	fi; \
+	if ! grep -q '<!-- BEGIN AICR-BOM -->' $(BOM_DOC_PATH) || \
+	   ! grep -q '<!-- END AICR-BOM -->' $(BOM_DOC_PATH); then \
+	   echo "ERROR: $(BOM_DOC_PATH) is missing AICR-BOM markers." >&2; exit 1; \
+	fi; \
+	if ! command -v yq >/dev/null 2>&1 || ! command -v helm >/dev/null 2>&1; then \
+	   echo "ERROR: yq and helm are required. Run 'make tools-setup'." >&2; exit 1; \
+	fi; \
+	WANT_HELM="$$(yq -r '.testing_tools.helm' .settings.yaml)"; \
+	HAVE_HELM="$$(helm version --template '{{.Version}}')"; \
+	if [ "$$HAVE_HELM" != "$$WANT_HELM" ]; then \
+	   echo "ERROR: helm $$WANT_HELM required (found '$$HAVE_HELM'). Rendered images differ across helm versions. Run 'make tools-setup'." >&2; exit 1; \
+	fi; \
+	TMP="$$(mktemp -d)"; \
+	trap 'rm -rf "$$TMP"' EXIT; \
+	echo "Regenerating auto-generated section of $(BOM_DOC_PATH) (helm rendering, ~30s)..."; \
+	GOFLAGS="-mod=readonly" go run ./tools/bom \
+	  -repo-root "$(CURDIR)" \
+	  -out-dir "$$TMP" \
+	  -aicr-version "main" \
+	  -deterministic \
+	  -no-title \
+	  -strict; \
+	awk -v body="$$TMP/bom.md" ' \
+	  /<!-- BEGIN AICR-BOM -->/ { print; while ((getline line < body) > 0) print line; close(body); skip = 1; next } \
+	  /<!-- END AICR-BOM -->/   { skip = 0 } \
+	  !skip                     { print } \
+	' $(BOM_DOC_PATH) > "$$TMP/merged.md"; \
+	mv "$$TMP/merged.md" $(BOM_DOC_PATH); \
+	FRESH="TestCommittedBOMVersionsMatchRegistry TestCommittedBOMVariantsMatchRecipePins"; \
+	OUT="$$(GOFLAGS="-mod=readonly" go test -count=1 -v ./tools/bom -run "^($$(echo $$FRESH | tr ' ' '|'))$$" 2>&1)" || { echo "$$OUT" >&2; exit 1; }; \
+	for t in $$FRESH; do \
+	   echo "$$OUT" | grep -q -- "--- PASS: $$t " || { echo "$$OUT" >&2; echo "ERROR: $$t did not run (renamed or removed?)." >&2; exit 1; }; \
+	done; \
+	echo "Updated $(BOM_DOC_PATH) (prose preserved, auto-generated section refreshed)"
+
+.PHONY: bom-check
+bom-check: ## Verifies $(BOM_DOC_PATH) is up to date with the live registry (opt-in; not wired into qualify/lint/merge gate)
+	@set -e; \
+	$(MAKE) bom-docs; \
+	if ! git diff --quiet -- $(BOM_DOC_PATH); then \
+	   echo "ERROR: $(BOM_DOC_PATH) is stale. Run 'make bom-docs' and commit the change." >&2; \
+	   git --no-pager diff --stat -- $(BOM_DOC_PATH) >&2; \
+	   exit 1; \
+	fi; \
+	echo "$(BOM_DOC_PATH) is up to date"
+
+# Path of the committed CUJ/CLI coverage matrix. Fully regenerated by
+# `make coverage-docs`, checked-fresh by `make coverage-check`, and refreshed
+# weekly by the coverage-matrix-refresh GitHub Action.
+#
+# The generator reads only in-repo signals (no network, no cluster), so the
+# freshness check is cheap enough to gate directly — unlike `bom-check`, which
+# re-renders every Helm chart. It runs in `make qualify` and, on PRs touching its
+# inputs, in the merge gate's coverage-freshness job. An enrolled cloud whose
+# uat-<cloud>.yaml has no enabled runner step fails the generator (and therefore
+# qualify); opt that cloud out with `nightly-intents: []` in
+# infra/uat/reservations.yaml.
+COVERAGE_DOC_PATH := docs/user/coverage-matrix.md
+
+.PHONY: coverage-docs
+coverage-docs: ## Regenerates $(COVERAGE_DOC_PATH) from the CLI registry and in-repo test signals
+	@set -e; \
+	echo "Regenerating $(COVERAGE_DOC_PATH) from the CLI registry and test signals..."; \
+	GOFLAGS="-mod=readonly" go run ./tools/coverage \
+	  -repo-root "$(CURDIR)" \
+	  -out "$(CURDIR)/$(COVERAGE_DOC_PATH)" \
+	  -deterministic; \
+	echo "Updated $(COVERAGE_DOC_PATH)"
+
+.PHONY: coverage-check
+coverage-check: ## Verifies $(COVERAGE_DOC_PATH) is up to date (run by qualify and the merge gate)
+	@set -e; \
+	$(MAKE) coverage-docs; \
+	if ! git diff --quiet -- $(COVERAGE_DOC_PATH); then \
+	   echo "ERROR: $(COVERAGE_DOC_PATH) is stale. Run 'make coverage-docs' and commit the change." >&2; \
+	   git --no-pager diff --stat -- $(COVERAGE_DOC_PATH) >&2; \
+	   exit 1; \
+	fi; \
+	echo "$(COVERAGE_DOC_PATH) is up to date"
+
+VERSION_MATRIX_DOC_PATH := docs/user/component-version-matrix.md
+
+.PHONY: version-matrix-docs
+version-matrix-docs: ## Regenerates the component version matrix in $(VERSION_MATRIX_DOC_PATH) from git history
+	@set -e; \
+	if ! grep -q '<!-- BEGIN AICR-VERSION-MATRIX -->' $(VERSION_MATRIX_DOC_PATH) || \
+	   ! grep -q '<!-- END AICR-VERSION-MATRIX -->' $(VERSION_MATRIX_DOC_PATH); then \
+	   echo "ERROR: $(VERSION_MATRIX_DOC_PATH) is missing AICR-VERSION-MATRIX markers." >&2; exit 1; \
+	fi; \
+	TMP="$$(mktemp -d)"; \
+	trap 'rm -rf "$$TMP"' EXIT; \
+	{ ./tools/upgrade-matrix --releases 8; echo; echo "## Transitions"; echo; \
+	  ./tools/upgrade-matrix --releases 8 --transitions; } > "$$TMP/matrix.md"; \
+	awk -v body="$$TMP/matrix.md" ' \
+	  /<!-- BEGIN AICR-VERSION-MATRIX -->/ { print; while ((getline line < body) > 0) print line; close(body); skip = 1; next } \
+	  /<!-- END AICR-VERSION-MATRIX -->/   { skip = 0 } \
+	  !skip                                { print } \
+	' $(VERSION_MATRIX_DOC_PATH) > "$$TMP/merged.md"; \
+	mv "$$TMP/merged.md" $(VERSION_MATRIX_DOC_PATH); \
+	echo "Updated $(VERSION_MATRIX_DOC_PATH)"
+
+.PHONY: bom-pinning-check
+bom-pinning-check: ## Verifies every Helm component in the registry has a pinned chart version (per ADR-006)
+	@set -e; \
+	echo "Verifying chart-version pins (ADR-006)..."; \
+	TMP="$$(mktemp -d)"; \
+	trap 'rm -rf "$$TMP"' EXIT; \
+	GOFLAGS="-mod=readonly" go run ./tools/bom \
+	  -repo-root "$(CURDIR)" \
+	  -out-dir "$$TMP" \
+	  -aicr-version "qualify" \
+	  -strict \
+	  -skip-helm
+
+.PHONY: nvcre-closure
+nvcre-closure: ## Regenerates the NVCRE workload runtime closure from the registry's pinned chart version
+	@GOFLAGS="-mod=readonly" go run ./tools/nvcre-closure
+
+.PHONY: nvcre-closure-check
+nvcre-closure-check: ## Verifies the committed NVCRE workload closure matches the pinned chart version
+	@GOFLAGS="-mod=readonly" go run ./tools/nvcre-closure -check
+
+.PHONY: crd-inventory
+crd-inventory: ## Regenerates recipes/components/*/crds.yaml, the CRDs each pinned chart installs (needs helm and network)
+	@GOFLAGS="-mod=readonly" go run ./tools/crd-inventory -repo-root "$(CURDIR)"
+
+.PHONY: crd-inventory-check
+crd-inventory-check: ## Verifies every committed CRD inventory matches a fresh render of its pinned chart (needs helm and network)
+	@GOFLAGS="-mod=readonly" go run ./tools/crd-inventory -repo-root "$(CURDIR)" -check
+
+.PHONY: registry-inventory
+registry-inventory: ## Extracts the build/CI registry & package egress inventory (YAML + Markdown) from structured sources
+	@GOFLAGS="-mod=readonly" go run ./tools/registry-inventory \
+	  -repo-root "$(CURDIR)" \
+	  -out-dir "$${REGISTRY_OUT_DIR:-dist/registry-inventory}"
+
+.PHONY: registry-check
+registry-check: ## Fails if a build/CI source reaches a registry host absent from tools/registry-inventory/registry-allowlist.yaml
+	@GOFLAGS="-mod=readonly" go run ./tools/registry-inventory -repo-root "$(CURDIR)" -check
+
+.PHONY: drift-report
+drift-report: ## Normalizes a Renovate dry-run report into the component drift report + Slack payload
+	@GOFLAGS="-mod=readonly" go run ./tools/drift-report \
+	  -repo-root "$(CURDIR)" \
+	  -renovate-report "$${RENOVATE_REPORT:-drift-report-raw.json}" \
+	  -out "$${DRIFT_OUT:-dist/drift-report.json}" \
+	  -slack-out "$${SLACK_OUT:-dist/slack-payload.json}"
+
+# Committed host-level egress doc. Regenerated by `make registry-docs`, checked
+# fresh by TestCommittedRegistryEgressDocFresh under `make test`.
+REGISTRY_DOC_PATH := docs/contributor/registry-egress.md
+
+.PHONY: registry-docs
+registry-docs: ## Regenerates $(REGISTRY_DOC_PATH) from the live build/CI sources
+	@GOFLAGS="-mod=readonly" go run ./tools/registry-inventory \
+	  -repo-root "$(CURDIR)" -doc-out "$(REGISTRY_DOC_PATH)"
+
+# Path of the committed recipe-health matrix doc. Regenerated by
+# `make recipe-health-docs`, checked-fresh by `make recipe-health-check`.
+# Named recipe-health-* (not health-*) to avoid the existing check-health /
+# check-health-all / component-health cluster-chainsaw family.
+HEALTH_DOC_PATH := docs/user/recipe-health.md
+
+# Destination for the per-dimension structural detail emitted by
+# `make recipe-health-summary`. Defaults to stdout for local inspection; the
+# weekly health-refresh workflow overrides it to $GITHUB_STEP_SUMMARY.
+SUMMARY_OUT ?= /dev/stdout
+
+.PHONY: recipe-health-docs
+recipe-health-docs: ## Regenerates the auto-generated section of $(HEALTH_DOC_PATH) from the recipe catalog
+	@set -e; \
+	if [ ! -f $(HEALTH_DOC_PATH) ]; then \
+	   echo "ERROR: $(HEALTH_DOC_PATH) does not exist; cannot splice." >&2; exit 1; \
+	fi; \
+	if ! grep -qF '{/* BEGIN AICR-HEALTH */}' $(HEALTH_DOC_PATH) || \
+	   ! grep -qF '{/* END AICR-HEALTH */}' $(HEALTH_DOC_PATH); then \
+	   echo "ERROR: $(HEALTH_DOC_PATH) is missing AICR-HEALTH markers." >&2; exit 1; \
+	fi; \
+	TMP="$$(mktemp -d)"; \
+	trap 'rm -rf "$$TMP"' EXIT; \
+	echo "Regenerating auto-generated section of $(HEALTH_DOC_PATH)..."; \
+	GOFLAGS="-mod=readonly" go run ./tools/health \
+	  -out-dir "$$TMP" \
+	  -aicr-version "main" \
+	  -deterministic \
+	  -no-title; \
+	awk -v body="$$TMP/recipe-health.md" ' \
+	  index($$0, "{/* BEGIN AICR-HEALTH */}") { print; while ((getline line < body) > 0) print line; close(body); skip = 1; next } \
+	  index($$0, "{/* END AICR-HEALTH */}")   { skip = 0 } \
+	  !skip                                    { print } \
+	' $(HEALTH_DOC_PATH) > "$$TMP/merged.md"; \
+	mv "$$TMP/merged.md" $(HEALTH_DOC_PATH); \
+	echo "Updated $(HEALTH_DOC_PATH) (prose preserved, auto-generated section refreshed)"
+
+.PHONY: recipe-health-summary
+recipe-health-summary: ## Renders the per-dimension structural detail to $(SUMMARY_OUT) (default stdout); the weekly health-refresh workflow points it at $$GITHUB_STEP_SUMMARY
+	@set -e; \
+	TMP="$$(mktemp -d)"; \
+	trap 'rm -rf "$$TMP"' EXIT; \
+	GOFLAGS="-mod=readonly" go run ./tools/health \
+	  -out-dir "$$TMP" \
+	  -summary-out "$(SUMMARY_OUT)" \
+	  -aicr-version "main" \
+	  -deterministic \
+	  -no-title
+
+.PHONY: recipe-health-check
+recipe-health-check: ## Verifies $(HEALTH_DOC_PATH) is up to date with the recipe catalog (advisory; not wired into qualify/lint/merge gate)
+	@set -e; \
+	$(MAKE) recipe-health-docs; \
+	if ! git diff --quiet -- $(HEALTH_DOC_PATH); then \
+	   echo "ERROR: $(HEALTH_DOC_PATH) is stale. Run 'make recipe-health-docs' and commit the change." >&2; \
+	   git --no-pager diff --stat -- $(HEALTH_DOC_PATH) >&2; \
+	   exit 1; \
+	fi; \
+	echo "$(HEALTH_DOC_PATH) is up to date"
+
+# Path of the committed nodewright tuning-status doc. Regenerated by
+# `make tuning-docs`, checked-fresh by `make tuning-check`.
+TUNING_DOC_PATH := docs/integrator/components/nodewright.md
+
+.PHONY: tuning-docs
+tuning-docs: ## Regenerates the auto-generated tuning-status table in $(TUNING_DOC_PATH) from the recipe catalog
+	@set -e; \
+	if [ ! -f $(TUNING_DOC_PATH) ]; then \
+	   echo "ERROR: $(TUNING_DOC_PATH) does not exist; cannot splice." >&2; exit 1; \
+	fi; \
+	if ! grep -qF '{/* BEGIN AICR-TUNING */}' $(TUNING_DOC_PATH) || \
+	   ! grep -qF '{/* END AICR-TUNING */}' $(TUNING_DOC_PATH); then \
+	   echo "ERROR: $(TUNING_DOC_PATH) is missing AICR-TUNING markers." >&2; exit 1; \
+	fi; \
+	TMP="$$(mktemp -d)"; \
+	trap 'rm -rf "$$TMP"' EXIT; \
+	echo "Regenerating tuning-status table in $(TUNING_DOC_PATH)..."; \
+	GOFLAGS="-mod=readonly" go run ./tools/tuning \
+	  -out-dir "$$TMP" \
+	  -aicr-version "main" \
+	  -deterministic \
+	  -no-title; \
+	awk -v body="$$TMP/tuning-status.md" ' \
+	  index($$0, "{/* BEGIN AICR-TUNING */}") { print; while ((getline line < body) > 0) print line; close(body); skip = 1; next } \
+	  index($$0, "{/* END AICR-TUNING */}")   { skip = 0 } \
+	  !skip                                    { print } \
+	' $(TUNING_DOC_PATH) > "$$TMP/merged.md"; \
+	mv "$$TMP/merged.md" $(TUNING_DOC_PATH); \
+	echo "Updated $(TUNING_DOC_PATH) (prose preserved, tuning-status table refreshed)"
+
+.PHONY: tuning-check
+tuning-check: ## Verifies $(TUNING_DOC_PATH) tuning-status table is up to date (run by make qualify and the merge-gate on tuning-relevant PRs)
+	@set -e; \
+	$(MAKE) tuning-docs; \
+	if ! git diff --quiet -- $(TUNING_DOC_PATH); then \
+	   echo "ERROR: $(TUNING_DOC_PATH) is stale. Run 'make tuning-docs' and commit the change." >&2; \
+	   git --no-pager diff --stat -- $(TUNING_DOC_PATH) >&2; \
+	   exit 1; \
+	fi; \
+	echo "$(TUNING_DOC_PATH) is up to date"
+
+.PHONY: server
+server: ## Starts a local development server with debug logging
+	@set -e; \
+	echo "Starting local development server..."; \
+	GOFLAGS="-mod=readonly" AICR_LOG_LEVEL=debug go run cmd/aicrd/main.go
+
+.PHONY: docs
+docs: ## Serves Go documentation on http://localhost:6060
+	@set -e; \
+	echo "Starting Go documentation server on http://localhost:6060"; \
+	command -v pkgsite >/dev/null 2>&1 && pkgsite -http=:6060 || \
+	(command -v godoc >/dev/null 2>&1 && godoc -http=:6060 || \
+	(echo "Installing pkgsite..." && go install golang.org/x/pkgsite/cmd/pkgsite@latest && pkgsite -http=:6060))
+
+.PHONY: testgrid-publish
+testgrid-publish: ## Build testgrid-publish binary to ./dist/testgrid-publish
+	@mkdir -p ./dist
+	GOFLAGS="-mod=readonly" go build -o ./dist/testgrid-publish ./tools/testgrid-publish
+
+.PHONY: testgrid-publish-dryrun
+testgrid-publish-dryrun: testgrid-publish ## Dry-run testgrid-publish against BUNDLE_DIR (usage: make testgrid-publish-dryrun BUNDLE_DIR=<path>)
+	@[ -n "$(BUNDLE_DIR)" ] || (echo "usage: make testgrid-publish-dryrun BUNDLE_DIR=<path>"; exit 1)
+	./dist/testgrid-publish --bundle-dir "$(BUNDLE_DIR)" --bucket aicr-testgrid-staging --source-class uat --dry-run
+
+.PHONY: build
+build: ## Builds binaries for the current OS and architecture
+	@set -e; \
+	goreleaser build --clean --single-target --snapshot --timeout 10m0s || exit 1; \
+	echo "Build completed, binaries are in ./dist"
+
+.PHONY: image
+image: ## Builds and pushes container image (IMAGE_REGISTRY, IMAGE_TAG)
+	@set -e; \
+	echo "Building and pushing image to $(IMAGE_REGISTRY)/aicr:$(IMAGE_TAG)"; \
+	KO_DOCKER_REPO=$(IMAGE_REGISTRY) ko build --bare --sbom=none --tags=$(IMAGE_TAG) ./cmd/aicr
+
+.PHONY: validator-binaries
+validator-binaries: ## Builds Linux validator binaries (VALIDATOR_PHASES, VALIDATOR_ARCHES)
+	@VALIDATOR_PHASES="$(VALIDATOR_PHASES)" VALIDATOR_ARCHES="$(VALIDATOR_ARCHES)" \
+		./tools/build-validator-binaries
+
+.PHONY: image-validators
+image-validators: build ## Builds per-phase validator images (IMAGE_REGISTRY, IMAGE_TAG, VALIDATOR_ARCHES)
+	@set -e; \
+	arch="$(VALIDATOR_ARCHES)"; \
+	if [ -z "$${arch}" ]; then arch="$$(go env GOARCH)"; fi; \
+	arch="$$(echo "$${arch}" | tr ',' ' ')"; \
+	if [ "$$(echo $${arch} | wc -w)" -gt 1 ]; then \
+		echo "VALIDATOR_ARCHES=\"$${arch}\" names more than one architecture;" >&2; \
+		echo "each image is tagged per phase without an architecture suffix, so" >&2; \
+		echo "a second arch would overwrite the first. Build one at a time, or" >&2; \
+		echo "use validator-binaries, which does accept a list." >&2; \
+		exit 1; \
+	fi; \
+	echo "Building validator images for linux/$${arch}"; \
+	VALIDATOR_ARCHES="$${arch}" ./tools/build-validator-binaries; \
+	for phase in deployment performance conformance; do \
+		echo "Building validator image: $(IMAGE_REGISTRY)/aicr-validators/$${phase}:$(IMAGE_TAG)"; \
+		docker build -f validators/$${phase}/Dockerfile \
+			--platform linux/$${arch} \
+			--build-arg TARGETARCH=$${arch} \
+			-t $(IMAGE_REGISTRY)/aicr-validators/$${phase}:$(IMAGE_TAG) .; \
+		if [ -n "$(IMAGE_REGISTRY)" ] && [ "$(IMAGE_REGISTRY)" != "localhost:5005" ]; then \
+			echo "Pushing: $(IMAGE_REGISTRY)/aicr-validators/$${phase}:$(IMAGE_TAG)"; \
+			docker push $(IMAGE_REGISTRY)/aicr-validators/$${phase}:$(IMAGE_TAG); \
+		fi; \
+	done; \
+	echo "Building validator image: $(IMAGE_REGISTRY)/aicr-validators/aiperf-bench:$(IMAGE_TAG)"; \
+	docker build -f validators/performance/aiperf-bench.Dockerfile \
+		--platform linux/$${arch} \
+		-t $(IMAGE_REGISTRY)/aicr-validators/aiperf-bench:$(IMAGE_TAG) .; \
+	if [ -n "$(IMAGE_REGISTRY)" ] && [ "$(IMAGE_REGISTRY)" != "localhost:5005" ]; then \
+		echo "Pushing: $(IMAGE_REGISTRY)/aicr-validators/aiperf-bench:$(IMAGE_TAG)"; \
+		docker push $(IMAGE_REGISTRY)/aicr-validators/aiperf-bench:$(IMAGE_TAG); \
+	fi
+
+.PHONY: check-health
+check-health: ## Runs chainsaw health check directly against Kind cluster (COMPONENT=<name>)
+	@set -e; \
+	if [ -z "$(COMPONENT)" ]; then \
+		echo "Usage: make check-health COMPONENT=<name>"; \
+		echo "Available components:"; \
+		ls -1 recipes/checks/; \
+		exit 1; \
+	fi; \
+	CHECK_FILE="recipes/checks/$(COMPONENT)/health-check.yaml"; \
+	if [ ! -f "$$CHECK_FILE" ]; then \
+		echo "Error: $$CHECK_FILE not found"; \
+		echo "Available components:"; \
+		ls -1 recipes/checks/; \
+		exit 1; \
+	fi; \
+	echo "Running health check for $(COMPONENT)..."; \
+	chainsaw test --test-dir "recipes/checks/$(COMPONENT)/" --test-file health-check.yaml --no-color
+
+.PHONY: check-health-all
+# Iterates registry.yaml's healthCheck.assertFile entries, not a raw glob of
+# recipes/checks/*/: this is the set every shipped recipe actually exercises,
+# so opt-in-only checks (e.g. nvsentinel-observability) are excluded by
+# construction -- run those directly via `make check-health COMPONENT=<name>`.
+# --test-dir/--test-file are derived from each declared path rather than
+# reconstructed from a component name, so a non-conventional assertFile
+# (e.g. checks/shared/foo.yaml) is honored as declared.
+#
+# yq's exit status is captured separately from the pipeline that follows:
+# without `set -o pipefail`, a failing yq piped straight into the loop would
+# silently yield zero components and a false "All health checks passed".
+# The empty-list check below is a second guard against the same outcome.
+check-health-all: ## Runs chainsaw health checks for every registry-linked component against Kind cluster
+	@set -e; \
+	FAILED=""; \
+	ASSERT_FILES=$$(yq -r '.components[].healthCheck.assertFile' recipes/registry.yaml) || { echo "Error: yq failed to read recipes/registry.yaml"; exit 1; }; \
+	PATHS=$$(printf '%s\n' "$$ASSERT_FILES" | grep -v '^null$$' | sort -u); \
+	if [ -z "$$PATHS" ]; then \
+		echo "Error: no registry-linked health checks found in recipes/registry.yaml -- refusing to report success on zero checks"; \
+		exit 1; \
+	fi; \
+	for ASSERT in $$PATHS; do \
+		dir="recipes/$$(dirname "$$ASSERT")/"; \
+		file="$$(basename "$$ASSERT")"; \
+		echo "=== $$ASSERT ==="; \
+		if chainsaw test --test-dir "$$dir" --test-file "$$file" --no-color; then \
+			echo "PASS: $$ASSERT"; \
+		else \
+			echo "FAIL: $$ASSERT"; \
+			FAILED="$$FAILED $$ASSERT"; \
+		fi; \
+		echo ""; \
+	done; \
+	if [ -n "$$FAILED" ]; then \
+		echo "Failed checks:$$FAILED"; \
+		exit 1; \
+	fi; \
+	echo "All registry-linked health checks passed"
+
+.PHONY: validate-local
+validate-local: image-validators ## Builds validator images and runs validation in Kind (RECIPE=<path>)
+	@set -e; \
+	if [ -z "$(RECIPE)" ]; then \
+		echo "Usage: make validate-local RECIPE=<path-to-recipe.yaml>"; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$(RECIPE)" ]; then \
+		echo "Error: recipe file $(RECIPE) not found"; \
+		exit 1; \
+	fi; \
+	echo "Loading validator images into Kind cluster..."; \
+	for phase in deployment performance conformance aiperf-bench; do \
+		kind load docker-image $(IMAGE_REGISTRY)/aicr-validators/$${phase}:$(IMAGE_TAG) --name kind-aicr; \
+	done; \
+	echo "Running validation with local images..."; \
+	AICR_BIN=$$(find dist/ -name "aicr" -type f | head -1); \
+	if [ -z "$$AICR_BIN" ]; then \
+		echo "Error: aicr binary not found in dist/. Run 'make build' first."; \
+		exit 1; \
+	fi; \
+	AICR_VALIDATOR_IMAGE_REGISTRY=$(IMAGE_REGISTRY) $$AICR_BIN validate \
+		--recipe "$(RECIPE)" \
+		--phase deployment
+
+.PHONY: validate-performance
+validate-performance: ## Recipe performance phase on the current kubecontext (RECIPE= [SNAPSHOT=] [NODE_SELECTOR=])
+	@set -e; \
+	if [ -z "$(RECIPE)" ]; then \
+		echo "Usage: make validate-performance RECIPE=<path-to-recipe.yaml> [SNAPSHOT=<path>] [NODE_SELECTOR=nvidia.com/gpu.present=true]"; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$(RECIPE)" ]; then \
+		echo "Error: recipe file $(RECIPE) not found"; \
+		exit 1; \
+	fi; \
+	AICR_BIN=$$(command -v aicr 2>/dev/null || true); \
+	if [ -z "$$AICR_BIN" ]; then \
+		HOST_GOOS=$$(go env GOOS); HOST_GOARCH=$$(go env GOARCH); \
+		DIST_DIR=$$(find dist -maxdepth 1 -type d -name "aicr_$${HOST_GOOS}_$${HOST_GOARCH}*" 2>/dev/null | head -1); \
+		if [ -n "$$DIST_DIR" ] && [ -x "$$DIST_DIR/aicr" ]; then \
+			AICR_BIN="$$DIST_DIR/aicr"; \
+		fi; \
+	fi; \
+	if [ -z "$$AICR_BIN" ]; then \
+		echo "Error: aicr binary not found. Run 'make build' or put aicr on PATH."; \
+		exit 1; \
+	fi; \
+	set -- validate --recipe "$(RECIPE)" --phase performance --fail-on-error; \
+	if [ -n "$(SNAPSHOT)" ]; then \
+		if [ ! -f "$(SNAPSHOT)" ]; then \
+			echo "Error: snapshot file $(SNAPSHOT) not found"; \
+			exit 1; \
+		fi; \
+		set -- "$$@" --snapshot "$(SNAPSHOT)"; \
+	fi; \
+	if [ -n "$(NODE_SELECTOR)" ]; then \
+		set -- "$$@" --node-selector "$(NODE_SELECTOR)"; \
+	fi; \
+	echo "Running performance phase with $$AICR_BIN"; \
+	"$$AICR_BIN" "$$@"
+
+.PHONY: python-licenses
+python-licenses: ## Refreshes the committed Python license section for the aiperf-bench image (needs network)
+	@python3 tools/generate-python-licenses
+
+.PHONY: notices
+notices: ## Generates THIRD_PARTY_NOTICES.md aggregating every dependency's license
+	@bash tools/generate-notices
+
+# `notices` is a prerequisite so the THIRD_PARTY_NOTICES.md that goreleaser
+# attaches is generated from the tag being released, not inherited from whatever
+# happened to be committed. OSRB requires the notices published with a release to
+# match that release; nothing requires the source tree to be current between
+# releases, so this is the only place the guarantee has to hold.
+#
+# .goreleaser.yaml's release.extra_files globs the file from the repo root, and
+# --clean only wipes dist/, so it survives the run.
+#
+# The file is gitignored, so regenerating it leaves the tree clean and
+# goreleaser's dirty-state validation is unaffected. That is why it must stay
+# untracked: were it tracked, a regeneration that differed from the committed
+# copy would abort the release with "git is currently in a dirty state", which
+# names neither the file nor the cause.
+.PHONY: release
+release: notices ## Runs the full release process with goreleaser (regenerates THIRD_PARTY_NOTICES.md first)
+	@set -e; \
+	goreleaser release --clean --config .goreleaser.yaml --fail-fast --timeout 60m0s
+
+.PHONY: bump-major
+bump-major: ## Tags major version bump (1.2.3 → 2.0.0)
+	tools/bump major
+
+.PHONY: bump-minor
+bump-minor: ## Tags minor version bump (1.2.3 → 1.3.0)
+	tools/bump minor
+
+.PHONY: bump-patch
+bump-patch: ## Tags patch version bump (1.2.3 → 1.2.4)
+	tools/bump patch
+
+.PHONY: bump-rc
+bump-rc: ## Tags RC pre-release (v1.2.3 → v1.3.0-rc1 → v1.3.0-rc2)
+	tools/bump rc
+
+.PHONY: bump-promote
+bump-promote: ## Promotes a pre-release to stable on the same SHA. Use TAG=v1.2.3-rc1
+	tools/bump promote $(TAG)
+
+.PHONY: changelog
+changelog: ## Shows changes since the last release
+	@tools/changelog
+
+.PHONY: clean
+clean: ## Cleans build artifacts (dist, coverage files, third-party notices)
+	@rm -rf ./dist ./bin ./coverage.out ./coverage.full.out ./THIRD_PARTY_NOTICES.md ./.licenses-cache
+	@go clean ./...
+	@echo "Cleaned build artifacts"
+
+.PHONY: clean-all
+clean-all: clean ## Deep cleans including Go module cache
+	@echo "Cleaning module cache..."
+	@go clean -modcache
+	@echo "Deep clean completed"
+
+.PHONY: cleanup
+cleanup: ## Cleans up AICR Kubernetes resources (requires a kubeconfig and helm)
+	GOFLAGS="-mod=readonly" go run ./tools/cleanup
+
+# =============================================================================
+# AICR Operator (ADR-027)
+# =============================================================================
+
+# The operator's pins live under `operator:` in .settings.yaml. Its unit and
+# envtest suites run in `make test`; these targets cover what `make test`
+# cannot: the Kubernetes floor, generated code, and the kind suites, which use
+# only the kind cluster's own kubeconfig, never ~/.kube/config.
+OPERATOR_ENVTEST_K8S_FLOOR ?= $(shell yq -r '.operator.envtest_kubernetes_floor' .settings.yaml 2>/dev/null)
+OPERATOR_E2E_KUBECONFIG    ?= $(CURDIR)/.operator-e2e/kubeconfig
+AICR_E2E_IMAGE             ?= $(shell yq -r '.operator.aicr_image' .settings.yaml 2>/dev/null)
+AICR_E2E_VERSION           ?= $(shell yq -r '.operator.aicr_version' .settings.yaml 2>/dev/null)
+AICR_E2E_VALIDATOR_IMAGES  ?= $(shell yq -r '.operator.aicr_validator_images | [.[]] | join(",")' .settings.yaml 2>/dev/null)
+# A development build. Only operator-candidate stamps release versions, and
+# only the aicr_operator_development tag lets the operator accept development
+# settings. OPERATOR_TAGS= builds without it.
+OPERATOR_VERSION           ?= v0.0.0-dev
+OPERATOR_TAGS              ?= aicr_operator_development
+OPERATOR_LDFLAGS           := -s -w \
+	-X github.com/NVIDIA/aicr/pkg/operator/version.Version=$(OPERATOR_VERSION) \
+	-X github.com/NVIDIA/aicr/pkg/operator/version.Commit=$(COMMIT)
+
+.PHONY: operator-build
+operator-build: ## Builds the operator (development opt-in) and the kubectl-aicr plugin into dist/
+	@GOFLAGS="-mod=readonly" CGO_ENABLED=0 go build -trimpath -tags "$(OPERATOR_TAGS)" -ldflags "$(OPERATOR_LDFLAGS)" -o dist/aicr-operator ./cmd/aicr-operator
+	@GOFLAGS="-mod=readonly" CGO_ENABLED=0 go build -trimpath -ldflags "$(OPERATOR_LDFLAGS)" -o dist/kubectl-aicr ./cmd/kubectl-aicr
+	@echo "Built dist/aicr-operator and dist/kubectl-aicr ($(OPERATOR_VERSION))"
+
+.PHONY: operator-check-generated
+operator-check-generated: generate ## Fails if the operator's generated deep copies or CRDs are stale
+	@git diff --exit-code -- api/operator charts/aicr-operator/files/crds >/dev/null || \
+		(echo "Generated code is stale. Run 'make generate' and commit the result." && git diff --stat -- api/operator charts/aicr-operator/files/crds && exit 1)
+	@test -z "$$(git status --porcelain --untracked-files=all -- ':(glob)api/operator/**/zz_generated.*' charts/aicr-operator/files/crds)" || \
+		(echo "Untracked generated files:" && git status --porcelain --untracked-files=all -- ':(glob)api/operator/**/zz_generated.*' charts/aicr-operator/files/crds && exit 1)
+	@echo "Generated code is current"
+
+# CRD rules and admission policies are evaluated by the API server, so they
+# run again on the oldest supported Kubernetes.
+.PHONY: operator-envtest-floor
+operator-envtest-floor: ## Runs the operator's CRD validation and chart suites on the Kubernetes floor
+	@set -e; \
+	test -n "$(OPERATOR_ENVTEST_K8S_FLOOR)" || { echo "no operator.envtest_kubernetes_floor in .settings.yaml (is yq installed?)"; exit 1; }; \
+	echo "Running CRD validation and chart tests on Kubernetes $(OPERATOR_ENVTEST_K8S_FLOOR)..."; \
+	assets=$$(setup-envtest use $(OPERATOR_ENVTEST_K8S_FLOOR) -p path); \
+	test -n "$$assets" || { echo "setup-envtest returned no assets for $(OPERATOR_ENVTEST_K8S_FLOOR)"; exit 1; }; \
+	KUBECONFIG=$(CURDIR)/.no-kubeconfig KUBERNETES_SERVICE_HOST= KUBERNETES_SERVICE_PORT= \
+	KUBEBUILDER_ASSETS="$$assets" \
+	GOFLAGS="-mod=readonly" go test -count=1 -timeout=$(TEST_TIMEOUT) ./api/operator/... ./tests/operator/chart/...
+
+.PHONY: operator-kind-up
+operator-kind-up: ## Creates the operator's kind cluster with the e2e suite's registry
+	@./tools/operator-kind up
+
+.PHONY: operator-kind-up-floor
+operator-kind-up-floor: ## Creates the operator's kind cluster on the Kubernetes floor
+	@./tools/operator-kind up floor
+
+.PHONY: operator-kind-down
+operator-kind-down: ## Deletes the operator's kind cluster
+	@./tools/operator-kind down
+
+.PHONY: operator-candidate
+operator-candidate: ## Builds an operator candidate into dist/candidate (CANDIDATE_VERSION=v0.1.0-rc.1)
+	@./tools/operator-candidate build
+
+.PHONY: operator-candidate-verify
+operator-candidate-verify: ## Builds the operator candidate twice and requires identical bytes
+	@./tools/operator-candidate verify
+
+.PHONY: operator-e2e
+operator-e2e: ## Runs the pinned AICR images as operator-built Jobs on the operator's kind cluster
+	@AICR_OPERATOR_E2E_KUBECONFIG=$(OPERATOR_E2E_KUBECONFIG) \
+	AICR_OPERATOR_E2E_REGISTRY_AUTH=$(CURDIR)/.operator-e2e/registry-auth.json \
+	AICR_OPERATOR_E2E_IMAGE=$(AICR_E2E_IMAGE) \
+	AICR_OPERATOR_E2E_AICR_VERSION=$(AICR_E2E_VERSION) \
+	AICR_OPERATOR_E2E_VALIDATOR_IMAGES=$(AICR_E2E_VALIDATOR_IMAGES) \
+	GOFLAGS="-mod=readonly" go test -count=1 -v -timeout=30m ./tests/operator/e2e/...
+
+.PHONY: operator-skeleton
+operator-skeleton: ## Runs the operator with the pinned Argo CD on its kind cluster, one release end to end
+	@./tools/operator-skeleton
+
+.PHONY: operator-qualify
+operator-qualify: ## Runs the operator's fault-injection suite against dist/candidate, upgrading to dist/candidate-next
+	@./tools/operator-qualify
+
+.PHONY: operator-qualify-published
+operator-qualify-published: ## Installs the newest published operator release and runs the lifecycle scenarios upgrading to dist/candidate
+	@./tools/operator-qualify pull-published
+	@AICR_OPERATOR_QUALIFY_LIFECYCLE_ONLY=1 QUALIFY_TIMEOUT=45m CANDIDATE_DIR="$${PUBLISHED_DIR:-dist/published}" CANDIDATE_NEXT_DIR=dist/candidate ./tools/operator-qualify
+
+# =============================================================================
+# Tilt Local Development
+# =============================================================================
+
+.PHONY: tilt-up
+tilt-up: ## Starts Tilt development environment
+	@echo "Starting Tilt development environment..."
+	@if ! command -v tilt >/dev/null 2>&1; then \
+		echo "Error: tilt is not installed."; \
+		echo "Install: brew install tilt-dev/tap/tilt"; \
+		echo "     or: curl -fsSL https://raw.githubusercontent.com/tilt-dev/tilt/master/scripts/install.sh | bash"; \
+		exit 1; \
+	fi
+	tilt up -f tilt/Tiltfile
+
+.PHONY: tilt-down
+tilt-down: ## Stops Tilt development environment
+	@echo "Stopping Tilt development environment..."
+	@if command -v tilt >/dev/null 2>&1; then \
+		tilt down -f tilt/Tiltfile; \
+	else \
+		echo "Warning: tilt is not installed"; \
+	fi
+
+.PHONY: tilt-ci
+tilt-ci: ## Runs Tilt in CI mode (no UI, waits for resources)
+	@echo "Running Tilt in CI mode..."
+	@if ! command -v tilt >/dev/null 2>&1; then \
+		echo "Error: tilt is not installed."; \
+		echo "Install: brew install tilt-dev/tap/tilt"; \
+		echo "     or: curl -fsSL https://raw.githubusercontent.com/tilt-dev/tilt/master/scripts/install.sh | bash"; \
+		exit 1; \
+	fi
+	@for i in 1 2 3; do \
+		echo "Attempt $$i of 3..."; \
+		if tilt ci -f tilt/Tiltfile --timeout=5m; then \
+			echo "Tilt CI succeeded on attempt $$i"; \
+			break; \
+		else \
+			if [ $$i -lt 3 ]; then \
+				echo "Tilt CI failed on attempt $$i, retrying in 10 seconds..."; \
+				sleep 10; \
+			else \
+				echo "Tilt CI failed after 3 attempts"; \
+				exit 1; \
+			fi; \
+		fi; \
+	done
+
+# =============================================================================
+# Cluster Management (ctlptl + Kind)
+# =============================================================================
+
+.PHONY: cluster-create
+# Exported to the recipe rather than pasted into it, so a quote in a
+# DOCKERHUB_MIRROR override cannot rewrite the validation command.
+cluster-create: export DOCKERHUB_MIRROR := $(DOCKERHUB_MIRROR)
+cluster-create: ## Creates local Kind cluster with registry
+	@echo "Creating local development cluster..."
+	@if ! command -v ctlptl >/dev/null 2>&1; then \
+		echo "Error: ctlptl is not installed."; \
+		echo "Install: brew install tilt-dev/tap/ctlptl"; \
+		echo "     or: go install github.com/tilt-dev/ctlptl/cmd/ctlptl@latest"; \
+		exit 1; \
+	fi
+	@if ! command -v docker >/dev/null 2>&1; then \
+		echo "Error: docker is not installed."; \
+		echo "Install: https://docs.docker.com/get-docker/"; \
+		exit 1; \
+	fi
+	@if ! command -v kind >/dev/null 2>&1; then \
+		echo "Error: kind is not installed."; \
+		echo "Install: brew install kind"; \
+		echo "     or: go install sigs.k8s.io/kind@latest"; \
+		exit 1; \
+	fi
+	@if ! command -v yq >/dev/null 2>&1; then \
+		echo "Error: yq is not installed."; \
+		echo "Install: brew install yq"; \
+		echo "     or: go install github.com/mikefarah/yq/v4@latest"; \
+		exit 1; \
+	fi
+	@if [ -z "$(KIND_NODE_IMAGE)" ]; then \
+		echo "Error: could not resolve testing.kind_node_image from .settings.yaml."; \
+		echo "Check the key exists and .settings.yaml is valid YAML."; \
+		exit 1; \
+	fi
+	@if [ -z "$(KIND_REGISTRY_IMAGE)" ] || [ "$(KIND_REGISTRY_IMAGE)" = "null" ]; then \
+		echo "Error: could not resolve testing_tools.registry_image from .settings.yaml."; \
+		exit 1; \
+	fi
+	@# Same bash test as .github/actions/load-versions, so CI and local runs accept
+	@# exactly the same values (grep would match a multi-line value line by line).
+	@bash -c '[[ $$DOCKERHUB_MIRROR =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$$ ]]' || { \
+		echo "Error: DOCKERHUB_MIRROR (default: .settings.yaml build.dockerhub_mirror) must be an https:// host URL with no path, got '$$DOCKERHUB_MIRROR'."; \
+		exit 1; \
+	}
+	@# kind pulls the node image only when it is not already local, so seeding it
+	@# from the Docker Hub mirror keeps the anonymous Docker Hub rate limit out
+	@# of the critical path. On a mirror miss kind pulls from Docker Hub.
+	@docker image inspect "$(KIND_NODE_IMAGE)" >/dev/null 2>&1 || \
+		{ docker pull -q "$(DOCKERHUB_MIRROR_HOST)/$(KIND_NODE_IMAGE)" && docker tag "$(DOCKERHUB_MIRROR_HOST)/$(KIND_NODE_IMAGE)" "$(KIND_NODE_IMAGE)"; } || \
+		echo "Warning: $(DOCKERHUB_MIRROR_HOST)/$(KIND_NODE_IMAGE) unavailable; kind will pull from Docker Hub"
+	@# ctlptl drops its pull's progress stream, where the daemon reports mid-pull
+	@# failures such as a refused layer download, so those surface only as a
+	@# misleading "No such image" at container create. Pulling here keeps the
+	@# real error in the log and adds the mirror as a second source.
+	@docker image inspect "$(KIND_REGISTRY_IMAGE)" >/dev/null 2>&1 || \
+		docker pull -q "$(KIND_REGISTRY_IMAGE)" || \
+		{ echo "Warning: $(KIND_REGISTRY_IMAGE) pull failed; trying $(KIND_REGISTRY_MIRROR_IMAGE)"; \
+		  docker pull -q "$(KIND_REGISTRY_MIRROR_IMAGE)" && docker tag "$(KIND_REGISTRY_MIRROR_IMAGE)" "$(KIND_REGISTRY_IMAGE)"; }
+	@echo "Pinning Kind node image: $(KIND_NODE_IMAGE), registry image: $(KIND_REGISTRY_IMAGE) (from .settings.yaml)"
+	img="$(KIND_NODE_IMAGE)" reg="$(KIND_REGISTRY_IMAGE)" yq eval-all '(select(.kind == "Cluster") | .kindV1Alpha4Cluster.nodes[]).image = strenv(img) | (select(.kind == "Registry")).image = strenv(reg)' $(CTLPTL_CONFIG_FILE) | ctlptl apply -f -
+	@echo "Waiting for nodes to be ready..."
+	@kubectl wait --for=condition=ready nodes --all --timeout=300s
+	@echo "Cluster created. Registry at localhost:$(REGISTRY_PORT)"
+
+.PHONY: cluster-delete
+cluster-delete: ## Deletes local Kind cluster and registry
+	@echo "Deleting local development cluster..."
+	ctlptl delete -f $(CTLPTL_CONFIG_FILE) || echo "Cluster not found"
+
+.PHONY: cluster-status
+cluster-status: ## Shows cluster and registry status
+	@echo "=== Cluster Status ==="
+	@if command -v ctlptl >/dev/null 2>&1; then \
+		ctlptl get clusters 2>/dev/null || echo "No ctlptl clusters"; \
+	fi
+	@if command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1; then \
+		echo "Context: $$(kubectl config current-context)"; \
+		kubectl get nodes -o wide 2>/dev/null || true; \
+		echo ""; \
+		echo "Registry:"; \
+		docker ps --filter "name=$(REGISTRY_NAME)" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || true; \
+	else \
+		echo "No active cluster"; \
+	fi
+
+# =============================================================================
+# KWOK Cluster Simulation
+# =============================================================================
+
+# KWOK version for simulated GPU nodes (from .settings.yaml)
+KWOK_VERSION ?= $(shell yq -r '.testing_tools.kwok' .settings.yaml 2>/dev/null)
+ifeq ($(KWOK_VERSION),)
+KWOK_VERSION := v0.7.0
+endif
+CTLPTL_KWOK_CONFIG_FILE := .ctlptl-kwok.yaml
+
+.PHONY: kwok-cluster
+kwok-cluster: ## Creates KWOK cluster for GPU simulation (control-plane only)
+	@echo "Creating KWOK cluster..."
+	@if ! command -v ctlptl >/dev/null 2>&1; then \
+		echo "Error: ctlptl is not installed."; \
+		echo "Install: brew install tilt-dev/tap/ctlptl"; \
+		exit 1; \
+	fi
+	@if ! command -v kind >/dev/null 2>&1; then \
+		echo "Error: kind is not installed."; \
+		echo "Install: brew install kind"; \
+		exit 1; \
+	fi
+	ctlptl apply -f $(CTLPTL_KWOK_CONFIG_FILE)
+	@echo "Installing KWOK controller..."
+	curl -fsSL --connect-timeout 10 --max-time 60 "https://github.com/kubernetes-sigs/kwok/releases/download/$(KWOK_VERSION)/kwok.yaml" | kubectl apply --request-timeout=30s -f -
+	curl -fsSL --connect-timeout 10 --max-time 60 "https://github.com/kubernetes-sigs/kwok/releases/download/$(KWOK_VERSION)/stage-fast.yaml" | kubectl apply --request-timeout=30s -f -
+	@echo "Waiting for KWOK controller to be ready..."
+	kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s
+	@echo "Tainting control-plane to force workloads to KWOK nodes..."
+	kubectl taint nodes -l node-role.kubernetes.io/control-plane node-role.kubernetes.io/control-plane:NoSchedule --overwrite 2>/dev/null || true
+	@echo "KWOK cluster created. Use 'make kwok-nodes RECIPE=<name>' to add simulated nodes."
+
+.PHONY: kwok-cluster-delete
+kwok-cluster-delete: ## Deletes KWOK cluster
+	@echo "Deleting KWOK cluster..."
+	ctlptl delete -f $(CTLPTL_KWOK_CONFIG_FILE) || echo "Cluster not found"
+
+.PHONY: kwok-nodes
+kwok-nodes: ## Creates KWOK nodes from recipe overlay (RECIPE=gb200-eks-training)
+ifndef RECIPE
+	@echo "Error: RECIPE is required"
+	@echo "Usage: make kwok-nodes RECIPE=gb200-eks-training"
+	@echo "Available recipes (with service criteria):"
+	@for f in recipes/overlays/*.yaml; do \
+		name=$$(basename "$$f" .yaml); \
+		service=$$(yq eval '.spec.criteria.service // ""' "$$f" 2>/dev/null); \
+		if [ -n "$$service" ] && [ "$$service" != "null" ] && [ "$$service" != "any" ]; then \
+			echo "  $$name (service=$$service)"; \
+		fi; \
+	done
+	@exit 1
+endif
+	@echo "Creating KWOK nodes for recipe: $(RECIPE)"
+	bash kwok/scripts/apply-nodes.sh "$(RECIPE)"
+
+.PHONY: kwok-nodes-delete
+kwok-nodes-delete: ## Deletes all KWOK-simulated nodes
+	@echo "Deleting KWOK nodes..."
+	kubectl delete nodes -l type=kwok --ignore-not-found
+
+.PHONY: kwok-test
+kwok-test: ## Validates bundle scheduling on KWOK cluster (RECIPE=gb200-eks-training)
+ifndef RECIPE
+	@echo "Error: RECIPE is required"
+	@echo "Usage: make kwok-test RECIPE=gb200-eks-training"
+	@exit 1
+endif
+	@echo "Validating scheduling for recipe: $(RECIPE)"
+	bash kwok/scripts/validate-scheduling.sh "$(RECIPE)"
+
+.PHONY: kwok-status
+kwok-status: ## Shows KWOK cluster and node status
+	@echo "=== KWOK Cluster Status ==="
+	@if kubectl cluster-info >/dev/null 2>&1; then \
+		echo "Context: $$(kubectl config current-context)"; \
+		echo ""; \
+		echo "KWOK Controller:"; \
+		kubectl get deployment -n kube-system kwok-controller 2>/dev/null || echo "  Not installed"; \
+		echo ""; \
+		echo "KWOK Nodes:"; \
+		kubectl get nodes -l type=kwok -o wide 2>/dev/null || echo "  None"; \
+		echo ""; \
+		echo "GPU Resources:"; \
+		kubectl get nodes -l type=kwok -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.capacity.nvidia\.com/gpu}{" GPUs\n"}{end}' 2>/dev/null || true; \
+	else \
+		echo "No active cluster"; \
+	fi
+
+.PHONY: kwok-e2e
+kwok-e2e: ## Full KWOK e2e workflow: cluster, nodes, validate (RECIPE=gb200-eks-training)
+ifndef RECIPE
+	@echo "Error: RECIPE is required"
+	@echo "Usage: make kwok-e2e RECIPE=gb200-eks-training"
+	@exit 1
+endif
+	@echo "Running full KWOK e2e workflow for recipe: $(RECIPE)"
+	$(MAKE) kwok-cluster
+	$(MAKE) kwok-nodes RECIPE=$(RECIPE)
+	$(MAKE) kwok-test RECIPE=$(RECIPE)
+
+.PHONY: kwok-test-all
+kwok-test-all: build ## Run all KWOK recipe tests in a shared cluster
+	@bash kwok/scripts/run-all-recipes.sh
+
+.PHONY: kwok-test-deployer
+kwok-test-deployer: build ## Validate scheduling under a specific deployer (RECIPE=… DEPLOYER=helm|argocd-oci|argocd-helm-oci|argocd-git|flux-oci|flux-git)
+ifndef RECIPE
+	@echo "Error: RECIPE is required"
+	@echo "Usage: make kwok-test-deployer RECIPE=eks-training DEPLOYER=argocd-oci"
+	@exit 1
+endif
+ifndef DEPLOYER
+	@echo "Error: DEPLOYER is required (helm | argocd-oci | argocd-helm-oci | argocd-git | flux-oci | flux-git)"
+	@exit 1
+endif
+	@echo "Validating $(RECIPE) under deployer=$(DEPLOYER)"
+	bash kwok/scripts/run-all-recipes.sh --deployer $(DEPLOYER) $(RECIPE)
+
+# =============================================================================
+# Talos local test harness
+# =============================================================================
+TALOS_CLUSTER_NAME ?= aicr-talos
+TALOS_KUBECONFIG   ?= $(HOME)/.kube/aicr-talos
+TALOS_VERSION      ?= v1.9.0
+
+.PHONY: talos-dev-env
+talos-dev-env: ## Spin up a local Talos cluster (Docker provisioner) for snapshot testing.
+	@# TALOS_KUBECONFIG (user-facing var, documented in tools/talos-test/README.md)
+	@# is forwarded into up.sh as KUBECONFIG_OUT (script-internal var).
+	@TALOS_CLUSTER_NAME=$(TALOS_CLUSTER_NAME) \
+	 TALOS_VERSION=$(TALOS_VERSION) \
+	 KUBECONFIG_OUT=$(TALOS_KUBECONFIG) \
+	 ./tools/talos-test/up.sh
+
+.PHONY: talos-dev-env-clean
+talos-dev-env-clean: ## Destroy the local Talos cluster.
+	@TALOS_CLUSTER_NAME=$(TALOS_CLUSTER_NAME) \
+	 ./tools/talos-test/down.sh
+
+.PHONY: talos-snapshot-test
+talos-snapshot-test: build ## Run the Talos snapshot chainsaw test against an already-running cluster.
+	@HOST_GOOS=$$(go env GOOS); HOST_GOARCH=$$(go env GOARCH); \
+	 DIST_DIR=$$(find dist -maxdepth 1 -type d -name "aicr_$${HOST_GOOS}_$${HOST_GOARCH}*" 2>/dev/null | head -1); \
+	 if [ -z "$$DIST_DIR" ] || [ ! -x "$$DIST_DIR/aicr" ]; then \
+	    echo "error: aicr binary not found under dist/aicr_$${HOST_GOOS}_$${HOST_GOARCH}*; run 'make build' first" >&2; exit 1; \
+	 fi; \
+	 KUBECONFIG=$(TALOS_KUBECONFIG) \
+	 PATH=$$DIST_DIR:$$PATH \
+	 chainsaw test --test-dir tests/chainsaw/snapshot/deploy-agent-talos
+
+# =============================================================================
+# Component Testing
+# =============================================================================
+
+.PHONY: component-test
+component-test: build ## Test a single component end-to-end (COMPONENT=cert-manager [TIER=deploy])
+ifndef COMPONENT
+	@echo "Error: COMPONENT is required"
+	@echo "Usage: make component-test COMPONENT=cert-manager"
+	@echo "       make component-test COMPONENT=gpu-operator TIER=gpu-aware"
+	@exit 1
+endif
+	@set -e; \
+	TIER=$${TIER:-$$(bash tools/component-test/detect-tier.sh $(COMPONENT))}; \
+	echo "[INFO] Detected tier: $$TIER"; \
+	do_cleanup() { \
+		if [ "$${KEEP_CLUSTER:-false}" != "true" ]; then \
+			COMPONENT=$(COMPONENT) bash tools/component-test/cleanup.sh || true; \
+		fi; \
+	}; \
+	trap do_cleanup EXIT; \
+	TIER=$$TIER bash tools/component-test/ensure-cluster.sh; \
+	if [ "$$TIER" = "gpu-aware" ]; then \
+		GPU_PROFILE=$${GPU_PROFILE:-} GPU_COUNT=$${GPU_COUNT:-} bash tools/component-test/setup-gpu-mock.sh; \
+	fi; \
+	if [ "$$TIER" = "scheduling" ]; then \
+		echo "[INFO] Scheduling tier uses KWOK, not this harness."; \
+		echo "[INFO] Run: make kwok-e2e RECIPE=<recipe-name>"; \
+		echo "[INFO] No test was executed. Exiting with code 2."; \
+		exit 2; \
+	fi; \
+	COMPONENT=$(COMPONENT) HELM_NAMESPACE=$${HELM_NAMESPACE:-} bash tools/component-test/deploy-component.sh; \
+	COMPONENT=$(COMPONENT) bash tools/component-test/run-health-check.sh
+
+.PHONY: component-detect
+component-detect: ## Show detected test tier for a component (COMPONENT=cert-manager)
+ifndef COMPONENT
+	@echo "Error: COMPONENT is required"
+	@echo "Usage: make component-detect COMPONENT=cert-manager"
+	@exit 1
+endif
+	@bash tools/component-test/detect-tier.sh $(COMPONENT)
+
+.PHONY: component-cluster
+component-cluster: ## Create or reuse the component test Kind cluster
+	@TIER=$${TIER:-deploy} bash tools/component-test/ensure-cluster.sh
+
+.PHONY: component-deploy
+component-deploy: build ## Deploy a single component (COMPONENT=cert-manager)
+ifndef COMPONENT
+	@echo "Error: COMPONENT is required"
+	@exit 1
+endif
+	@COMPONENT=$(COMPONENT) HELM_NAMESPACE=$${HELM_NAMESPACE:-} bash tools/component-test/deploy-component.sh
+
+.PHONY: component-health
+component-health: ## Run health check for a deployed component (COMPONENT=cert-manager)
+ifndef COMPONENT
+	@echo "Error: COMPONENT is required"
+	@exit 1
+endif
+	@COMPONENT=$(COMPONENT) bash tools/component-test/run-health-check.sh
+
+.PHONY: component-cleanup
+component-cleanup: ## Clean up component test resources (COMPONENT=cert-manager [DELETE_CLUSTER=true])
+	@COMPONENT=$${COMPONENT:-} DELETE_CLUSTER=$${DELETE_CLUSTER:-false} KEEP_CLUSTER=$${KEEP_CLUSTER:-false} bash tools/component-test/cleanup.sh
+
+.PHONY: k8s-aibom-test
+k8s-aibom-test: build ## Prove k8s-aibom AIBOM generation, reconciliation, and cleanup on Kind
+	@bash tools/k8s-aibom-test/run.sh
+
+# =============================================================================
+# Combined Development Targets
+# =============================================================================
+
+.PHONY: dev-env
+dev-env: cluster-create tilt-up ## Creates cluster and starts Tilt (full setup)
+
+.PHONY: dev-env-clean
+dev-env-clean: tilt-down cluster-delete ## Stops Tilt and deletes cluster (full cleanup)
+
+.PHONY: dev-restart
+dev-restart: tilt-down tilt-up ## Restarts Tilt without recreating cluster
+
+.PHONY: dev-reset
+dev-reset: dev-env-clean dev-env ## Full reset (tear down and recreate everything)
+
+.PHONY: help
+help: ## Displays available commands
+	@echo "Available make targets:"
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk \
+		'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
+
+.PHONY: help-full
+help-full: ## Displays commands grouped by category
+	@echo ""
+	@echo "\033[1m=== Quality & Testing ===\033[0m"
+	@echo "  make qualify        Full qualification (test + lint + e2e + scan)"
+	@echo "  make test           Unit tests with race detector"
+	@echo "  make test-coverage  Tests with coverage threshold enforcement"
+	@echo "  make lint           Lint Go, YAML, and license headers"
+	@echo "  make e2e            CLI end-to-end tests"
+	@echo "  make e2e-tilt       E2E tests with Tilt cluster"
+	@echo "  make scan           Vulnerability scan with grype"
+	@echo "  make bench          Run benchmarks"
+	@echo ""
+	@echo "\033[1m=== Build & Release ===\033[0m"
+	@echo "  make build          Build binaries for current OS/arch"
+	@echo "  make image          Build and push container image"
+	@echo "  make notices        Generate THIRD_PARTY_NOTICES.md from Go deps (untracked; made by 'make release')"
+	@echo "  make release        Full release with goreleaser"
+	@echo "  make bump-rc        Tag RC pre-release (v1.2.3 -> v1.3.0-rc1)"
+	@echo "  make bump-promote   Promote RC to stable (TAG=v1.2.4-rc1)"
+	@echo "  make bump-patch     Tag patch version (1.2.3 -> 1.2.4)"
+	@echo "  make bump-minor     Tag minor version (1.2.3 -> 1.3.0)"
+	@echo "  make bump-major     Tag major version (1.2.3 -> 2.0.0)"
+	@echo "  make changelog      Show changes since last release"
+	@echo ""
+	@echo "\033[1m=== Local Development ===\033[0m"
+	@echo "  make dev-env        Create cluster and start Tilt (full setup)"
+	@echo "  make dev-env-clean  Stop Tilt and delete cluster (full cleanup)"
+	@echo "  make dev-restart    Restart Tilt without recreating cluster"
+	@echo "  make dev-reset      Full reset (tear down and recreate everything)"
+	@echo "  make cluster-create Create Kind cluster with registry"
+	@echo "  make cluster-delete Delete Kind cluster and registry"
+	@echo "  make cluster-status Show cluster and registry status"
+	@echo "  make tilt-up        Start Tilt development environment"
+	@echo "  make tilt-down      Stop Tilt development environment"
+	@echo "  make server         Start local development server"
+	@echo ""
+	@echo "\033[1m=== KWOK Cluster Simulation ===\033[0m"
+	@echo "  make kwok-cluster   Create KWOK cluster for GPU simulation"
+	@echo "  make kwok-cluster-delete Delete KWOK cluster"
+	@echo "  make kwok-nodes     Create simulated nodes (RECIPE=<name>)"
+	@echo "  make kwok-nodes-delete Delete all KWOK nodes"
+	@echo "  make kwok-test      Validate bundle scheduling (RECIPE=<name>)"
+	@echo "  make kwok-status    Show KWOK cluster and node status"
+	@echo "  make kwok-e2e       Full KWOK workflow (RECIPE=<name>)"
+	@echo "  make kwok-test-all  Run all recipes in shared cluster"
+	@echo ""
+	@echo "\033[1m=== Code Maintenance ===\033[0m"
+	@echo "  make tidy           Format code and update dependencies"
+	@echo "  make fmt-check      Check code formatting (CI-friendly)"
+	@echo "  make upgrade        Upgrade all dependencies"
+	@echo "  make generate       Run go generate"
+	@echo "  make license        Add/verify license headers"
+	@echo ""
+	@echo "\033[1m=== Tools ===\033[0m"
+	@echo "  make tools-check    Check tools and compare versions"
+	@echo "  make tools-setup    Install all development tools"
+	@echo "  make tools-update   Upgrade all tools to .settings.yaml"
+	@echo ""
+	@echo "\033[1m=== Utilities ===\033[0m"
+	@echo "  make info           Print project info"
+	@echo "  make docs           Serve Go documentation"
+	@echo "  make clean          Clean build artifacts"
+	@echo "  make clean-all      Deep clean including module cache"
+	@echo "  make cleanup        Clean up AICR Kubernetes resources"
+	@echo ""

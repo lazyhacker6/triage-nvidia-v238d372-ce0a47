@@ -1,0 +1,1085 @@
+// Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/bom"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/helm/helmtest"
+)
+
+// writeTestRegistry writes a minimal registry YAML to path and returns the
+// repo root directory (parent of recipes/).
+func writeTestRegistry(t *testing.T, content string) string {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, "recipes")
+	// overlays/ and mixins/ always exist in a real repo root; variant
+	// discovery fails closed when either is missing.
+	for _, sub := range []string{"overlays", "mixins"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
+			t.Fatalf("mkdir recipes/%s: %v", sub, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "registry.yaml"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write registry.yaml: %v", err)
+	}
+	return root
+}
+
+const testRegistryHelm = `apiVersion: v1
+kind: ComponentRegistry
+components:
+  - name: gpu-operator
+    displayName: GPU Operator
+    helm:
+      defaultRepository: "oci://ghcr.io/nvidia"
+      defaultChart: gpu-operator
+      defaultVersion: "25.3.0"
+      defaultNamespace: gpu-operator
+`
+
+const testRegistryKustomize = `apiVersion: v1
+kind: ComponentRegistry
+components:
+  - name: my-kustomize
+    displayName: My Kustomize
+    kustomize:
+      defaultSource: "https://github.com/example/my-app"
+      defaultPath: deploy
+      defaultTag: v1.0.0
+`
+
+const testRegistryMixed = `apiVersion: v1
+kind: ComponentRegistry
+components:
+  - name: gpu-operator
+    displayName: GPU Operator
+    helm:
+      defaultRepository: "oci://ghcr.io/nvidia"
+      defaultChart: gpu-operator
+      defaultVersion: "25.3.0"
+      defaultNamespace: gpu-operator
+  - name: my-kustomize
+    displayName: My Kustomize
+    kustomize:
+      defaultSource: "https://github.com/example/my-app"
+      defaultPath: deploy
+      defaultTag: v1.0.0
+`
+
+const testRegistryHelmUnpinned = `apiVersion: v1
+kind: ComponentRegistry
+components:
+  - name: gpu-operator
+    displayName: GPU Operator
+    helm:
+      defaultRepository: "oci://ghcr.io/nvidia"
+      defaultChart: gpu-operator
+      defaultNamespace: gpu-operator
+`
+
+// renderedYAML is a minimal Kubernetes manifest returned by the mock renderer.
+const renderedYAML = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-operator
+spec:
+  template:
+    spec:
+      containers:
+        - name: gpu-operator
+          image: nvcr.io/nvidia/gpu-operator:v25.3.0
+        - name: toolkit
+          image: nvcr.io/nvidia/k8s/container-toolkit:v1.17.5-ubuntu22.04
+`
+
+func TestComponentKind(t *testing.T) {
+	tests := []struct {
+		name string
+		comp component
+		want string
+	}{
+		{
+			name: "helm component",
+			comp: component{
+				Helm: helmCfg{DefaultRepository: "oci://ghcr.io/nvidia", DefaultChart: "gpu-operator"},
+			},
+			want: "helm",
+		},
+		{
+			name: "helm component chart only",
+			comp: component{
+				Helm: helmCfg{DefaultChart: "gpu-operator"},
+			},
+			want: "helm",
+		},
+		{
+			name: "kustomize component",
+			comp: component{
+				Kustomize: kustCfg{DefaultSource: "https://github.com/example/app"},
+			},
+			want: "kustomize",
+		},
+		{
+			name: "manifest component",
+			comp: component{
+				Name: "bare-manifests",
+			},
+			want: "manifest",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.comp.kind()
+			if got != tt.want {
+				t.Errorf("kind() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadRegistry(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	regPath := filepath.Join(root, "recipes", "registry.yaml")
+
+	reg, err := loadRegistry(regPath)
+	if err != nil {
+		t.Fatalf("loadRegistry() error = %v", err)
+	}
+	if len(reg.Components) != 1 {
+		t.Fatalf("expected 1 component, got %d", len(reg.Components))
+	}
+	if reg.Components[0].Name != "gpu-operator" {
+		t.Errorf("component name = %q, want %q", reg.Components[0].Name, "gpu-operator")
+	}
+	if reg.Components[0].Helm.DefaultVersion != "25.3.0" {
+		t.Errorf("default version = %q, want %q", reg.Components[0].Helm.DefaultVersion, "25.3.0")
+	}
+}
+
+func TestLoadRegistryNotFound(t *testing.T) {
+	_, err := loadRegistry("/nonexistent/registry.yaml")
+	if err == nil {
+		t.Fatal("expected error for missing file, got nil")
+	}
+}
+
+func TestLoadRegistryInvalidYAML(t *testing.T) {
+	root := writeTestRegistry(t, "not: [valid: yaml: {{")
+	regPath := filepath.Join(root, "recipes", "registry.yaml")
+
+	_, err := loadRegistry(regPath)
+	if err == nil {
+		t.Fatal("expected error for invalid YAML, got nil")
+	}
+}
+
+func TestSurveyComponentHelm(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(renderedYAML),
+		},
+	}
+
+	c := component{
+		Name:        "gpu-operator",
+		DisplayName: "GPU Operator",
+		Helm: helmCfg{
+			DefaultRepository: "oci://ghcr.io/nvidia",
+			DefaultChart:      "gpu-operator",
+			DefaultVersion:    "25.3.0",
+			DefaultNamespace:  "gpu-operator",
+		},
+	}
+
+	res, surveyErr := surveyComponent(context.Background(), root, c, mock, false)
+	if surveyErr != nil {
+		t.Fatalf("surveyComponent() error = %v", surveyErr)
+	}
+	if res.Name != "gpu-operator" {
+		t.Errorf("Name = %q, want %q", res.Name, "gpu-operator")
+	}
+	if res.Type != "helm" {
+		t.Errorf("Type = %q, want %q", res.Type, "helm")
+	}
+	if !res.Pinned {
+		t.Error("expected Pinned = true")
+	}
+	if len(res.Images) != 2 {
+		t.Fatalf("expected 2 images, got %d: %v", len(res.Images), res.Images)
+	}
+	// Images are sorted.
+	if res.Images[0] != "nvcr.io/nvidia/gpu-operator:v25.3.0" {
+		t.Errorf("Images[0] = %q, want %q", res.Images[0], "nvcr.io/nvidia/gpu-operator:v25.3.0")
+	}
+	if res.Images[1] != "nvcr.io/nvidia/k8s/container-toolkit:v1.17.5-ubuntu22.04" {
+		t.Errorf("Images[1] = %q, want %q", res.Images[1], "nvcr.io/nvidia/k8s/container-toolkit:v1.17.5-ubuntu22.04")
+	}
+	if len(res.Warnings) != 0 {
+		t.Errorf("unexpected warnings: %v", res.Warnings)
+	}
+}
+
+func TestSurveyComponentSkipHelm(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(renderedYAML),
+		},
+	}
+
+	c := component{
+		Name:        "gpu-operator",
+		DisplayName: "GPU Operator",
+		Helm: helmCfg{
+			DefaultRepository: "oci://ghcr.io/nvidia",
+			DefaultChart:      "gpu-operator",
+			DefaultVersion:    "25.3.0",
+		},
+	}
+
+	res, surveyErr := surveyComponent(context.Background(), root, c, mock, true)
+	if surveyErr != nil {
+		t.Fatalf("surveyComponent() error = %v", surveyErr)
+	}
+	// With skipHelm, no images should come from the renderer.
+	if len(res.Images) != 0 {
+		t.Errorf("expected 0 images with skipHelm, got %d: %v", len(res.Images), res.Images)
+	}
+}
+
+func TestSurveyComponentRendererError(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	mock := &helmtest.MockRenderer{
+		Errs: map[string]error{
+			"gpu-operator": errors.New(errors.ErrCodeInternal, "mock render failure"),
+		},
+	}
+
+	c := component{
+		Name:        "gpu-operator",
+		DisplayName: "GPU Operator",
+		Helm: helmCfg{
+			DefaultRepository: "oci://ghcr.io/nvidia",
+			DefaultChart:      "gpu-operator",
+			DefaultVersion:    "25.3.0",
+		},
+	}
+
+	res, surveyErr := surveyComponent(context.Background(), root, c, mock, false)
+	if surveyErr != nil {
+		t.Fatalf("surveyComponent() error = %v", surveyErr)
+	}
+	if len(res.Warnings) == 0 {
+		t.Fatal("expected warnings from renderer error, got none")
+	}
+}
+
+func TestSurveyComponentKustomize(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryKustomize)
+	mock := &helmtest.MockRenderer{}
+
+	c := component{
+		Name:        "my-kustomize",
+		DisplayName: "My Kustomize",
+		Kustomize: kustCfg{
+			DefaultSource: "https://github.com/example/my-app",
+			DefaultPath:   "deploy",
+			DefaultTag:    "v1.0.0",
+		},
+	}
+
+	res, surveyErr := surveyComponent(context.Background(), root, c, mock, false)
+	if surveyErr != nil {
+		t.Fatalf("surveyComponent() error = %v", surveyErr)
+	}
+	if res.Type != "kustomize" {
+		t.Errorf("Type = %q, want %q", res.Type, "kustomize")
+	}
+	// Kustomize components don't call the helm renderer.
+	if len(res.Images) != 0 {
+		t.Errorf("expected 0 images for kustomize component, got %d", len(res.Images))
+	}
+}
+
+func TestSurveyComponentManifestsDir(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+
+	// Create a manifests directory with a YAML file containing an image.
+	manifestsDir := filepath.Join(root, "recipes", "components", "my-comp", "manifests")
+	if err := os.MkdirAll(manifestsDir, 0o755); err != nil {
+		t.Fatalf("mkdir manifests: %v", err)
+	}
+	manifest := `apiVersion: v1
+kind: Pod
+metadata:
+  name: test
+spec:
+  containers:
+    - name: app
+      image: docker.io/library/nginx:1.27
+`
+	if err := os.WriteFile(filepath.Join(manifestsDir, "pod.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	mock := &helmtest.MockRenderer{}
+	c := component{
+		Name:        "my-comp",
+		DisplayName: "My Component",
+	}
+
+	res, surveyErr := surveyComponent(context.Background(), root, c, mock, false)
+	if surveyErr != nil {
+		t.Fatalf("surveyComponent() error = %v", surveyErr)
+	}
+	if res.Type != "manifest" {
+		t.Errorf("Type = %q, want %q", res.Type, "manifest")
+	}
+	if len(res.Images) != 1 {
+		t.Fatalf("expected 1 image from manifests dir, got %d: %v", len(res.Images), res.Images)
+	}
+	if res.Images[0] != "docker.io/library/nginx:1.27" {
+		t.Errorf("Images[0] = %q, want %q", res.Images[0], "docker.io/library/nginx:1.27")
+	}
+}
+
+func TestSurveyComponentRejectsInvalidStructuredImageDescriptorInManifest(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	manifestPath := filepath.Join(
+		root,
+		"recipes",
+		"components",
+		"my-comp",
+		"manifests",
+		"config.yaml",
+	)
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+		t.Fatalf("mkdir manifests: %v", err)
+	}
+	manifest := `apiVersion: example.com/v1
+kind: Config
+spec:
+  operand:
+    image:
+      name: null
+      repository: nvcr.io/nvidia
+      tag: v25.3.0
+`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	_, err := surveyComponent(
+		context.Background(),
+		root,
+		component{Name: "my-comp"},
+		&helmtest.MockRenderer{},
+		true,
+	)
+	if err == nil {
+		t.Fatal("surveyComponent() error = nil, want invalid structured image descriptor error")
+	}
+	if !bom.IsInvalidStructuredImageDescriptor(err) {
+		t.Errorf("IsInvalidStructuredImageDescriptor(%v) = false, want true", err)
+	}
+	if !strings.Contains(err.Error(), manifestPath) {
+		t.Errorf("error %q does not identify manifest %q", err, manifestPath)
+	}
+}
+
+func TestSurveyComponentHelmPlusManifests(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+
+	// Create a manifests directory with an additional image.
+	manifestsDir := filepath.Join(root, "recipes", "components", "gpu-operator", "manifests")
+	if err := os.MkdirAll(manifestsDir, 0o755); err != nil {
+		t.Fatalf("mkdir manifests: %v", err)
+	}
+	manifest := `apiVersion: v1
+kind: Pod
+metadata:
+  name: sidecar
+spec:
+  containers:
+    - name: sidecar
+      image: docker.io/library/busybox:1.37
+`
+	if err := os.WriteFile(filepath.Join(manifestsDir, "sidecar.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(renderedYAML),
+		},
+	}
+
+	c := component{
+		Name:        "gpu-operator",
+		DisplayName: "GPU Operator",
+		Helm: helmCfg{
+			DefaultRepository: "oci://ghcr.io/nvidia",
+			DefaultChart:      "gpu-operator",
+			DefaultVersion:    "25.3.0",
+		},
+	}
+
+	res, surveyErr := surveyComponent(context.Background(), root, c, mock, false)
+	if surveyErr != nil {
+		t.Fatalf("surveyComponent() error = %v", surveyErr)
+	}
+	// 2 from helm + 1 from manifests = 3 unique images.
+	if len(res.Images) != 3 {
+		t.Fatalf("expected 3 images (helm + manifests), got %d: %v", len(res.Images), res.Images)
+	}
+}
+
+func TestRenderHelmComponent(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(renderedYAML),
+		},
+	}
+
+	c := component{
+		Name: "gpu-operator",
+		Helm: helmCfg{
+			DefaultChart:      "gpu-operator",
+			DefaultRepository: "oci://ghcr.io/nvidia",
+			DefaultVersion:    "25.3.0",
+			DefaultNamespace:  "gpu-operator",
+		},
+	}
+
+	out, warnings := renderHelmComponent(context.Background(), root, c, mock)
+	if len(warnings) != 0 {
+		t.Errorf("unexpected warnings: %v", warnings)
+	}
+	if len(out) == 0 {
+		t.Error("expected non-empty rendered output")
+	}
+}
+
+func TestRenderHelmComponentError(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	mock := &helmtest.MockRenderer{
+		Errs: map[string]error{
+			"gpu-operator": errors.New(errors.ErrCodeInternal, "helm template failed"),
+		},
+	}
+
+	c := component{
+		Name: "gpu-operator",
+		Helm: helmCfg{
+			DefaultChart:      "gpu-operator",
+			DefaultRepository: "oci://ghcr.io/nvidia",
+		},
+	}
+
+	out, warnings := renderHelmComponent(context.Background(), root, c, mock)
+	if len(out) != 0 {
+		t.Errorf("expected empty output on error, got %d bytes", len(out))
+	}
+	if len(warnings) == 0 {
+		t.Fatal("expected warnings from renderer error, got none")
+	}
+}
+
+func TestRenderHelmComponentWithValuesFile(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+
+	// Create a values.yaml file for the component.
+	valuesDir := filepath.Join(root, "recipes", "components", "gpu-operator")
+	if err := os.MkdirAll(valuesDir, 0o755); err != nil {
+		t.Fatalf("mkdir values: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(valuesDir, "values.yaml"), []byte("driver:\n  enabled: true\n"), 0o644); err != nil {
+		t.Fatalf("write values.yaml: %v", err)
+	}
+
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(renderedYAML),
+		},
+	}
+
+	c := component{
+		Name: "gpu-operator",
+		Helm: helmCfg{
+			DefaultChart:      "gpu-operator",
+			DefaultRepository: "oci://ghcr.io/nvidia",
+			DefaultVersion:    "25.3.0",
+		},
+	}
+
+	out, warnings := renderHelmComponent(context.Background(), root, c, mock)
+	if len(warnings) != 0 {
+		t.Errorf("unexpected warnings: %v", warnings)
+	}
+	if len(out) == 0 {
+		t.Error("expected non-empty rendered output")
+	}
+
+	// Verify the values file path was passed to the renderer.
+	if len(mock.Inputs) != 1 {
+		t.Fatalf("expected 1 render call, got %d", len(mock.Inputs))
+	}
+	wantValuesPath := filepath.Join(root, "recipes", "components", "gpu-operator", "values.yaml")
+	if got := mock.Inputs[0].ValuesPath; got != wantValuesPath {
+		t.Errorf("ValuesPath = %q, want %q", got, wantValuesPath)
+	}
+}
+
+func TestRenderHelmComponentValuesStatError(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+
+	// Create the component directory but make it unreadable so os.Stat
+	// on values.yaml returns a permission error rather than os.IsNotExist.
+	valuesDir := filepath.Join(root, "recipes", "components", "gpu-operator")
+	if err := os.MkdirAll(valuesDir, 0o755); err != nil {
+		t.Fatalf("mkdir values: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(valuesDir, "values.yaml"), []byte("x: 1\n"), 0o644); err != nil {
+		t.Fatalf("write values.yaml: %v", err)
+	}
+	// Remove read+execute on the directory so stat on the file fails with EACCES.
+	if err := os.Chmod(valuesDir, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(valuesDir, 0o755) }) //nolint:errcheck // best-effort restore for TempDir cleanup
+
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(renderedYAML),
+		},
+	}
+
+	c := component{
+		Name: "gpu-operator",
+		Helm: helmCfg{
+			DefaultChart:      "gpu-operator",
+			DefaultRepository: "oci://ghcr.io/nvidia",
+			DefaultVersion:    "25.3.0",
+		},
+	}
+
+	_, warnings := renderHelmComponent(context.Background(), root, c, mock)
+	if len(warnings) == 0 {
+		t.Fatal("expected warning from values.yaml stat permission error, got none")
+	}
+
+	found := false
+	for _, w := range warnings {
+		if len(w) > 0 && w[:len("stat values.yaml:")] == "stat values.yaml:" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected stat warning, got: %v", warnings)
+	}
+
+	// ValuesPath should be cleared so the render still proceeds.
+	if len(mock.Inputs) != 1 {
+		t.Fatalf("expected 1 render call, got %d", len(mock.Inputs))
+	}
+	if mock.Inputs[0].ValuesPath != "" {
+		t.Errorf("ValuesPath = %q, want empty after stat error", mock.Inputs[0].ValuesPath)
+	}
+}
+
+func TestRunEndToEnd(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	outDir := t.TempDir()
+
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(renderedYAML),
+		},
+	}
+
+	err := run(root, outDir, "test-v1", mock, false, false, true, true)
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	// Verify output files exist and are non-empty.
+	jsonPath := filepath.Join(outDir, "bom.cdx.json")
+	jsonData, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read bom.cdx.json: %v", err)
+	}
+	if len(jsonData) == 0 {
+		t.Error("bom.cdx.json is empty")
+	}
+
+	mdPath := filepath.Join(outDir, "bom.md")
+	mdData, err := os.ReadFile(mdPath)
+	if err != nil {
+		t.Fatalf("read bom.md: %v", err)
+	}
+	if len(mdData) == 0 {
+		t.Error("bom.md is empty")
+	}
+}
+
+func TestRunMissingRegistry(t *testing.T) {
+	outDir := t.TempDir()
+	mock := &helmtest.MockRenderer{}
+
+	err := run("/nonexistent", outDir, "test-v1", mock, false, false, false, false)
+	if err == nil {
+		t.Fatal("expected error for missing registry, got nil")
+	}
+}
+
+func TestRunStrictUnpinnedVersion(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelmUnpinned)
+	outDir := t.TempDir()
+
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(renderedYAML),
+		},
+	}
+
+	err := run(root, outDir, "test-v1", mock, false, true, true, true)
+	if err == nil {
+		t.Fatal("expected error in strict mode for unpinned version, got nil")
+	}
+}
+
+func TestRunStrictWithWarnings(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	outDir := t.TempDir()
+
+	mock := &helmtest.MockRenderer{
+		Errs: map[string]error{
+			"gpu-operator": errors.New(errors.ErrCodeInternal, "mock render failure"),
+		},
+	}
+
+	err := run(root, outDir, "test-v1", mock, false, true, true, true)
+	if err == nil {
+		t.Fatal("expected error in strict mode with warnings, got nil")
+	}
+}
+
+func TestRunRejectsInvalidStructuredImageDescriptorWithoutStrict(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	outDir := t.TempDir()
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(`
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - image: nvcr.io/nvidia/gpu-operator:v25.3.0
+---
+apiVersion: example.com/v1
+kind: Config
+spec:
+  operand:
+    image:
+      name: null
+      repository: nvcr.io/nvidia
+      tag: v25.3.0
+`),
+		},
+	}
+
+	err := run(root, outDir, "test-v1", mock, false, false, true, true)
+	if err == nil {
+		t.Fatal("run() error = nil, want invalid structured image descriptor error")
+	}
+	if !bom.IsInvalidStructuredImageDescriptor(err) {
+		t.Errorf("IsInvalidStructuredImageDescriptor(%v) = false, want true", err)
+	}
+	for _, name := range []string{"bom.cdx.json", "bom.md"} {
+		if _, statErr := os.Stat(filepath.Join(outDir, name)); !os.IsNotExist(statErr) {
+			t.Errorf("%s was written despite fatal extraction error: %v", name, statErr)
+		}
+	}
+}
+
+func TestRunSkipHelm(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	outDir := t.TempDir()
+
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(renderedYAML),
+		},
+	}
+
+	err := run(root, outDir, "test-v1", mock, true, false, true, true)
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	// Output files should still exist even with skipHelm (just no chart images).
+	if _, err := os.Stat(filepath.Join(outDir, "bom.cdx.json")); err != nil {
+		t.Errorf("expected bom.cdx.json to exist: %v", err)
+	}
+}
+
+func TestRunMixedComponents(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryMixed)
+	outDir := t.TempDir()
+
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(renderedYAML),
+		},
+	}
+
+	err := run(root, outDir, "test-v1", mock, false, false, true, true)
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+}
+
+// TestRunStrictDegenerateVersions pins the strict gate against the shared
+// resolution rule (recipe.IsEffectiveChartVersion plus the padded-value
+// rejection): a defaultVersion that is whitespace-only, a bare "v", or
+// padded would pass an empty-string check here but fail ValidateCoherence
+// at recipe resolution — the CI gate must be at least as strict as the
+// resolver it guards.
+func TestRunStrictDegenerateVersions(t *testing.T) {
+	registryFor := func(version string) string {
+		return `apiVersion: v1
+kind: ComponentRegistry
+components:
+  - name: gpu-operator
+    displayName: GPU Operator
+    helm:
+      defaultRepository: "oci://ghcr.io/nvidia"
+      defaultChart: gpu-operator
+      defaultVersion: "` + version + `"
+      defaultNamespace: gpu-operator
+`
+	}
+	tests := []struct {
+		name    string
+		version string
+		wantErr bool
+	}{
+		{"whitespace-only version fails strict", "   ", true},
+		{"bare v version fails strict", "v", true},
+		{"padded version fails strict", " 1.0.0", true},
+		{"trailing-space version fails strict", "1.0.0 ", true},
+		{"pinned version passes strict", "v25.3.0", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := writeTestRegistry(t, registryFor(tt.version))
+			outDir := t.TempDir()
+			mock := &helmtest.MockRenderer{
+				Rendered: map[string][]byte{"gpu-operator": []byte(renderedYAML)},
+			}
+			err := run(root, outDir, "test-v1", mock, false, true, true, true)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("run() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestSurveyComponentSourceOnlyChartFallback pins the registry-level chart
+// fallback: a Helm entry with a defaultRepository but no defaultChart deploys
+// the component-name chart (recipe.ComponentRef.EffectiveChart), so the BOM
+// must render that chart and record it — not pass an empty chart to the
+// renderer ("no helm chart configured" in strict mode) and omit the metadata.
+func TestSurveyComponentSourceOnlyChartFallback(t *testing.T) {
+	root := writeTestRegistry(t, testRegistryHelm)
+	mock := &helmtest.MockRenderer{
+		Rendered: map[string][]byte{
+			"gpu-operator": []byte(renderedYAML),
+		},
+	}
+
+	c := component{
+		Name:        "gpu-operator",
+		DisplayName: "GPU Operator",
+		Helm: helmCfg{
+			DefaultRepository: "oci://ghcr.io/nvidia",
+			DefaultVersion:    "25.3.0",
+			DefaultNamespace:  "gpu-operator",
+		},
+	}
+
+	res, surveyErr := surveyComponent(context.Background(), root, c, mock, false)
+	if surveyErr != nil {
+		t.Fatalf("surveyComponent() error = %v", surveyErr)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", res.Warnings)
+	}
+	if res.Chart != "gpu-operator" {
+		t.Errorf("Chart = %q, want the component-name fallback %q", res.Chart, "gpu-operator")
+	}
+	if len(mock.Inputs) != 1 {
+		t.Fatalf("renderer calls = %d, want 1", len(mock.Inputs))
+	}
+	if got := mock.Inputs[0].Chart; got != "gpu-operator" {
+		t.Errorf("renderer ChartInput.Chart = %q, want fallback %q", got, "gpu-operator")
+	}
+
+	// A manifest-only entry (no repository, no chart) stays chartless.
+	manifestOnly := component{Name: "nodewright-customizations", DisplayName: "nodewright"}
+	if got := manifestOnly.effectiveChart(); got != "" {
+		t.Errorf("manifest-only effectiveChart() = %q, want empty", got)
+	}
+}
+
+// draNodeLabelerImageRE matches a literal, digest-pinned alpine/kubectl
+// reference. The registry host stays explicit because short-name-enforcing
+// runtimes reject unqualified references, and the tag is constrained to a
+// version shape so a floating tag such as :latest cannot satisfy it.
+var draNodeLabelerImageRE = regexp.MustCompile(`^docker\.io/alpine/kubectl:[0-9]+(?:\.[0-9]+)*@sha256:[0-9a-f]{64}$`)
+
+// TestSurveyComponent_DRANodeLabelerImageInventoried pins the supply-chain
+// contract for dra-node-labeler: its one executable image is a literal,
+// digest-pinned reference in the embedded manifest, so the manifest walk (no
+// Helm rendering) must inventory exactly that reference (#2813 review).
+func TestSurveyComponent_DRANodeLabelerImageInventoried(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("repo root: %v", err)
+	}
+	c := component{
+		Name:        "dra-node-labeler",
+		DisplayName: "dra-node-labeler",
+		Helm:        helmCfg{DefaultNamespace: "gpu-operator"},
+	}
+	got, surveyErr := surveyComponent(context.Background(), repoRoot, c, nil, true)
+	if surveyErr != nil {
+		t.Fatalf("surveyComponent() error = %v", surveyErr)
+	}
+	// Shape rather than an exact digest: Renovate rotates the digest as upstream
+	// rebuilds the tag.
+	if len(got.Images) != 1 || !draNodeLabelerImageRE.MatchString(got.Images[0]) {
+		t.Fatalf("dra-node-labeler images = %v, want exactly one matching %s; a templated image renders as a placeholder and drops out of the BOM", got.Images, draNodeLabelerImageRE)
+	}
+	if got.Type != kindManifest {
+		t.Errorf("type = %q, want %q", got.Type, kindManifest)
+	}
+}
+
+// TestRunStrictNoImages guards against an unlisted chart with zero images
+// passing strict, since that is what a silent pull failure looks like.
+func TestRunStrictNoImages(t *testing.T) {
+	reg := func(name string) string {
+		return `apiVersion: v1
+kind: ComponentRegistry
+components:
+  - name: ` + name + `
+    displayName: X
+    helm:
+      defaultRepository: "oci://ghcr.io/nvidia"
+      defaultChart: x
+      defaultVersion: "1.0.0"
+`
+	}
+	const listed = "prometheus-operator-crds"
+	tests := []struct {
+		name     string
+		comp     string
+		rendered []byte
+		manifest bool
+		wantErr  bool
+	}{
+		{"unlisted chart with no images fails", "gpu-operator", nil, false, true},
+		{"listed chart with no images passes", listed, nil, false, false},
+		{"listed chart with images fails", listed, []byte(renderedYAML), false, true},
+		{"unlisted chart with images passes", "gpu-operator", []byte(renderedYAML), false, false},
+		{"manifest images do not mask an empty unlisted chart", "gpu-operator", nil, true, true},
+		{"manifest images do not fail a listed empty chart", listed, nil, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := writeTestRegistry(t, reg(tt.comp))
+			if tt.manifest {
+				dir := filepath.Join(root, "recipes", "components", tt.comp, "manifests")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatalf("mkdir manifests: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "m.yaml"), []byte(renderedYAML), 0o644); err != nil {
+					t.Fatalf("write manifest: %v", err)
+				}
+			}
+			mock := &helmtest.MockRenderer{Rendered: map[string][]byte{tt.comp: tt.rendered}}
+			err := run(root, t.TempDir(), "test-v1", mock, false, true, true, true)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("run() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRunNonStrictOmitsNoImagesWarning keeps the contributor-facing
+// expectedNoImages hint out of the released BOM artifacts.
+func TestRunNonStrictOmitsNoImagesWarning(t *testing.T) {
+	root := writeTestRegistry(t, `apiVersion: v1
+kind: ComponentRegistry
+components:
+  - name: gpu-operator
+    displayName: X
+    helm:
+      defaultRepository: "oci://ghcr.io/nvidia"
+      defaultChart: x
+      defaultVersion: "1.0.0"
+`)
+	out := t.TempDir()
+	mock := &helmtest.MockRenderer{Rendered: map[string][]byte{"gpu-operator": nil}}
+	if err := run(root, out, "test-v1", mock, false, false, true, true); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	for _, f := range []string{"bom.md", "bom.cdx.json"} {
+		data, err := os.ReadFile(filepath.Join(out, f))
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		if strings.Contains(string(data), "expectedNoImages") {
+			t.Errorf("%s contains the expectedNoImages hint", f)
+		}
+	}
+}
+
+// TestExpectedNoImagesNamesRegistryHelmComponents catches a removed, renamed,
+// or misspelled expectedNoImages key, which would otherwise never match.
+func TestExpectedNoImagesNamesRegistryHelmComponents(t *testing.T) {
+	reg, err := loadRegistry(filepath.Join("..", "..", "recipes", "registry.yaml"))
+	if err != nil {
+		t.Fatalf("loadRegistry: %v", err)
+	}
+	helmComponents := map[string]bool{}
+	for _, c := range reg.Components {
+		if c.kind() == kindHelm {
+			helmComponents[c.Name] = true
+		}
+	}
+	for name := range expectedNoImages {
+		if !helmComponents[name] {
+			t.Errorf("expectedNoImages lists %q, which is not a Helm component in recipes/registry.yaml", name)
+		}
+	}
+}
+
+// TestReadWorkloadClosureFailsClosed pins the review follow-up on #3087: the
+// closure records sourceVersion and the survey never read it back, so a chart
+// bump landing before the closure was regenerated republished the previous
+// version's workload images under the new pin. An absent or empty file was
+// also indistinguishable from a component that legitimately has no closure,
+// which narrowed the BOM without an error. The check is offline and inside
+// the survey so `make bom-docs` and the committed-BOM test gate it.
+func TestReadWorkloadClosureFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	const pinned = "v0.2.0"
+	tests := []struct {
+		name      string
+		component string
+		// file is written to workload-images.yaml; empty means write nothing.
+		file     string
+		wantErr  bool
+		wantRefs []string
+	}{
+		{
+			name:      "required component, closure absent",
+			component: "nvcre",
+			wantErr:   true,
+		},
+		{
+			name:      "optional component, closure absent",
+			component: "gpu-operator",
+			wantRefs:  nil,
+		},
+		{
+			name:      "required component, closure lists no images",
+			component: "nvcre",
+			file:      "sourceVersion: v0.2.0\nimages: []\n",
+			wantErr:   true,
+		},
+		{
+			// The bump Mark described: defaultVersion moves, the closure
+			// does not, and the BOM would carry v0.1.0's images under v0.2.0.
+			name:      "sourceVersion behind the pinned chart version",
+			component: "nvcre",
+			file:      "sourceVersion: v0.1.0\nimages:\n  - image: ghcr.io/x/y\n    digest: sha256:abc\n",
+			wantErr:   true,
+		},
+		{
+			// Absent is not a free pass: a closure that declares no version
+			// cannot vouch for the one it was generated from.
+			name:      "sourceVersion absent",
+			component: "nvcre",
+			file:      "images:\n  - image: ghcr.io/x/y\n",
+			wantErr:   true,
+		},
+		{
+			name:      "sourceVersion matches the pin",
+			component: "nvcre",
+			file:      "sourceVersion: v0.2.0\nimages:\n  - image: ghcr.io/x/y\n    digest: sha256:abc\n",
+			wantRefs:  []string{"ghcr.io/x/y@sha256:abc"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			dir := filepath.Join(root, "recipes", "components", tt.component)
+			if err := os.MkdirAll(dir, 0o750); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			if tt.file != "" {
+				path := filepath.Join(dir, "workload-images.yaml")
+				if err := os.WriteFile(path, []byte(tt.file), 0o600); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			}
+
+			refs, err := readWorkloadClosure(root, tt.component, pinned)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("readWorkloadClosure error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if len(refs) != len(tt.wantRefs) {
+				t.Fatalf("refs = %v, want %v", refs, tt.wantRefs)
+			}
+			for i := range refs {
+				if refs[i] != tt.wantRefs[i] {
+					t.Errorf("refs[%d] = %q, want %q", i, refs[i], tt.wantRefs[i])
+				}
+			}
+		})
+	}
+}

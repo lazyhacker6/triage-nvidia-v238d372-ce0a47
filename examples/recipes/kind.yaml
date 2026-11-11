@@ -1,0 +1,76 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Hand-curated illustration of RecipeResult structure; intentionally incomplete.
+# Components, metadata, and validation differ from actual generated output.
+# Generate a current recipe with `aicr recipe` before bundling or validation.
+# Shows selected supporting components only; omits the GPU stack and validation.
+
+kind: RecipeResult
+apiVersion: aicr.run/v1
+metadata:
+  version: dev
+criteria:
+  service: kind
+  accelerator: any
+  intent: training
+  os: any
+constraints:
+  - name: K8s.server.version
+    value: '>= 1.30'
+componentRefs:
+  - name: cert-manager
+    namespace: cert-manager
+    chart: cert-manager
+    type: Helm
+    source: https://charts.jetstack.io
+    version: v1.20.2
+    valuesFile: components/cert-manager/values.yaml
+  - name: nodewright-operator
+    namespace: nodewright
+    chart: nodewright
+    type: Helm
+    source: oci://ghcr.io/nvidia/nodewright/charts
+    version: v0.21.0
+    valuesFile: components/nodewright-operator/values.yaml
+  - name: prometheus-operator-crds
+    namespace: nvidia-system
+    chart: prometheus-operator-crds
+    type: Helm
+    source: https://prometheus-community.github.io/helm-charts
+    version: 28.0.1
+    valuesFile: components/prometheus-operator-crds/values.yaml
+  - name: kube-prometheus-stack
+    namespace: nvidia-system
+    chart: kube-prometheus-stack
+    type: Helm
+    source: https://prometheus-community.github.io/helm-charts
+    version: 84.4.0
+    valuesFile: components/kube-prometheus-stack/values.yaml
+    dependencyRefs:
+      - prometheus-operator-crds
+  - name: k8s-ephemeral-storage-metrics
+    namespace: nvidia-system
+    chart: k8s-ephemeral-storage-metrics
+    type: Helm
+    source: https://jmcgrath207.github.io/k8s-ephemeral-storage-metrics/chart
+    version: 1.19.2
+    valuesFile: components/k8s-ephemeral-storage-metrics/values.yaml
+
+deploymentOrder:
+  - cert-manager
+  - nodewright-operator
+  - prometheus-operator-crds
+  - kube-prometheus-stack
+  - k8s-ephemeral-storage-metrics

@@ -1,0 +1,155 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package helm
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/errors"
+
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+)
+
+func TestLastPathSegment(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"nvidia/gpu-operator", "gpu-operator"},
+		{"gpu-operator", "gpu-operator"},
+		{"a/b/c", "c"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := lastPathSegment(tt.input); got != tt.want {
+				t.Errorf("lastPathSegment(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRenderChartNoChart(t *testing.T) {
+	_, err := RenderChart(t.Context(), ChartInput{
+		Name: "test",
+	})
+	if err == nil {
+		t.Fatal("expected error for empty chart, got nil")
+	}
+}
+
+func TestLimitedWriterUnderLimit(t *testing.T) {
+	var buf bytes.Buffer
+	lw := &limitedWriter{w: &buf, limit: 100}
+
+	data := []byte("hello world")
+	n, err := lw.Write(data)
+	if err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if n != len(data) {
+		t.Errorf("Write() n = %d, want %d", n, len(data))
+	}
+	if buf.String() != "hello world" {
+		t.Errorf("buffer = %q, want %q", buf.String(), "hello world")
+	}
+	if lw.written != int64(len(data)) {
+		t.Errorf("written = %d, want %d", lw.written, len(data))
+	}
+}
+
+func TestLimitedWriterExactLimit(t *testing.T) {
+	var buf bytes.Buffer
+	lw := &limitedWriter{w: &buf, limit: 5}
+
+	n, err := lw.Write([]byte("12345"))
+	if err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if n != 5 {
+		t.Errorf("Write() n = %d, want 5", n)
+	}
+}
+
+func TestLimitedWriterOverflow(t *testing.T) {
+	var buf bytes.Buffer
+	lw := &limitedWriter{w: &buf, limit: 10}
+
+	// First write fits.
+	if _, err := lw.Write([]byte("12345")); err != nil {
+		t.Fatalf("first Write() error = %v", err)
+	}
+
+	// Second write exceeds the limit — must error.
+	_, err := lw.Write([]byte("678901"))
+	if err == nil {
+		t.Fatal("expected error on overflow, got nil")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeInternal {
+		t.Errorf("expected ErrCodeInternal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "exceeds size limit") {
+		t.Errorf("error message = %q, want substring %q", err.Error(), "exceeds size limit")
+	}
+
+	// Buffer must contain only the first write — no partial data from overflow.
+	if buf.String() != "12345" {
+		t.Errorf("buffer after overflow = %q, want %q", buf.String(), "12345")
+	}
+}
+
+func TestLimitedWriterSingleWriteOverflow(t *testing.T) {
+	var buf bytes.Buffer
+	lw := &limitedWriter{w: &buf, limit: 3}
+
+	_, err := lw.Write([]byte("too long"))
+	if err == nil {
+		t.Fatal("expected error on overflow, got nil")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("buffer should be empty after rejected write, got %q", buf.String())
+	}
+}
+
+func TestSummarizeHelmError(t *testing.T) {
+	tests := []struct {
+		name   string
+		stderr string
+		want   string
+	}{
+		{"empty", "", ""},
+		{"no error line", "WARNING: something happened", ""},
+		{"single line", "Error: chart not found", "chart not found"},
+		{
+			"warning mentioning Error is skipped",
+			"WARNING: retry after Error: timeout\nError: failed to pull chart",
+			"failed to pull chart",
+		},
+		{
+			"continuation lines are kept",
+			"Error: template: x/templates/a.yaml:3:4: executing\n  nil pointer evaluating\n\nUse --debug",
+			"template: x/templates/a.yaml:3:4: executing nil pointer evaluating",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := summarizeHelmError(tt.stderr); got != tt.want {
+				t.Errorf("summarizeHelmError() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

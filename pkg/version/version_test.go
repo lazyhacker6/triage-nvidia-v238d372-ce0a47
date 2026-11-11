@@ -1,0 +1,988 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package version
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+func TestParseVersion(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		expected      Version
+		expectedError bool
+	}{
+		{
+			name:  "major only",
+			input: "1",
+			expected: Version{
+				Major:     1,
+				Minor:     0,
+				Patch:     0,
+				Precision: 1,
+			},
+			expectedError: false,
+		},
+		{
+			name:  "major only with v prefix",
+			input: "v2",
+			expected: Version{
+				Major:     2,
+				Minor:     0,
+				Patch:     0,
+				Precision: 1,
+			},
+			expectedError: false,
+		},
+		{
+			name:  "major.minor",
+			input: "1.2",
+			expected: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     0,
+				Precision: 2,
+			},
+			expectedError: false,
+		},
+		{
+			name:  "major.minor with v prefix",
+			input: "v0.1",
+			expected: Version{
+				Major:     0,
+				Minor:     1,
+				Patch:     0,
+				Precision: 2,
+			},
+			expectedError: false,
+		},
+		{
+			name:  "full version",
+			input: "1.2.3",
+			expected: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     3,
+				Precision: 3,
+			},
+			expectedError: false,
+		},
+		{
+			name:  "full version with v prefix",
+			input: "v1.2.3",
+			expected: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     3,
+				Precision: 3,
+			},
+			expectedError: false,
+		},
+		{
+			name:  "version with zeros",
+			input: "v0.0.0",
+			expected: Version{
+				Major:     0,
+				Minor:     0,
+				Patch:     0,
+				Precision: 3,
+			},
+			expectedError: false,
+		},
+		{
+			name:          "invalid - too many components",
+			input:         "1.2.3.4",
+			expected:      Version{},
+			expectedError: true,
+		},
+		{
+			name:  "kernel version with extras",
+			input: "6.8.0-1028-aws",
+			expected: Version{
+				Major:     6,
+				Minor:     8,
+				Patch:     0,
+				Precision: 3,
+				Extras:    "-1028-aws",
+			},
+			expectedError: false,
+		},
+		{
+			name:  "eks version with extras",
+			input: "v1.33.5-eks-3025e55",
+			expected: Version{
+				Major:     1,
+				Minor:     33,
+				Patch:     5,
+				Precision: 3,
+				Extras:    "-eks-3025e55",
+			},
+			expectedError: false,
+		},
+		{
+			name:  "gke version with extras",
+			input: "v1.28.0-gke.1337000",
+			expected: Version{
+				Major:     1,
+				Minor:     28,
+				Patch:     0,
+				Precision: 3,
+				Extras:    "-gke.1337000",
+			},
+			expectedError: false,
+		},
+		{
+			name:  "aks version with extras",
+			input: "1.29.2-hotfix.20240322",
+			expected: Version{
+				Major:     1,
+				Minor:     29,
+				Patch:     2,
+				Precision: 3,
+				Extras:    "-hotfix.20240322",
+			},
+			expectedError: false,
+		},
+		{
+			name:          "invalid - non-numeric",
+			input:         "v1.2.a",
+			expected:      Version{},
+			expectedError: true,
+		},
+		{
+			name:          "invalid - empty string",
+			input:         "",
+			expected:      Version{},
+			expectedError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := ParseVersion(tt.input)
+			if tt.expectedError {
+				if err == nil {
+					t.Errorf("expected error but got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+			if result.Major != tt.expected.Major {
+				t.Errorf("Major: got %d, want %d", result.Major, tt.expected.Major)
+			}
+			if result.Minor != tt.expected.Minor {
+				t.Errorf("Minor: got %d, want %d", result.Minor, tt.expected.Minor)
+			}
+			if result.Patch != tt.expected.Patch {
+				t.Errorf("Patch: got %d, want %d", result.Patch, tt.expected.Patch)
+			}
+			if result.Precision != tt.expected.Precision {
+				t.Errorf("Precision: got %d, want %d", result.Precision, tt.expected.Precision)
+			}
+			if result.Extras != tt.expected.Extras {
+				t.Errorf("Extras: got %q, want %q", result.Extras, tt.expected.Extras)
+			}
+			if want := strings.HasPrefix(tt.input, "v"); result.Prefixed != want {
+				t.Errorf("Prefixed: got %v, want %v", result.Prefixed, want)
+			}
+		})
+	}
+}
+
+func TestVersionString(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  Version
+		expected string
+	}{
+		{
+			name: "major only",
+			version: Version{
+				Major:     1,
+				Minor:     0,
+				Patch:     0,
+				Precision: 1,
+			},
+			expected: "1",
+		},
+		{
+			name: "major.minor",
+			version: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     0,
+				Precision: 2,
+			},
+			expected: "1.2",
+		},
+		{
+			name: "full version",
+			version: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     3,
+				Precision: 3,
+			},
+			expected: "1.2.3",
+		},
+		{
+			name: "zero version with precision 2",
+			version: Version{
+				Major:     0,
+				Minor:     1,
+				Patch:     5,
+				Precision: 2,
+			},
+			expected: "0.1",
+		},
+		{
+			name: "version with extras - should not include in String()",
+			version: Version{
+				Major:     6,
+				Minor:     8,
+				Patch:     0,
+				Precision: 3,
+				Extras:    "-1028-aws",
+			},
+			expected: "6.8.0",
+		},
+		{
+			name: "eks version with extras - should not include in String()",
+			version: Version{
+				Major:     1,
+				Minor:     33,
+				Patch:     5,
+				Precision: 3,
+				Extras:    "-eks-3025e55",
+			},
+			expected: "1.33.5",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.version.String()
+			if result != tt.expected {
+				t.Errorf("got %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestEqualsOrNewer(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  Version
+		other    Version
+		expected bool
+	}{
+		{
+			name: "major only - equal",
+			version: Version{
+				Major:     1,
+				Minor:     0,
+				Patch:     0,
+				Precision: 1,
+			},
+			other: Version{
+				Major:     1,
+				Minor:     5,
+				Patch:     10,
+				Precision: 3,
+			},
+			expected: true,
+		},
+		{
+			name: "major only - newer",
+			version: Version{
+				Major:     2,
+				Minor:     0,
+				Patch:     0,
+				Precision: 1,
+			},
+			other: Version{
+				Major:     1,
+				Minor:     9,
+				Patch:     9,
+				Precision: 3,
+			},
+			expected: true,
+		},
+		{
+			name: "major only - older",
+			version: Version{
+				Major:     1,
+				Minor:     0,
+				Patch:     0,
+				Precision: 1,
+			},
+			other: Version{
+				Major:     2,
+				Minor:     0,
+				Patch:     0,
+				Precision: 3,
+			},
+			expected: false,
+		},
+		{
+			name: "major.minor - equal (example from user: v0.1 matches 0.1.1)",
+			version: Version{
+				Major:     0,
+				Minor:     1,
+				Patch:     0,
+				Precision: 2,
+			},
+			other: Version{
+				Major:     0,
+				Minor:     1,
+				Patch:     1,
+				Precision: 3,
+			},
+			expected: true,
+		},
+		{
+			name: "major.minor - newer minor",
+			version: Version{
+				Major:     1,
+				Minor:     3,
+				Patch:     0,
+				Precision: 2,
+			},
+			other: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     99,
+				Precision: 3,
+			},
+			expected: true,
+		},
+		{
+			name: "major.minor - older minor",
+			version: Version{
+				Major:     1,
+				Minor:     1,
+				Patch:     0,
+				Precision: 2,
+			},
+			other: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     0,
+				Precision: 3,
+			},
+			expected: false,
+		},
+		{
+			name: "full version - equal",
+			version: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     3,
+				Precision: 3,
+			},
+			other: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     3,
+				Precision: 3,
+			},
+			expected: true,
+		},
+		{
+			name: "full version - newer patch",
+			version: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     4,
+				Precision: 3,
+			},
+			other: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     3,
+				Precision: 3,
+			},
+			expected: true,
+		},
+		{
+			name: "full version - older patch",
+			version: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     2,
+				Precision: 3,
+			},
+			other: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     3,
+				Precision: 3,
+			},
+			expected: false,
+		},
+		{
+			name: "full version - newer major",
+			version: Version{
+				Major:     2,
+				Minor:     0,
+				Patch:     0,
+				Precision: 3,
+			},
+			other: Version{
+				Major:     1,
+				Minor:     9,
+				Patch:     9,
+				Precision: 3,
+			},
+			expected: true,
+		},
+		{
+			name: "full version - newer minor",
+			version: Version{
+				Major:     1,
+				Minor:     3,
+				Patch:     0,
+				Precision: 3,
+			},
+			other: Version{
+				Major:     1,
+				Minor:     2,
+				Patch:     99,
+				Precision: 3,
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.version.EqualsOrNewer(tt.other)
+			if result != tt.expected {
+				t.Errorf("got %v, want %v (comparing %s vs %s)", result, tt.expected, tt.version.String(), tt.other.String())
+			}
+		})
+	}
+}
+
+func TestNewVersion(t *testing.T) {
+	v := NewVersion(1, 2, 3)
+	if v.Major != 1 || v.Minor != 2 || v.Patch != 3 || v.Precision != 3 {
+		t.Errorf("NewVersion(1,2,3) = %+v, want Major:1 Minor:2 Patch:3 Precision:3", v)
+	}
+}
+
+func TestMustParseVersion(t *testing.T) {
+	// Should not panic on valid input
+	v := MustParseVersion("v1.2.3")
+	if v.Major != 1 || v.Minor != 2 || v.Patch != 3 {
+		t.Errorf("MustParseVersion failed: got %+v", v)
+	}
+
+	// Should panic on invalid input
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("MustParseVersion did not panic on invalid input")
+		}
+	}()
+	MustParseVersion("invalid")
+}
+
+func TestIsNewer(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  Version
+		other    Version
+		expected bool
+	}{
+		{
+			name:     "newer major",
+			version:  Version{Major: 2, Minor: 0, Patch: 0, Precision: 3},
+			other:    Version{Major: 1, Minor: 9, Patch: 9, Precision: 3},
+			expected: true,
+		},
+		{
+			name:     "newer minor",
+			version:  Version{Major: 1, Minor: 3, Patch: 0, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 99, Precision: 3},
+			expected: true,
+		},
+		{
+			name:     "newer patch",
+			version:  Version{Major: 1, Minor: 2, Patch: 4, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			expected: true,
+		},
+		{
+			name:     "equal - full version",
+			version:  Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			expected: false,
+		},
+		{
+			name:     "equal - precision 1",
+			version:  Version{Major: 1, Minor: 0, Patch: 0, Precision: 1},
+			other:    Version{Major: 1, Minor: 5, Patch: 10, Precision: 3},
+			expected: false,
+		},
+		{
+			name:     "older",
+			version:  Version{Major: 1, Minor: 2, Patch: 2, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.version.isNewer(tt.other)
+			if result != tt.expected {
+				t.Errorf("got %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestEquals(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  Version
+		other    Version
+		expected bool
+	}{
+		{
+			name:     "equal",
+			version:  Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			expected: true,
+		},
+		{
+			name:     "equal - different precision",
+			version:  Version{Major: 1, Minor: 2, Patch: 3, Precision: 2},
+			other:    Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			expected: true,
+		},
+		{
+			name:     "different major",
+			version:  Version{Major: 2, Minor: 2, Patch: 3, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			expected: false,
+		},
+		{
+			name:     "different minor",
+			version:  Version{Major: 1, Minor: 3, Patch: 3, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			expected: false,
+		},
+		{
+			name:     "different patch",
+			version:  Version{Major: 1, Minor: 2, Patch: 4, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.version.Equals(tt.other)
+			if result != tt.expected {
+				t.Errorf("got %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCompare(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  Version
+		other    Version
+		expected int
+	}{
+		{
+			name:     "less - major",
+			version:  Version{Major: 1, Minor: 9, Patch: 9, Precision: 3},
+			other:    Version{Major: 2, Minor: 0, Patch: 0, Precision: 3},
+			expected: -1,
+		},
+		{
+			name:     "less - minor",
+			version:  Version{Major: 1, Minor: 2, Patch: 99, Precision: 3},
+			other:    Version{Major: 1, Minor: 3, Patch: 0, Precision: 3},
+			expected: -1,
+		},
+		{
+			name:     "less - patch",
+			version:  Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 4, Precision: 3},
+			expected: -1,
+		},
+		{
+			name:     "equal - full",
+			version:  Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			expected: 0,
+		},
+		{
+			name:     "equal - precision 1",
+			version:  Version{Major: 1, Minor: 0, Patch: 0, Precision: 1},
+			other:    Version{Major: 1, Minor: 5, Patch: 10, Precision: 3},
+			expected: 0,
+		},
+		{
+			name:     "equal - precision 2",
+			version:  Version{Major: 1, Minor: 2, Patch: 0, Precision: 2},
+			other:    Version{Major: 1, Minor: 2, Patch: 5, Precision: 3},
+			expected: 0,
+		},
+		{
+			name:     "greater - major",
+			version:  Version{Major: 2, Minor: 0, Patch: 0, Precision: 3},
+			other:    Version{Major: 1, Minor: 9, Patch: 9, Precision: 3},
+			expected: 1,
+		},
+		{
+			name:     "greater - minor",
+			version:  Version{Major: 1, Minor: 3, Patch: 0, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 99, Precision: 3},
+			expected: 1,
+		},
+		{
+			name:     "greater - patch",
+			version:  Version{Major: 1, Minor: 2, Patch: 4, Precision: 3},
+			other:    Version{Major: 1, Minor: 2, Patch: 3, Precision: 3},
+			expected: 1,
+		},
+		// GKE build suffix tie-break cases
+		{
+			name:     "gke same build → 0",
+			version:  Version{Major: 1, Minor: 34, Patch: 3, Precision: 3, Extras: "-gke.1318000"},
+			other:    Version{Major: 1, Minor: 34, Patch: 3, Precision: 3, Extras: "-gke.1318000"},
+			expected: 0,
+		},
+		{
+			name:     "actual has higher gke build → 1",
+			version:  Version{Major: 1, Minor: 34, Patch: 3, Precision: 3, Extras: "-gke.2000000"},
+			other:    Version{Major: 1, Minor: 34, Patch: 3, Precision: 3, Extras: "-gke.1318000"},
+			expected: 1,
+		},
+		{
+			name:     "actual has lower gke build → -1",
+			version:  Version{Major: 1, Minor: 34, Patch: 3, Precision: 3, Extras: "-gke.1000000"},
+			other:    Version{Major: 1, Minor: 34, Patch: 3, Precision: 3, Extras: "-gke.1318000"},
+			expected: -1,
+		},
+		{
+			name:     "only constraint has gke suffix → actual fails floor → -1",
+			version:  Version{Major: 1, Minor: 34, Patch: 3, Precision: 3},
+			other:    Version{Major: 1, Minor: 34, Patch: 3, Precision: 3, Extras: "-gke.1318000"},
+			expected: -1,
+		},
+		{
+			name:     "only actual has gke suffix → passes bare constraint → 1",
+			version:  Version{Major: 1, Minor: 34, Patch: 3, Precision: 3, Extras: "-gke.1318000"},
+			other:    Version{Major: 1, Minor: 34, Patch: 3, Precision: 3},
+			expected: 1,
+		},
+		{
+			name:     "EKS non-numeric extras both sides → 0",
+			version:  Version{Major: 1, Minor: 34, Patch: 3, Precision: 3, Extras: "-eks-3025e55"},
+			other:    Version{Major: 1, Minor: 34, Patch: 3, Precision: 3, Extras: "-eks-abc"},
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.version.Compare(tt.other)
+			if result != tt.expected {
+				t.Errorf("got %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseVersionErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		expectedErr error
+	}{
+		{
+			name:        "empty string",
+			input:       "",
+			expectedErr: ErrEmptyVersion,
+		},
+		{
+			name:        "too many components",
+			input:       "1.2.3.4",
+			expectedErr: ErrTooManyComponents,
+		},
+		{
+			name:        "non-numeric major",
+			input:       "a.2.3",
+			expectedErr: ErrNonNumeric,
+		},
+		{
+			name:        "non-numeric minor",
+			input:       "1.b.3",
+			expectedErr: ErrNonNumeric,
+		},
+		{
+			name:        "non-numeric patch",
+			input:       "1.2.c",
+			expectedErr: ErrNonNumeric,
+		},
+		{
+			name:        "negative major",
+			input:       "-1.2.3",
+			expectedErr: ErrNegativeComponent,
+		},
+		{
+			name:        "negative minor",
+			input:       "1.-2.3",
+			expectedErr: ErrNegativeComponent,
+		},
+		{
+			name:        "negative patch",
+			input:       "1.2.-3",
+			expectedErr: ErrNegativeComponent,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseVersion(tt.input)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !errors.Is(err, tt.expectedErr) && !strings.Contains(err.Error(), tt.expectedErr.Error()) {
+				t.Errorf("expected error containing %v, got %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestParseCanonical(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    Version
+		wantErr error
+	}{
+		{name: "three components", input: "1.2.3", want: NewVersion(1, 2, 3)},
+		{name: "v prefix", input: "v25.10.1", want: Version{Major: 25, Minor: 10, Patch: 1, Precision: 3, Prefixed: true}},
+		{name: "two components", input: "v1.2", want: Version{Major: 1, Minor: 2, Precision: 2, Prefixed: true}},
+		{name: "one component", input: "7", want: Version{Major: 7, Precision: 1}},
+		{name: "zero components", input: "v0.0.0", want: Version{Precision: 3, Prefixed: true}},
+		{name: "pre-release suffix", input: "1.2.3-rc.1", wantErr: ErrNotCanonical},
+		{name: "build suffix", input: "v1.2.3+build", wantErr: ErrNotCanonical},
+		{name: "GKE suffix", input: "1.28.0-gke.1337000", wantErr: ErrNotCanonical},
+		{name: "leading zero", input: "01.2", wantErr: ErrNotCanonical},
+		{name: "signed component", input: "1.+2", wantErr: ErrNotCanonical},
+		{name: "double v prefix", input: "vv1.2", wantErr: ErrNonNumeric},
+		{name: "too many components", input: "1.2.3.4", wantErr: ErrTooManyComponents},
+		{name: "empty", input: "", wantErr: ErrEmptyVersion},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseCanonical(tt.input)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("ParseCanonical(%q) error = %v, want %v", tt.input, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseCanonical(%q) error = %v", tt.input, err)
+			}
+			if got != tt.want {
+				t.Errorf("ParseCanonical(%q) = %+v, want %+v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseVersionRoundTrip(t *testing.T) {
+	tests := []string{
+		"1",
+		"v2",
+		"1.2",
+		"v0.1",
+		"1.2.3",
+		"v1.2.3",
+	}
+
+	for _, input := range tests {
+		t.Run(input, func(t *testing.T) {
+			v, err := ParseVersion(input)
+			if err != nil {
+				t.Fatalf("ParseVersion failed: %v", err)
+			}
+			// Parse again from the string representation
+			v2, err := ParseVersion(v.String())
+			if err != nil {
+				t.Fatalf("ParseVersion round-trip failed: %v", err)
+			}
+			if v.Major != v2.Major || v.Minor != v2.Minor || v.Patch != v2.Patch || v.Precision != v2.Precision {
+				t.Errorf("round-trip mismatch: %+v != %+v", v, v2)
+			}
+		})
+	}
+}
+
+// ExampleParseVersion demonstrates how to parse version strings
+func ExampleParseVersion() {
+	// Parse various version formats
+	v1, _ := ParseVersion("1")
+	v2, _ := ParseVersion("v1.2")
+	v3, _ := ParseVersion("1.2.3")
+
+	fmt.Println(v1.String())
+	fmt.Println(v2.String())
+	fmt.Println(v3.String())
+	// Output:
+	// 1
+	// 1.2
+	// 1.2.3
+}
+
+// ExampleVersion_EqualsOrNewer demonstrates precision-aware version comparison
+func ExampleVersion_EqualsOrNewer() {
+	// Parse versions with different precisions
+	v1, _ := ParseVersion("v1.2")  // Precision 2: Major.Minor
+	v2, _ := ParseVersion("1.2.5") // Precision 3: Full version
+	v3, _ := ParseVersion("1.3.0") // Precision 3: Full version
+
+	// v1.2 matches v1.2.5 because v1.2 has precision 2
+	fmt.Println(v1.EqualsOrNewer(v2))
+
+	// v1.2 does not match v1.3.0 because minor differs
+	fmt.Println(v1.EqualsOrNewer(v3))
+
+	// Output:
+	// true
+	// false
+}
+
+// Example_precision demonstrates how precision affects version matching
+func Example_precision() {
+	// v1 has precision 1 (Major only)
+	major, _ := ParseVersion("v1")
+
+	// These all match because major is the only significant component
+	fmt.Println(major.EqualsOrNewer(Version{Major: 1, Minor: 0, Patch: 0, Precision: 3}))
+	fmt.Println(major.EqualsOrNewer(Version{Major: 1, Minor: 5, Patch: 0, Precision: 3}))
+	fmt.Println(major.EqualsOrNewer(Version{Major: 1, Minor: 99, Patch: 99, Precision: 3}))
+
+	// This doesn't match because major differs
+	fmt.Println(major.EqualsOrNewer(Version{Major: 2, Minor: 0, Patch: 0, Precision: 3}))
+
+	// Output:
+	// true
+	// true
+	// true
+	// false
+}
+
+// ExampleNewVersion demonstrates creating a version programmatically
+func ExampleNewVersion() {
+	v := NewVersion(1, 2, 3)
+	fmt.Println(v.String())
+	fmt.Printf("Major: %d, Minor: %d, Patch: %d, Precision: %d\n", v.Major, v.Minor, v.Patch, v.Precision)
+	// Output:
+	// 1.2.3
+	// Major: 1, Minor: 2, Patch: 3, Precision: 3
+}
+
+func TestExtractGKEBuild(t *testing.T) {
+	tests := []struct {
+		name      string
+		extras    string
+		wantBuild int64
+		wantIsGKE bool
+	}{
+		{name: "standard GKE suffix", extras: "-gke.1318000", wantBuild: 1318000, wantIsGKE: true},
+		{name: "zero build number", extras: "-gke.0", wantBuild: 0, wantIsGKE: true},
+		{name: "EKS non-GKE suffix", extras: "-eks-3025e55", wantBuild: 0, wantIsGKE: false},
+		{name: "empty extras", extras: "", wantBuild: 0, wantIsGKE: false},
+		{name: "GKE prefix with empty number", extras: "-gke.", wantBuild: 0, wantIsGKE: false},
+		{name: "GKE prefix with non-numeric suffix", extras: "-gke.abc", wantBuild: 0, wantIsGKE: false},
+		{name: "hotfix suffix", extras: "-hotfix.20240322", wantBuild: 0, wantIsGKE: false},
+		{name: "aws kernel suffix", extras: "-1028-aws", wantBuild: 0, wantIsGKE: false},
+		{name: "negative build number rejected", extras: "-gke.-1", wantBuild: 0, wantIsGKE: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			build, isGKE := ExtractGKEBuild(tt.extras)
+			if build != tt.wantBuild {
+				t.Errorf("ExtractGKEBuild(%q) build = %d, want %d", tt.extras, build, tt.wantBuild)
+			}
+			if isGKE != tt.wantIsGKE {
+				t.Errorf("ExtractGKEBuild(%q) isGKE = %v, want %v", tt.extras, isGKE, tt.wantIsGKE)
+			}
+		})
+	}
+}
+
+// TestHasRawGKESuffix verifies that HasRawGKESuffix returns true whenever the
+// -gke. prefix is present, regardless of build-number validity.
+func TestHasRawGKESuffix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		extras string
+		want   bool
+	}{
+		{"-gke.1318000", true},  // valid
+		{"-gke.-1", true},       // invalid build but prefix present
+		{"-gke.abc", true},      // invalid build but prefix present
+		{"-gke.", true},         // empty build but prefix present
+		{"-eks-3025e55", false}, // non-GKE
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.extras, func(t *testing.T) {
+			t.Parallel()
+			if got := HasRawGKESuffix(tt.extras); got != tt.want {
+				t.Errorf("HasRawGKESuffix(%q) = %v, want %v", tt.extras, got, tt.want)
+			}
+		})
+	}
+}
+
+// ExampleVersion_Compare demonstrates sorting versions
+func ExampleVersion_Compare() {
+	v1, _ := ParseVersion("1.2.0")
+	v2, _ := ParseVersion("1.2.3")
+	v3, _ := ParseVersion("1.3.0")
+
+	fmt.Println(v1.Compare(v2)) // v1 < v2
+	//nolint:gocritic // intentional self-comparison for demonstration
+	fmt.Println(v2.Compare(v2)) // v2 == v2
+	fmt.Println(v3.Compare(v1)) // v3 > v1
+
+	// Output:
+	// -1
+	// 0
+	// 1
+}

@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ printf "%q" .AppName }}
+  namespace: argocd
+{{- if .CascadeDelete }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+{{- end }}
+spec:
+  project: default
+  source:
+    repoURL: {{ .RepoURL }}
+    targetRevision: {{ .TargetRevision }}
+    path: {{ .Path }}
+    directory:
+      recurse: true
+      include: '*/application.yaml'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

@@ -1,0 +1,109 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package localformat
+
+import "github.com/NVIDIA/aicr/pkg/bundler/deployer"
+
+// FolderKind classifies a written folder by the presence/absence of Chart.yaml.
+type FolderKind int
+
+const (
+	// KindUpstreamHelm: folder contains no Chart.yaml; install.sh references
+	// an upstream Helm chart via upstream.env.
+	KindUpstreamHelm FolderKind = iota
+	// KindLocalHelm: folder contains a generated Chart.yaml + templates/;
+	// install.sh installs ./ as a local chart.
+	KindLocalHelm
+)
+
+// String returns the stable textual name for the kind. Used by logs and
+// golden-file diagnostics so diffs show kind names rather than integers.
+func (k FolderKind) String() string {
+	switch k {
+	case KindUpstreamHelm:
+		return "upstream-helm"
+	case KindLocalHelm:
+		return "local-helm"
+	default:
+		return "unknown"
+	}
+}
+
+// Upstream holds upstream chart reference fields written to upstream.env.
+type Upstream struct {
+	Chart   string
+	Repo    string
+	Version string
+}
+
+// Folder describes one written folder. Returned by Write so callers
+// (deployers) can generate orchestration files without re-classifying.
+type Folder struct {
+	Index     int    // 1-based; rendered as zero-padded 3-digit prefix in Dir
+	Dir       string // e.g. "001-nfd"
+	Kind      FolderKind
+	Name      string    // helm release name: component name, or "<name>-pre" / "<name>-post" for injected
+	Namespace string    // target namespace for the helm release; matches Component.Namespace
+	Parent    string    // component this folder belongs to (== Name for primary)
+	Upstream  *Upstream // set iff Kind == KindUpstreamHelm
+	Files     []string  // relative paths (to OutputDir) of files written in this folder
+	// CreateNamespace is true when the orchestration layer should pass
+	// --create-namespace to helm for this folder's release, false when
+	// the folder's chart ships its own Namespace resource (the Talos
+	// privileged-namespace pre-injection pattern). install.sh already
+	// honors this internally; the field exposes the same decision to
+	// out-of-band deployers (e.g., helmfile) that bypass install.sh.
+	// Helm 3 refuses to import a namespace it created out-of-band via
+	// --create-namespace because that namespace lacks the release's
+	// ownership annotations.
+	CreateNamespace bool
+	// CarriesPostManifests is true when this folder's chart contains the
+	// component's post-phase raw manifests — the injected "<name>-post"
+	// wrapper for mixed components (vendored and non-vendored alike;
+	// #1835). Deployers key manifest-specific per-release behavior off
+	// this marker (e.g. helmfile's disableValidation for
+	// ManifestsUseChartCRDs components) instead of re-deriving the
+	// folder shape from release-name suffixes alone.
+	CarriesPostManifests bool
+	// AppliesCRDs is true when this folder carries an apply-crds.sh: the
+	// component owns its CRDs and that script must run before the
+	// release's `helm upgrade`. install.sh already invokes it; the field
+	// exposes the same decision to deployers that bypass install.sh
+	// (helmfile emits a presync hook from it), so the hook cannot name a
+	// script the writers did not emit.
+	AppliesCRDs bool
+}
+
+// IsReadiness reports whether f is the readiness gate folder injected for its
+// parent component.
+func (f Folder) IsReadiness() bool {
+	return f.Name == f.Parent+"-"+string(phaseReadiness)
+}
+
+// Releases maps the written folders to deployer.Release entries, preserving
+// folder order (which is deployment order). Manifest is left empty; deployers
+// that add a per-folder declaration file set it afterwards.
+func (r WriteResult) Releases() []deployer.Release {
+	out := make([]deployer.Release, 0, len(r.Folders))
+	for _, f := range r.Folders {
+		out = append(out, deployer.Release{
+			Name:      f.Name,
+			Component: f.Parent,
+			Namespace: f.Namespace,
+			Path:      f.Dir,
+		})
+	}
+	return out
+}

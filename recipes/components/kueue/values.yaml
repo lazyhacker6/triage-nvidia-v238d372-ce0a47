@@ -1,0 +1,132 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kueue Helm values
+# Kubernetes-native job queueing system with quota management,
+# fair sharing, priority-based preemption, and multi-tenancy support.
+#
+# Upstream chart defaults are sufficient for resource requests/limits
+# and security context (runAsNonRoot, readOnlyRootFilesystem,
+# drop ALL capabilities, seccomp RuntimeDefault).
+
+controllerManager:
+  tolerations:
+    - operator: Exists
+
+enablePrometheus: true
+
+# Pinned copy of the chart 0.19.6 default controllerManagerConfigYaml with
+# ONE deliberate change: integrations.frameworks is trimmed to the
+# frameworks AICR manages (batch/job, JobSet, TrainJob). The chart default
+# also enables mpijob/ray (rayjob, rayservice, raycluster)/appwrapper/pod/
+# deployment/statefulset/leaderworkerset integrations, webhook interception
+# surface we do not ship by default. The kubeflow v1 jobs (paddlejob,
+# pytorchjob, tfjob, xgboostjob, jaxjob) are commented out upstream as of
+# 0.19.x, so they are not part of the trim.
+#
+# Upstream defaults accepted at the 0.19.3 bump, deliberately NOT pinned:
+# groupKindConcurrency Workload 5->10 and LocalQueue/ClusterQueue 1->5, and
+# clientConnection qps 50->300 with burst 100->500. WaitForPodsReady is also
+# enabled by default from 0.19 (30m timeout, 30m recoveryTimeout, and
+# blockAdmission false); a kind experiment confirmed it releases quota on
+# timeout and does not block the queue, so it is inherited rather than
+# overridden.
+#
+# Upgrading a standing 0.18.x install (the WaitForPodsReady default above, the
+# reserved `pods` resource name, stricter validation of directly-authored TAS
+# Workloads, and the ten feature gates, checked against 0.19.6, that an
+# override disabling TAS now has to set together): see "Upgrade Notes" >
+# kueue in docs/user/component-catalog.md.
+#
+# MAINTENANCE: this is a string blob (Helm does not merge it). On every
+# chart version bump, re-diff against
+#   helm show values oci://registry.k8s.io/kueue/charts/kueue --version <new>
+# and re-apply the frameworks trim.
+managerConfig:
+  controllerManagerConfigYaml: |-
+    apiVersion: config.kueue.x-k8s.io/v1beta2
+    kind: Configuration
+    health:
+      healthProbeBindAddress: :8081
+    metrics:
+      bindAddress: :8443
+    # enableClusterQueueResources: true
+    webhook:
+      port: 9443
+    leaderElection:
+      leaderElect: true
+      resourceName: c1f6bfd2.kueue.x-k8s.io
+    controller:
+      groupKindConcurrency:
+        Job.batch: 5
+        Pod: 5
+        Workload.kueue.x-k8s.io: 10
+        LocalQueue.kueue.x-k8s.io: 5
+        Cohort.kueue.x-k8s.io: 1
+        ClusterQueue.kueue.x-k8s.io: 5
+        ResourceFlavor.kueue.x-k8s.io: 1
+    clientConnection:
+      qps: 300
+      burst: 500
+    #pprofBindAddress: :8083
+    #waitForPodsReady:
+    #  timeout: 5m
+    #  recoveryTimeout: 3m
+    #  blockAdmission: false
+    #  requeuingStrategy:
+    #    timestamp: Eviction
+    #    backoffLimitCount: null # null indicates infinite requeuing
+    #    backoffBaseSeconds: 60
+    #    backoffMaxSeconds: 3600
+    #manageJobsWithoutQueueName: true
+    # See "Opt-in Namespace Management" for guidance on namespace management:
+    # https://kueue.sigs.k8s.io/docs/tasks/manage/enforce_job_management/opt_in_namespace_management/
+    #managedJobsNamespaceSelector:
+    #  matchExpressions:
+    #    - key: kubernetes.io/metadata.name
+    #      operator: NotIn
+    #      values: [ kube-system, kueue-system ]
+    #internalCertManagement:
+    #  enable: false
+    #  webhookServiceName: ""
+    #  webhookSecretName: ""
+    integrations:
+      frameworks:
+      - "batch/job"
+      - "jobset.x-k8s.io/jobset"
+      - "trainer.kubeflow.org/trainjob"
+    #  externalFrameworks:
+    #  - "Foo.v1.example.com"
+    #fairSharing:
+    #  preemptionStrategies: [LessThanOrEqualToFinalShare, LessThanInitialShare]
+    #admissionFairSharing:
+    #  usageHalfLifeTime: "168h" # 7 days
+    #  usageSamplingInterval: "5m"
+    #  resourceWeights: # optional, defaults to 1 for all resources if not specified
+    #    cpu: 0    # if you want to completely ignore cpu usage
+    #    memory: 0 # ignore completely memory usage
+    #    example.com/gpu: 100 # and you care only about GPUs usage
+    #resources:
+    #  excludeResourcePrefixes: []
+    #  quotaCheckStrategy: "BlockUndeclared"
+    # transformations:
+    # - input: nvidia.com/mig-4g.5gb
+    #   strategy: Replace | Retain
+    #   outputs:
+    #     example.com/accelerator-memory: 5Gi
+    #     example.com/accelerator-gpc: 4
+    #objectRetentionPolicies:
+    #  workloads:
+    #    afterFinished: null # null indicates infinite retention, 0s means no retention at all
+    #    afterDeactivatedByKueue: null # null indicates infinite retention, 0s means no retention at all

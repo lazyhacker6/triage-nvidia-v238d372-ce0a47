@@ -1,0 +1,163 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: GPU Smoke Test (nvkind + L40G)
+
+on:
+  schedule:
+    - cron: '0 6,18 * * *'  # Every 12 hours (2x daily)
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  workflow_dispatch: {}  # Allow manual runs
+
+permissions:
+  contents: read
+
+jobs:
+
+  # Gate GPU tests on actual PR diff (against main), not the push diff.
+  # Without this, rebasing a pull-request/* branch includes merged changes
+  # in the push diff, causing GPU tests to trigger for unrelated PRs.
+  check-paths:
+    if: github.repository == 'nvidia/aicr' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      should-run: ${{ steps.filter.outputs.matched }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        id: filter
+        with:
+          base: main
+          predicate-quantifier: 'some-with-excludes'
+          filters: |
+            matched:
+              - '.github/workflows/gpu-smoke-test.yaml'
+              - '.settings.yaml'
+              - '.github/actions/gpu-cluster-setup/**'
+              - '.github/actions/runtime-install/**'
+              - '.github/actions/aicr-build/**'
+              - '.github/actions/gpu-debug-diagnostics/**'
+              - '.github/actions/gpu-test-cleanup/**'
+              - '.github/actions/gpu-smoke-nvidia-smi/**'
+              - '.github/actions/load-versions/**'
+              - '.github/scripts/gpu-debug-diagnostics.sh'
+              - '.github/scripts/gpu-smoke-run-nvidia-smi.sh'
+              - '.github/scripts/gpu-smoke-show-nvidia-smi-log.sh'
+              - 'pkg/collector/**'
+              - 'pkg/snapshotter/**'
+              - '.github/actions/gpu-snapshot-validate/**'
+              # `aicr snapshot`/`validate` run here; constraint evaluation lives
+              # across pkg/validator (not just job/ + catalog/) and the CLI/entrypoint.
+              - 'pkg/validator/**'
+              - 'pkg/cli/**'
+              - 'cmd/aicr/**'
+              # Vendored deps build into the binary, so a dependency-only sync
+              # must still trigger this gate.
+              - 'go.mod'
+              - 'go.sum'
+              - 'pkg/defaults/timeouts.go'
+              - 'validators/conformance/**'
+              # Markdown/MDX under the runtime globs is documentation — never a
+              # reason to launch a GPU job (#2149). Requires some-with-excludes.
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
+
+  gpu-smoke-test:
+    needs: [check-paths]
+    # NVIDIA self-hosted GPU runners reject pull_request event jobs before
+    # checkout. PR GPU coverage runs through the pull-request/<number> push
+    # mirror, which copy-pr-bot syncs for trusted authors and bots
+    # (.github/copy-pr-bot.yaml) and for anyone else after /ok to test.
+    if: >
+      always() && github.repository == 'nvidia/aicr' && (
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && needs.check-paths.outputs.should-run == 'true')
+      )
+    name: GPU Smoke Test (nvkind + L40G)
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: linux-amd64-gpu-l40g-latest-1
+    timeout-minutes: 30
+
+    env:
+      KIND_CLUSTER_NAME: gpu-smoke-test
+
+    steps:
+
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Runner preflight snapshot
+        shell: bash
+        run: |
+          echo "::group::Runner preflight snapshot"
+          echo "hostname:     $(hostname)"
+          echo "kernel:       $(uname -a)"
+          echo "uptime:       $(uptime)"
+          echo "loadavg:      $(cat /proc/loadavg 2>/dev/null || echo unavailable)"
+          echo "nproc:        $(nproc 2>/dev/null || echo unavailable)"
+          free -h 2>/dev/null || true
+          df -h / 2>/dev/null || true
+          echo "::endgroup::"
+
+      - name: Set up GPU cluster
+        uses: ./.github/actions/gpu-cluster-setup
+        with:
+          # Keep smoke runner preflight explicit so action default changes do not
+          # silently alter L40G coverage.
+          min_gpu_count: '1'
+          min_free_disk_gb: '20'
+          min_available_memory_gb: '8'
+
+      - name: Build aicr
+        uses: ./.github/actions/aicr-build
+        with:
+          build_snapshot_agent: 'false'
+          validator_phases: 'none'
+
+      - name: Install GPU operator (helm)
+        uses: ./.github/actions/runtime-install
+        with:
+          method: helm
+
+      - name: Run nvidia-smi in a pod
+        uses: ./.github/actions/gpu-smoke-nvidia-smi
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+
+      # --- Snapshot and validation ---
+
+      - name: Snapshot and validate GPU
+        uses: ./.github/actions/gpu-snapshot-validate
+        with:
+          gpu_model: L40G
+          min_gpu_count: '1'
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+
+      - name: GPU Test Cleanup
+        if: always()
+        uses: ./.github/actions/gpu-test-cleanup
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          collect_artifacts: ${{ job.status != 'success' }}
+          diagnostic_mode: smoke

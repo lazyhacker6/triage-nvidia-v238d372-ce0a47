@@ -1,0 +1,4582 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package argocdhelm
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"testing"
+	"testing/iotest"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/NVIDIA/aicr/pkg/allocpolicy"
+	"github.com/NVIDIA/aicr/pkg/bundler/config"
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer"
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer/argocd/argocdtest"
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer/localformat/localformattest"
+	"github.com/NVIDIA/aicr/pkg/bundler/gatemanifest"
+	"github.com/NVIDIA/aicr/pkg/component"
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+	"github.com/NVIDIA/aicr/pkg/helm/helmtest"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+	"github.com/NVIDIA/aicr/pkg/recipe/providertest"
+)
+
+// update regenerates goldens under testdata/ when set via `go test -update`.
+// Same convention as helm and localformat deployer test suites.
+var update = flag.Bool("update", false, "update golden files")
+
+// helmTemplateTimeout bounds every `helm template` subprocess this file's
+// live-render tests spawn — generous for a local render, short enough that a
+// wedged helm cannot stall the suite.
+const helmTemplateTimeout = 30 * time.Second
+
+func newRecipeResult(version string, refs []recipe.ComponentRef) *recipe.RecipeResult {
+	r := &recipe.RecipeResult{
+		ComponentRefs: refs,
+	}
+	r.Metadata.Version = version
+	return r
+}
+
+func TestGenerate(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   *Generator
+		assert  func(t *testing.T, outputDir string, output *deployer.Output)
+		wantErr bool
+	}{
+		// Coverage of "produces Chart.yaml + templates/ directory and does NOT
+		// emit a flat app-of-apps.yaml" lives in TestBundleGolden_*; that
+		// freezes the full bundle layout (file existence + content). A
+		// separate substring case here would be redundant.
+		{
+			name: "dynamic paths stubbed in root values.yaml",
+			input: &Generator{
+				RecipeResult: newRecipeResult("1.0.0", []recipe.ComponentRef{
+					{Name: "gpu-operator", Namespace: "gpu-operator", Type: recipe.ComponentTypeHelm, Source: "https://helm.ngc.nvidia.com/nvidia", Chart: "gpu-operator", Version: "v24.9.0"},
+				}),
+				ComponentValues: map[string]map[string]any{
+					"gpu-operator": {"driver": map[string]any{"version": "580", "registry": "nvcr.io"}},
+				},
+				Version: "test",
+				RepoURL: "https://github.com/example/repo.git",
+				DynamicValues: map[string][]string{
+					"gpu-operator": {"driver.version"},
+				},
+			},
+			assert: func(t *testing.T, outputDir string, _ *deployer.Output) {
+				t.Helper()
+				content, err := os.ReadFile(filepath.Join(outputDir, "values.yaml"))
+				if err != nil {
+					t.Fatalf("failed to read values.yaml: %v", err)
+				}
+				var values map[string]any
+				if unmarshalErr := yaml.Unmarshal(content, &values); unmarshalErr != nil {
+					t.Fatalf("failed to parse values.yaml: %v", unmarshalErr)
+				}
+
+				// Root values.yaml should ONLY have dynamic stubs
+				key, keyErr := resolveOverrideKey("gpu-operator", nil)
+				if keyErr != nil {
+					t.Fatalf("resolveOverrideKey failed: %v", keyErr)
+				}
+				compValues, ok := values[key].(map[string]any)
+				if !ok {
+					t.Fatalf("expected dynamic stubs under key %q", key)
+				}
+				driver, ok := compValues["driver"].(map[string]any)
+				if !ok {
+					t.Fatal("expected driver map in dynamic stubs")
+				}
+				// Dynamic path should have the resolved default value (not empty —
+				// the Argo CD Helm chart preserves defaults so users see what to override)
+				if driver["version"] == nil {
+					t.Error("dynamic path driver.version should be present in root values.yaml")
+				}
+				// Static values should NOT be in root values.yaml
+				if _, hasRegistry := driver["registry"]; hasRegistry {
+					t.Error("static path driver.registry should NOT be in root values.yaml (it's in static/)")
+				}
+
+				// Static values should be in static/ directory
+				staticContent, staticErr := os.ReadFile(filepath.Join(outputDir, "static", "gpu-operator.yaml"))
+				if staticErr != nil {
+					t.Fatalf("failed to read static/gpu-operator.yaml: %v", staticErr)
+				}
+				if !strings.Contains(string(staticContent), "nvcr.io") {
+					t.Error("static/gpu-operator.yaml should contain static values like registry")
+				}
+			},
+		},
+		{
+			name: "transformed template uses values",
+			input: &Generator{
+				RecipeResult: newRecipeResult("1.0.0", []recipe.ComponentRef{
+					{Name: "gpu-operator", Namespace: "gpu-operator", Type: recipe.ComponentTypeHelm, Source: "https://helm.ngc.nvidia.com/nvidia", Chart: "gpu-operator", Version: "v24.9.0"},
+				}),
+				ComponentValues: map[string]map[string]any{
+					"gpu-operator": {"driver": map[string]any{"version": "580"}},
+				},
+				Version: "test",
+				RepoURL: "https://github.com/example/repo.git",
+				DynamicValues: map[string][]string{
+					"gpu-operator": {"driver.version"},
+				},
+			},
+			assert: func(t *testing.T, outputDir string, _ *deployer.Output) {
+				t.Helper()
+				tmplContent, err := os.ReadFile(filepath.Join(outputDir, "templates", "gpu-operator.yaml"))
+				if err != nil {
+					t.Fatalf("failed to read template: %v", err)
+				}
+				tmplStr := string(tmplContent)
+
+				if !strings.Contains(tmplStr, "values:") {
+					t.Error("template should contain values:")
+				}
+				if !strings.Contains(tmplStr, "static/gpu-operator.yaml") {
+					t.Error("template should load static values via .Files.Get")
+				}
+				if !strings.Contains(tmplStr, "mustMergeOverwrite") {
+					t.Error("template should merge static + dynamic values")
+				}
+				// Should be single-source, not multi-source
+				if strings.Contains(tmplStr, "sources:") {
+					t.Error("template should use single 'source:', not multi-source 'sources:'")
+				}
+				if strings.Contains(tmplStr, "$values") {
+					t.Error("template should not reference $values (flat Argo CD pattern)")
+				}
+			},
+		},
+		{
+			name: "deployment steps reference helm install",
+			input: &Generator{
+				RecipeResult: newRecipeResult("1.0.0", []recipe.ComponentRef{
+					{Name: "gpu-operator", Namespace: "gpu-operator", Type: recipe.ComponentTypeHelm, Source: "https://charts.example.com", Chart: "gpu-operator", Version: "v1.0.0"},
+				}),
+				ComponentValues: map[string]map[string]any{"gpu-operator": {}},
+				Version:         "test",
+				RepoURL:         "https://github.com/example/repo.git",
+				DynamicValues:   map[string][]string{"gpu-operator": {"driver.version"}},
+			},
+			assert: func(t *testing.T, _ string, output *deployer.Output) {
+				t.Helper()
+				found := false
+				for _, step := range output.DeploymentSteps {
+					if strings.Contains(step, "helm install") {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Error("deployment steps should reference 'helm install'")
+				}
+			},
+		},
+		{
+			name: "Chart.yaml has correct version from recipe",
+			input: &Generator{
+				RecipeResult: newRecipeResult("2.5.0", []recipe.ComponentRef{
+					{Name: "gpu-operator", Namespace: "gpu-operator", Type: recipe.ComponentTypeHelm, Source: "https://charts.example.com", Chart: "gpu-operator", Version: "v1.0.0"},
+				}),
+				ComponentValues: map[string]map[string]any{"gpu-operator": {}},
+				Version:         "test",
+				RepoURL:         "https://github.com/example/repo.git",
+				DynamicValues:   map[string][]string{"gpu-operator": {"driver.version"}},
+			},
+			assert: func(t *testing.T, outputDir string, _ *deployer.Output) {
+				t.Helper()
+				content, err := os.ReadFile(filepath.Join(outputDir, "Chart.yaml"))
+				if err != nil {
+					t.Fatalf("failed to read Chart.yaml: %v", err)
+				}
+				// writeChartYAML quotes the version scalar so YAML
+				// reserved scalars (e.g. "1.0", "null") round-trip as
+				// strings; see issue #1034.
+				if !strings.Contains(string(content), `version: "2.5.0"`) {
+					t.Errorf("Chart.yaml should contain version: \"2.5.0\", got:\n%s", string(content))
+				}
+			},
+		},
+		{
+			name:    "nil input returns error",
+			input:   nil,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outputDir := t.TempDir()
+			var output *deployer.Output
+			var err error
+			if tt.input != nil {
+				output, err = tt.input.Generate(context.Background(), outputDir)
+			} else {
+				gen := &Generator{}
+				output, err = gen.Generate(context.Background(), outputDir)
+			}
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Generate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if tt.assert != nil {
+				tt.assert(t, outputDir, output)
+			}
+		})
+	}
+}
+
+func TestGenerate_ProfileLockTemplate(t *testing.T) {
+	t.Run("unprofiled bundle emits no guard", func(t *testing.T) {
+		outputDir := t.TempDir()
+		g := &Generator{
+			RecipeResult: newRecipeResult("v1.0.0", []recipe.ComponentRef{{
+				Name: "gpu-operator", Namespace: "gpu-operator", Chart: "gpu-operator",
+				Version: "v25.3.3", Type: recipe.ComponentTypeHelm,
+				Source: "https://helm.ngc.nvidia.com/nvidia",
+			}}),
+			ComponentValues: map[string]map[string]any{"gpu-operator": {}},
+			Version:         "v0.0.0-test",
+		}
+		if _, err := g.Generate(t.Context(), outputDir); err != nil {
+			t.Fatalf("Generate() error = %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(outputDir, "templates", "aicr-profile-lock.yaml")); !os.IsNotExist(err) {
+			t.Fatalf("unprofiled guard stat error = %v, want not-exist", err)
+		}
+	})
+
+	t.Run("profiled guard rejects structural intersections", func(t *testing.T) {
+		helmtest.RequireBinary(t)
+
+		outputDir := t.TempDir()
+		result := newRecipeResult("v1.0.0", []recipe.ComponentRef{{
+			Name: "gpu-operator", Namespace: "gpu-operator", Chart: "gpu-operator",
+			Version: "v25.3.3", Type: recipe.ComponentTypeHelm,
+			Source: "https://helm.ngc.nvidia.com/nvidia",
+		}})
+		result.APIVersion = recipe.RecipeProfileAPIVersion
+		result.Metadata.SelectedProfile = &recipe.SelectedProfile{
+			Name:  "gpuStack",
+			Value: "driver-installed",
+			OwnedPaths: map[string][]string{
+				"gpu-operator": {"driver.enabled", "enabled"},
+			},
+		}
+		g := &Generator{
+			RecipeResult: result,
+			ComponentValues: map[string]map[string]any{
+				"gpu-operator": {"driver": map[string]any{"enabled": false}},
+			},
+			Version: "v0.0.0-test",
+		}
+		if _, err := g.Generate(t.Context(), outputDir); err != nil {
+			t.Fatalf("Generate() error = %v", err)
+		}
+		if _, err := g.Generate(t.Context(), outputDir); err != nil {
+			t.Fatalf("second Generate() into the same output directory error = %v", err)
+		}
+		guardPath := filepath.Join(outputDir, "templates", "aicr-profile-lock.yaml")
+		guard, err := os.ReadFile(guardPath)
+		if err != nil {
+			t.Fatalf("read profile lock guard: %v", err)
+		}
+		if !strings.Contains(string(guard), "gpu-operator.driver.enabled") {
+			t.Fatalf("profile lock guard does not name owned path:\n%s", guard)
+		}
+
+		tests := []struct {
+			name      string
+			extraArgs []string
+			wantErr   bool
+		}{
+			{name: "no component override"},
+			{
+				name:      "unrelated sibling",
+				extraArgs: []string{"--set", "gpuoperator.driver.version=580"},
+			},
+			{
+				name:      "exact false still intersects",
+				extraArgs: []string{"--set", "gpuoperator.driver.enabled=false"},
+				wantErr:   true,
+			},
+			{
+				name:      "explicit null still intersects",
+				extraArgs: []string{"--set-json", "gpuoperator.driver.enabled=null"},
+				wantErr:   true,
+			},
+			{
+				name:      "empty list still intersects",
+				extraArgs: []string{"--set-json", "gpuoperator.driver.enabled=[]"},
+				wantErr:   true,
+			},
+			{
+				name:      "non-map ancestor intersects",
+				extraArgs: []string{"--set-string", "gpuoperator.driver=blocked"},
+				wantErr:   true,
+			},
+			{
+				name:      "synthetic presence intersects",
+				extraArgs: []string{"--set", "gpuoperator.enabled=true"},
+				wantErr:   true,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				cmdCtx, cancel := context.WithTimeout(t.Context(), helmTemplateTimeout)
+				defer cancel()
+				args := []string{
+					"template", "test-release", outputDir,
+					"--set", "repoURL=oci://example.test/aicr",
+				}
+				args = append(args, tt.extraArgs...)
+				cmd := exec.CommandContext(cmdCtx, "helm", args...) //nolint:gosec // controlled test arguments
+				out, err := cmd.CombinedOutput()
+				if (err != nil) != tt.wantErr {
+					t.Fatalf("helm template error = %v, wantErr %v\noutput:\n%s", err, tt.wantErr, out)
+				}
+				// The driver-ownership lock rejects driver.enabled too. Helm
+				// executes templates in reverse lexical order within a
+				// directory and stops at the first failure (sortTemplates in
+				// helm.sh/helm/v4 pkg/engine), so aicr-profile-lock.yaml always
+				// reports before aicr-driver-ownership-lock.yaml.
+				if tt.wantErr && !strings.Contains(string(out), "intersects profile-owned path") {
+					t.Fatalf("helm template error does not name profile intersection:\n%s", out)
+				}
+			})
+		}
+	})
+
+	t.Run("advertiser-owning profile guard locks closure selector paths", func(t *testing.T) {
+		outputDir := t.TempDir()
+		result := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+			{
+				Name: "gpu-operator", Namespace: "gpu-operator", Chart: "gpu-operator",
+				Version: "v25.3.3", Type: recipe.ComponentTypeHelm,
+				Source: "https://helm.ngc.nvidia.com/nvidia",
+			},
+			{
+				Name: "nvidia-dra-driver-gpu", Namespace: "nvidia-dra-driver-gpu",
+				Chart: "nvidia-dra-driver-gpu", Version: "v25.3.0",
+				Type:   recipe.ComponentTypeHelm,
+				Source: "https://helm.ngc.nvidia.com/nvidia",
+			},
+		})
+		result.APIVersion = recipe.RecipeProfileAPIVersion
+		// gke-default shape: an external advertiser plus a disabled
+		// gpu-operator device plugin. The external advertiser triggers the
+		// #1327 closure, so the guard must lock the recomputed closure
+		// paths of every enabled descriptor component — not only the
+		// declared ownedPaths.
+		result.Metadata.SelectedProfile = &recipe.SelectedProfile{
+			Name:       "gpuStack",
+			Value:      "gke-default",
+			Advertiser: allocpolicy.AdvertiserExternal,
+			OwnedPaths: map[string][]string{
+				"gpu-operator": {allocpolicy.PathDevicePluginEnabled, "enabled"},
+			},
+		}
+		g := &Generator{
+			RecipeResult: result,
+			ComponentValues: map[string]map[string]any{
+				"gpu-operator":          {"devicePlugin": map[string]any{"enabled": false}},
+				"nvidia-dra-driver-gpu": {},
+			},
+			Version: "v0.0.0-test",
+		}
+		if _, err := g.Generate(t.Context(), outputDir); err != nil {
+			t.Fatalf("Generate() error = %v", err)
+		}
+		guard, err := os.ReadFile(filepath.Join(outputDir, "templates", "aicr-profile-lock.yaml"))
+		if err != nil {
+			t.Fatalf("read profile lock guard: %v", err)
+		}
+		for _, want := range []string{
+			allocpolicy.ComponentGPUOperator + "." + allocpolicy.PathDevicePluginEnabled,
+			allocpolicy.ComponentDRADriver + "." + allocpolicy.PathDRAGPUsEnabled,
+			allocpolicy.ComponentDRADriver + "." + allocpolicy.PathDRAGPUsEnabledOverride,
+		} {
+			if !strings.Contains(string(guard), want) {
+				t.Fatalf("profile lock guard missing closure path %q:\n%s", want, guard)
+			}
+		}
+
+		// Live-render the guard: closure-derived paths (never listed in the
+		// declared ownedPaths) must reject install-time overrides exactly
+		// like declared ones — the string assertions above prove the paths
+		// are named, this proves the rejection actually fires.
+		t.Run("closure path rejects install-time override", func(t *testing.T) {
+			helmtest.RequireBinary(t)
+
+			tests := []struct {
+				name      string
+				extraArgs []string
+				wantErr   bool
+			}{
+				{name: "no component override"},
+				{
+					name:      "closure-derived DRA path intersects",
+					extraArgs: []string{"--set", "dradriver.resources.gpus.enabled=false"},
+					wantErr:   true,
+				},
+			}
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					cmdCtx, cancel := context.WithTimeout(t.Context(), helmTemplateTimeout)
+					defer cancel()
+					args := []string{
+						"template", "test-release", outputDir,
+						"--set", "repoURL=oci://example.test/aicr",
+					}
+					args = append(args, tt.extraArgs...)
+					cmd := exec.CommandContext(cmdCtx, "helm", args...) //nolint:gosec // controlled test arguments
+					out, err := cmd.CombinedOutput()
+					if (err != nil) != tt.wantErr {
+						t.Fatalf("helm template error = %v, wantErr %v\noutput:\n%s", err, tt.wantErr, out)
+					}
+					if tt.wantErr && !strings.Contains(string(out), "intersects profile-owned path") {
+						t.Fatalf("helm template error does not name profile intersection:\n%s", out)
+					}
+				})
+			}
+		})
+	})
+
+	t.Run("profiled to unprofiled regeneration removes guard", func(t *testing.T) {
+		outputDir := t.TempDir()
+		result := newRecipeResult("v1.0.0", []recipe.ComponentRef{{
+			Name: "gpu-operator", Namespace: "gpu-operator", Chart: "gpu-operator",
+			Version: "v25.3.3", Type: recipe.ComponentTypeHelm,
+			Source: "https://helm.ngc.nvidia.com/nvidia",
+		}})
+		result.APIVersion = recipe.RecipeProfileAPIVersion
+		result.Metadata.SelectedProfile = &recipe.SelectedProfile{
+			Name:  "gpuStack",
+			Value: "driver-installed",
+			OwnedPaths: map[string][]string{
+				"gpu-operator": {"driver.enabled", "enabled"},
+			},
+		}
+		g := &Generator{
+			RecipeResult: result,
+			ComponentValues: map[string]map[string]any{
+				"gpu-operator": {"driver": map[string]any{"enabled": false}},
+			},
+			Version: "v0.0.0-test",
+		}
+		if _, err := g.Generate(t.Context(), outputDir); err != nil {
+			t.Fatalf("profiled Generate() error = %v", err)
+		}
+		guardPath := filepath.Join(outputDir, "templates", "aicr-profile-lock.yaml")
+		if _, err := os.Stat(guardPath); err != nil {
+			t.Fatalf("profile guard stat error = %v", err)
+		}
+
+		result.APIVersion = recipe.RecipeResultAPIVersion
+		result.Metadata.SelectedProfile = nil
+		if _, err := g.Generate(t.Context(), outputDir); err != nil {
+			t.Fatalf("unprofiled regeneration error = %v", err)
+		}
+		if _, err := os.Stat(guardPath); !os.IsNotExist(err) {
+			t.Fatalf("stale profile guard stat error = %v, want not-exist", err)
+		}
+	})
+}
+
+func TestGenerate_ProfileLockTemplateBytes(t *testing.T) {
+	result := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{Name: "gpu-operator", Namespace: "g", Chart: "gpu-operator", Version: "v25.3.3", Type: recipe.ComponentTypeHelm, Source: "https://helm.ngc.nvidia.com/nvidia"},
+		{Name: "nvidia-dra-driver-gpu", Namespace: "n", Chart: "nvidia-dra-driver-gpu", Version: "v25.3.0", Type: recipe.ComponentTypeHelm, Source: "https://helm.ngc.nvidia.com/nvidia"},
+	})
+	result.APIVersion = recipe.RecipeProfileAPIVersion
+	result.Metadata.SelectedProfile = &recipe.SelectedProfile{
+		Name: "gpuStack", Value: "gke-default", Advertiser: allocpolicy.AdvertiserExternal,
+		OwnedPaths: map[string][]string{
+			"gpu-operator": {allocpolicy.PathDevicePluginEnabled, "driver.enabled", "enabled"},
+		},
+	}
+	g := &Generator{
+		RecipeResult: result,
+		ComponentValues: map[string]map[string]any{
+			"gpu-operator": {}, "nvidia-dra-driver-gpu": {},
+		},
+		Version: "v0.0.0-test",
+	}
+	outputDir := t.TempDir()
+	if _, err := g.Generate(t.Context(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	// Captured from nvidia/main at 54f9e67d6, including the allocation-policy closure.
+	const wantHash = "51955a9a8191bce9556105d283d16282d26aa4562889646ce720e99d439fcac7"
+	guard := readBundleFile(t, outputDir, "templates/"+profileLockTemplateName+".yaml")
+	if got := fmt.Sprintf("%x", sha256.Sum256(guard)); got != wantHash {
+		t.Fatalf("profile lock bytes changed: sha256 = %s, want %s\n%s", got, wantHash, guard)
+	}
+}
+
+// driverOwnershipGuardCase is one family member's bundle shape and the
+// install-time overrides the driver-ownership lock must accept or reject.
+type driverOwnershipGuardCase struct {
+	component   string
+	overrideKey string
+	// paths are the guarded leaf paths the guard file must name.
+	paths []string
+	// failing are --set/--set-json/--set-string arguments (flag, value) that
+	// touch a guarded leaf or replace one of its ancestors.
+	failing [][2]string
+	// passing are sibling overrides that must keep rendering.
+	passing [][2]string
+}
+
+func driverOwnershipGuardCases() []driverOwnershipGuardCase {
+	gpuOperator := func(component, key string) driverOwnershipGuardCase {
+		return driverOwnershipGuardCase{
+			component:   component,
+			overrideKey: key,
+			paths:       []string{"driver.enabled", "toolkit.enabled", "hostPaths.driverInstallDir"},
+			failing: [][2]string{
+				{"--set", key + ".driver.enabled=true"},
+				{"--set", key + ".driver.enabled=false"},
+				{"--set", key + ".toolkit.enabled=false"},
+				{"--set", key + ".hostPaths.driverInstallDir=/x"},
+				{"--set-json", key + ".driver.enabled=null"},
+				{"--set-json", key + ".driver.enabled=[]"},
+				{"--set-string", key + ".driver=blocked"},
+				{"--set-string", key + ".hostPaths=blocked"},
+				{"--set-string", key + ".toolkit=blocked"},
+				{"--set-json", key + ".driver=null"},
+				{"--set-json", key + ".toolkit=null"},
+				{"--set-json", key + ".hostPaths=null"},
+				{"--set-json", key + "=null"},
+				{"--set-json", key + ".driver.enabled={\"nested\":true}"},
+			},
+			passing: [][2]string{
+				{"--set", key + ".driver.version=580"},
+				{"--set", key + ".toolkit.version=x"},
+				{"--set", key + ".hostPaths.rootFS=/host"},
+			},
+		}
+	}
+	draDriver := func(component, key string) driverOwnershipGuardCase {
+		return driverOwnershipGuardCase{
+			component:   component,
+			overrideKey: key,
+			paths:       []string{"nvidiaDriverRoot"},
+			failing: [][2]string{
+				{"--set", key + ".nvidiaDriverRoot=/x"},
+				{"--set-json", key + ".nvidiaDriverRoot=null"},
+				{"--set-json", key + ".nvidiaDriverRoot=[]"},
+				{"--set-json", key + "=null"},
+			},
+			passing: [][2]string{
+				{"--set", key + ".image.tag=v1"},
+			},
+		}
+	}
+	return []driverOwnershipGuardCase{
+		gpuOperator("gpu-operator", "gpuoperator"),
+		gpuOperator("gpu-operator-ocp", "gpuoperatorocp"),
+		draDriver("nvidia-dra-driver-gpu", "dradriver"),
+		draDriver("nvidia-dra-driver-gpu-ocp", "dradriverocp"),
+	}
+}
+
+func driverOwnershipGenerator(component string) *Generator {
+	return &Generator{
+		RecipeResult: newRecipeResult("v1.0.0", []recipe.ComponentRef{{
+			Name: component, Namespace: component, Chart: component,
+			Version: "v25.3.3", Type: recipe.ComponentTypeHelm,
+			Source: "https://helm.ngc.nvidia.com/nvidia",
+		}}),
+		ComponentValues: map[string]map[string]any{component: {}},
+		Version:         "v0.0.0-test",
+	}
+}
+
+func TestGenerate_DriverOwnershipLockTemplate(t *testing.T) {
+	lockRel := filepath.Join("templates", driverOwnershipLockTemplateName+".yaml")
+
+	t.Run("guard names every leaf of each family member", func(t *testing.T) {
+		for _, tc := range driverOwnershipGuardCases() {
+			t.Run(tc.component, func(t *testing.T) {
+				outputDir := t.TempDir()
+				output, err := driverOwnershipGenerator(tc.component).Generate(t.Context(), outputDir)
+				if err != nil {
+					t.Fatalf("Generate() error = %v", err)
+				}
+				guard, err := os.ReadFile(filepath.Join(outputDir, lockRel))
+				if err != nil {
+					t.Fatalf("read driver-ownership guard: %v", err)
+				}
+				if !strings.HasPrefix(string(guard), driverOwnershipLockTemplateHeader) {
+					t.Fatalf("guard does not start with the generated header:\n%s", guard)
+				}
+				for _, p := range tc.paths {
+					if !strings.Contains(string(guard), "driver-ownership path "+tc.component+"."+p+";") {
+						t.Errorf("guard does not name %s.%s:\n%s", tc.component, p, guard)
+					}
+				}
+				if !slices.Contains(output.Files, filepath.Join(outputDir, lockRel)) {
+					t.Errorf("output.Files does not list the guard: %v", output.Files)
+				}
+			})
+		}
+	})
+
+	t.Run("no guard without a guarded component", func(t *testing.T) {
+		tests := []struct {
+			name string
+			gen  *Generator
+		}{
+			{"no components", &Generator{RecipeResult: newRecipeResult("v1.0.0", nil)}},
+			{"unrelated component only", driverOwnershipGenerator("cert-manager")},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				outputDir := t.TempDir()
+				if _, err := tt.gen.Generate(t.Context(), outputDir); err != nil {
+					t.Fatalf("Generate() error = %v", err)
+				}
+				if _, err := os.Stat(filepath.Join(outputDir, lockRel)); !os.IsNotExist(err) {
+					t.Fatalf("guard stat error = %v, want not-exist", err)
+				}
+			})
+		}
+	})
+
+	// Generate emits an Application for a disabled ref too, so the guard keys
+	// on presence. The bundler drops disabled refs before calling Generate.
+	t.Run("guarded component disabled keeps its guard", func(t *testing.T) {
+		outputDir := t.TempDir()
+		g := driverOwnershipGenerator("gpu-operator")
+		g.RecipeResult.ComponentRefs[0].Overrides = map[string]any{"enabled": false}
+		if _, err := g.Generate(t.Context(), outputDir); err != nil {
+			t.Fatalf("Generate() error = %v", err)
+		}
+		readBundleFile(t, outputDir, "templates/gpu-operator.yaml")
+		guard := readBundleFile(t, outputDir, lockRel)
+		if !strings.Contains(string(guard), "driver-ownership path gpu-operator.driver.enabled;") {
+			t.Fatalf("disabled component's Application is unguarded:\n%s", guard)
+		}
+	})
+
+	t.Run("stale generated guard alone is removed", func(t *testing.T) {
+		outputDir := t.TempDir()
+		templatesDir := filepath.Join(outputDir, "templates")
+		if err := os.MkdirAll(templatesDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if _, _, err := driverOwnershipGenerator("gpu-operator").writeDriverOwnershipLockTemplate(templatesDir, nil, nil); err != nil {
+			t.Fatalf("write guard: %v", err)
+		}
+		if _, err := driverOwnershipGenerator("cert-manager").Generate(t.Context(), outputDir); err != nil {
+			t.Fatalf("regeneration error = %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(outputDir, lockRel)); !os.IsNotExist(err) {
+			t.Fatalf("stale guard stat error = %v, want not-exist", err)
+		}
+	})
+
+	t.Run("profiled bundle keeps both guards", func(t *testing.T) {
+		outputDir := t.TempDir()
+		g := driverOwnershipGenerator("gpu-operator")
+		g.RecipeResult.APIVersion = recipe.RecipeProfileAPIVersion
+		g.RecipeResult.Metadata.SelectedProfile = &recipe.SelectedProfile{
+			Name: "gpuStack", Value: "driver-installed",
+			OwnedPaths: map[string][]string{"gpu-operator": {"driver.enabled", "enabled"}},
+		}
+		if _, err := g.Generate(t.Context(), outputDir); err != nil {
+			t.Fatalf("Generate() error = %v", err)
+		}
+		for _, name := range []string{profileLockTemplateName, driverOwnershipLockTemplateName} {
+			if _, err := os.Stat(filepath.Join(outputDir, "templates", name+".yaml")); err != nil {
+				t.Errorf("%s stat error = %v", name, err)
+			}
+		}
+	})
+}
+
+func TestGenerate_DriverOwnershipRegeneration(t *testing.T) {
+	for _, tc := range driverOwnershipGuardCases() {
+		for _, checksums := range []bool{false, true} {
+			for _, replacement := range []string{"omitted", "disabled"} {
+				t.Run(fmt.Sprintf("%s/checksums=%v/%s", tc.component, checksums, replacement), func(t *testing.T) {
+					outputDir := t.TempDir()
+					g := driverOwnershipGenerator(tc.component)
+					g.IncludeChecksums = checksums
+					if _, err := g.Generate(t.Context(), outputDir); err != nil {
+						t.Fatalf("initial Generate() error = %v", err)
+					}
+					guardPath := "templates/" + driverOwnershipLockTemplateName + ".yaml"
+					appPath := "templates/" + tc.component + ".yaml"
+					guard := readBundleFile(t, outputDir, guardPath)
+					app := readBundleFile(t, outputDir, appPath)
+					values := readBundleFile(t, outputDir, "values.yaml")
+
+					// A disabled ref still emits its Application, so its guard
+					// is regenerated and reuse of the directory is safe.
+					if replacement == "disabled" {
+						next := driverOwnershipGenerator(tc.component)
+						next.IncludeChecksums = checksums
+						next.RecipeResult.ComponentRefs[0].Overrides = map[string]any{"enabled": false}
+						if _, err := next.Generate(t.Context(), outputDir); err != nil {
+							t.Fatalf("disabled regeneration error = %v", err)
+						}
+						readBundleFile(t, outputDir, appPath)
+						if got := readBundleFile(t, outputDir, guardPath); string(got) != string(guard) {
+							t.Errorf("disabled regeneration changed the guard:\n%s", got)
+						}
+						return
+					}
+
+					next := driverOwnershipGenerator("cert-manager")
+					next.IncludeChecksums = checksums
+					_, err := next.Generate(t.Context(), outputDir)
+					if err == nil {
+						t.Fatal("regeneration accepted stale component output without its guard")
+					}
+					errorstest.WantReportedCode(t, err, aicrerrors.ErrCodeInvalidRequest)
+					if !strings.Contains(err.Error(), "fresh output directory") {
+						t.Fatalf("error lacks regeneration remedy: %v", err)
+					}
+					for path, want := range map[string][]byte{guardPath: guard, appPath: app, "values.yaml": values} {
+						if got := readBundleFile(t, outputDir, path); string(got) != string(want) {
+							t.Errorf("failed regeneration mutated %s", path)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestGenerate_DriverOwnershipRejectsStaleArtifacts(t *testing.T) {
+	for _, artifact := range []string{
+		"templates/gpu-operator.yaml",
+		"templates/gpu-operator-pre.yaml",
+		"templates/gpu-operator-post.yaml",
+		"templates/gpu-operator-readiness.yaml",
+		"static/gpu-operator.yaml",
+		"001-gpu-operator/Chart.yaml",
+		"002-gpu-operator-pre/Chart.yaml",
+	} {
+		t.Run(artifact, func(t *testing.T) {
+			outputDir := t.TempDir()
+			artifactPath := filepath.Join(outputDir, artifact)
+			if err := os.MkdirAll(filepath.Dir(artifactPath), 0o755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			const sentinel = "prior artifact must survive\n"
+			if err := os.WriteFile(artifactPath, []byte(sentinel), 0o600); err != nil {
+				t.Fatalf("write prior artifact: %v", err)
+			}
+			_, err := driverOwnershipGenerator("cert-manager").Generate(t.Context(), outputDir)
+			if err == nil {
+				t.Fatal("Generate() accepted stale ownership artifact")
+			}
+			errorstest.WantReportedCode(t, err, aicrerrors.ErrCodeInvalidRequest)
+			if got := readBundleFile(t, outputDir, artifact); string(got) != sentinel {
+				t.Fatalf("Generate() mutated prior artifact: %s", got)
+			}
+		})
+	}
+}
+
+// TestGenerate_DriverOwnershipRejectsDynamicPaths covers a direct caller: a
+// dynamic path is stubbed into the root values.yaml, so one that intersects a
+// guarded path would ship a chart the lock rejects on every render.
+func TestGenerate_DriverOwnershipRejectsDynamicPaths(t *testing.T) {
+	tests := []struct {
+		name      string
+		component string
+		path      string
+		vendored  bool
+		disabled  bool
+		wantErr   bool
+	}{
+		{name: "guarded leaf", component: "nvidia-dra-driver-gpu", path: "nvidiaDriverRoot", wantErr: true},
+		{name: "guarded ancestor", component: "gpu-operator", path: "driver", wantErr: true},
+		{name: "guarded descendant", component: "gpu-operator", path: "hostPaths.driverInstallDir.x", wantErr: true},
+		{name: "disabled ref is still emitted", component: "gpu-operator-ocp", path: "toolkit.enabled", disabled: true, wantErr: true},
+		{name: "vendored dependency path", component: "nvidia-dra-driver-gpu", path: "dra-driver-nvidia-gpu.nvidiaDriverRoot", vendored: true, wantErr: true},
+		{name: "dependency path without vendoring", component: "nvidia-dra-driver-gpu", path: "dra-driver-nvidia-gpu.nvidiaDriverRoot"},
+		{name: "sibling", component: "gpu-operator", path: "driver.version"},
+		{name: "vendored sibling", component: "nvidia-dra-driver-gpu", path: "dra-driver-nvidia-gpu.image.tag", vendored: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outputDir := filepath.Join(t.TempDir(), "bundle")
+			g := driverOwnershipGenerator(tt.component)
+			g.DynamicValues = map[string][]string{tt.component: {tt.path}}
+			if tt.vendored {
+				g.RecipeResult.ComponentRefs[0].Chart = "dra-driver-nvidia-gpu"
+				g.VendorCharts = true
+				g.Puller = localformattest.StubPuller{}
+			}
+			if tt.disabled {
+				g.RecipeResult.ComponentRefs[0].Overrides = map[string]any{"enabled": false}
+			}
+			_, err := g.Generate(t.Context(), outputDir)
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("Generate() error = %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Generate() accepted a dynamic driver-ownership path")
+			}
+			errorstest.WantReportedCode(t, err, aicrerrors.ErrCodeInvalidRequest)
+			if !strings.Contains(err.Error(), "install-time path "+tt.component+"."+tt.path+" intersects driver-ownership path") ||
+				!strings.Contains(err.Error(), "so bundle-time ownership checks apply") {
+
+				t.Fatalf("error lacks path or remedy: %v", err)
+			}
+			if _, statErr := os.Stat(outputDir); !os.IsNotExist(statErr) {
+				t.Fatalf("rejected Generate() created output: %v", statErr)
+			}
+		})
+	}
+}
+
+// TestDriverOwnershipRemedy covers the remedy the guard and the dynamic-path
+// rejection give: a profile-owned path is chosen with aicr recipe --profile,
+// since enforceOwnedPaths rejects a bundle-time --set on it.
+func TestDriverOwnershipRemedy(t *testing.T) {
+	profiled := driverOwnershipGenerator("gpu-operator").RecipeResult
+	profiled.Metadata.SelectedProfile = &recipe.SelectedProfile{
+		Name: "gpuStack", Value: "azure-managed",
+		OwnedPaths: map[string][]string{"gpu-operator": {"driver.enabled", "enabled"}},
+	}
+	tests := []struct {
+		name   string
+		result *recipe.RecipeResult
+		path   string
+		want   string
+		not    string
+	}{
+		{
+			name: "unprofiled", result: driverOwnershipGenerator("gpu-operator").RecipeResult, path: "driver.enabled",
+			want: "set driver ownership at bundle time (aicr bundle --set gpuoperator:driver.enabled=...) so bundle-time ownership checks apply",
+		},
+		{
+			name: "profile-owned", result: profiled, path: "driver.enabled",
+			want: "the selected profile gpuStack=azure-managed owns it, so choose the profile value at recipe time (aicr recipe --profile gpuStack=...)",
+			not:  "aicr bundle --set",
+		},
+		{
+			name: "profiled but not owned", result: profiled, path: "hostPaths.driverInstallDir",
+			want: "aicr bundle --set gpuoperator:hostPaths.driverInstallDir=...",
+			not:  "aicr recipe --profile",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := driverOwnershipRemedy(tt.result, "gpu-operator", "gpuoperator", tt.path)
+			if !strings.Contains(got, tt.want) || (tt.not != "" && strings.Contains(got, tt.not)) {
+				t.Fatalf("driverOwnershipRemedy() = %q, want %q without %q", got, tt.want, tt.not)
+			}
+		})
+	}
+}
+
+// TestGenerate_DriverOwnershipLockProfiledRemedy proves the rendered guard
+// carries the profile remedy for a profile-owned path and the bundle-time one
+// for the rest.
+func TestGenerate_DriverOwnershipLockProfiledRemedy(t *testing.T) {
+	outputDir := t.TempDir()
+	g := driverOwnershipGenerator("gpu-operator")
+	g.RecipeResult.APIVersion = recipe.RecipeProfileAPIVersion
+	g.RecipeResult.Metadata.SelectedProfile = &recipe.SelectedProfile{
+		Name: "gpuStack", Value: "azure-managed",
+		OwnedPaths: map[string][]string{"gpu-operator": {"driver.enabled", "enabled"}},
+	}
+	if _, err := g.Generate(t.Context(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	guard := string(readBundleFile(t, outputDir, "templates/"+driverOwnershipLockTemplateName+".yaml"))
+	for _, want := range []string{
+		"driver-ownership path gpu-operator.driver.enabled; the selected profile gpuStack=azure-managed owns it, so choose the profile value at recipe time (aicr recipe --profile gpuStack=...)",
+		"driver-ownership path gpu-operator.toolkit.enabled; set driver ownership at bundle time (aicr bundle --set gpuoperator:toolkit.enabled=...)",
+	} {
+		if !strings.Contains(guard, want) {
+			t.Errorf("guard lacks %q:\n%s", want, guard)
+		}
+	}
+	if strings.Contains(guard, "aicr bundle --set gpuoperator:driver.enabled") {
+		t.Errorf("guard prescribes a bundle-time --set on a profile-owned path:\n%s", guard)
+	}
+}
+
+func TestWriteDriverOwnershipLockTemplateRejectsUnownedExistingFile(t *testing.T) {
+	templatesDir := t.TempDir()
+	guardPath := filepath.Join(templatesDir, driverOwnershipLockTemplateName+".yaml")
+	const sentinel = "user-owned template\n"
+	if err := os.WriteFile(guardPath, []byte(sentinel), 0o600); err != nil {
+		t.Fatalf("write user-owned template: %v", err)
+	}
+
+	_, _, err := driverOwnershipGenerator("gpu-operator").writeDriverOwnershipLockTemplate(templatesDir, nil, nil)
+	if err == nil {
+		t.Fatal("writeDriverOwnershipLockTemplate() accepted a user-owned template collision")
+	}
+	errorstest.WantReportedCode(t, err, aicrerrors.ErrCodeInvalidRequest)
+	got, readErr := os.ReadFile(guardPath)
+	if readErr != nil {
+		t.Fatalf("read user-owned template: %v", readErr)
+	}
+	if string(got) != sentinel {
+		t.Fatalf("user-owned template = %q, want unchanged %q", got, sentinel)
+	}
+
+	// Without a guarded component the same unowned file is left alone.
+	if _, _, err := driverOwnershipGenerator("cert-manager").writeDriverOwnershipLockTemplate(templatesDir, nil, nil); err != nil {
+		t.Fatalf("writeDriverOwnershipLockTemplate() without guarded component error = %v", err)
+	}
+	got, readErr = os.ReadFile(guardPath)
+	if readErr != nil {
+		t.Fatalf("read user-owned template: %v", readErr)
+	}
+	if string(got) != sentinel {
+		t.Fatalf("user-owned template = %q, want unchanged %q", got, sentinel)
+	}
+}
+
+func TestGenerate_RejectsComponentNamedLikeDriverOwnershipLock(t *testing.T) {
+	outputDir := t.TempDir()
+	g := &Generator{
+		RecipeResult: newRecipeResult("v1.0.0", []recipe.ComponentRef{
+			{
+				Name: "gpu-operator", Namespace: "gpu-operator", Chart: "gpu-operator",
+				Version: "v25.3.3", Type: recipe.ComponentTypeHelm,
+				Source: "https://helm.ngc.nvidia.com/nvidia",
+			},
+			{
+				Name: driverOwnershipLockTemplateName, Namespace: "x", Chart: "x",
+				Version: "v1.0.0", Type: recipe.ComponentTypeHelm,
+				Source: "https://example.test/charts",
+			},
+		}),
+		ComponentValues: map[string]map[string]any{"gpu-operator": {}, driverOwnershipLockTemplateName: {}},
+		Version:         "v0.0.0-test",
+	}
+	dataDir := t.TempDir()
+	registry := `apiVersion: aicr.run/v1beta1
+kind: ComponentRegistry
+components:
+  - name: aicr-driver-ownership-lock
+    displayName: Collision
+    valueOverrideKeys: [ownershiplock]
+    helm:
+      defaultRepository: https://example.test/charts
+      defaultChart: x
+      defaultVersion: v1.0.0
+`
+	if err := os.WriteFile(filepath.Join(dataDir, "registry.yaml"), []byte(registry), 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+	provider, err := recipe.NewLayeredDataProvider(
+		recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), ""),
+		recipe.LayeredProviderConfig{ExternalDir: dataDir},
+	)
+	if err != nil {
+		t.Fatalf("NewLayeredDataProvider: %v", err)
+	}
+	g.RecipeResult.BindDataProvider(provider)
+	_, err = g.Generate(t.Context(), outputDir)
+	if err == nil || !strings.Contains(err.Error(), "collides with a deployer-owned template") {
+		t.Fatalf("Generate() error = %v, want template collision rejection", err)
+	}
+	errorstest.WantReportedCode(t, err, aicrerrors.ErrCodeInvalidRequest)
+	guard := readBundleFile(t, outputDir, "templates/"+driverOwnershipLockTemplateName+".yaml")
+	if !strings.HasPrefix(string(guard), driverOwnershipLockTemplateHeader) {
+		t.Fatalf("component replaced the guard: %s", guard)
+	}
+}
+
+func TestHelmTemplate_DriverOwnershipLock(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	const wantMessage = "install-time value intersects driver-ownership path"
+	lockTemplateRel := filepath.Join("templates", driverOwnershipLockTemplateName+".yaml")
+	for _, tc := range driverOwnershipGuardCases() {
+		t.Run(tc.component, func(t *testing.T) {
+			outputDir := t.TempDir()
+			g := driverOwnershipGenerator(tc.component)
+			values := map[string]any{}
+			for _, p := range tc.paths {
+				var value any = "/run/nvidia/driver"
+				if strings.HasSuffix(p, ".enabled") {
+					value = true
+				}
+				component.SetValueByPath(values, p, value)
+			}
+			g.ComponentValues[tc.component] = values
+			if _, err := g.Generate(t.Context(), outputDir); err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+			var rootValues map[string]any
+			if err := yaml.Unmarshal(readBundleFile(t, outputDir, "values.yaml"), &rootValues); err != nil {
+				t.Fatalf("parse root values: %v", err)
+			}
+			if _, present := rootValues[tc.overrideKey]; present {
+				t.Fatalf("static ownership values leaked into root values: %v", rootValues)
+			}
+
+			render := func(t *testing.T, extraArgs ...string) (string, error) {
+				t.Helper()
+				cmdCtx, cancel := context.WithTimeout(t.Context(), helmTemplateTimeout)
+				defer cancel()
+				args := append([]string{
+					"template", "test-release", outputDir,
+					"--set", "repoURL=oci://example.test/aicr",
+				}, extraArgs...)
+				out, err := exec.CommandContext(cmdCtx, "helm", args...).CombinedOutput() //nolint:gosec // controlled test arguments
+				return string(out), err
+			}
+
+			t.Run("no overrides renders", func(t *testing.T) {
+				if out, err := render(t); err != nil {
+					t.Fatalf("helm template error = %v\noutput:\n%s", err, out)
+				}
+			})
+			// Replacing the whole component with a scalar also breaks the
+			// component's own template, which Helm reports instead: it executes
+			// templates in reverse lexical order within a directory and stops at
+			// the first failure (sortTemplates in helm.sh/helm/v4 pkg/engine), so
+			// templates/<component>.yaml runs before
+			// templates/aicr-driver-ownership-lock.yaml. A chart holding only the
+			// guard proves the guard itself rejects it.
+			t.Run("guard alone rejects scalar component", func(t *testing.T) {
+				guardOnly := t.TempDir()
+				if err := os.MkdirAll(filepath.Join(guardOnly, "templates"), 0o755); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+				guard, err := os.ReadFile(filepath.Join(outputDir, lockTemplateRel))
+				if err != nil {
+					t.Fatalf("read guard: %v", err)
+				}
+				if err = os.WriteFile(filepath.Join(guardOnly, "templates", "guard.yaml"), guard, 0o600); err != nil {
+					t.Fatalf("write guard: %v", err)
+				}
+				chart := "apiVersion: v2\nname: guard-only\nversion: 0.0.1\n"
+				if err = os.WriteFile(filepath.Join(guardOnly, "Chart.yaml"), []byte(chart), 0o600); err != nil {
+					t.Fatalf("write Chart.yaml: %v", err)
+				}
+				cmdCtx, cancel := context.WithTimeout(t.Context(), helmTemplateTimeout)
+				defer cancel()
+				out, err := exec.CommandContext(cmdCtx, "helm", "template", "guard-only", guardOnly, //nolint:gosec // controlled test arguments
+					"--set-string", tc.overrideKey+"=blocked").CombinedOutput()
+				if err == nil || !strings.Contains(string(out), wantMessage+" "+tc.component+"."+tc.paths[0]+";") ||
+					!strings.Contains(string(out), "so bundle-time ownership checks apply") {
+
+					t.Fatalf("guard-only helm template error = %v, want %q\noutput:\n%s", err, wantMessage, out)
+				}
+			})
+			t.Run("full chart rejects scalar component", func(t *testing.T) {
+				if out, err := render(t, "--set-string", tc.overrideKey+"=blocked"); err == nil {
+					t.Fatalf("helm template accepted a scalar component\noutput:\n%s", out)
+				}
+			})
+			t.Run("generated values.yaml renders", func(t *testing.T) {
+				if out, err := render(t, "-f", filepath.Join(outputDir, "values.yaml")); err != nil {
+					t.Fatalf("helm template error = %v\noutput:\n%s", err, out)
+				}
+			})
+			for _, override := range tc.passing {
+				t.Run("sibling "+override[1], func(t *testing.T) {
+					if out, err := render(t, override[0], override[1]); err != nil {
+						t.Fatalf("helm template error = %v\noutput:\n%s", err, out)
+					}
+				})
+			}
+			for _, override := range tc.failing {
+				t.Run("rejects "+override[0]+" "+override[1], func(t *testing.T) {
+					out, err := render(t, override[0], override[1])
+					if err == nil {
+						t.Fatalf("helm template accepted %s %s\noutput:\n%s", override[0], override[1], out)
+					}
+					if !strings.Contains(out, wantMessage+" "+tc.component+".") ||
+						!strings.Contains(out, "set driver ownership at bundle time") {
+
+						t.Fatalf("helm template error does not carry the guard message:\n%s", out)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestHelmTemplate_DriverOwnershipLockDynamicSiblings(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	for _, tc := range driverOwnershipGuardCases() {
+		t.Run(tc.component, func(t *testing.T) {
+			outputDir := t.TempDir()
+			g := driverOwnershipGenerator(tc.component)
+			g.DynamicValues = map[string][]string{}
+			for _, override := range tc.passing {
+				assignment, value, _ := strings.Cut(override[1], "=")
+				valuePath := strings.TrimPrefix(assignment, tc.overrideKey+".")
+				g.DynamicValues[tc.component] = append(g.DynamicValues[tc.component], valuePath)
+				component.SetValueByPath(g.ComponentValues[tc.component], valuePath, value)
+			}
+			if _, err := g.Generate(t.Context(), outputDir); err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+			defaults := readBundleFile(t, outputDir, "values.yaml")
+			var root map[string]any
+			if err := yaml.Unmarshal(defaults, &root); err != nil {
+				t.Fatalf("parse root defaults: %v", err)
+			}
+			for _, path := range tc.paths {
+				if _, present := component.GetValueByPath(root, tc.overrideKey+"."+path); present {
+					t.Fatalf("guarded path %s leaked into root defaults", path)
+				}
+			}
+			render := func(t *testing.T, args ...string) (string, error) {
+				t.Helper()
+				ctx, cancel := context.WithTimeout(t.Context(), helmTemplateTimeout)
+				defer cancel()
+				args = append([]string{"template", "test", outputDir, "--set", "repoURL=oci://example.test/aicr"}, args...)
+				out, err := exec.CommandContext(ctx, "helm", args...).CombinedOutput() //nolint:gosec // controlled test arguments
+				return string(out), err
+			}
+			passing := append([][2]string{{}, {"-f", filepath.Join(outputDir, "values.yaml")}}, tc.passing...)
+			for index, args := range passing {
+				t.Run(fmt.Sprintf("allowed/%d", index), func(t *testing.T) {
+					var extra []string
+					if args[0] != "" {
+						extra = args[:]
+					}
+					if out, err := render(t, extra...); err != nil {
+						t.Fatalf("helm template error = %v\n%s", err, out)
+					}
+				})
+			}
+			ancestors := []string{tc.overrideKey}
+			for _, path := range tc.paths {
+				if parent, _, nested := strings.Cut(path, "."); nested {
+					ancestors = append(ancestors, tc.overrideKey+"."+parent)
+				}
+			}
+			for _, ancestor := range ancestors {
+				t.Run("null/"+ancestor, func(t *testing.T) {
+					out, err := render(t, "--set-json", ancestor+"=null")
+					if err == nil || !strings.Contains(out, "install-time value intersects driver-ownership path "+tc.component+".") ||
+						!strings.Contains(out, "set driver ownership at bundle time") {
+
+						t.Fatalf("null ancestor not rejected with ownership remedy: err=%v\n%s", err, out)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestHelmTemplate_DriverOwnershipLockVendored covers --vendor-charts: the
+// child Application installs a wrapper chart that forwards values to the
+// upstream chart only under its dependency name, so the guarded paths must be
+// rejected under <key>.<dependency> as well. The DRA charts are not named
+// after their components, which proves the name comes from the wrapper.
+func TestHelmTemplate_DriverOwnershipLockVendored(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	dependencies := map[string]string{
+		"gpu-operator":              "gpu-operator",
+		"gpu-operator-ocp":          "gpu-operator",
+		"nvidia-dra-driver-gpu":     "dra-driver-nvidia-gpu",
+		"nvidia-dra-driver-gpu-ocp": "dra-driver-nvidia-gpu",
+	}
+	for _, tc := range driverOwnershipGuardCases() {
+		dependency := dependencies[tc.component]
+		nest := func(override [2]string) [2]string {
+			return [2]string{override[0], tc.overrideKey + "." + dependency + strings.TrimPrefix(override[1], tc.overrideKey)}
+		}
+		// A dynamic sibling under the dependency puts its ancestors in the root
+		// defaults, where Helm coalescing erases a null instead of rendering it.
+		for _, dynamic := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/dynamic=%v", tc.component, dynamic), func(t *testing.T) {
+				outputDir := t.TempDir()
+				g := driverOwnershipGenerator(tc.component)
+				g.RecipeResult.ComponentRefs[0].Chart = dependency
+				g.VendorCharts = true
+				g.Puller = localformattest.StubPuller{}
+				if dynamic {
+					assignment, _, _ := strings.Cut(nest(tc.passing[0])[1], "=")
+					g.DynamicValues = map[string][]string{
+						tc.component: {strings.TrimPrefix(assignment, tc.overrideKey+".")},
+					}
+				}
+				if _, err := g.Generate(t.Context(), outputDir); err != nil {
+					t.Fatalf("Generate() error = %v", err)
+				}
+				wrapper := readBundleFile(t, outputDir, "001-"+tc.component+"/Chart.yaml")
+				if !strings.Contains(string(wrapper), "- name: "+dependency+"\n") {
+					t.Fatalf("wrapper does not declare dependency %q:\n%s", dependency, wrapper)
+				}
+
+				render := func(t *testing.T, args ...string) (string, error) {
+					t.Helper()
+					ctx, cancel := context.WithTimeout(t.Context(), helmTemplateTimeout)
+					defer cancel()
+					args = append([]string{"template", "test", outputDir, "--set", "repoURL=oci://example.test/aicr"}, args...)
+					out, err := exec.CommandContext(ctx, "helm", args...).CombinedOutput() //nolint:gosec // controlled test arguments
+					return string(out), err
+				}
+				passing := make([][2]string, 0, 1+len(tc.passing))
+				passing = append(passing, [2]string{"-f", filepath.Join(outputDir, "values.yaml")})
+				for _, override := range tc.passing {
+					passing = append(passing, nest(override))
+				}
+				for _, override := range passing {
+					t.Run("accepts "+override[1], func(t *testing.T) {
+						if out, err := render(t, override[0], override[1]); err != nil {
+							t.Fatalf("helm template error = %v\n%s", err, out)
+						}
+					})
+				}
+				failing := make([][2]string, 0, 1+len(tc.failing))
+				failing = append(failing, [2]string{"--set-string", tc.overrideKey + "." + dependency + "=blocked"})
+				for _, override := range tc.failing {
+					failing = append(failing, nest(override))
+				}
+				for _, override := range failing {
+					t.Run("rejects "+override[0]+" "+override[1], func(t *testing.T) {
+						out, err := render(t, override[0], override[1])
+						if err == nil || !strings.Contains(out, "install-time value intersects driver-ownership path "+tc.component+".") ||
+							!strings.Contains(out, "set driver ownership at bundle time") {
+
+							t.Fatalf("nested override not rejected with ownership remedy: err=%v\n%s", err, out)
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
+// TestGenerate_DriverOwnershipLockBytesNonVendored pins the guard of a bundle
+// without --vendor-charts: it guards only <key>.<path>, and its bytes match
+// those generated before vendored guards existed except for the remedy text.
+func TestGenerate_DriverOwnershipLockBytesNonVendored(t *testing.T) {
+	charts := [][2]string{
+		{"gpu-operator", "gpu-operator"},
+		{"gpu-operator-ocp", "gpu-operator"},
+		{"nvidia-dra-driver-gpu", "dra-driver-nvidia-gpu"},
+		{"nvidia-dra-driver-gpu-ocp", "dra-driver-nvidia-gpu"},
+	}
+	refs := make([]recipe.ComponentRef, 0, len(charts))
+	values := map[string]map[string]any{}
+	for _, ref := range charts {
+		refs = append(refs, recipe.ComponentRef{
+			Name: ref[0], Namespace: ref[0], Chart: ref[1], Version: "v25.3.3",
+			Type: recipe.ComponentTypeHelm, Source: "https://helm.ngc.nvidia.com/nvidia",
+		})
+		values[ref[0]] = map[string]any{}
+	}
+	g := &Generator{
+		RecipeResult:    newRecipeResult("v1.0.0", refs),
+		ComponentValues: values,
+		Version:         "v0.0.0-test",
+	}
+	outputDir := t.TempDir()
+	if _, err := g.Generate(t.Context(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	// be29d0c80's bytes (sha256 300a2eba...), before vendored dependency
+	// guards were added, with the remedy "so CheckDriverOwnershipCoherence can
+	// verify it" reworded to "so bundle-time ownership checks apply".
+	const wantHash = "cb4b9e7c66a7c90b873dd450b7f722a18bd37b365157baa3eed54fbed262e3d6"
+	guard := readBundleFile(t, outputDir, "templates/"+driverOwnershipLockTemplateName+".yaml")
+	if strings.Contains(string(guard), "aicrDriverVendored") {
+		t.Fatalf("non-vendored bundle guards a dependency path:\n%s", guard)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(guard)); got != wantHash {
+		t.Fatalf("non-vendored driver-ownership lock bytes changed: sha256 = %s, want %s\n%s", got, wantHash, guard)
+	}
+}
+
+func TestHasGeneratedGuardHeader_BoundedRead(t *testing.T) {
+	for _, header := range []string{profileLockTemplateHeader, driverOwnershipLockTemplateHeader} {
+		readPastHeader := errors.New("read past guard header")
+		reader := io.MultiReader(
+			strings.NewReader(header),
+			iotest.ErrReader(readPastHeader),
+		)
+
+		generated, err := hasGeneratedGuardHeader(reader, header)
+		if err != nil {
+			t.Fatalf("hasGeneratedGuardHeader() error = %v", err)
+		}
+		if !generated {
+			t.Fatal("hasGeneratedGuardHeader() = false, want true")
+		}
+	}
+}
+
+func TestWriteProfileLockTemplateRejectsUnownedExistingFile(t *testing.T) {
+	templatesDir := t.TempDir()
+	guardPath := filepath.Join(templatesDir, profileLockTemplateName+".yaml")
+	const sentinel = "user-owned template\n"
+	if err := os.WriteFile(guardPath, []byte(sentinel), 0o600); err != nil {
+		t.Fatalf("write user-owned profile lock template: %v", err)
+	}
+
+	g := &Generator{RecipeResult: &recipe.RecipeResult{
+		Metadata: recipe.RecipeResultMetadata{
+			SelectedProfile: &recipe.SelectedProfile{
+				Name:  "gpuStack",
+				Value: "driver-installed",
+				OwnedPaths: map[string][]string{
+					"gpu-operator": {"driver.enabled", "enabled"},
+				},
+			},
+		},
+	}}
+	_, _, err := g.writeProfileLockTemplate(templatesDir)
+	if err == nil {
+		t.Fatal("writeProfileLockTemplate() accepted a user-owned template collision")
+	}
+	if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
+		t.Fatalf("writeProfileLockTemplate() error = %v, want ErrCodeInvalidRequest", err)
+	}
+	got, readErr := os.ReadFile(guardPath)
+	if readErr != nil {
+		t.Fatalf("read user-owned profile lock template: %v", readErr)
+	}
+	if string(got) != sentinel {
+		t.Fatalf("user-owned profile lock template = %q, want unchanged %q", got, sentinel)
+	}
+}
+
+func TestTransformApplicationRejectsDeployerTemplateCollision(t *testing.T) {
+	srcDir := t.TempDir()
+	templatesDir := t.TempDir()
+	const (
+		folderName    = "001-aicr-profile-lock"
+		componentName = "aicr-profile-lock"
+		sentinel      = "profile lock must survive"
+	)
+
+	componentDir := filepath.Join(srcDir, folderName)
+	if err := os.MkdirAll(componentDir, 0o755); err != nil {
+		t.Fatalf("create component directory: %v", err)
+	}
+	app := `apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aicr-profile-lock
+spec:
+  destination:
+    namespace: argocd
+    server: https://kubernetes.default.svc
+  source:
+    repoURL: https://example.test/repository
+    path: 001-aicr-profile-lock
+    targetRevision: main
+`
+	if err := os.WriteFile(filepath.Join(componentDir, "application.yaml"), []byte(app), 0o600); err != nil {
+		t.Fatalf("write source application: %v", err)
+	}
+
+	lockPath := filepath.Join(templatesDir, componentName+".yaml")
+	if err := os.WriteFile(lockPath, []byte(sentinel), 0o600); err != nil {
+		t.Fatalf("write deployer-owned template: %v", err)
+	}
+
+	_, _, err := transformApplication(
+		srcDir, templatesDir, folderName, componentName, "profilelock", []string{profileLockTemplateName},
+	)
+	if err == nil {
+		t.Fatal("transformApplication() error = nil, want collision rejection")
+	}
+	if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
+		t.Fatalf("error code = %v, want ErrCodeInvalidRequest", err)
+	}
+	if !strings.Contains(err.Error(), "collides with a deployer-owned template") {
+		t.Fatalf("error = %v, want collision message", err)
+	}
+	got, readErr := os.ReadFile(lockPath)
+	if readErr != nil {
+		t.Fatalf("read deployer-owned template: %v", readErr)
+	}
+	if string(got) != sentinel {
+		t.Fatalf("deployer-owned template was overwritten: %q", got)
+	}
+}
+
+func TestGenerate_ChartVersion(t *testing.T) {
+	tests := []struct {
+		name               string
+		recipeVersion      string
+		bundleChartVersion string
+		want               string
+	}{
+		{
+			name:          "empty override uses normalized recipe version",
+			recipeVersion: "v2.5.0",
+			want:          "2.5.0",
+		},
+		{
+			name:               "semantic build metadata is preserved exactly",
+			recipeVersion:      "v9.9.9",
+			bundleChartVersion: "1.2.3+build.5",
+			want:               "1.2.3+build.5",
+		},
+		{
+			// Helm rejects "dev" for Chart.yaml version:, which made every
+			// argocd-helm bundle from an unstamped build unloadable — the
+			// README's own `helm install .` failed. See ADR-021 Decision 7.
+			name:          "unstamped dev build folds to a Helm-valid version",
+			recipeVersion: defaults.DevVersion,
+			want:          defaults.DevChartVersion,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outputDir := t.TempDir()
+			g := &Generator{
+				RecipeResult:       newRecipeResult(tt.recipeVersion, nil),
+				Version:            "test",
+				BundleChartVersion: tt.bundleChartVersion,
+			}
+			if _, err := g.Generate(context.Background(), outputDir); err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+			chartYAML, err := os.ReadFile(filepath.Join(outputDir, "Chart.yaml"))
+			if err != nil {
+				t.Fatalf("ReadFile(Chart.yaml) error = %v", err)
+			}
+			if !strings.Contains(string(chartYAML), `version: "`+tt.want+`"`) {
+				t.Errorf("Chart.yaml =\n%s\nwant exact quoted version %q", chartYAML, tt.want)
+			}
+		})
+	}
+}
+
+func TestGeneratorTargetRevision(t *testing.T) {
+	tests := []struct {
+		name               string
+		recipeVersion      string
+		bundleChartVersion string
+		targetRevision     string
+		want               string
+	}{
+		{
+			name:               "bundle chart version is the default",
+			recipeVersion:      "v9.9.9",
+			bundleChartVersion: "1.2.3+build.5",
+			want:               "1.2.3+build.5",
+		},
+		{
+			name:          "recipe version is the fallback",
+			recipeVersion: "v2.5.0",
+			want:          "2.5.0",
+		},
+		{
+			name:               "explicit target revision wins",
+			recipeVersion:      "v9.9.9",
+			bundleChartVersion: "1.2.3",
+			targetRevision:     "release-candidate",
+			want:               "release-candidate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := &Generator{
+				RecipeResult:       newRecipeResult(tt.recipeVersion, nil),
+				BundleChartVersion: tt.bundleChartVersion,
+				TargetRevision:     tt.targetRevision,
+			}
+			if got := g.targetRevision(); got != tt.want {
+				t.Errorf("targetRevision() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGenerate_RejectsInvalidBundleChartVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+	}{
+		{name: "non semantic version", version: "latest"},
+		{name: "leading v", version: "v1.2.3"},
+		{name: "missing patch", version: "1.2"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outputDir := t.TempDir()
+			g := &Generator{
+				RecipeResult:       newRecipeResult("v9.9.9", nil),
+				Version:            "test",
+				BundleChartVersion: tt.version,
+			}
+
+			_, err := g.Generate(context.Background(), outputDir)
+			if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
+				t.Fatalf("Generate() error = %v, want ErrCodeInvalidRequest", err)
+			}
+			entries, readErr := os.ReadDir(outputDir)
+			if readErr != nil {
+				t.Fatalf("ReadDir() error = %v", readErr)
+			}
+			if len(entries) != 0 {
+				t.Errorf("Generate() wrote %d entries before rejecting BundleChartVersion", len(entries))
+			}
+		})
+	}
+}
+
+// TestGenerate_PreManifestParentResolution exercises the synthetic
+// `-pre` folder path that recipes with ComponentPreManifests emit
+// (e.g. the gke-cos OS overlay, which injects a Talos-style driver
+// prerequisite Namespace ahead of gpu-operator). The folder is named
+// `NNN-gpu-operator-pre`; the bundler must strip the `-pre` suffix
+// when resolving the override key, otherwise resolveOverrideKey is
+// called with "gpu-operator-pre" and fails `component %q not found
+// in registry` at bundle time. Caught in the KWOK gke-cos-training
+// CI lane after the pre-fix; before this commit the bug only
+// surfaced for recipes that combined Helm + pre-manifest overlays.
+func TestGenerate_PreManifestParentResolution(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	g := &Generator{
+		RecipeResult: newRecipeResult("1.0.0", []recipe.ComponentRef{
+			{Name: "gpu-operator", Namespace: "gpu-operator", Source: "https://helm.ngc.nvidia.com/nvidia", Chart: "gpu-operator", Version: "v24.9.0"},
+		}),
+		ComponentValues: map[string]map[string]any{
+			"gpu-operator": {"driver": map[string]any{"version": "580"}},
+		},
+		Version: "test",
+		RepoURL: "https://github.com/example/repo.git",
+		ComponentPreManifests: map[string]map[string][]byte{
+			"gpu-operator": {
+				"components/gpu-operator/manifests/cos-namespace.yaml": []byte(
+					"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: gpu-operator\n",
+				),
+			},
+		},
+	}
+
+	if _, err := g.Generate(ctx, outputDir); err != nil {
+		t.Fatalf("Generate() error = %v (regression: -pre suffix not stripped before resolveOverrideKey)", err)
+	}
+
+	// The -pre folder content is copied into the bundle so Argo CD's
+	// repo-server can resolve the path-based child Application's
+	// `path: NNN-<name>-pre` reference. Confirm it survived the
+	// argocdhelm wrapper transformation.
+	preDir := filepath.Join(outputDir, "001-gpu-operator-pre")
+	if _, err := os.Stat(preDir); err != nil {
+		t.Errorf("expected -pre folder copied into bundle at %s: %v", preDir, err)
+	}
+
+	// The transformed template under templates/ should be keyed by the
+	// PARENT component (gpu-operator), not the -pre folder name,
+	// because the override key comes from the parent's registry entry.
+	tmplPath := filepath.Join(outputDir, "templates", "gpu-operator-pre.yaml")
+	if _, err := os.Stat(tmplPath); err != nil {
+		t.Errorf("expected wrapper template for -pre folder at %s: %v", tmplPath, err)
+	}
+}
+
+// TestGenerate_PreAndPostManifestParentResolution covers the actual
+// gke-cos OS overlay shape: a single registered component (`gpu-operator`)
+// with BOTH preManifestFiles (cos-namespace prep) and postManifestFiles
+// (dcgm-exporter). The argocdhelm processFolders loop sees 3 entries
+// (`<NNN>-gpu-operator-pre`, `<NNN>-gpu-operator`, `<NNN>-gpu-operator-post`)
+// and runs the suffix-strip logic twice across two distinct folders.
+// Both wrapper templates must resolve back to the same parent override
+// key so the values applied to the chart and the manifest hooks stay
+// consistent. Earlier revisions handled only `-post`; this test guards
+// against re-introducing that asymmetry.
+func TestGenerate_PreAndPostManifestParentResolution(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	g := &Generator{
+		RecipeResult: newRecipeResult("1.0.0", []recipe.ComponentRef{
+			{Name: "gpu-operator", Namespace: "gpu-operator", Source: "https://helm.ngc.nvidia.com/nvidia", Chart: "gpu-operator", Version: "v24.9.0"},
+		}),
+		ComponentValues: map[string]map[string]any{
+			"gpu-operator": {"driver": map[string]any{"version": "580"}},
+		},
+		Version: "test",
+		RepoURL: "https://github.com/example/repo.git",
+		ComponentPreManifests: map[string]map[string][]byte{
+			"gpu-operator": {
+				"components/gpu-operator/manifests/cos-namespace.yaml": []byte(
+					"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: gpu-operator\n",
+				),
+			},
+		},
+		ComponentPostManifests: map[string]map[string][]byte{
+			"gpu-operator": {
+				"components/gpu-operator/manifests/dcgm-exporter.yaml": []byte(
+					"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: dcgm-config\n",
+				),
+			},
+		},
+	}
+
+	if _, err := g.Generate(ctx, outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Both synthetic folders must exist in the bundle so the path-based
+	// child Applications can resolve them.
+	preDir := filepath.Join(outputDir, "001-gpu-operator-pre")
+	if _, err := os.Stat(preDir); err != nil {
+		t.Errorf("expected -pre folder at %s: %v", preDir, err)
+	}
+	postDir := filepath.Join(outputDir, "003-gpu-operator-post")
+	if _, err := os.Stat(postDir); err != nil {
+		t.Errorf("expected -post folder at %s: %v", postDir, err)
+	}
+
+	// Both wrapper templates must be present under templates/, both
+	// keyed by the PARENT component name (not the -pre / -post folder
+	// names). Asymmetric handling would lose one of them.
+	for _, suffix := range []string{"-pre", "-post"} {
+		tmplPath := filepath.Join(outputDir, "templates", "gpu-operator"+suffix+".yaml")
+		if _, err := os.Stat(tmplPath); err != nil {
+			t.Errorf("expected wrapper template for %s folder at %s: %v", suffix, tmplPath, err)
+		}
+	}
+}
+
+func TestGenerate_DataFiles(t *testing.T) {
+	makeGenerator := func(dataFiles []string, includeChecksums bool) *Generator {
+		return &Generator{
+			RecipeResult: newRecipeResult("1.0.0", []recipe.ComponentRef{
+				{Name: "gpu-operator", Namespace: "gpu-operator", Source: "https://helm.ngc.nvidia.com/nvidia", Chart: "gpu-operator", Version: "v24.9.0"},
+			}),
+			ComponentValues:  map[string]map[string]any{"gpu-operator": {}},
+			Version:          "test",
+			RepoURL:          "https://github.com/example/repo.git",
+			IncludeChecksums: includeChecksums,
+			DataFiles:        dataFiles,
+		}
+	}
+
+	tests := []struct {
+		name             string
+		stageDataFile    string
+		includeChecksums bool
+		dataFiles        []string
+		wantErr          bool
+		wantErrMsg       string
+	}{
+		{
+			name:             "valid data file included in checksums",
+			stageDataFile:    "data/overrides.yaml",
+			includeChecksums: true,
+			dataFiles:        []string{"data/overrides.yaml"},
+		},
+		{
+			name:       "path traversal rejected",
+			dataFiles:  []string{"../../../etc/passwd"},
+			wantErr:    true,
+			wantErrMsg: "escapes base directory",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			outputDir := t.TempDir()
+
+			if tt.stageDataFile != "" {
+				full := filepath.Join(outputDir, tt.stageDataFile)
+				if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+					t.Fatalf("stage dir: %v", err)
+					return
+				}
+				if err := os.WriteFile(full, []byte("key: value"), 0600); err != nil {
+					t.Fatalf("stage file: %v", err)
+					return
+				}
+			}
+
+			g := makeGenerator(tt.dataFiles, tt.includeChecksums)
+			output, err := g.Generate(ctx, outputDir)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+					return
+				}
+				if !strings.Contains(err.Error(), tt.wantErrMsg) {
+					t.Errorf("expected error containing %q, got: %v", tt.wantErrMsg, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Generate() unexpected error = %v", err)
+				return
+			}
+
+			found := false
+			for _, f := range output.Files {
+				if strings.HasSuffix(f, tt.stageDataFile) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("data file %q not included in output.Files", tt.stageDataFile)
+			}
+
+			if tt.includeChecksums {
+				content, readErr := os.ReadFile(filepath.Join(outputDir, "checksums.txt"))
+				if readErr != nil {
+					t.Fatalf("read checksums.txt: %v", readErr)
+					return
+				}
+				if !strings.Contains(string(content), tt.stageDataFile) {
+					t.Errorf("checksums.txt should contain %q entry", tt.stageDataFile)
+				}
+			}
+		})
+	}
+}
+
+// TestGenerate_DynamicRejectedForLocalChart verifies --dynamic fails closed
+// when the named component is a local chart (Helm with empty Source). Before
+// #1949 the request was silently dropped: Generate exited 0 and the root
+// values.yaml carried no stub, so install-time overrides had nowhere to land.
+func TestGenerate_DynamicRejectedForLocalChart(t *testing.T) {
+	tests := []struct {
+		name string
+		ref  recipe.ComponentRef
+	}{
+		{
+			name: "local helm chart empty source",
+			ref:  recipe.ComponentRef{Name: "nfd-ocp", Namespace: "nfd", Type: recipe.ComponentTypeHelm, Source: ""},
+		},
+		{
+			// HasExternalChart is case-insensitive for Helm; a lowercase
+			// "kustomize" must not be mistaken for a remote chart just because
+			// Source is set (the pre-#1949 Type!=Kustomize check would).
+			name: "uncanonicalized kustomize with source",
+			ref: recipe.ComponentRef{
+				Name: "nfd-ocp", Namespace: "nfd",
+				Type: recipe.ComponentType("kustomize"), Source: "https://example.com/overlay",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			localManifest := map[string][]byte{
+				"nfd.yaml": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: nfd\n"),
+			}
+			gen := &Generator{
+				RecipeResult: newRecipeResult("v1.0.0", []recipe.ComponentRef{tt.ref}),
+				ComponentValues: map[string]map[string]any{
+					"nfd-ocp": {"image": map[string]any{"tag": "v1"}},
+				},
+				ComponentPostManifests: map[string]map[string][]byte{
+					"nfd-ocp": localManifest,
+				},
+				Version: "test",
+				RepoURL: "https://github.com/example/repo.git",
+				DynamicValues: map[string][]string{
+					"nfd-ocp": {"image.tag"},
+				},
+			}
+
+			_, err := gen.Generate(context.Background(), t.TempDir())
+			if err == nil {
+				t.Fatal("Generate() error = nil, want ErrCodeInvalidRequest for --dynamic on unsupported component")
+			}
+			if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
+				t.Fatalf("Generate() error code = %v, want ErrCodeInvalidRequest", err)
+			}
+			if !strings.Contains(err.Error(), "nfd-ocp") || !strings.Contains(err.Error(), "--dynamic") {
+				t.Fatalf("Generate() error = %v, want mention of --dynamic and component name", err)
+			}
+		})
+	}
+}
+
+// TestGenerate_StaticDirCreatedOnlyWhenPopulated verifies that static/ is
+// emitted only when at least one component contributes a values file.
+//
+// Components land in static/ only when they resolve to a remote Helm chart
+// (type Helm with a non-empty Source). A recipe whose components are all
+// local charts — the OCP overlays, which build from manifestFiles with no
+// upstream Source — contributes nothing, so an unconditionally created
+// static/ would remain empty. The bundle inventory validator walks the
+// finished tree and rejects any directory contributing no files, which
+// failed generation outright. See issue #1942.
+func TestGenerate_StaticDirCreatedOnlyWhenPopulated(t *testing.T) {
+	// Manifest-only components must carry post-manifests so the delegated
+	// argocd.Generator wraps them as local charts, mirroring how the OCP
+	// overlays supply manifestFiles.
+	localManifest := func(name string) map[string][]byte {
+		return map[string][]byte{
+			name + ".yaml": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " + name + "\n"),
+		}
+	}
+
+	localOnlyRefs := []recipe.ComponentRef{
+		{Name: "nfd-ocp-olm", Namespace: "nfd", Type: recipe.ComponentTypeHelm, Source: ""},
+		{Name: "nfd-ocp", Namespace: "nfd", Type: recipe.ComponentTypeHelm, Source: ""},
+	}
+	localOnlyValues := map[string]map[string]any{
+		"nfd-ocp-olm": {"enabled": true},
+		"nfd-ocp":     {"enabled": true},
+	}
+	localOnlyManifests := map[string]map[string][]byte{
+		"nfd-ocp-olm": localManifest("nfd-ocp-olm"),
+		"nfd-ocp":     localManifest("nfd-ocp"),
+	}
+
+	tests := []struct {
+		name           string
+		refs           []recipe.ComponentRef
+		values         map[string]map[string]any
+		postManifests  map[string]map[string][]byte
+		staleStaticDir bool
+		wantStaticDir  bool
+	}{
+		{
+			name:          "all components local charts omits static dir",
+			refs:          localOnlyRefs,
+			values:        localOnlyValues,
+			postManifests: localOnlyManifests,
+			wantStaticDir: false,
+		},
+		{
+			// A pre-fix failed run leaves an empty static/ in --output, and
+			// generation does not clear the directory between runs, so the
+			// retry must remove it rather than fail the same way again.
+			name:           "stale empty static dir from a prior run is removed",
+			refs:           localOnlyRefs,
+			values:         localOnlyValues,
+			postManifests:  localOnlyManifests,
+			staleStaticDir: true,
+			wantStaticDir:  false,
+		},
+		{
+			name: "at least one remote chart creates static dir",
+			refs: []recipe.ComponentRef{
+				{Name: "nfd-ocp", Namespace: "nfd", Type: recipe.ComponentTypeHelm, Source: ""},
+				{
+					Name:      "cert-manager",
+					Namespace: "cert-manager",
+					Type:      recipe.ComponentTypeHelm,
+					Chart:     "cert-manager",
+					Version:   "v1.20.2",
+					Source:    "https://charts.jetstack.io",
+				},
+			},
+			values: map[string]map[string]any{
+				"nfd-ocp":      {"enabled": true},
+				"cert-manager": {"replicaCount": 1},
+			},
+			postManifests: map[string]map[string][]byte{
+				"nfd-ocp": localManifest("nfd-ocp"),
+			},
+			wantStaticDir: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outputDir := t.TempDir()
+			rr := newRecipeResult("v1.0.0", tt.refs)
+			order := make([]string, 0, len(tt.refs))
+			for _, ref := range tt.refs {
+				order = append(order, ref.Name)
+			}
+			rr.DeploymentOrder = order
+
+			g := &Generator{
+				RecipeResult:           rr,
+				ComponentValues:        tt.values,
+				Version:                "test",
+				RepoURL:                "https://github.com/example/repo.git",
+				TargetRevision:         "main",
+				ComponentPostManifests: tt.postManifests,
+				// Drives finalizeOutput -> checksum.WriteChecksums ->
+				// validateExactTree, the check that actually rejected the
+				// empty directory in #1942. Without it this test asserts
+				// only the proxy (static/ absent from a fresh tree).
+				IncludeChecksums: true,
+			}
+
+			if tt.staleStaticDir {
+				if err := os.MkdirAll(filepath.Join(outputDir, "static"), 0o755); err != nil {
+					t.Fatalf("failed to seed stale static/: %v", err)
+				}
+			}
+
+			if _, err := g.Generate(context.Background(), outputDir); err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+
+			staticPath := filepath.Join(outputDir, "static")
+			info, err := os.Stat(staticPath)
+			switch {
+			case tt.wantStaticDir:
+				if err != nil {
+					t.Fatalf("static/ missing, want present: %v", err)
+				}
+				entries, readErr := os.ReadDir(staticPath)
+				if readErr != nil {
+					t.Fatalf("failed to read static/: %v", readErr)
+				}
+				if len(entries) == 0 {
+					t.Error("static/ exists but is empty; an empty directory fails bundle inventory validation")
+				}
+			case err == nil:
+				t.Errorf("static/ present (isDir=%v), want omitted when no component contributes values", info.IsDir())
+			case !os.IsNotExist(err):
+				t.Fatalf("unexpected error stating static/: %v", err)
+			}
+		})
+	}
+}
+
+// TestGenerate_StaleStaticPathIsNotDestroyed verifies that clearing a stale
+// static/ never destroys data at that path.
+//
+// os.Remove unlinks regular files as readily as it removes empty directories,
+// so a non-directory must be rejected rather than silently deleted, and a
+// populated directory must be preserved for validateExactTree to report.
+func TestGenerate_StaleStaticPathIsNotDestroyed(t *testing.T) {
+	localManifest := map[string][]byte{
+		"nfd-ocp.yaml": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: nfd-ocp\n"),
+	}
+	// withRemoteChart toggles between the two routes to the static path: with
+	// no remote chart every component is skipped and only removeStaleStaticDir
+	// runs, while a single upstream chart reaches ensureStaticDir first. Both
+	// must reject a non-directory identically.
+	newGen := func(withRemoteChart bool) *Generator {
+		refs := []recipe.ComponentRef{
+			{Name: "nfd-ocp", Namespace: "nfd", Type: recipe.ComponentTypeHelm, Source: ""},
+		}
+		values := map[string]map[string]any{"nfd-ocp": {"enabled": true}}
+		if withRemoteChart {
+			refs = append(refs, recipe.ComponentRef{
+				Name:      "cert-manager",
+				Namespace: "cert-manager",
+				Type:      recipe.ComponentTypeHelm,
+				Chart:     "cert-manager",
+				Version:   "v1.20.2",
+				Source:    "https://charts.jetstack.io",
+			})
+			values["cert-manager"] = map[string]any{"replicaCount": 1}
+		}
+		rr := newRecipeResult("v1.0.0", refs)
+		order := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			order = append(order, ref.Name)
+		}
+		rr.DeploymentOrder = order
+		return &Generator{
+			RecipeResult:           rr,
+			ComponentValues:        values,
+			Version:                "test",
+			RepoURL:                "https://github.com/example/repo.git",
+			TargetRevision:         "main",
+			ComponentPostManifests: map[string]map[string][]byte{"nfd-ocp": localManifest},
+			// Reaches finalizeOutput -> checksum.WriteChecksums ->
+			// validateExactTree, the check that rejected the empty directory
+			// in #1942.
+			//
+			// This only affects the "populated static dir is preserved"
+			// subtest, the one that runs far enough to reach the validator.
+			// The file and symlink subtests fail earlier inside
+			// checkStaticPath and return before finalizeOutput, so they assert
+			// checkStaticPath's own message and DO pin the error code in both
+			// directions -- including the no-ErrCodeInternal check that keeps
+			// the CLI exit code at 2. Do not relax those.
+			//
+			// For the validator subtest only: production builds this Generator
+			// with IncludeChecksums false (the argocdhelm.Generator literal in
+			// DefaultBundler.buildDeployer) and reaches the same validator from
+			// DefaultBundler.runDeployer instead, so the wrapper around that
+			// failure differs from the shipped CLI. Its assertion is on
+			// validateExactTree's message, identical on both routes; its
+			// surrounding error code is not pinned. End-to-end coverage of the
+			// production path lives in tests/chainsaw/cli/bundle-ocp.
+			IncludeChecksums: true,
+		}
+	}
+
+	for _, tc := range []struct {
+		name            string
+		withRemoteChart bool
+	}{
+		{"no remote chart (removeStaleStaticDir path)", false},
+		{"with remote chart (ensureStaticDir path)", true},
+	} {
+		t.Run("regular file at the static path is rejected, not unlinked: "+tc.name, func(t *testing.T) {
+			outputDir := t.TempDir()
+			staticPath := filepath.Join(outputDir, "static")
+			const payload = "user data that must survive\n"
+			if err := os.WriteFile(staticPath, []byte(payload), 0o600); err != nil {
+				t.Fatalf("failed to seed file: %v", err)
+			}
+
+			_, err := newGen(tc.withRemoteChart).Generate(context.Background(), outputDir)
+			if err == nil {
+				t.Fatal("Generate() succeeded, want failure when static path is not a directory")
+			}
+			if !strings.Contains(err.Error(), "is not a directory") {
+				t.Errorf("Generate() error = %v, want it to name the non-directory path", err)
+			}
+			// Both routes must agree on the code: the same user error must not
+			// be INVALID_REQUEST for one recipe shape and INTERNAL for another.
+			if errorstest.ReportedCode(err) != aicrerrors.ErrCodeInvalidRequest {
+				t.Errorf("Generate() error code = %v, want ErrCodeInvalidRequest", err)
+			}
+			// Stricter than the reported code. An Internal wrap anywhere in the
+			// chain means writeValuesFiles stopped propagating the inner code.
+			if errors.Is(err, aicrerrors.New(aicrerrors.ErrCodeInternal, "")) {
+				t.Errorf("Generate() error = %v, want no ErrCodeInternal anywhere in the chain", err)
+			}
+
+			got, readErr := os.ReadFile(staticPath)
+			if readErr != nil {
+				t.Fatalf("file at static path was destroyed: %v", readErr)
+			}
+			if string(got) != payload {
+				t.Errorf("file contents = %q, want %q", got, payload)
+			}
+		})
+	}
+
+	t.Run("symlink at the static path is rejected", func(t *testing.T) {
+		outputDir := t.TempDir()
+		target := t.TempDir()
+		staticPath := filepath.Join(outputDir, "static")
+		if err := os.Symlink(target, staticPath); err != nil {
+			t.Skipf("symlinks unsupported here: %v", err)
+		}
+
+		_, err := newGen(false).Generate(context.Background(), outputDir)
+		if err == nil {
+			t.Fatal("Generate() succeeded, want failure when static path is a symlink")
+		}
+		if !strings.Contains(err.Error(), "symbolic link") {
+			t.Errorf("Generate() error = %v, want it to name the symlink", err)
+		}
+		if _, statErr := os.Lstat(staticPath); statErr != nil {
+			t.Errorf("symlink was removed: %v", statErr)
+		}
+	})
+
+	t.Run("populated static dir is preserved", func(t *testing.T) {
+		outputDir := t.TempDir()
+		staticPath := filepath.Join(outputDir, "static")
+		if err := os.MkdirAll(staticPath, 0o755); err != nil {
+			t.Fatalf("failed to seed dir: %v", err)
+		}
+		leftover := filepath.Join(staticPath, "leftover.yaml")
+		if err := os.WriteFile(leftover, []byte("stale: true\n"), 0o600); err != nil {
+			t.Fatalf("failed to seed leftover file: %v", err)
+		}
+
+		// Generation fails because validateExactTree reports the stale output.
+		// For an all-local recipe static/ is not an expected directory at all,
+		// so the walk rejects the directory itself before reaching its
+		// contents — the message names the directory, not leftover.yaml.
+		// Asserted specifically so the subtest cannot drift into passing on
+		// some unrelated error.
+		_, err := newGen(false).Generate(context.Background(), outputDir)
+		if err == nil {
+			t.Fatal("Generate() succeeded, want failure on unexpected stale output")
+		}
+		if !strings.Contains(err.Error(), `unexpected directory: "static"`) {
+			t.Errorf("Generate() error = %v, want validateExactTree to reject the stale static/", err)
+		}
+		if _, statErr := os.Stat(leftover); statErr != nil {
+			t.Errorf("populated static/ was removed: %v", statErr)
+		}
+	})
+}
+
+// TestConvertToSingleSourceWithValues verifies the structured YAML
+// transformation from multi-source to single-source with helm.values.
+func TestConvertToSingleSourceWithValues(t *testing.T) {
+	// Build a valid multi-source Application map
+	app := map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "Application",
+		"metadata":   map[string]any{"name": "gpu-operator"},
+		"spec": map[string]any{
+			"project": "default",
+			"sources": []any{
+				map[string]any{
+					"repoURL":        "https://helm.ngc.nvidia.com/nvidia",
+					"chart":          "gpu-operator",
+					"targetRevision": "v24.9.0",
+				},
+				map[string]any{
+					"repoURL": "https://github.com/example/repo.git",
+					"ref":     "values",
+				},
+			},
+			"destination": map[string]any{
+				"server":    "https://kubernetes.default.svc",
+				"namespace": "gpu-operator",
+			},
+		},
+	}
+
+	err := convertToSingleSourceWithValues(app, "gpu-operator", "gpuOperator")
+	if err != nil {
+		t.Fatalf("convertToSingleSourceWithValues() error = %v", err)
+	}
+
+	spec := app["spec"].(map[string]any)
+
+	// Should have single "source", not "sources"
+	if _, hasSources := spec["sources"]; hasSources {
+		t.Error("should remove multi-source 'sources'")
+	}
+	source, ok := spec["source"].(map[string]any)
+	if !ok {
+		t.Fatal("should have single 'source' map")
+	}
+
+	// Verify chart fields preserved
+	if source["repoURL"] != "https://helm.ngc.nvidia.com/nvidia" {
+		t.Errorf("repoURL = %v, want nvidia repo", source["repoURL"])
+	}
+	if source["chart"] != "gpu-operator" {
+		t.Errorf("chart = %v, want gpu-operator", source["chart"])
+	}
+	if source["targetRevision"] != "v24.9.0" {
+		t.Errorf("targetRevision = %v, want v24.9.0", source["targetRevision"])
+	}
+
+	// Verify helm.values contains template expressions. It's a *yaml.Node with
+	// LiteralStyle so yaml.Marshal emits it as a block scalar (not a quoted string).
+	helm, ok := source["helm"].(map[string]any)
+	if !ok {
+		t.Fatal("source should have 'helm' map")
+	}
+	valuesNode, ok := helm["values"].(*yaml.Node)
+	if !ok {
+		t.Fatalf("helm.values should be *yaml.Node, got %T", helm["values"])
+	}
+	if valuesNode.Style != yaml.LiteralStyle {
+		t.Errorf("helm.values should use LiteralStyle to render as block scalar, got %v", valuesNode.Style)
+	}
+	valuesStr := valuesNode.Value
+	if !strings.Contains(valuesStr, "static/gpu-operator.yaml") {
+		t.Error("values should reference static file")
+	}
+	if !strings.Contains(valuesStr, "mustMergeOverwrite") {
+		t.Error("values should use merge pattern")
+	}
+	if !strings.Contains(valuesStr, `"gpuOperator"`) {
+		t.Error("values should reference override key")
+	}
+	// Should NOT use valuesObject (that expects a YAML object, not a string)
+	if _, hasValuesObject := helm["valuesObject"]; hasValuesObject {
+		t.Error("should use 'values' (string), not 'valuesObject' (object)")
+	}
+
+	// Destination should be untouched
+	dest := spec["destination"].(map[string]any)
+	if dest["namespace"] != "gpu-operator" {
+		t.Error("destination should be preserved")
+	}
+}
+
+// TestConvertToSingleSource_MissingFields verifies error handling when the
+// Application manifest is missing required fields.
+func TestConvertToSingleSource_MissingFields(t *testing.T) {
+	tests := []struct {
+		name string
+		app  map[string]any
+	}{
+		{
+			name: "missing spec",
+			app:  map[string]any{"apiVersion": "v1"},
+		},
+		{
+			name: "missing sources",
+			app: map[string]any{
+				"spec": map[string]any{
+					"source": map[string]any{"repoURL": "https://example.com"},
+				},
+			},
+		},
+		{
+			name: "empty sources",
+			app: map[string]any{
+				"spec": map[string]any{"sources": []any{}},
+			},
+		},
+		{
+			name: "missing chart in first source",
+			app: map[string]any{
+				"spec": map[string]any{
+					"sources": []any{
+						map[string]any{
+							"repoURL":        "https://example.com",
+							"targetRevision": "v1.0.0",
+							// chart is missing
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := convertToSingleSourceWithValues(tt.app, "test", "test")
+			if err == nil {
+				t.Error("expected error for malformed application")
+			}
+		})
+	}
+}
+
+func TestSetValueByPath_StubBehavior(t *testing.T) {
+	m := map[string]any{
+		"driver": map[string]any{"version": "580", "registry": "nvcr.io"},
+	}
+	component.SetValueByPath(m, "driver.version", "")
+
+	driver := m["driver"].(map[string]any)
+	if driver["version"] != "" {
+		t.Errorf("expected empty stub, got %v", driver["version"])
+	}
+	if driver["registry"] != "nvcr.io" {
+		t.Error("should not affect sibling keys")
+	}
+}
+
+// TestValuesBlockScalarMarshal verifies that the raw Helm template expression
+// in helm.values survives yaml.Marshal as a block scalar (not a quoted string).
+// Argo CD needs the raw template text so Helm evaluates it at render time.
+func TestValuesBlockScalarMarshal(t *testing.T) {
+	app := map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "Application",
+		"spec": map[string]any{
+			"sources": []any{
+				map[string]any{
+					"repoURL":        "https://helm.ngc.nvidia.com/nvidia",
+					"chart":          "gpu-operator",
+					"targetRevision": "v24.9.0",
+				},
+			},
+		},
+	}
+
+	if err := convertToSingleSourceWithValues(app, "gpu-operator", "gpuOperator"); err != nil {
+		t.Fatalf("convertToSingleSourceWithValues error: %v", err)
+	}
+
+	marshaled, err := yaml.Marshal(app)
+	if err != nil {
+		t.Fatalf("yaml.Marshal error: %v", err)
+	}
+
+	out := string(marshaled)
+	// Block scalar indicator must be present so Helm sees raw template text.
+	if !strings.Contains(out, "values: |") {
+		t.Errorf("marshaled output should use block scalar (|) for values, got:\n%s", out)
+	}
+	// Helm template expressions must NOT be quoted.
+	if strings.Contains(out, `values: "{{-`) || strings.Contains(out, `values: '{{-`) {
+		t.Errorf("marshaled output must not quote the template, got:\n%s", out)
+	}
+	if !strings.Contains(out, "{{- $static") {
+		t.Error("marshaled output should contain raw template expression")
+	}
+	if !strings.Contains(out, "mustMergeOverwrite") {
+		t.Error("marshaled output should contain mustMergeOverwrite")
+	}
+
+	// Regression: nindent inside the template must exceed the column of the
+	// `values:` key, otherwise Helm renders the merged values OUTSIDE the
+	// literal block as siblings of `helm:`, breaking Application schema
+	// validation. Locate the `values:` key and the nindent directive, parse
+	// both columns, and assert the nindent argument is greater.
+	valuesKeyCol, nindentArg := -1, -1
+	for line := range strings.SplitSeq(out, "\n") {
+		if valuesKeyCol == -1 && strings.Contains(line, "values:") {
+			valuesKeyCol = strings.Index(line, "values:")
+		}
+		if nindentArg == -1 {
+			if _, rest, ok := strings.Cut(line, "nindent "); ok {
+				_, _ = fmt.Sscanf(strings.TrimSpace(rest), "%d", &nindentArg)
+			}
+		}
+	}
+	if valuesKeyCol == -1 {
+		t.Fatal("could not locate `values:` column in marshaled output")
+	}
+	if nindentArg == -1 {
+		t.Fatal("could not locate `nindent <N>` directive in marshaled output")
+	}
+	if nindentArg <= valuesKeyCol {
+		t.Errorf("nindent argument %d must exceed values: column %d, otherwise merged "+
+			"content lands outside the literal block scalar", nindentArg, valuesKeyCol)
+	}
+}
+
+// injectValuesIntoSingleSource handles the path-based input shape produced
+// by argocd's KindLocalHelm folders (manifest-only, kustomize-wrapped, mixed
+// -post). It must add a helm.values block with dynamic stubs, leave the
+// existing source.path / source.repoURL intact, and emit a literal-block
+// scalar at indent that stays inside `values: |-`.
+func TestInjectValuesIntoSingleSource(t *testing.T) {
+	app := map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "Application",
+		"spec": map[string]any{
+			"source": map[string]any{
+				"repoURL":        "https://github.com/myorg/myrepo.git",
+				"targetRevision": "main",
+				"path":           "003-nodewright-customizations",
+			},
+		},
+	}
+
+	if err := injectValuesIntoSingleSource(app, "nodewrightcustomizations"); err != nil {
+		t.Fatalf("injectValuesIntoSingleSource error: %v", err)
+	}
+
+	out, err := yaml.Marshal(app)
+	if err != nil {
+		t.Fatalf("yaml.Marshal error: %v", err)
+	}
+	str := string(out)
+	// Path and repo preserved.
+	if !strings.Contains(str, "path: 003-nodewright-customizations") {
+		t.Errorf("source.path should be preserved, got:\n%s", str)
+	}
+	// helm.values block scalar present.
+	if !strings.Contains(str, "values: |") {
+		t.Errorf("helm.values should be a block scalar, got:\n%s", str)
+	}
+	// Dynamic-only template (no .Files.Get static merge).
+	if !strings.Contains(str, `index .Values "nodewrightcustomizations"`) {
+		t.Errorf("template should reference dynamic .Values key, got:\n%s", str)
+	}
+	if strings.Contains(str, ".Files.Get") {
+		t.Errorf("path-based shape should NOT use .Files.Get static merge, got:\n%s", str)
+	}
+	// Same column-math regression as TestValuesBlockScalarMarshal.
+	valuesKeyCol, nindentArg := -1, -1
+	for line := range strings.SplitSeq(str, "\n") {
+		if valuesKeyCol == -1 && strings.Contains(line, "values:") {
+			valuesKeyCol = strings.Index(line, "values:")
+		}
+		if nindentArg == -1 {
+			if _, rest, ok := strings.Cut(line, "nindent "); ok {
+				_, _ = fmt.Sscanf(strings.TrimSpace(rest), "%d", &nindentArg)
+			}
+		}
+	}
+	if nindentArg <= valuesKeyCol {
+		t.Errorf("nindent %d must exceed values: column %d", nindentArg, valuesKeyCol)
+	}
+
+	// URL-portability invariants — the input source had baked-in URL/tag,
+	// the output should have rewritten them to Helm template directives so
+	// the rendered child App picks up .Values.repoURL/targetRevision at
+	// install time. The single-quoted YAML scalar form is required so the
+	// embedded `"..."` inside `required` survives intact (double-quoted
+	// YAML would force escape sequences that break Helm's parser).
+	if !strings.Contains(str, `repoURL: '{{ required `) {
+		t.Errorf("source.repoURL should be rewritten to single-quoted Helm directive, got:\n%s", str)
+	}
+	if !strings.Contains(str, `.Values.repoURL`) {
+		t.Errorf("source.repoURL Helm directive should reference .Values.repoURL, got:\n%s", str)
+	}
+	if !strings.Contains(str, `targetRevision: '{{ .Values.targetRevision | default .Chart.Version }}'`) {
+		t.Errorf("source.targetRevision should be rewritten to Helm directive with .Chart.Version fallback, got:\n%s", str)
+	}
+	// The original baked URL must be gone (otherwise the bundle remains
+	// non-portable).
+	if strings.Contains(str, "https://github.com/myorg/myrepo.git") {
+		t.Errorf("baked-in input repoURL leaked into output, got:\n%s", str)
+	}
+}
+
+// TestInjectValuesIntoSingleSource_MissingFields mirrors the multi-source
+// validation regression: if the upstream argocd template emits an empty path
+// or repoURL, argocdhelm should fail at bundle time with a clear message
+// rather than silently produce a broken Application.
+func TestInjectValuesIntoSingleSource_MissingFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  map[string]any
+		wantMsg string
+	}{
+		{
+			name: "empty repoURL",
+			source: map[string]any{
+				"repoURL":        "",
+				"targetRevision": "main",
+				"path":           "001-component",
+			},
+			wantMsg: "repoURL",
+		},
+		{
+			name: "empty path",
+			source: map[string]any{
+				"repoURL":        "https://github.com/example/repo.git",
+				"targetRevision": "main",
+				"path":           "",
+			},
+			wantMsg: "path",
+		},
+		{
+			name: "both empty",
+			source: map[string]any{
+				"repoURL":        "",
+				"targetRevision": "main",
+				"path":           "",
+			},
+			wantMsg: "repoURL, path",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := map[string]any{
+				"spec": map[string]any{"source": tt.source},
+			}
+			err := injectValuesIntoSingleSource(app, "anything")
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Errorf("error %q should contain %q", err, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestDeepCopyMap(t *testing.T) {
+	original := map[string]any{
+		"driver": map[string]any{"version": "580"},
+	}
+	copied := component.DeepCopyMap(original)
+
+	if inner, ok := copied["driver"].(map[string]any); ok {
+		inner["version"] = "changed"
+	}
+	if original["driver"].(map[string]any)["version"] != "580" {
+		t.Error("deepCopyMap should produce independent copy")
+	}
+}
+
+// (TestDeriveParentChartSource removed: the parent Application is now a
+// chart template that consumes .Values.repoURL at install time, so the
+// bundler no longer needs URL-splitting logic — the URL never enters the
+// generated chart bytes.)
+
+// TestBundleGolden_HelmAndManifestOnly freezes the argocd-helm bundle output
+// for a recipe containing both Application input shapes the transformation
+// must handle:
+//
+//   - cert-manager: pure Helm → multi-source input → flipped to single-source
+//     with helm.values that merges static (.Files.Get) and dynamic (.Values.<key>)
+//     via mustMergeOverwrite + nindent 16.
+//   - nodewright-customizations: manifest-only → path-based single-source
+//     input → helm.values injected with dynamic-only override (no .Files.Get).
+//
+// To regenerate after intentional output changes:
+//
+//	go test ./pkg/bundler/deployer/argocdhelm/... -run TestBundleGolden -args -update
+//
+// Substring assertions miss indentation drift (which Bug A was — nindent 8
+// silently rendered values OUTSIDE the literal block); byte-comparing against
+// checked-in goldens catches that class of regression.
+func TestBundleGolden_HelmAndManifestOnly(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name:      "cert-manager",
+			Namespace: "cert-manager",
+			Chart:     "cert-manager",
+			Version:   "v1.20.2",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://charts.jetstack.io",
+		},
+		{
+			Name:      "nodewright-customizations",
+			Namespace: "skyhook",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "", // manifest-only
+		},
+	})
+	rr.DeploymentOrder = []string{"cert-manager", "nodewright-customizations"}
+
+	g := &Generator{
+		RecipeResult: rr,
+		ComponentValues: map[string]map[string]any{
+			"cert-manager":              {"replicaCount": 1, "prometheus": map[string]any{"enabled": true}},
+			"nodewright-customizations": {"enabled": true},
+		},
+		Version:        "v0.0.0-golden",
+		RepoURL:        "https://github.com/example/aicr-bundles.git",
+		TargetRevision: "main",
+		DynamicValues: map[string][]string{
+			"cert-manager": {"replicaCount"},
+		},
+		ComponentPostManifests: map[string]map[string][]byte{
+			"nodewright-customizations": {
+				"tuning.yaml": []byte("apiVersion: skyhook.nvidia.com/v1alpha1\n" +
+					"kind: Skyhook\n" +
+					"metadata:\n" +
+					"  name: tuning\n" +
+					"  namespace: {{ .Release.Namespace }}\n" +
+					"spec:\n" +
+					"  packages:\n" +
+					"    - tuning\n"),
+			},
+		},
+	}
+
+	if _, err := g.Generate(ctx, outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	for _, rel := range []string{
+		"Chart.yaml",
+		"values.yaml",
+		"values.schema.json",        // install-time deployer.* schema gate
+		"templates/aicr-stack.yaml", // parent App, Helm-templated
+		"templates/cert-manager.yaml",
+		"templates/nodewright-customizations.yaml",
+		"static/cert-manager.yaml",
+		"001-cert-manager/values.yaml",
+		"002-nodewright-customizations/Chart.yaml",
+		"002-nodewright-customizations/templates/tuning.yaml",
+	} {
+		assertGolden(t, outputDir, "testdata/helm_and_manifest_only", rel)
+	}
+}
+
+// TestBundleGolden_MixedComponent freezes the argocd-helm bundle output for
+// a mixed component (Helm + raw manifests). The localformat layer emits a
+// primary 001-<name>/ folder plus an injected 002-<name>-post/ folder. The
+// argocdhelm transformation must:
+//
+//   - Generate templates/<name>.yaml (multi-source flip) for the primary.
+//   - Generate templates/<name>-post.yaml (path-based inject) for the -post.
+//   - Route -post override-key lookups through the parent component (relies
+//     on findComponentByName + the localformat collision check).
+func TestBundleGolden_MixedComponent(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name:      "gpu-operator",
+			Namespace: "gpu-operator",
+			Chart:     "gpu-operator",
+			Version:   "v25.3.3",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://helm.ngc.nvidia.com/nvidia",
+		},
+	})
+	rr.DeploymentOrder = []string{"gpu-operator"}
+
+	g := &Generator{
+		RecipeResult: rr,
+		ComponentValues: map[string]map[string]any{
+			"gpu-operator": {"driver": map[string]any{"version": "580", "enabled": true}},
+		},
+		Version:        "v0.0.0-golden",
+		RepoURL:        "https://github.com/example/aicr-bundles.git",
+		TargetRevision: "main",
+		DynamicValues: map[string][]string{
+			"gpu-operator": {"driver.version"},
+		},
+		ComponentPostManifests: map[string]map[string][]byte{
+			"gpu-operator": {
+				"dcgm-exporter.yaml": []byte("apiVersion: v1\n" +
+					"kind: ConfigMap\n" +
+					"metadata:\n" +
+					"  name: dcgm-exporter-config\n" +
+					"  namespace: {{ .Release.Namespace }}\n" +
+					"data:\n" +
+					"  config.yaml: |\n" +
+					"    metrics: enabled\n"),
+			},
+		},
+	}
+
+	if _, err := g.Generate(ctx, outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	for _, rel := range []string{
+		"Chart.yaml",
+		"values.yaml",
+		"templates/aicr-stack.yaml",        // parent App, Helm-templated
+		"templates/gpu-operator.yaml",      // multi-source primary
+		"templates/gpu-operator-post.yaml", // path-based -post (parent override key)
+		"static/gpu-operator.yaml",
+		"002-gpu-operator-post/templates/dcgm-exporter.yaml",
+	} {
+		assertGolden(t, outputDir, "testdata/mixed_component", rel)
+	}
+}
+
+// TestBundleGolden_OCI_BakesRepoURL verifies that when OCIParentNamespace is
+// set the bundle's root values.yaml contains the parent namespace as the
+// repoURL default, not an empty string. See #1342.
+func TestBundleGolden_OCI_BakesRepoURL(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name:      "cert-manager",
+			Namespace: "cert-manager",
+			Chart:     "cert-manager",
+			Version:   "v1.20.2",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://charts.jetstack.io",
+		},
+	})
+	rr.DeploymentOrder = []string{"cert-manager"}
+
+	const wantNamespace = "oci://ghcr.io/myorg"
+
+	g := &Generator{
+		RecipeResult:       rr,
+		ComponentValues:    map[string]map[string]any{"cert-manager": {"replicaCount": 1}},
+		Version:            "v0.0.0-golden",
+		TargetRevision:     "v1.0.0",
+		OCIParentNamespace: wantNamespace,
+	}
+
+	if _, err := g.Generate(ctx, outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	valuesBytes, err := os.ReadFile(filepath.Join(outputDir, "values.yaml"))
+	if err != nil {
+		t.Fatalf("read values.yaml: %v", err)
+	}
+	values := string(valuesBytes)
+
+	if !strings.Contains(values, `repoURL: `+wantNamespace) {
+		t.Errorf("values.yaml missing baked repoURL; got:\n%s", values)
+	}
+	if strings.Contains(values, "repoURL: \"\"") {
+		t.Errorf("values.yaml should not contain empty repoURL when OCIParentNamespace is set; got:\n%s", values)
+	}
+}
+
+// TestBundleGolden_ReadinessGate freezes the argocd-helm bundle output when a
+// component ships a readiness gate. The delegated argocd.Generator emits a
+// 002-<name>-readiness/ local-helm folder after the primary; the argocdhelm
+// transform flips it into a path-based child App (templates/<name>-readiness.yaml)
+// that inherits the next sync-wave, so Argo CD blocks on the gate Job via its
+// built-in batch/Job health. See #904.
+func TestBundleGolden_ReadinessGate(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name:      "gpu-operator",
+			Namespace: "gpu-operator",
+			Chart:     "gpu-operator",
+			Version:   "v25.3.3",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://helm.ngc.nvidia.com/nvidia",
+		},
+	})
+	rr.DeploymentOrder = []string{"gpu-operator"}
+
+	g := &Generator{
+		RecipeResult: rr,
+		ComponentValues: map[string]map[string]any{
+			"gpu-operator": {"driver": map[string]any{"version": "580"}},
+		},
+		Version:        "v0.0.0-golden",
+		RepoURL:        "https://github.com/example/aicr-bundles.git",
+		TargetRevision: "main",
+		ComponentReadiness: map[string]map[string][]byte{
+			"gpu-operator": {
+				"readiness.yaml": readinessGateManifest(t),
+			},
+		},
+	}
+
+	if _, err := g.Generate(ctx, outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	for _, rel := range []string{
+		"templates/gpu-operator.yaml",           // multi-source primary
+		"templates/gpu-operator-readiness.yaml", // path-based readiness child
+		"002-gpu-operator-readiness/templates/readiness.yaml",
+	} {
+		assertGolden(t, outputDir, "testdata/readiness_gate", rel)
+	}
+}
+
+// TestBundleGolden_SyncRetry freezes spec.syncPolicy.retry through the
+// transformApplication YAML round-trip on every kind of child template —
+// pre, primary, post, and readiness gate. See #3264.
+func TestBundleGolden_SyncRetry(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name:      "gpu-operator",
+			Namespace: "gpu-operator",
+			Chart:     "gpu-operator",
+			Version:   "v25.3.3",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://helm.ngc.nvidia.com/nvidia",
+		},
+	})
+	rr.DeploymentOrder = []string{"gpu-operator"}
+
+	g := &Generator{
+		RecipeResult: rr,
+		ComponentValues: map[string]map[string]any{
+			"gpu-operator": {"driver": map[string]any{"version": "580"}},
+		},
+		Version:        "v0.0.0-golden",
+		RepoURL:        "https://github.com/example/aicr-bundles.git",
+		TargetRevision: "main",
+		ComponentPreManifests: map[string]map[string][]byte{
+			"gpu-operator": {
+				"components/gpu-operator/manifests/namespace.yaml": []byte("apiVersion: v1\n" +
+					"kind: Namespace\n" +
+					"metadata:\n" +
+					"  name: gpu-operator\n"),
+			},
+		},
+		ComponentPostManifests: map[string]map[string][]byte{
+			"gpu-operator": {
+				"dcgm-exporter.yaml": []byte("apiVersion: v1\n" +
+					"kind: ConfigMap\n" +
+					"metadata:\n" +
+					"  name: dcgm-exporter-config\n" +
+					"  namespace: {{ .Release.Namespace }}\n"),
+			},
+		},
+		ComponentReadiness: map[string]map[string][]byte{
+			"gpu-operator": {
+				"readiness.yaml": readinessGateManifest(t),
+			},
+		},
+		SyncRetry: &config.SyncRetry{
+			Limit:              20,
+			BackoffDuration:    "30s",
+			BackoffFactor:      2,
+			BackoffMaxDuration: "5m",
+		},
+	}
+
+	if _, err := g.Generate(ctx, outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	for _, rel := range []string{
+		"templates/gpu-operator-pre.yaml",
+		"templates/gpu-operator.yaml",
+		"templates/gpu-operator-post.yaml",
+		"templates/gpu-operator-readiness.yaml",
+	} {
+		assertGolden(t, outputDir, "testdata/sync_retry", rel)
+	}
+}
+
+// TestGenerateReportsLayout asserts Generate populates output.Entrypoint and
+// output.Releases with the layout it actually wrote to outputDir, mirroring
+// the flux and helmfile deployers' equivalent coverage. gpu-operator carries
+// pre-manifests, post-manifests, AND a readiness gate so the fixture
+// exercises the full `-pre` / `-post` / `-readiness` suffix-strip in
+// processFolders in one run.
+//
+// ComponentRefs declaration order, DeploymentOrder, and alphabetical
+// component-name order are all deliberately distinct here:
+//   - declaration (ComponentRefs order below): gpu-operator, cert-manager, nfd
+//   - DeploymentOrder: cert-manager, nfd, gpu-operator (the real dependency
+//     order — nfd labels nodes before gpu-operator consumes those labels)
+//   - alphabetical: cert-manager, gpu-operator, nfd
+//
+// so the primaryOrder assertion below can only pass if Generate genuinely
+// honors DeploymentOrder rather than sorting by name or falling back to
+// declaration order.
+func TestGenerateReportsLayout(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name:      "gpu-operator",
+			Namespace: "gpu-operator",
+			Chart:     "gpu-operator",
+			Version:   "v25.3.3",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://helm.ngc.nvidia.com/nvidia",
+		},
+		{
+			Name:      "cert-manager",
+			Namespace: "cert-manager",
+			Chart:     "cert-manager",
+			Version:   "v1.17.2",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://charts.jetstack.io",
+		},
+		{
+			Name:      "nfd",
+			Namespace: "nfd",
+			Chart:     "node-feature-discovery",
+			Version:   "v0.16.4",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://kubernetes-sigs.github.io/node-feature-discovery-charts",
+		},
+	})
+	rr.DeploymentOrder = []string{"cert-manager", "nfd", "gpu-operator"}
+
+	g := &Generator{
+		RecipeResult: rr,
+		ComponentValues: map[string]map[string]any{
+			"gpu-operator": {"driver": map[string]any{"version": "580"}},
+			"cert-manager": {"crds": map[string]any{"enabled": true}},
+			"nfd":          {"enabled": true},
+		},
+		Version:        "v0.0.0-test",
+		RepoURL:        "https://github.com/example/aicr-bundles.git",
+		TargetRevision: "main",
+		ComponentPreManifests: map[string]map[string][]byte{
+			"gpu-operator": {
+				"components/gpu-operator/manifests/cos-namespace.yaml": []byte(
+					"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: gpu-operator\n",
+				),
+			},
+		},
+		ComponentPostManifests: map[string]map[string][]byte{
+			"gpu-operator": {
+				"components/gpu-operator/manifests/dcgm-exporter.yaml": []byte(
+					"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: dcgm-config\n",
+				),
+			},
+		},
+		ComponentReadiness: map[string]map[string][]byte{
+			"gpu-operator": {
+				"readiness.yaml": readinessGateManifest(t),
+			},
+		},
+	}
+
+	out, err := g.Generate(ctx, outputDir)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	if out.Entrypoint != fileChart {
+		t.Errorf("Entrypoint = %q, want %s", out.Entrypoint, fileChart)
+	}
+	if len(out.Releases) == 0 {
+		t.Fatal("Generate reported no releases; the bundle index would be empty")
+	}
+	for _, r := range out.Releases {
+		if r.Name == "" || r.Component == "" || r.Path == "" || r.Namespace == "" {
+			t.Errorf("incomplete release entry: %+v", r)
+		}
+		if _, statErr := os.Stat(filepath.Join(outputDir, r.Path)); statErr != nil {
+			t.Errorf("release %q claims path %q, which does not exist: %v", r.Name, r.Path, statErr)
+		}
+		// This deployer always declares a release through a chart template
+		// (never through an orchestration script), so Manifest must never
+		// be empty.
+		if r.Manifest == "" {
+			t.Errorf("release %q has empty Manifest; argocd-helm always declares one", r.Name)
+		}
+		wantManifest := path.Join("templates", r.Name+".yaml")
+		if r.Manifest != wantManifest {
+			t.Errorf("release %q manifest = %q, want %q", r.Name, r.Manifest, wantManifest)
+		}
+		if _, statErr := os.Stat(filepath.Join(outputDir, r.Manifest)); statErr != nil {
+			t.Errorf("release %q claims manifest %q, which does not exist: %v", r.Name, r.Manifest, statErr)
+		}
+	}
+
+	// Releases order is normative: consumers read deployment sequence from
+	// list position. Extract the primary releases (Name == Component;
+	// excludes injected -pre/-post/-readiness entries) and confirm their
+	// relative order matches the recipe's DeploymentOrder — a sort or
+	// reversal of out.Releases must fail this check.
+	var primaryOrder []string
+	for _, r := range out.Releases {
+		if r.Name == r.Component {
+			primaryOrder = append(primaryOrder, r.Name)
+		}
+	}
+	if !slices.Equal(primaryOrder, rr.DeploymentOrder) {
+		t.Errorf("primary release order = %v, want %v (recipe DeploymentOrder)",
+			primaryOrder, rr.DeploymentOrder)
+	}
+
+	// gpu-operator's -pre / -post / -readiness injections must be grouped
+	// under it via Component, and land in the emission order the delegated
+	// argocd generator's NNN- prefixes actually assigned.
+	names := make([]string, len(out.Releases))
+	components := make([]string, len(out.Releases))
+	for i, r := range out.Releases {
+		names[i] = r.Name
+		components[i] = r.Component
+	}
+	wantNames := []string{"cert-manager", "nfd", "gpu-operator-pre", "gpu-operator", "gpu-operator-post", "gpu-operator-readiness"}
+	if !slices.Equal(names, wantNames) {
+		t.Errorf("release name order = %v, want %v", names, wantNames)
+	}
+	wantComponents := []string{"cert-manager", "nfd", "gpu-operator", "gpu-operator", "gpu-operator", "gpu-operator"}
+	if !slices.Equal(components, wantComponents) {
+		t.Errorf("release component order = %v, want %v", components, wantComponents)
+	}
+}
+
+// TestGenerate_ApplyOutOfSyncOnlySyncOptions is the empirical proof that
+// transformApplication's generic map[string]any YAML round-trip preserves
+// the ApplyOutOfSyncOnly=true syncOptions entry the delegated argocd.Generator
+// adds to the readiness folder's Application, and that it stays scoped to
+// only that folder's transformed Helm-chart-template output. See #2367.
+func TestGenerate_ApplyOutOfSyncOnlySyncOptions(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name:      "gpu-operator",
+			Namespace: "gpu-operator",
+			Chart:     "gpu-operator",
+			Version:   "v25.3.3",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://helm.ngc.nvidia.com/nvidia",
+		},
+	})
+	rr.DeploymentOrder = []string{"gpu-operator"}
+
+	g := &Generator{
+		RecipeResult: rr,
+		ComponentValues: map[string]map[string]any{
+			"gpu-operator": {"driver": map[string]any{"version": "580"}},
+		},
+		Version:        "v0.0.0-test",
+		RepoURL:        "https://github.com/example/aicr-bundles.git",
+		TargetRevision: "main",
+		ComponentReadiness: map[string]map[string][]byte{
+			"gpu-operator": {
+				"readiness.yaml": readinessGateManifest(t),
+			},
+		},
+	}
+
+	if _, err := g.Generate(ctx, outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	primary, err := os.ReadFile(filepath.Join(outputDir, "templates", "gpu-operator.yaml"))
+	if err != nil {
+		t.Fatalf("read primary template: %v", err)
+	}
+	if strings.Contains(string(primary), "ApplyOutOfSyncOnly") {
+		t.Errorf("primary child template must not mention ApplyOutOfSyncOnly:\n%s", primary)
+	}
+
+	readiness, err := os.ReadFile(filepath.Join(outputDir, "templates", "gpu-operator-readiness.yaml"))
+	if err != nil {
+		t.Fatalf("read readiness template: %v", err)
+	}
+	if !strings.Contains(string(readiness), "ApplyOutOfSyncOnly=true") {
+		t.Errorf("readiness child template must contain \"ApplyOutOfSyncOnly=true\":\n%s", readiness)
+	}
+}
+
+// TestHelmTemplate_RendersWithSetRepoURL is the live-render counterpart to
+// the golden tests: goldens freeze the pre-render template bytes, this
+// test verifies that running `helm template` against the generated bundle
+// with `--set repoURL=...` actually produces a valid Argo Application
+// manifest with the user-supplied URL substituted in.
+//
+// Catches regressions that goldens miss: a typo in the parent template's
+// `required`/`default` directives, a missing `}}`, or the wrong YAML
+// scalar style on the injected child source fields would all silently
+// freeze into goldens but blow up at install time. This test runs the
+// chart through Helm and asserts the rendered output is correct.
+//
+// Skipped when helm is not on PATH so unit-test environments without
+// helm aren't broken by it.
+func TestHelmTemplate_RendersWithSetRepoURL(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	outputDir := t.TempDir()
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name:      "cert-manager",
+			Namespace: "cert-manager",
+			Chart:     "cert-manager",
+			Version:   "v1.20.2",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://charts.jetstack.io",
+		},
+		{
+			Name:      "nodewright-customizations",
+			Namespace: "skyhook",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "", // manifest-only → path-based child
+		},
+	})
+	rr.DeploymentOrder = []string{"cert-manager", "nodewright-customizations"}
+
+	g := &Generator{
+		RecipeResult: rr,
+		ComponentValues: map[string]map[string]any{
+			"cert-manager":              {"replicaCount": 1},
+			"nodewright-customizations": {"enabled": true},
+		},
+		Version: "v0.0.0-test",
+		ComponentPostManifests: map[string]map[string][]byte{
+			"nodewright-customizations": {
+				"tuning.yaml": []byte("apiVersion: skyhook.nvidia.com/v1alpha1\n" +
+					"kind: Skyhook\n" +
+					"metadata:\n" +
+					"  name: tuning\n" +
+					"  namespace: skyhook\n" +
+					"spec:\n" +
+					"  packages:\n" +
+					"    - tuning\n"),
+			},
+		},
+	}
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// --set repoURL carries the parent namespace only. Both the parent
+	// App template and the path-based child template append /<chart-name>
+	// themselves so Argo CD's native-OCI lookup resolves at
+	// `<namespace>/<chart>:<tag>` — see parentAppTemplate and
+	// injectValuesIntoSingleSource in argocdhelm.go.
+	const setRepoURL = "oci://example.test/myorg"
+	const wantParentRepoURL = setRepoURL + "/" + DefaultChartName
+	const wantChildRepoURL = setRepoURL + "/" + DefaultChartName
+	const wantTagName = "v9.9.9-render-test"
+	cmdCtx, cancel := context.WithTimeout(context.Background(), helmTemplateTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, "helm", "template", "test-release", outputDir, //nolint:gosec // controlled args
+		"--set", "repoURL="+setRepoURL,
+		"--set", "targetRevision="+wantTagName,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v\noutput:\n%s", err, out)
+	}
+
+	// Walk the rendered multi-doc YAML, find the parent and a path-based
+	// child by name, assert their source.repoURL / source.targetRevision.
+	dec := yaml.NewDecoder(strings.NewReader(string(out)))
+	type appLite struct {
+		Metadata struct{ Name string } `yaml:"metadata"`
+		Spec     struct {
+			Source struct {
+				RepoURL        string `yaml:"repoURL"`
+				Chart          string `yaml:"chart"`
+				TargetRevision string `yaml:"targetRevision"`
+				Path           string `yaml:"path"`
+			} `yaml:"source"`
+		} `yaml:"spec"`
+	}
+	found := map[string]appLite{}
+	for {
+		var a appLite
+		decErr := dec.Decode(&a)
+		if errors.Is(decErr, io.EOF) {
+			break
+		}
+		if decErr != nil {
+			t.Fatalf("failed to decode rendered YAML: %v\noutput:\n%s", decErr, out)
+		}
+		if a.Metadata.Name != "" {
+			found[a.Metadata.Name] = a
+		}
+	}
+
+	parent, ok := found["aicr-stack"]
+	if !ok {
+		t.Fatalf("rendered output missing parent Application 'aicr-stack'\noutput:\n%s", out)
+	}
+	if parent.Spec.Source.RepoURL != wantParentRepoURL {
+		t.Errorf("parent App repoURL: got %q, want %q (must be parent-namespace + chart-name; see parentAppTemplate)", parent.Spec.Source.RepoURL, wantParentRepoURL)
+	}
+	if parent.Spec.Source.Chart != "" {
+		t.Errorf("parent App chart: got %q, want empty (native-OCI mode ignores source.chart; see PR #1047 regression)", parent.Spec.Source.Chart)
+	}
+	if parent.Spec.Source.Path != "." {
+		t.Errorf("parent App path: got %q, want %q (native-OCI source renders chart from artifact root)", parent.Spec.Source.Path, ".")
+	}
+	if parent.Spec.Source.TargetRevision != wantTagName {
+		t.Errorf("parent App targetRevision: got %q, want %q", parent.Spec.Source.TargetRevision, wantTagName)
+	}
+
+	child, ok := found["nodewright-customizations"]
+	if !ok {
+		t.Fatalf("rendered output missing path-based child 'nodewright-customizations'")
+	}
+	if child.Spec.Source.RepoURL != wantChildRepoURL {
+		t.Errorf("child path-based repoURL: got %q, want %q (parent namespace + chart name; see #1034)", child.Spec.Source.RepoURL, wantChildRepoURL)
+	}
+	if child.Spec.Source.TargetRevision != wantTagName {
+		t.Errorf("child path-based targetRevision: got %q, want %q", child.Spec.Source.TargetRevision, wantTagName)
+	}
+	if child.Spec.Source.Path != "002-nodewright-customizations" {
+		t.Errorf("child path: got %q, want \"002-nodewright-customizations\" (NNN-folder name is structural, must not be templated)", child.Spec.Source.Path)
+	}
+
+	// And a multi-source upstream-helm child should NOT have its repoURL
+	// templated — its repoURL is the upstream chart registry, not the
+	// bundle URL.
+	upstream, ok := found["cert-manager"]
+	if !ok {
+		t.Fatalf("rendered output missing upstream-helm child 'cert-manager'")
+	}
+	if upstream.Spec.Source.RepoURL != "https://charts.jetstack.io" {
+		t.Errorf("upstream-helm child repoURL should be the upstream chart registry, got %q", upstream.Spec.Source.RepoURL)
+	}
+}
+
+// TestHelmTemplate_RendersWithHelmRepoRepoURL verifies the parent App
+// template renders the HTTPS Helm-repo shape (repoURL + source.chart,
+// no path) when .Values.repoURL is not an oci:// URL. The bundle is
+// pure-Helm (only upstream-helm children, no path-based children), so
+// installation from ChartMuseum / GitHub Pages-style repos is the
+// supported use case. See PR #1051's Codex P2 review.
+func TestHelmTemplate_RendersWithHelmRepoRepoURL(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name: "cert-manager", Namespace: "cert-manager", Chart: "cert-manager",
+			Version: "v1.20.2", Type: recipe.ComponentTypeHelm,
+			Source: "https://charts.jetstack.io",
+		},
+	})
+	rr.DeploymentOrder = []string{"cert-manager"}
+
+	g := &Generator{
+		RecipeResult:    rr,
+		ComponentValues: map[string]map[string]any{"cert-manager": {}},
+		Version:         "v0.0.0-helm-repo-test",
+	}
+	if _, err := g.Generate(ctx, outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	const setRepoURL = "https://charts.example.com"
+	const wantTagName = "v9.9.9-helm-repo-test"
+	cmdCtx, cancel := context.WithTimeout(context.Background(), helmTemplateTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, "helm", "template", "test-release", outputDir, //nolint:gosec // controlled args
+		"--set", "repoURL="+setRepoURL,
+		"--set", "targetRevision="+wantTagName,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v\noutput:\n%s", err, out)
+	}
+
+	dec := yaml.NewDecoder(strings.NewReader(string(out)))
+	type appLite struct {
+		Metadata struct{ Name string } `yaml:"metadata"`
+		Spec     struct {
+			Source struct {
+				RepoURL        string `yaml:"repoURL"`
+				Chart          string `yaml:"chart"`
+				TargetRevision string `yaml:"targetRevision"`
+				Path           string `yaml:"path"`
+			} `yaml:"source"`
+		} `yaml:"spec"`
+	}
+	var parent appLite
+	var found bool
+	for {
+		var a appLite
+		decErr := dec.Decode(&a)
+		if errors.Is(decErr, io.EOF) {
+			break
+		}
+		if decErr != nil {
+			t.Fatalf("failed to decode rendered YAML: %v\noutput:\n%s", decErr, out)
+		}
+		if a.Metadata.Name == "aicr-stack" {
+			parent = a
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("rendered output missing parent Application 'aicr-stack'\noutput:\n%s", out)
+	}
+
+	// HTTPS Helm-repo shape: repoURL is the registry as-is, chart is
+	// the chart name, and path is NOT set (path is a native-OCI-only
+	// field). Mirror these three assertions exactly — silently
+	// regressing any one of them puts the parent App back into the
+	// broken shape that #1047 / #1048 / #1051 chased.
+	if parent.Spec.Source.RepoURL != setRepoURL {
+		t.Errorf("parent App repoURL: got %q, want %q (HTTPS Helm-repo mode: repoURL stays as-is, chart name is in source.chart)", parent.Spec.Source.RepoURL, setRepoURL)
+	}
+	if parent.Spec.Source.Chart != DefaultChartName {
+		t.Errorf("parent App chart: got %q, want %q (HTTPS Helm-repo mode requires source.chart)", parent.Spec.Source.Chart, DefaultChartName)
+	}
+	if parent.Spec.Source.Path != "" {
+		t.Errorf("parent App path: got %q, want empty (path is a native-OCI-only field; emitting it on a Helm-repo source confuses Argo CD)", parent.Spec.Source.Path)
+	}
+	if parent.Spec.Source.TargetRevision != wantTagName {
+		t.Errorf("parent App targetRevision: got %q, want %q", parent.Spec.Source.TargetRevision, wantTagName)
+	}
+}
+
+// TestGenerate_CustomChartName verifies the Generator's ChartName field
+// flows into both Chart.yaml's `name:` and the parent Application's
+// `source.repoURL` (parent namespace + `/` + .Chart.Name) at install
+// time. Regression coverage for issue #1019: when a user passes
+// `--output oci://reg/path/my-bundle:tag`, the OCI repository's last
+// segment (`my-bundle`) must propagate so the assembled
+// `<namespace>/<chart>:<targetRevision>` resolves against the actual
+// published artifact instead of the literal `aicr-bundle`.
+func TestGenerate_CustomChartName(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	const customName = "my-custom-bundle"
+	outputDir := t.TempDir()
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name: "cert-manager", Namespace: "cert-manager", Chart: "cert-manager",
+			Version: "v1.20.2", Type: recipe.ComponentTypeHelm,
+			Source: "https://charts.jetstack.io",
+		},
+	})
+	rr.DeploymentOrder = []string{"cert-manager"}
+
+	g := &Generator{
+		RecipeResult:    rr,
+		ComponentValues: map[string]map[string]any{"cert-manager": {}},
+		Version:         "v0.0.0-test",
+		ChartName:       customName,
+	}
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	chartBytes, err := os.ReadFile(filepath.Join(outputDir, "Chart.yaml"))
+	if err != nil {
+		t.Fatalf("read Chart.yaml: %v", err)
+	}
+	// writeChartYAML quotes the name so OCI artifact paths whose last
+	// segment is a YAML reserved scalar round-trip as strings; see #1034.
+	if !strings.Contains(string(chartBytes), `name: "`+customName+"\"\n") {
+		t.Errorf("Chart.yaml missing quoted custom name %q; got:\n%s", customName, chartBytes)
+	}
+
+	cmdCtx, cancel := context.WithTimeout(context.Background(), helmTemplateTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, "helm", "template", "test-release", outputDir, //nolint:gosec // controlled args
+		"--set", "repoURL=oci://example.test/myorg",
+		"--set", "targetRevision=v1.0.0",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v\noutput:\n%s", err, out)
+	}
+
+	dec := yaml.NewDecoder(strings.NewReader(string(out)))
+	type appLite struct {
+		Metadata struct{ Name string } `yaml:"metadata"`
+		Spec     struct {
+			Source struct {
+				RepoURL string `yaml:"repoURL"`
+			} `yaml:"source"`
+		} `yaml:"spec"`
+	}
+	var foundParentRepoURL string
+	for {
+		var a appLite
+		decErr := dec.Decode(&a)
+		if errors.Is(decErr, io.EOF) {
+			break
+		}
+		if decErr != nil {
+			t.Fatalf("failed to decode rendered YAML: %v\noutput:\n%s", decErr, out)
+		}
+		if a.Metadata.Name == "aicr-stack" {
+			foundParentRepoURL = a.Spec.Source.RepoURL
+		}
+	}
+	wantParentRepoURL := "oci://example.test/myorg/" + customName
+	if foundParentRepoURL != wantParentRepoURL {
+		t.Errorf("parent App repoURL: got %q, want %q (rendered repoURL must end with the Chart.yaml chart name; see #1019)",
+			foundParentRepoURL, wantParentRepoURL)
+	}
+}
+
+// TestHelmTemplate_AppNameOverride verifies the parent App's
+// metadata.name is templated from .Values.appName so an operator can
+// run two AICR bundles in the same Argo CD namespace by passing
+// --set appName=<distinct> at install time. Bundle-time --app-name
+// (Generator.AppName) is the chart default; install-time --set wins.
+//
+// Regression coverage for issue #1011 — without templating, the parent
+// Application's metadata.name was the literal "aicr-stack" and the
+// second bundle silently overwrote the first.
+func TestHelmTemplate_AppNameOverride(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	tests := []struct {
+		name              string
+		bundleTimeAppName string
+		installTimeSet    string
+		wantParentName    string
+	}{
+		{
+			name:           "default (no override) renders DefaultAppName",
+			wantParentName: DefaultAppName,
+		},
+		{
+			name:              "bundle-time AppName flows into values.yaml as the default",
+			bundleTimeAppName: "gpu-runtime",
+			wantParentName:    "gpu-runtime",
+		},
+		{
+			name:              "install-time --set appName overrides the bundle-time default",
+			bundleTimeAppName: "gpu-runtime",
+			installTimeSet:    "ops-runtime",
+			wantParentName:    "ops-runtime",
+		},
+		{
+			name:           "install-time --set appName works without a bundle-time default",
+			installTimeSet: "tenant-a",
+			wantParentName: "tenant-a",
+		},
+		{
+			// Helm's plain --set type inference: appName=true arrives as a
+			// bool. The parent template pipes through `quote` and every
+			// child template's collision guard coerces via `toString`, so
+			// the render must succeed with the parent named "true" —
+			// previously the guard's `eq` crashed with "incompatible types
+			// for comparison".
+			name:           "install-time --set appName=true (type-inferred bool) renders",
+			installTimeSet: "true",
+			wantParentName: "true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outputDir := t.TempDir()
+			rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+				{
+					Name: "cert-manager", Namespace: "cert-manager", Chart: "cert-manager",
+					Version: "v1.20.2", Type: recipe.ComponentTypeHelm,
+					Source: "https://charts.jetstack.io",
+				},
+			})
+			rr.DeploymentOrder = []string{"cert-manager"}
+
+			g := &Generator{
+				RecipeResult:    rr,
+				ComponentValues: map[string]map[string]any{"cert-manager": {}},
+				Version:         "v0.0.0-test",
+				AppName:         tt.bundleTimeAppName,
+			}
+			if _, err := g.Generate(context.Background(), outputDir); err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+
+			helmArgs := []string{"template", "test-release", outputDir,
+				"--set", "repoURL=oci://example.test/myorg",
+				"--set", "targetRevision=v1.0.0",
+			}
+			if tt.installTimeSet != "" {
+				helmArgs = append(helmArgs, "--set", "appName="+tt.installTimeSet)
+			}
+
+			cmdCtx, cancel := context.WithTimeout(context.Background(), helmTemplateTimeout)
+			defer cancel()
+			cmd := exec.CommandContext(cmdCtx, "helm", helmArgs...) //nolint:gosec // controlled args
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("helm template failed: %v\noutput:\n%s", err, out)
+			}
+
+			dec := yaml.NewDecoder(strings.NewReader(string(out)))
+			type appLite struct {
+				Kind     string `yaml:"kind"`
+				Metadata struct {
+					Name      string `yaml:"name"`
+					Namespace string `yaml:"namespace"`
+				} `yaml:"metadata"`
+				Spec struct {
+					Source struct {
+						RepoURL string `yaml:"repoURL"`
+						Path    string `yaml:"path"`
+					} `yaml:"source"`
+				} `yaml:"spec"`
+			}
+			var parentName string
+			for {
+				var a appLite
+				decErr := dec.Decode(&a)
+				if errors.Is(decErr, io.EOF) {
+					break
+				}
+				if decErr != nil {
+					t.Fatalf("failed to decode rendered YAML: %v\noutput:\n%s", decErr, out)
+				}
+				// Parent App heuristic: Kind=Application in argocd namespace
+				// with path="." (parent renders chart at artifact root;
+				// path-based children use path=NNN-<name>).
+				if a.Kind == "Application" && a.Metadata.Namespace == "argocd" && a.Spec.Source.Path == "." && strings.HasPrefix(a.Spec.Source.RepoURL, "oci://example.test/myorg") {
+					parentName = a.Metadata.Name
+				}
+			}
+			if parentName != tt.wantParentName {
+				t.Errorf("parent App metadata.name: got %q, want %q\noutput:\n%s",
+					parentName, tt.wantParentName, out)
+			}
+		})
+	}
+}
+
+// TestGenerate_AppNameValidatedAtBoundary verifies the deployer boundary
+// rejects an invalid AppName even when callers bypass the CLI/API
+// validation layer (e.g. direct library use). Failing here keeps the
+// invalid name from reaching the rendered chart's values.yaml and the
+// parent App template, where it would only surface as a cryptic
+// apiserver admission error at `helm install`.
+func TestGenerate_AppNameValidatedAtBoundary(t *testing.T) {
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name: "cert-manager", Namespace: "cert-manager", Chart: "cert-manager",
+			Version: "v1.20.2", Type: recipe.ComponentTypeHelm,
+			Source: "https://charts.jetstack.io",
+		},
+	})
+	rr.DeploymentOrder = []string{"cert-manager"}
+
+	g := &Generator{
+		RecipeResult:    rr,
+		ComponentValues: map[string]map[string]any{"cert-manager": {}},
+		Version:         "v0.0.0-test",
+		AppName:         "GPU_Runtime", // uppercase + underscore both reject as DNS-1123
+	}
+	_, err := g.Generate(context.Background(), t.TempDir())
+	if err == nil {
+		t.Fatal("Generate() should reject invalid DNS-1123 AppName, got nil")
+	}
+	if !strings.Contains(err.Error(), "DNS-1123") {
+		t.Errorf("error should mention DNS-1123 validation, got: %v", err)
+	}
+}
+
+// TestGenerate_InnerParentCollisionUsesEffectiveAppName verifies the
+// effective parent name is forwarded to the delegated argocd.Generator so
+// its parent-collision check tests children against THIS deployer's parent
+// ("aicr-stack" or --app-name), not argocd's own "nvidia-stack" default.
+// Without the forward, a component legitimately named "nvidia-stack"
+// (possible via an external --data registry) was falsely rejected as an
+// internal error.
+func TestGenerate_InnerParentCollisionUsesEffectiveAppName(t *testing.T) {
+	t.Run("component named nvidia-stack bundles under the default parent", func(t *testing.T) {
+		// External registry declaring a component named "nvidia-stack" —
+		// the embedded registry has no such component, and the inner
+		// argocd generator's own default parent name is exactly
+		// "nvidia-stack".
+		registryYAML := `apiVersion: aicr.run/v1beta1
+kind: ComponentRegistry
+components:
+  - name: nvidia-stack
+    displayName: Nvidia Stack
+    valueOverrideKeys:
+      - nvidiastack
+    helm:
+      defaultRepository: https://charts.example.com
+      defaultChart: example/nvidia-stack
+`
+		dataDir := providertest.WriteDir(t, map[string][]byte{recipe.RegistryFileName: []byte(registryYAML)})
+		embedded := recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), "")
+		layered, err := recipe.NewLayeredDataProvider(embedded, recipe.LayeredProviderConfig{ExternalDir: dataDir})
+		if err != nil {
+			t.Fatalf("NewLayeredDataProvider: %v", err)
+		}
+
+		rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+			{
+				Name: "nvidia-stack", Namespace: "nvidia-stack", Chart: "nvidia-stack",
+				Version: "v1.0.0", Type: recipe.ComponentTypeHelm,
+				Source: "https://charts.example.com",
+			},
+		})
+		rr.DeploymentOrder = []string{"nvidia-stack"}
+		rr.BindDataProvider(layered)
+		g := &Generator{
+			RecipeResult:    rr,
+			ComponentValues: map[string]map[string]any{"nvidia-stack": {}},
+			Version:         "v0.0.0-test",
+		}
+		if _, genErr := g.Generate(context.Background(), t.TempDir()); genErr != nil {
+			t.Fatalf("Generate() error = %v; a component named \"nvidia-stack\" must not collide with THIS deployer's parent %q", genErr, DefaultAppName)
+		}
+	})
+
+	t.Run("forwarded AppName is load-bearing for the collision check", func(t *testing.T) {
+		g := newTestHelmGenerator(t)
+		g.AppName = "gpu-operator" // collides with the recipe's only component
+		_, err := g.Generate(context.Background(), t.TempDir())
+		if err == nil {
+			t.Fatal("expected collision error, got nil")
+		}
+		if !strings.Contains(err.Error(), "collides") {
+			t.Errorf("error %q does not mention the parent-name collision", err.Error())
+		}
+	})
+}
+
+// TestHelmTemplate_MixedComponentPreChildResolvesFromOCI is the live-render
+// regression test for issue #1018: a recipe with a Helm component AND
+// ComponentPreManifests for that same component (the gke-cos / EKS GB200
+// shape from the bug report) produces a synthetic NNN-<name>-pre folder
+// rendered into a path-based child Application. Before the post-#1035
+// contract, the path-based child's `source.repoURL` did not append
+// `.Chart.Name`, so when the user `--set repoURL=oci://<registry>/<org>`
+// (the parent namespace) Argo CD's generic OCI source resolved
+// `<registry>/<org>:<tag>` — an artifact that does not exist — and the
+// child stuck at `Unknown / Failed to load target state`.
+//
+// This test exercises the full chain: generator → helm template render
+// → rendered child Application asserts. It pins both the parent and the
+// `-pre` child to the same expected `<parent-namespace>/<chart-name>:
+// <tag>` OCI artifact reference. The sibling upstream-helm child
+// (`gpu-operator`) is also asserted to confirm its `repoURL` stays as
+// the upstream Helm chart registry (not templated from .Values.repoURL).
+func TestHelmTemplate_MixedComponentPreChildResolvesFromOCI(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	outputDir := t.TempDir()
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name: "gpu-operator", Namespace: "gpu-operator", Chart: "gpu-operator",
+			Version: "v25.3.3", Type: recipe.ComponentTypeHelm,
+			Source: "https://helm.ngc.nvidia.com/nvidia",
+		},
+	})
+	rr.DeploymentOrder = []string{"gpu-operator"}
+
+	g := &Generator{
+		RecipeResult: rr,
+		ComponentValues: map[string]map[string]any{
+			"gpu-operator": {"driver": map[string]any{"version": "580"}},
+		},
+		Version: "v0.0.0-test",
+		// Pre-manifest in the gke-cos / EKS GB200 shape from #1018 — a
+		// Namespace primer that must apply before the gpu-operator chart.
+		ComponentPreManifests: map[string]map[string][]byte{
+			"gpu-operator": {
+				"components/gpu-operator/manifests/kernel-module-params.yaml": []byte(
+					"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: nvidia-kernel-module-params\n  namespace: gpu-operator\n",
+				),
+			},
+		},
+	}
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	const setRepoURL = "oci://example.test/myorg"
+	const wantPathChildRepoURL = setRepoURL + "/" + DefaultChartName // post-#1035 fix
+	const wantTagName = "v9.9.9-issue-1018"
+
+	cmdCtx, cancel := context.WithTimeout(context.Background(), helmTemplateTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, "helm", "template", "test-release", outputDir, //nolint:gosec // controlled args
+		"--set", "repoURL="+setRepoURL,
+		"--set", "targetRevision="+wantTagName,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v\noutput:\n%s", err, out)
+	}
+
+	dec := yaml.NewDecoder(strings.NewReader(string(out)))
+	type appLite struct {
+		Kind     string                `yaml:"kind"`
+		Metadata struct{ Name string } `yaml:"metadata"`
+		Spec     struct {
+			Source struct {
+				RepoURL        string `yaml:"repoURL"`
+				Chart          string `yaml:"chart"`
+				TargetRevision string `yaml:"targetRevision"`
+				Path           string `yaml:"path"`
+			} `yaml:"source"`
+		} `yaml:"spec"`
+	}
+	found := map[string]appLite{}
+	for {
+		var a appLite
+		decErr := dec.Decode(&a)
+		if errors.Is(decErr, io.EOF) {
+			break
+		}
+		if decErr != nil {
+			t.Fatalf("failed to decode rendered YAML: %v\noutput:\n%s", decErr, out)
+		}
+		if a.Kind == "Application" && a.Metadata.Name != "" {
+			found[a.Metadata.Name] = a
+		}
+	}
+
+	// Parent: native-OCI source shape (repoURL = namespace + "/" + chart,
+	// no source.chart, path = ".").
+	parent, ok := found["aicr-stack"]
+	if !ok {
+		t.Fatalf("rendered output missing parent Application 'aicr-stack'\noutput:\n%s", out)
+	}
+	wantParentRepoURL := setRepoURL + "/" + DefaultChartName
+	if parent.Spec.Source.RepoURL != wantParentRepoURL {
+		t.Errorf("parent App repoURL: got %q, want %q (parent namespace + chart name; native-OCI source)", parent.Spec.Source.RepoURL, wantParentRepoURL)
+	}
+	if parent.Spec.Source.Chart != "" {
+		t.Errorf("parent App chart: got %q, want empty (native-OCI mode ignores source.chart)", parent.Spec.Source.Chart)
+	}
+	if parent.Spec.Source.Path != "." {
+		t.Errorf("parent App path: got %q, want %q", parent.Spec.Source.Path, ".")
+	}
+
+	// The path-based -pre child is the #1018 regression target. Argo CD's
+	// generic OCI source treats `repoURL` as the full artifact, so the
+	// rendered value MUST equal `<parent-namespace>/<chart-name>` for the
+	// `<reg>/<org>/<chart>:<tag>` lookup to resolve.
+	preChild, ok := found["gpu-operator-pre"]
+	if !ok {
+		t.Fatalf("rendered output missing path-based child 'gpu-operator-pre'\noutput:\n%s", out)
+	}
+	if preChild.Spec.Source.RepoURL != wantPathChildRepoURL {
+		t.Errorf("gpu-operator-pre child repoURL: got %q, want %q (issue #1018: must be parent-namespace + chart-name so the generic OCI source resolves to the published artifact)", preChild.Spec.Source.RepoURL, wantPathChildRepoURL)
+	}
+	if preChild.Spec.Source.Path != "001-gpu-operator-pre" {
+		t.Errorf("gpu-operator-pre path: got %q, want %q (NNN-folder name is structural; must not be templated)", preChild.Spec.Source.Path, "001-gpu-operator-pre")
+	}
+	if preChild.Spec.Source.TargetRevision != wantTagName {
+		t.Errorf("gpu-operator-pre child targetRevision: got %q, want %q", preChild.Spec.Source.TargetRevision, wantTagName)
+	}
+
+	// The sibling upstream-helm child must keep the upstream chart
+	// registry — its source.repoURL is NOT templated from .Values.repoURL.
+	// Guards against accidentally widening the path-based template change.
+	upstream, ok := found["gpu-operator"]
+	if !ok {
+		t.Fatalf("rendered output missing upstream-helm child 'gpu-operator'\noutput:\n%s", out)
+	}
+	if upstream.Spec.Source.RepoURL != "https://helm.ngc.nvidia.com/nvidia" {
+		t.Errorf("gpu-operator upstream-helm child repoURL: got %q, want upstream Helm registry (must not be templated from .Values.repoURL)", upstream.Spec.Source.RepoURL)
+	}
+}
+
+// TestHelmTemplate_FailsWithoutRepoURL verifies the `required` directive
+// in the parent App template fires when the user omits --set repoURL. This
+// is the safety net that prevents users from accidentally publishing a
+// chart whose Application would point at an empty URL.
+func TestHelmTemplate_FailsWithoutRepoURL(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	outputDir := t.TempDir()
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name: "cert-manager", Namespace: "cert-manager", Chart: "cert-manager",
+			Version: "v1.20.2", Type: recipe.ComponentTypeHelm,
+			Source: "https://charts.jetstack.io",
+		},
+	})
+	rr.DeploymentOrder = []string{"cert-manager"}
+	g := &Generator{
+		RecipeResult:    rr,
+		ComponentValues: map[string]map[string]any{"cert-manager": {}},
+		Version:         "v0.0.0-test",
+	}
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	cmdCtx, cancel := context.WithTimeout(context.Background(), helmTemplateTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, "helm", "template", "test-release", outputDir) //nolint:gosec // controlled args
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected helm template to fail without --set repoURL, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(string(out), "repoURL is required") {
+		t.Errorf("expected error message to mention 'repoURL is required', got:\n%s", out)
+	}
+}
+
+func readinessGateManifest(t *testing.T) []byte {
+	t.Helper()
+	manifest, err := gatemanifest.Render(
+		"gpu-operator",
+		"ghcr.io/nvidia/aicr-gate:v0.0.0-golden",
+		[]byte(`apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: gpu-operator-readiness
+`),
+		config.DeployerArgoCDHelm,
+		gatemanifest.Placement{},
+	)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	return manifest
+}
+
+// assertGolden reads outDir/relPath and diffs it against goldenDir/relPath.
+// With -update, writes the actual content to the golden path.
+func assertGolden(t *testing.T, outDir, goldenDir, relPath string) {
+	t.Helper()
+	got, err := os.ReadFile(filepath.Join(outDir, relPath))
+	if err != nil {
+		t.Fatalf("read actual %s: %v", relPath, err)
+	}
+	goldenPath := filepath.Join(goldenDir, relPath)
+	if *update {
+		if err = os.MkdirAll(filepath.Dir(goldenPath), 0o755); err != nil {
+			t.Fatalf("mkdir golden: %v", err)
+		}
+		if err = os.WriteFile(goldenPath, got, 0o644); err != nil {
+			t.Fatalf("write golden: %v", err)
+		}
+		return
+	}
+	want, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden %s: %v (run with -update to regenerate)", goldenPath, err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("%s differs from golden:\n--- got ---\n%s\n--- want ---\n%s", relPath, got, want)
+	}
+}
+
+// TestInjectValuesIntoSingleSource_AppendsChartName pins the
+// post-#1032 path-based-children fix from issue #1034: path-based
+// child Applications have no `chart` field, so Argo CD's generic OCI
+// source uses `repoURL` directly as the full artifact reference. The
+// rendered template must therefore append .Chart.Name to the
+// install-time --set repoURL value so the assembled URL matches the
+// artifact the parent Application's `repoURL/chart:tag` triple
+// resolves to. Without the append, --set repoURL=oci://reg/org (the
+// contract documented elsewhere in this file) produces a child
+// source pointing at `oci://reg/org:tag` — an artifact that does not
+// exist — and the child Application fails to sync.
+func TestInjectValuesIntoSingleSource_AppendsChartName(t *testing.T) {
+	app := map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "Application",
+		"spec": map[string]any{
+			"source": map[string]any{
+				"repoURL":        "https://github.com/myorg/myrepo.git",
+				"targetRevision": "main",
+				"path":           "003-nodewright-customizations",
+			},
+		},
+	}
+
+	if err := injectValuesIntoSingleSource(app, "nodewrightcustomizations"); err != nil {
+		t.Fatalf("injectValuesIntoSingleSource error: %v", err)
+	}
+
+	out, err := yaml.Marshal(app)
+	if err != nil {
+		t.Fatalf("yaml.Marshal error: %v", err)
+	}
+	str := string(out)
+
+	// The .Values.repoURL expression may be wrapped in a trimSuffix
+	// pipeline (defense-in-depth against operator-supplied trailing
+	// slashes); the load-bearing assertion is that .Chart.Name is
+	// appended directly so the assembled URL matches the artifact the
+	// parent App's repoURL/chart:tag triple resolves to.
+	if !strings.Contains(str, `}}/{{ .Chart.Name }}`) {
+		t.Errorf("path-based child repoURL should append /{{ .Chart.Name }} after the .Values.repoURL expression so the rendered value is the full OCI artifact reference; got:\n%s", str)
+	}
+	// The error message must direct callers to pass the parent
+	// namespace (the same contract the parent Application uses) so
+	// users don't try to bake the chart name into --set repoURL.
+	if !strings.Contains(str, "do NOT include the chart name") {
+		t.Errorf("required-message must instruct callers not to include the chart name in --set repoURL; got:\n%s", str)
+	}
+}
+
+// TestWriteChartYAML_QuotesYAMLReservedScalarsAsName documents the
+// chart-name quoting fix from issue #1034. Valid OCI artifact paths
+// whose last segment is a YAML reserved scalar ("null", "true",
+// "false", numeric strings, etc.) must round-trip as strings; if
+// emitted unquoted, Helm's YAML parser reinterprets `name: null` as
+// YAML null, chart.Metadata.Name becomes empty, and the chart is
+// rejected by `helm package` / `helm push` with "chart.metadata.name
+// is required".
+func TestWriteChartYAML_QuotesYAMLReservedScalarsAsName(t *testing.T) {
+	tests := []struct {
+		name         string
+		chartName    string
+		chartVersion string
+	}{
+		{"YAML null literal name", "null", "1.0.0"},
+		{"YAML true literal name", "true", "1.0.0"},
+		{"YAML false literal name", "false", "1.0.0"},
+		{"numeric-looking name", "123", "1.0.0"},
+		{"YAML yes literal name", "yes", "1.0.0"},
+		// Versions like "1.0" reparse as the YAML float 1 without quoting,
+		// so the %q wrap on version is load-bearing, not cosmetic. Exercise
+		// that branch with the same round-trip assertion as for name.
+		{"float-looking version", "aicr-bundle", "1.0"},
+		{"numeric-looking version", "aicr-bundle", "123"},
+		{"hyphenated normal pair", "my-bundle", "1.2.3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outputDir := t.TempDir()
+			if _, _, err := writeChartYAML(outputDir, tt.chartName, tt.chartVersion); err != nil {
+				t.Fatalf("writeChartYAML: %v", err)
+			}
+			content, err := os.ReadFile(filepath.Join(outputDir, "Chart.yaml"))
+			if err != nil {
+				t.Fatalf("read Chart.yaml: %v", err)
+			}
+			var parsed struct {
+				APIVersion string `yaml:"apiVersion"`
+				Name       string `yaml:"name"`
+				Version    string `yaml:"version"`
+			}
+			if err := yaml.Unmarshal(content, &parsed); err != nil {
+				t.Fatalf("Chart.yaml does not unmarshal cleanly for name=%q version=%q:\n%s\nerror: %v",
+					tt.chartName, tt.chartVersion, content, err)
+			}
+			if parsed.Name != tt.chartName {
+				t.Errorf("Chart.yaml name = %q (after YAML unmarshal), want %q\nraw:\n%s",
+					parsed.Name, tt.chartName, content)
+			}
+			if parsed.Version != tt.chartVersion {
+				t.Errorf("Chart.yaml version = %q (after YAML unmarshal), want %q\nraw:\n%s",
+					parsed.Version, tt.chartVersion, content)
+			}
+		})
+	}
+}
+
+// newTestHelmGenerator returns a minimal single-Helm-component Generator
+// fixture for deployer-option tests. Callers set the deployer option
+// fields (NamePrefix, DestinationServer, Project, CascadeDelete) before
+// calling Generate.
+func newTestHelmGenerator(t *testing.T) *Generator {
+	t.Helper()
+	rr := newRecipeResult("v1.0.0", []recipe.ComponentRef{
+		{
+			Name: "gpu-operator", Namespace: "gpu-operator", Chart: "gpu-operator",
+			Version: "v25.3.3", Type: recipe.ComponentTypeHelm,
+			Source: "https://helm.ngc.nvidia.com/nvidia",
+		},
+	})
+	rr.DeploymentOrder = []string{"gpu-operator"}
+	return &Generator{
+		RecipeResult: rr,
+		ComponentValues: map[string]map[string]any{
+			"gpu-operator": {"driver": map[string]any{"version": "580"}},
+		},
+		Version: "v0.0.0-test",
+	}
+}
+
+// readBundleFile reads a bundle-relative file, failing the test on error.
+func readBundleFile(t *testing.T, outputDir, rel string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(outputDir, rel))
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	return data
+}
+
+// TestGenerate_UpgradeNotice covers the notice in the inline README builder,
+// which has no Components table: the notice follows the intro paragraph.
+func TestGenerate_UpgradeNotice(t *testing.T) {
+	const notice = "## Before You Upgrade\n\nNOTICE-SENTINEL\n\n"
+	tests := []struct {
+		name   string
+		notice string
+	}{
+		{"empty", ""},
+		{"set", notice},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outputDir := t.TempDir()
+			g := newTestHelmGenerator(t)
+			g.UpgradeNotice = tt.notice
+			if _, err := g.Generate(context.Background(), outputDir); err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+			readme := string(readBundleFile(t, outputDir, "README.md"))
+			if tt.notice == "" {
+				if strings.Contains(readme, "Before You Upgrade") {
+					t.Errorf("README rendered an upgrade notice that was not set:\n%s", readme)
+				}
+				if !strings.Contains(readme, "different registry.\n\n## Deploy\n") {
+					t.Errorf("intro paragraph must be followed by one blank line and Deploy:\n%s", readme)
+				}
+				return
+			}
+			idx := strings.Index(readme, tt.notice)
+			if idx < 0 {
+				t.Fatalf("README missing upgrade notice:\n%s", readme)
+			}
+			if !strings.HasSuffix(readme[:idx], "different registry.\n\n") {
+				t.Errorf("upgrade notice must follow the intro paragraph after one blank line:\n%s", readme)
+			}
+			if !strings.HasPrefix(readme[idx+len(tt.notice):], "## Deploy\n") {
+				t.Errorf("upgrade notice must directly precede ## Deploy:\n%s", readme)
+			}
+		})
+	}
+}
+
+func TestGenerate_DeployerValuesInChart(t *testing.T) {
+	outputDir := t.TempDir()
+	g := newTestHelmGenerator(t)
+	g.NamePrefix = "tenant-a-"
+	g.DestinationServer = "https://remote.example.com:6443"
+	g.Project = "tenant-a"
+	g.CascadeDelete = true
+
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	values := readBundleFile(t, outputDir, "values.yaml")
+	for _, want := range []string{"deployer:", "namePrefix: tenant-a-",
+		"destinationServer: https://remote.example.com:6443", "project: tenant-a"} {
+		if !strings.Contains(string(values), want) {
+			t.Errorf("values.yaml missing %q\n%s", want, values)
+		}
+	}
+	// Key form only — the doc header comment deliberately mentions
+	// cascadeDelete to explain that it is bundle-time only.
+	if strings.Contains(string(values), "cascadeDelete:") {
+		t.Error("cascadeDelete key must not appear in values.yaml (bundle-time only)")
+	}
+
+	child := readBundleFile(t, outputDir, "templates/gpu-operator.yaml")
+	for _, want := range []string{
+		`{{ (.Values.deployer | default dict).namePrefix | default "" }}gpu-operator`,
+		`(.Values.deployer | default dict).destinationServer`,
+		`(.Values.deployer | default dict).project`,
+		"resources-finalizer.argocd.argoproj.io",
+	} {
+		if !strings.Contains(string(child), want) {
+			t.Errorf("child template missing %q\n%s", want, child)
+		}
+	}
+
+	parent := readBundleFile(t, outputDir, "templates/aicr-stack.yaml")
+	if !strings.Contains(string(parent), "resources-finalizer.argocd.argoproj.io") {
+		t.Error("parent template missing finalizer when CascadeDelete set")
+	}
+	for _, reject := range []string{"tenant-a-", "remote.example.com"} {
+		if strings.Contains(string(parent), reject) {
+			t.Errorf("parent template unexpectedly contains %q", reject)
+		}
+	}
+}
+
+func TestGenerate_DeployerDefaults_NoOptions(t *testing.T) {
+	outputDir := t.TempDir()
+	g := newTestHelmGenerator(t)
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	values := readBundleFile(t, outputDir, "values.yaml")
+	// Defaults documented in values.yaml even without overrides.
+	for _, want := range []string{"destinationServer: https://kubernetes.default.svc", "project: default",
+		"includeRootApp: true"} {
+		if !strings.Contains(string(values), want) {
+			t.Errorf("values.yaml missing default %q\n%s", want, values)
+		}
+	}
+	parent := readBundleFile(t, outputDir, "templates/aicr-stack.yaml")
+	if strings.Contains(string(parent), "finalizers") {
+		t.Error("parent template must not carry finalizers by default")
+	}
+	if !strings.Contains(string(parent), `dig "includeRootApp" true`) {
+		t.Error("parent template missing includeRootApp gate")
+	}
+
+	schema := readBundleFile(t, outputDir, "values.schema.json")
+	if !strings.Contains(string(schema), `"includeRootApp"`) {
+		t.Error("values.schema.json missing includeRootApp property (additionalProperties:false would reject the --set)")
+	}
+}
+
+// TestHelmTemplate_DeployerNamePrefixOverride is the live-render check for
+// the install-time deployer.* vocabulary: `helm template --set
+// deployer.namePrefix=t-` must render the child Application's
+// metadata.name as `t-gpu-operator`, and project / destinationServer
+// overrides must land on the child spec. Skipped when helm is not on PATH.
+func TestHelmTemplate_DeployerNamePrefixOverride(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	outputDir := t.TempDir()
+	g := newTestHelmGenerator(t)
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	cmdCtx, cancel := context.WithTimeout(context.Background(), helmTemplateTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, "helm", "template", "test-release", outputDir, //nolint:gosec // controlled args
+		"--set", "repoURL=oci://example.test/myorg",
+		"--set", "targetRevision=v1.0.0",
+		"--set", "deployer.namePrefix=t-",
+		"--set", "deployer.project=tenant-a",
+		"--set", "deployer.destinationServer=https://remote.example.com:6443",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v\noutput:\n%s", err, out)
+	}
+
+	dec := yaml.NewDecoder(strings.NewReader(string(out)))
+	type appLite struct {
+		Kind     string                `yaml:"kind"`
+		Metadata struct{ Name string } `yaml:"metadata"`
+		Spec     struct {
+			Project     string `yaml:"project"`
+			Destination struct {
+				Server string `yaml:"server"`
+			} `yaml:"destination"`
+		} `yaml:"spec"`
+	}
+	found := map[string]appLite{}
+	for {
+		var a appLite
+		decErr := dec.Decode(&a)
+		if errors.Is(decErr, io.EOF) {
+			break
+		}
+		if decErr != nil {
+			t.Fatalf("failed to decode rendered YAML: %v\noutput:\n%s", decErr, out)
+		}
+		if a.Kind == "Application" && a.Metadata.Name != "" {
+			found[a.Metadata.Name] = a
+		}
+	}
+
+	child, ok := found["t-gpu-operator"]
+	if !ok {
+		t.Fatalf("rendered output missing prefixed child 't-gpu-operator'\noutput:\n%s", out)
+	}
+	if child.Spec.Project != "tenant-a" {
+		t.Errorf("child spec.project: got %q, want %q", child.Spec.Project, "tenant-a")
+	}
+	if child.Spec.Destination.Server != "https://remote.example.com:6443" {
+		t.Errorf("child destination.server: got %q, want %q", child.Spec.Destination.Server, "https://remote.example.com:6443")
+	}
+
+	// Parent Application stays unprefixed and on the control-plane cluster.
+	if _, ok := found[DefaultAppName]; !ok {
+		t.Errorf("rendered output missing unprefixed parent %q", DefaultAppName)
+	}
+}
+
+// TestHelmTemplate_IncludeRootAppToggle is the live-render check for
+// deployer.includeRootApp (#1723): default renders the parent app-of-apps,
+// `--set deployer.includeRootApp=false` renders children-only so an
+// externally managed root Application pointing at the published chart does
+// not fight the bundled parent over the same children, and a string value
+// fails the values schema loudly instead of rendering as truthy.
+// Skipped when helm is not on PATH.
+func TestHelmTemplate_IncludeRootAppToggle(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	outputDir := t.TempDir()
+	g := newTestHelmGenerator(t)
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	render := func(t *testing.T, extraArgs ...string) (string, error) {
+		t.Helper()
+		cmdCtx, cancel := context.WithTimeout(context.Background(), helmTemplateTimeout)
+		defer cancel()
+		args := append([]string{"template", "test-release", outputDir,
+			"--set", "repoURL=oci://example.test/myorg",
+			"--set", "targetRevision=v1.0.0",
+		}, extraArgs...)
+		cmd := exec.CommandContext(cmdCtx, "helm", args...) //nolint:gosec // controlled args
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	appNames := func(t *testing.T, rendered string) map[string]bool {
+		t.Helper()
+		dec := yaml.NewDecoder(strings.NewReader(rendered))
+		type appLite struct {
+			Kind     string                `yaml:"kind"`
+			Metadata struct{ Name string } `yaml:"metadata"`
+		}
+		names := map[string]bool{}
+		for {
+			var a appLite
+			decErr := dec.Decode(&a)
+			if errors.Is(decErr, io.EOF) {
+				break
+			}
+			if decErr != nil {
+				t.Fatalf("failed to decode rendered YAML: %v\noutput:\n%s", decErr, rendered)
+			}
+			if a.Kind == "Application" && a.Metadata.Name != "" {
+				names[a.Metadata.Name] = true
+			}
+		}
+		return names
+	}
+
+	t.Run("default renders parent and children", func(t *testing.T) {
+		out, err := render(t)
+		if err != nil {
+			t.Fatalf("helm template failed: %v\noutput:\n%s", err, out)
+		}
+		names := appNames(t, out)
+		if !names[DefaultAppName] {
+			t.Errorf("default render missing parent %q\noutput:\n%s", DefaultAppName, out)
+		}
+		if !names["gpu-operator"] {
+			t.Errorf("default render missing child gpu-operator\noutput:\n%s", out)
+		}
+	})
+
+	t.Run("includeRootApp=false renders children-only", func(t *testing.T) {
+		out, err := render(t, "--set", "deployer.includeRootApp=false")
+		if err != nil {
+			t.Fatalf("helm template failed: %v\noutput:\n%s", err, out)
+		}
+		names := appNames(t, out)
+		if names[DefaultAppName] {
+			t.Errorf("parent %q rendered despite includeRootApp=false\noutput:\n%s", DefaultAppName, out)
+		}
+		if !names["gpu-operator"] {
+			t.Errorf("children must still render with includeRootApp=false\noutput:\n%s", out)
+		}
+	})
+
+	t.Run("string value fails values schema", func(t *testing.T) {
+		out, err := render(t, "--set-string", "deployer.includeRootApp=false")
+		if err == nil {
+			t.Fatalf("expected helm template to fail schema validation for string value, but it succeeded:\n%s", out)
+		}
+	})
+}
+
+// TestGenerate_ChildNameLimits verifies the bundle-time guards for
+// composed child Application names in the argocd-helm path: names over
+// Helm's 53-character release-name cap and names colliding with the
+// parent Application are rejected with ErrCodeInvalidRequest before any
+// output is written. The install-time equivalents are covered by
+// TestHelmTemplate_ChildNameGuards below.
+func TestGenerate_ChildNameLimits(t *testing.T) {
+	for _, tt := range argocdtest.ChildNameCases() {
+		t.Run(tt.Name, func(t *testing.T) {
+			g := newTestHelmGenerator(t)
+			g.AppName, g.NamePrefix = tt.AppName, tt.NamePrefix
+			g.ComponentPreManifests, g.ComponentPostManifests, g.ComponentReadiness = tt.PreManifests, tt.PostManifests, tt.Readiness
+			outputDir := filepath.Join(t.TempDir(), "bundle")
+			_, genErr := g.Generate(context.Background(), outputDir)
+			if _, statErr := os.Stat(outputDir); !os.IsNotExist(statErr) {
+				t.Errorf("rejected bundle left output behind: stat error = %v", statErr)
+			}
+			argocdtest.WantRejected(t, "Generate", genErr, tt.ErrSubstr)
+		})
+	}
+}
+
+// TestGenerate_PrefixedChildMatchesAppNameUnprefixed covers an app name equal
+// to a component name, which collides only when the prefix is dropped.
+func TestGenerate_PrefixedChildMatchesAppNameUnprefixed(t *testing.T) {
+	g := newTestHelmGenerator(t)
+	g.AppName, g.NamePrefix = "gpu-operator", "t1-"
+	outputDir := t.TempDir()
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	walkErr := filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if strings.Contains(string(data), "t1-gpu-operator") {
+			t.Errorf("%s bakes the prefixed child name", path)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("walk output: %v", walkErr)
+	}
+}
+
+// TestGenerate_NamePrefixValidatedUpfront verifies the boundary check
+// rejects a malformed NamePrefix even when the recipe produces no
+// NNN-folders, so no child name is ever composed and checked.
+func TestGenerate_NamePrefixValidatedUpfront(t *testing.T) {
+	rr := newRecipeResult("v1.0.0", nil)
+	g := &Generator{
+		RecipeResult: rr,
+		Version:      "v0.0.0-test",
+		NamePrefix:   "-Bad_Prefix",
+	}
+	_, err := g.Generate(context.Background(), t.TempDir())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "Argo CD name prefix") {
+		t.Errorf("error %q does not mention the Argo CD name prefix", err.Error())
+	}
+}
+
+// TestHelmTemplate_ChildNameGuards is the install-time counterpart to
+// TestGenerate_ChildNameLimits: the bundle bakes valid deployer defaults,
+// but `helm template --set deployer.namePrefix=...` can still compose a
+// child name over Helm's release-name cap or one that collides with the
+// parent Application. The guard block prepended to every child template
+// must fail the render. Skipped when helm is not on PATH.
+func TestHelmTemplate_ChildNameGuards(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	outputDir := t.TempDir()
+	g := newTestHelmGenerator(t)
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		extraSets []string
+		errSubstr string
+	}{
+		{
+			name:      "namePrefix over release-name cap fails render",
+			extraSets: []string{"--set", "deployer.namePrefix=" + strings.Repeat("a", 49) + "-"},
+			errSubstr: "53",
+		},
+		{
+			name: "child name colliding with parent appName fails render",
+			extraSets: []string{
+				"--set", "deployer.namePrefix=tenant-",
+				"--set", "appName=tenant-gpu-operator",
+			},
+			errSubstr: "collides",
+		},
+		{
+			name:      "unknown deployer key fails schema validation",
+			extraSets: []string{"--set", "deployer.destinationSever=https://x"},
+			errSubstr: "destinationSever",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := []string{"template", "test-release", outputDir,
+				"--set", "repoURL=oci://example.test/myorg",
+				"--set", "targetRevision=v1.0.0",
+			}
+			args = append(args, tt.extraSets...)
+			cmdCtx, cancel := context.WithTimeout(context.Background(), helmTemplateTimeout)
+			defer cancel()
+			cmd := exec.CommandContext(cmdCtx, "helm", args...) //nolint:gosec // controlled args
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("expected helm template to fail, but it succeeded:\n%s", out)
+			}
+			if !strings.Contains(string(out), tt.errSubstr) {
+				t.Errorf("helm error output does not mention %q:\n%s", tt.errSubstr, out)
+			}
+		})
+	}
+}
+
+// TestValuesSchemaPatterns compiles the values.schema.json regex patterns
+// with Go's regexp package and verifies they align with the bundle-time Go
+// validators: destinationServer must reject embedded credentials, and
+// project must enforce per-label DNS-1123 subdomain rules (no empty labels,
+// labels capped at 63 chars).
+func TestValuesSchemaPatterns(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := writeValuesSchema(dir); err != nil {
+		t.Fatalf("writeValuesSchema() error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "values.schema.json"))
+	if err != nil {
+		t.Fatalf("read values.schema.json: %v", err)
+	}
+	var schema valuesSchema
+	if err := json.Unmarshal(data, &schema); err != nil {
+		t.Fatalf("unmarshal values.schema.json: %v", err)
+	}
+	props := schema.Properties.Deployer.Properties
+
+	// Pin the fail-closed shape independent of the golden fixtures and the
+	// (skippable) live helm test: without additionalProperties: false, an
+	// unknown deployer.* key would silently pass install-time validation.
+	// The raw-bytes check matters — a future `omitempty` on the struct field
+	// would drop the key entirely (JSON Schema then defaults to allowing
+	// unknown properties), and an unmarshal-based check could not see that.
+	if schema.Properties.Deployer.AdditionalProperties {
+		t.Error("deployer.additionalProperties must be false to fail unknown keys closed")
+	}
+	if !strings.Contains(string(data), `"additionalProperties": false`) {
+		t.Error(`values.schema.json must emit "additionalProperties": false explicitly; omitting it fails open`)
+	}
+
+	tests := []struct {
+		name    string
+		pattern string
+		input   string
+		match   bool
+	}{
+		{"destinationServer accepts plain https host", props.DestinationServer.Pattern, "https://kubernetes.default.svc", true},
+		{"destinationServer accepts explicit empty (reset to baked default)", props.DestinationServer.Pattern, "", true},
+		{"destinationServer accepts host with port", props.DestinationServer.Pattern, "https://api.example.com:6443", true},
+		{"destinationServer rejects embedded credentials", props.DestinationServer.Pattern, "https://u:p@host:6443", false},
+		{"destinationServer rejects port without hostname", props.DestinationServer.Pattern, "https://:6443", false},
+		{"destinationServer rejects path without hostname", props.DestinationServer.Pattern, "https:///path", false},
+		{"project accepts single label", props.Project.Pattern, "default", true},
+		{"project accepts dotted subdomain", props.Project.Pattern, "team-a.prod", true},
+		{"project rejects empty label", props.Project.Pattern, "a..b", false},
+		// Per-label caps are deliberately NOT enforced: IsDNS1123Subdomain
+		// only caps the total length, and a 64+-char label is a legal
+		// Kubernetes object name — an AppProject with a 70-char name can
+		// exist, so rejecting the reference would be a false positive.
+		{"project accepts 70-char label (legal k8s object name)", props.Project.Pattern, strings.Repeat("a", 70), true},
+		{"project accepts 63-char label", props.Project.Pattern, strings.Repeat("a", 63), true},
+		{"project accepts explicit empty (reset to baked default)", props.Project.Pattern, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			re, err := regexp.Compile(tt.pattern)
+			if err != nil {
+				t.Fatalf("pattern %q does not compile: %v", tt.pattern, err)
+			}
+			if got := re.MatchString(tt.input); got != tt.match {
+				t.Errorf("pattern %q match(%q) = %v, want %v", tt.pattern, tt.input, got, tt.match)
+			}
+		})
+	}
+}
+
+// TestValidationContractParity is the live contract test between the two
+// independent validation gates for deployer.* options:
+//
+//   - bundle time: the Go validators behind config.ParseArgoDeployerOptions
+//     (ValidateNamePrefix, ValidateDestinationServer, ValidateProject).
+//   - install time: values.schema.json patterns enforced by
+//     `helm template` (plus the template guards).
+//
+// The two have repeatedly drifted (see #1625/#1628 follow-ups); this test
+// closes the class by running BOTH gates against the same value and
+// asserting each equals an explicit wantValid — merely asserting the gates
+// agree would let a case where both wrongly accept a bad value pass.
+func TestValidationContractParity(t *testing.T) {
+	helmtest.RequireBinary(t)
+
+	outputDir := t.TempDir()
+	g := newTestHelmGenerator(t)
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// helmTemplate renders the generated bundle with one extra deployer.*
+	// assignment (setFlag is --set-string for byte-identical string parity,
+	// or --set for Helm's type-inference cases) and reports render output
+	// and success. Bounded by an exec timeout like the other live tests.
+	helmTemplate := func(t *testing.T, setFlag, key, value string) (string, bool) {
+		t.Helper()
+		cmdCtx, cancel := context.WithTimeout(context.Background(), helmTemplateTimeout)
+		defer cancel()
+		cmd := exec.CommandContext(cmdCtx, "helm", "template", "test-release", outputDir, //nolint:gosec // controlled args
+			"--set", "repoURL=oci://example.test/myorg",
+			"--set", "targetRevision=v1.0.0",
+			setFlag, "deployer."+key+"="+value,
+		)
+		out, err := cmd.CombinedOutput()
+		if cmdCtx.Err() != nil {
+			t.Fatalf("helm template timed out: %v\noutput:\n%s", err, out)
+		}
+		return string(out), err == nil
+	}
+
+	t.Run("string values", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			key       string
+			value     string
+			wantValid bool
+		}{
+			{"destinationServer valid https URL", "destinationServer", "https://api.example.com:6443", true},
+			{"destinationServer embedded credentials", "destinationServer", "https://u:p@host:6443", false},
+			// Port with no hostname is never a usable API endpoint; both
+			// gates fail it closed (ValidateHTTPSURL checks u.Hostname(),
+			// the schema pattern forbids ':' right after https://).
+			{"destinationServer port without hostname", "destinationServer", "https://:6443", false},
+			// url.Parse lowercases the scheme, so only an explicit prefix
+			// check keeps the Go validator aligned with the case-sensitive
+			// schema pattern.
+			{"destinationServer uppercase scheme", "destinationServer", "HTTPS://host:6443", false},
+			// '@' is rejected anywhere (not just userinfo) because the
+			// schema regex cannot distinguish authority from path.
+			{"destinationServer at-sign in path", "destinationServer", "https://host/path@thing", false},
+			{"project valid dotted subdomain", "project", "team-a.prod", true},
+			{"project empty label", "project", "a..b", false},
+			// Both gates mirror IsDNS1123Subdomain exactly: a 64-char
+			// label is a legal Kubernetes object name (only the 253-char
+			// total is capped), so both gates must accept it.
+			{"project 64-char label", "project", strings.Repeat("a", 64), true},
+			{"namePrefix valid trailing hyphen", "namePrefix", "tenant-a-", true},
+			{"namePrefix uppercase", "namePrefix", "Tenant-", false},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				// Bundle-time gate: single-key override map through the same
+				// entry point the CLI/API use for --set deployer:<key>=<value>.
+				_, err := config.ParseArgoDeployerOptions(map[string]string{tt.key: tt.value})
+				if goValid := err == nil; goValid != tt.wantValid {
+					t.Errorf("bundle-time Go validator: valid=%v, want %v (err=%v)", goValid, tt.wantValid, err)
+				}
+				// Install-time gate: --set-string keeps the value a string so
+				// both gates judge the identical bytes.
+				out, helmValid := helmTemplate(t, "--set-string", tt.key, tt.value)
+				if helmValid != tt.wantValid {
+					t.Errorf("install-time helm template: valid=%v, want %v\noutput:\n%s", helmValid, tt.wantValid, out)
+				}
+			})
+		}
+	})
+
+	// Helm's plain --set type-inference: `--set deployer.project=true`
+	// delivers a bool (not the string "true") to schema validation. The
+	// schema's `type: string` must reject every inferred non-string —
+	// otherwise a value the bundle-time gate could never even see (its
+	// overrides are always strings) slips through at install time.
+	t.Run("helm type inference rejected by schema", func(t *testing.T) {
+		for _, value := range []string{"true", "false", "123", "0"} {
+			t.Run("project="+value, func(t *testing.T) {
+				out, helmValid := helmTemplate(t, "--set", "project", value)
+				if helmValid {
+					t.Errorf("helm template accepted --set deployer.project=%s; schema type:string must reject the inferred non-string\noutput:\n%s", value, out)
+				}
+			})
+		}
+	})
+
+	// `--set deployer.project=null` is different: Helm deletes the key from
+	// the coalesced values instead of passing a null, so the schema never
+	// sees a value and the child template's `| default "default"` fallback
+	// renders the baked default. That render success is acceptable — the
+	// user gets the chart default, not a malformed project — so this case
+	// intentionally expects success and pins the fallback value.
+	t.Run("project=null deletes key and falls back to baked default", func(t *testing.T) {
+		out, helmValid := helmTemplate(t, "--set", "project", "null")
+		if !helmValid {
+			t.Fatalf("helm template failed for --set deployer.project=null; expected key deletion + default fallback\noutput:\n%s", out)
+		}
+		if !strings.Contains(out, "project: 'default'") {
+			t.Errorf("rendered output should fall back to the baked default project after null deletes the key; got:\n%s", out)
+		}
+	})
+
+	// An explicit-empty install-time value passes the schema's `^$|`
+	// alternative and resets to the baked default via the child
+	// template's `| default` fallback. The CLI cannot produce this case
+	// (ParseArgoDeployerOptions rejects an empty project, and the
+	// component-path parser rejects empty values), so it is install-time
+	// only — pin the fallback rendering here.
+	t.Run("explicit-empty project renders baked default", func(t *testing.T) {
+		out, helmValid := helmTemplate(t, "--set-string", "project", "")
+		if !helmValid {
+			t.Fatalf("helm template failed for --set-string deployer.project=\"\"; expected schema to accept empty and template to fall back\noutput:\n%s", out)
+		}
+		if !strings.Contains(out, "project: 'default'") {
+			t.Errorf("rendered output should fall back to the baked default project for an explicit-empty value; got:\n%s", out)
+		}
+	})
+
+	t.Run("explicit-empty destinationServer renders in-cluster default", func(t *testing.T) {
+		out, helmValid := helmTemplate(t, "--set-string", "destinationServer", "")
+		if !helmValid {
+			t.Fatalf("helm template failed for --set-string deployer.destinationServer=\"\"; expected schema to accept empty and template to fall back\noutput:\n%s", out)
+		}
+		if !strings.Contains(out, "server: 'https://kubernetes.default.svc'") {
+			t.Errorf("rendered output should fall back to the in-cluster destination server for an explicit-empty value; got:\n%s", out)
+		}
+	})
+}

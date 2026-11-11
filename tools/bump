@@ -1,0 +1,221 @@
+#!/bin/bash
+set -euo pipefail
+
+# Dir setup
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${DIR}/common"
+
+# Check if required tools are installed
+has_tools git
+
+# ==============================================================================
+# Version calculation helpers
+# ==============================================================================
+
+# Latest version tag reachable from HEAD, pre-releases included (e.g.
+# v1.3.0-rc2). --match restricts candidates to tags that look like versions,
+# so non-version tags (nightly, deploy-20240101, ...) are never selected.
+latest_tag() {
+  git describe --tags --abbrev=0 --match='v[0-9]*' 2>/dev/null || echo "v0.0.0"
+}
+
+# Latest stable tag reachable from HEAD. Any tag with a pre-release suffix
+# (-rc1, -beta1, ...) contains a hyphen and is skipped, the same rule
+# tools/changelog applies when it picks the last release.
+latest_stable_tag() {
+  git describe --tags --abbrev=0 --match='v[0-9]*' --exclude='*-*' 2>/dev/null || echo "v0.0.0"
+}
+
+# The version a bump type counts from.
+#
+# major, minor, and patch count from the latest STABLE tag. A leftover RC of
+# the next version (v1.3.0-rc2 after v1.2.3) must not move the result: counting
+# from the RC would turn `minor` into v1.4.0 and `patch` into v1.3.1.
+#
+# rc counts from the latest tag of any kind, because it has to see the RC it is
+# incrementing (v1.3.0-rc1 -> v1.3.0-rc2).
+base_version() {
+  case "$1" in
+    rc) latest_tag ;;
+    *)  latest_stable_tag ;;
+  esac
+}
+
+# Parse semver into components. Sets: MAJOR, MINOR, PATCH, PRERELEASE
+parse_version() {
+  local ver="${1#v}"
+  # Split off pre-release suffix (everything after first hyphen)
+  if [[ "$ver" == *-* ]]; then
+    PRERELEASE="${ver#*-}"
+    ver="${ver%%-*}"
+  else
+    PRERELEASE=""
+  fi
+  local IFS='.'
+  read -ra parts <<< "$ver"
+  MAJOR=${parts[0]:-0}
+  MINOR=${parts[1]:-0}
+  PATCH=${parts[2]:-0}
+}
+
+# Compute next version for a given bump type
+compute_next_version() {
+  local bump_type=$1
+  local cur
+  cur=$(base_version "$bump_type")
+  parse_version "$cur"
+
+  case "$bump_type" in
+    major)
+      MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0; PRERELEASE="" ;;
+    minor)
+      MINOR=$((MINOR + 1)); PATCH=0; PRERELEASE="" ;;
+    patch)
+      PATCH=$((PATCH + 1)); PRERELEASE="" ;;
+    rc)
+      # If current tag is already an RC, increment the RC suffix.
+      # Otherwise start at rc1 on the next minor version.
+      if [[ "$PRERELEASE" == rc* ]]; then
+        local num="${PRERELEASE#rc}"
+        num=$((num + 1))
+        PRERELEASE="rc${num}"
+      else
+        MINOR=$((MINOR + 1)); PATCH=0
+        PRERELEASE="rc1"
+      fi
+      ;;
+    *)
+      err "Invalid bump type '$bump_type'. Use: major, minor, patch, rc" ;;
+  esac
+
+  local new_version="v${MAJOR}.${MINOR}.${PATCH}"
+  if [[ -n "$PRERELEASE" ]]; then
+    new_version="${new_version}-${PRERELEASE}"
+  fi
+  echo "$new_version"
+}
+
+# ==============================================================================
+# Validation helpers
+# ==============================================================================
+
+check_clean_state() {
+  if ! git diff-index --quiet HEAD --; then
+    err "Working directory is not clean. Commit and push all changes first."
+  fi
+}
+
+check_pushed() {
+  if [ "$(git rev-list @{u}..HEAD --count 2>/dev/null || echo 0)" -gt 0 ]; then
+    err "There are unpushed commits. Push all changes first."
+  fi
+}
+
+check_tag_available() {
+  local tag=$1
+  if git tag --list | grep -q "^${tag}$"; then
+    err "Tag '${tag}' already exists locally."
+  fi
+  if git ls-remote --tags origin | grep -q "refs/tags/${tag}$"; then
+    err "Tag '${tag}' already exists on remote."
+  fi
+}
+
+# ==============================================================================
+# Subcommands
+# ==============================================================================
+
+# Tag the current HEAD and push the tag. No commits are created.
+cmd_tag() {
+  local bump_type=${1:-patch}
+
+  check_clean_state
+  check_pushed
+
+  local cur new_version
+  cur=$(base_version "$bump_type")
+  new_version=$(compute_next_version "$bump_type")
+
+  check_tag_available "$new_version"
+
+  msg "Tagging $bump_type version: $cur → $new_version"
+  git tag -a "$new_version" -m "Release $new_version"
+  git push origin "$new_version"
+}
+
+# Promote a pre-release tag to a stable release on the same SHA.
+cmd_promote() {
+  local rc_tag=${1:-}
+  if [[ -z "$rc_tag" ]]; then
+    err "Usage: $0 promote <rc-tag>  (e.g., v1.2.3-rc1)"
+  fi
+
+  # Verify the tag exists (not a branch or other ref)
+  if ! git rev-parse -q --verify "refs/tags/$rc_tag" >/dev/null; then
+    err "Tag '$rc_tag' does not exist."
+  fi
+
+  # Must be a pre-release tag
+  parse_version "$rc_tag"
+  if [[ -z "$PRERELEASE" ]]; then
+    err "'$rc_tag' is not a pre-release tag."
+  fi
+
+  local release_version="v${MAJOR}.${MINOR}.${PATCH}"
+  check_tag_available "$release_version"
+
+  local sha
+  sha=$(git rev-list -n1 "refs/tags/$rc_tag")
+
+  # Verify the SHA is reachable from origin/main
+  if ! git merge-base --is-ancestor "$sha" origin/main; then
+    err "RC tag $rc_tag points at $sha, which is not on origin/main. Refusing to promote."
+  fi
+
+  msg "Promoting $rc_tag → $release_version (SHA: ${sha:0:12})"
+  git tag -a "$release_version" "$sha" -m "Release $release_version"
+  git push origin "$release_version"
+}
+
+# ==============================================================================
+# Usage and dispatch
+# ==============================================================================
+
+usage() {
+  cat <<EOF
+Usage: $0 <command> [args]
+
+Commands:
+  major              Tag major bump   (v1.2.3 → v2.0.0)
+  minor              Tag minor bump   (v1.2.3 → v1.3.0)
+  patch              Tag patch bump   (v1.2.3 → v1.2.4)
+  rc                 Tag RC bump      (v1.2.3 → v1.3.0-rc1, then -rc2, …)
+  promote <rc-tag>   Promote a pre-release tag to stable on the same SHA
+
+major, minor, and patch count from the latest stable tag, so a leftover
+pre-release tag such as v1.3.0-rc2 does not change their result. rc counts from
+the latest tag of any kind, so it increments an existing RC.
+
+Changelog:
+  Use 'tools/changelog' (or 'make changelog') to preview changes since the
+  last tag. The changelog is generated for GitHub Release notes — it is not
+  committed to the repository.
+
+Examples:
+  $0 rc                      # Tag v1.3.0-rc1
+  $0 rc                      # Tag v1.3.0-rc2
+  $0 promote v1.3.0-rc2     # Promote to v1.3.0 on same SHA
+  $0 patch                   # Tag v1.2.4 on current HEAD
+EOF
+  exit 1
+}
+
+if [ $# -eq 0 ]; then
+  usage
+fi
+
+case "$1" in
+  promote)           shift; cmd_promote "$@" ;;
+  major|minor|patch|rc) cmd_tag "$1" ;;
+  *)                 usage ;;
+esac

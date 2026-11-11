@@ -1,0 +1,116 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package pod
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"io"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
+)
+
+// StreamLogs streams pod logs to the provided writer in real-time.
+// Logs are written line-by-line as they are received from the pod.
+// When containerName is empty, Kubernetes defaults to the first container.
+func StreamLogs(ctx context.Context, client kubernetes.Interface, namespace, podName, containerName string, logWriter io.Writer) error {
+	opts := &corev1.PodLogOptions{Follow: true}
+	if containerName != "" {
+		opts.Container = containerName
+	}
+	req := client.CoreV1().Pods(namespace).GetLogs(podName, opts)
+
+	stream, err := req.Stream(ctx)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to stream pod logs", err)
+	}
+	defer stream.Close()
+
+	scanner := bufio.NewScanner(stream)
+	scanner.Buffer(make([]byte, defaults.LogScannerBufferSize), defaults.LogScannerBufferSize)
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return errors.WrapCtxErr(ctx.Err(), errors.ErrCodeTimeout, "streaming pod logs")
+		default:
+		}
+		if _, err := logWriter.Write(append(scanner.Bytes(), '\n')); err != nil {
+			return errors.Wrap(errors.ErrCodeInternal, "failed to write log output", err)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to scan logs", err)
+	}
+
+	return nil
+}
+
+// GetPodLogs retrieves all logs from a pod as a string.
+// This function is suitable for completed pods or when you need the full log history.
+// When containerName is empty, Kubernetes defaults to the first container.
+func GetPodLogs(ctx context.Context, client kubernetes.Interface, namespace, podName, containerName string) (string, error) {
+	opts := &corev1.PodLogOptions{}
+	if containerName != "" {
+		opts.Container = containerName
+	}
+	req := client.CoreV1().Pods(namespace).GetLogs(podName, opts)
+
+	stream, err := req.Stream(ctx)
+	if err != nil {
+		return "", errors.Wrap(errors.ErrCodeInternal, "failed to get pod logs", err)
+	}
+	defer stream.Close()
+
+	return readLogStream(ctx, stream)
+}
+
+// readLogStream drains a completed pod's log stream into a string, checking
+// ctx between chunks. It reads fixed-size chunks rather than lines: no line
+// length may fail the read, since a check may print a large JSON document on
+// one line and the orchestrator must still see the output of a result that
+// exited 0 (#3703). Callers split the string on newlines.
+//
+// Errors:
+//   - ErrCodeTimeout or ErrCodeCanceled when ctx ends before the stream does.
+//   - ErrCodeInternal when the stream itself fails.
+func readLogStream(ctx context.Context, stream io.Reader) (string, error) {
+	var logBuffer bytes.Buffer
+	chunk := make([]byte, defaults.LogReadChunkSize)
+	for {
+		select {
+		case <-ctx.Done():
+			return "", errors.WrapCtxErr(ctx.Err(), errors.ErrCodeTimeout, "collecting pod logs")
+		default:
+		}
+		n, err := stream.Read(chunk)
+		logBuffer.Write(chunk[:n])
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", errors.Wrap(errors.ErrCodeInternal, "failed to read pod logs", err)
+		}
+	}
+	// Callers split on '\n' and expect the final line to be terminated.
+	if logBuffer.Len() > 0 && logBuffer.Bytes()[logBuffer.Len()-1] != '\n' {
+		logBuffer.WriteByte('\n')
+	}
+	return logBuffer.String(), nil
+}

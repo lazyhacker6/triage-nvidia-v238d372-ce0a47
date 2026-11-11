@@ -1,0 +1,339 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package attestation
+
+import (
+	"time"
+
+	"github.com/NVIDIA/aicr/pkg/fingerprint"
+	"github.com/NVIDIA/aicr/pkg/header"
+)
+
+// Public stability constants. These match the V1 schema documented in
+// ADR-007 (docs/design/007-recipe-evidence.md) and are part of the V1
+// stability boundary.
+const (
+	// PredicateTypeV1 is the in-toto predicateType URI for recipe evidence
+	// of UNPROFILED recipes. Profile-bearing recipes require
+	// PredicateTypeV2 (ADR-015 descriptor-currentness): the #1327 closure
+	// is recomputed rather than persisted, so a descriptor expansion
+	// changes no recipe digest, and only the v2 predicate's recorded
+	// descriptor identity distinguishes pre-expansion evidence from
+	// current evidence.
+	PredicateTypeV1 = "https://" + header.Domain + "/recipe-evidence/v1"
+
+	// PredicateTypeV2 is the in-toto predicateType URI for profile-bearing
+	// recipe evidence. It extends v1 with the predicate.profile block
+	// (selection, advertiser, policy-descriptor identity). Enforcement is
+	// bidirectional: v2 requires the profile block, and a profile-bearing
+	// predicate on v1 is rejected.
+	//
+	// v1 and v2 are retained only to keep already-signed evidence
+	// verifiable. PredicateTypeV3 is used for all newly produced evidence.
+	PredicateTypeV2 = "https://" + header.Domain + "/recipe-evidence/v2"
+
+	// PredicateTypeV3 is the predicateType URI for recipe evidence whose
+	// predicate.recipe.digest is computed with
+	// CanonicalizeRecipeYAMLV3, excluding metadata.version (the CLI version
+	// that generated the recipe) from the hashed bytes. Two binaries built
+	// differently for the same commit and the same recipe therefore
+	// produce the same digest.
+	//
+	// The profile block (Predicate.Profile) may be present or absent
+	// regardless of type, unlike v1/v2 where the type alone signaled
+	// profile presence. Existing v1/v2 evidence remains verifiable under
+	// its original algorithm, but must be regenerated and re-signed as v3
+	// to be recognized as current by a v3-aware digest comparison.
+	PredicateTypeV3 = "https://" + header.Domain + "/recipe-evidence/v3"
+
+	// PredicateSchemaVersion is the recipe-evidence predicate schema version.
+	PredicateSchemaVersion = "1.0.0"
+
+	// PointerSchemaVersion is the on-disk pointer file schema version.
+	PointerSchemaVersion = "1.0.0"
+
+	// ManifestSchemaVersion is the manifest.json schema version.
+	ManifestSchemaVersion = "1.0.0"
+
+	// BOMFormat is the BOM format we emit. CycloneDX is the only V1 option.
+	BOMFormat = "CycloneDX"
+
+	// SubjectNamePrefix is prepended to the recipe name in subject[0].name.
+	SubjectNamePrefix = "recipe:"
+
+	// AttestationFilename is the bundle-relative path of the signed
+	// in-toto Statement (DSSE-wrapped, cosign keyless).
+	AttestationFilename = "attestation.intoto.jsonl"
+
+	// StatementFilename is the bundle-relative path of the unsigned
+	// in-toto Statement. Always written by Build so the bundle
+	// directory is self-contained and can be signed later (via cosign
+	// or another DSSE signer) without re-running aicr validate.
+	StatementFilename = "statement.intoto.json"
+
+	// ManifestFilename is the bundle-relative path of the integrity inventory.
+	ManifestFilename = "manifest.json"
+
+	// RecipeFilename is the bundle-relative path of the canonical recipe YAML.
+	RecipeFilename = "recipe.yaml"
+
+	// SnapshotFilename is the bundle-relative path of the validate-time snapshot.
+	SnapshotFilename = "snapshot.yaml"
+
+	// BOMFilename is the bundle-relative path of the CycloneDX BOM.
+	BOMFilename = "bom.cdx.json"
+
+	// SummaryBundleDirName is the local-output directory for the summary bundle.
+	SummaryBundleDirName = "summary-bundle"
+
+	// PointerFilename is the local-output filename for the pointer YAML.
+	PointerFilename = "pointer.yaml"
+
+	// ctrfDirName is the bundle subdirectory that holds per-phase CTRF reports.
+	ctrfDirName = "ctrf"
+
+	// DefaultCycloneDXVersion is the BOM spec version we record when callers
+	// don't override it. Mirrors what `make bom` produces today.
+	DefaultCycloneDXVersion = "1.6"
+)
+
+// Phase enumerates the validation phases that may appear in the bundle.
+// String values must match the on-disk filenames under ctrf/<phase>.json
+// and the predicate's phases.<key> map keys.
+type Phase string
+
+// Validation phases recorded in the predicate.
+const (
+	PhaseDeployment  Phase = "deployment"
+	PhasePerformance Phase = "performance"
+	PhaseConformance Phase = "conformance"
+)
+
+// AllPhases is the canonical iteration order for deterministic attestation
+// output. It is intentionally fixed and independent of the validator's
+// execution order (pkg/validator.PhaseOrder, which runs performance last) —
+// freezing it keeps attestation predicate bytes reproducible across releases
+// regardless of execution-order changes.
+var AllPhases = []Phase{PhaseDeployment, PhasePerformance, PhaseConformance}
+
+// CTRFRelPath returns the bundle-relative, forward-slash path of the per-phase
+// CTRF report file (e.g. "ctrf/deployment.json"). It matches both the manifest
+// entry path and the on-disk layout the builder writes, so verifiers can map a
+// Phase back to its committed report.
+func CTRFRelPath(p Phase) string {
+	return ctrfDirName + "/" + string(p) + ".json"
+}
+
+// Predicate is the body of the signed in-toto Statement. It serializes
+// to JSON for the on-the-wire predicate and to YAML for human-readable
+// embedding in spec docs.
+//
+// Fingerprint and CriteriaMatch are pkg/fingerprint types used
+// directly so the predicate-v1 schema stays exactly aligned with what
+// fingerprint.FromMeasurements and Fingerprint.Match produce.
+//
+// AICRCommit is the git commit the aicr binary was built from. It is
+// omitted when the binary carries no valid commit stamp, so evidence from
+// an unstamped build serializes without the field.
+type Predicate struct {
+	SchemaVersion           string                  `json:"schemaVersion" yaml:"schemaVersion"`
+	AttestedAt              time.Time               `json:"attestedAt" yaml:"attestedAt"`
+	AICRVersion             string                  `json:"aicrVersion" yaml:"aicrVersion"`
+	AICRCommit              string                  `json:"aicrCommit,omitempty" yaml:"aicrCommit,omitempty"`
+	ValidatorCatalogVersion string                  `json:"validatorCatalogVersion" yaml:"validatorCatalogVersion"`
+	ValidatorImages         []ValidatorImage        `json:"validatorImages" yaml:"validatorImages"`
+	Recipe                  RecipeRef               `json:"recipe" yaml:"recipe"`
+	Fingerprint             fingerprint.Fingerprint `json:"fingerprint" yaml:"fingerprint"`
+	CriteriaMatch           fingerprint.MatchResult `json:"criteriaMatch" yaml:"criteriaMatch"`
+	Phases                  map[Phase]PhaseSummary  `json:"phases" yaml:"phases"`
+	BOM                     BOMRef                  `json:"bom" yaml:"bom"`
+	Manifest                ManifestRef             `json:"manifest" yaml:"manifest"`
+
+	// Redaction records the policy that scrubbed the bundle's backing
+	// content (snapshot allowlist, CTRF stdout/message omission). It is
+	// nil — and omitted from the serialized predicate — for full
+	// (unredacted) bundles, so a `--full` predicate is byte-identical to
+	// pre-feature output. Present, it tells a verifier exactly what was
+	// removed; the cryptographic binding is unaffected either way because
+	// the digests cover whatever bytes actually shipped.
+	Redaction *RedactionInfo `json:"redaction,omitempty" yaml:"redaction,omitempty"`
+
+	// Profile is present exactly when the attested recipe carries
+	// metadata.selectedProfile, and nil otherwise. Under PredicateTypeV3 its
+	// presence is independent of the statement type. Under the legacy V1/V2
+	// types its presence determines the type, nil selects V1 and set
+	// selects V2.
+	Profile *ProfilePredicate `json:"profile,omitempty" yaml:"profile,omitempty"`
+}
+
+// ProfilePredicate is the signed profile identity of a profiled recipe's
+// evidence (ADR-015). PolicyDescriptorIdentity is the deterministic,
+// recipe-scoped identity of the #1327 descriptor entries contributing to
+// the attested recipe's effective closure at production time
+// (pkg/allocpolicy.IdentityFor over the recipe's
+// ClosureDescriptorEntries): profiled evidence is CURRENT only when both
+// the recipe digest and this identity match the values recomputed at
+// verification time; a mismatch is historical-only and requires
+// re-qualification and re-signing.
+type ProfilePredicate struct {
+	// Selection is the exact name=value selection baked into the recipe.
+	Selection string `json:"selection" yaml:"selection"`
+	// Advertiser mirrors metadata.selectedProfile.advertiser ("" omitted).
+	Advertiser string `json:"advertiser,omitempty" yaml:"advertiser,omitempty"`
+	// PolicyDescriptorIdentity is the recipe-scoped
+	// pkg/allocpolicy.IdentityFor identity at production time.
+	PolicyDescriptorIdentity string `json:"policyDescriptorIdentity" yaml:"policyDescriptorIdentity"`
+}
+
+// RedactionInfo is the provenance of the minimal-bundle redaction recorded
+// in the signed predicate. Policy/Version identify the rule set; Applied
+// lists the sorted rule identifiers that ran (e.g.
+// "snapshot.measurements.allowlist", "ctrf.tests.omit:stdout").
+type RedactionInfo struct {
+	Policy  string   `json:"policy" yaml:"policy"`
+	Version string   `json:"version" yaml:"version"`
+	Applied []string `json:"applied" yaml:"applied"`
+}
+
+// RecipeRef records the recipe the predicate attests to. Carried in
+// the predicate body — not just in the in-toto Statement subject —
+// because pushed bundles use the OCI artifact digest as the subject
+// so cosign can discover the signature via the Referrers API; the
+// recipe identity therefore needs a stable home in the signed
+// payload. Digest is sha256(canonicalize(recipe.yaml)) hex, using
+// whichever canonicalization (legacy or content-only) the enclosing
+// statement's predicateType requires. See SubjectDigestForType.
+type RecipeRef struct {
+	Name   string `json:"name" yaml:"name"`
+	Digest string `json:"digest" yaml:"digest"`
+}
+
+// ValidatorImage records one validator image that ran during the
+// validate session. The list is sorted by Image for determinism.
+type ValidatorImage struct {
+	Image  string `json:"image" yaml:"image"`
+	Digest string `json:"digest" yaml:"digest"`
+}
+
+// PhaseSummary is the per-phase outcome recorded in the predicate.
+// CTRFDigest is the sha256 of the corresponding ctrf/<phase>.json file
+// in the bundle, providing a hash-based binding from the signed
+// predicate to the unsigned but pre-committed phase report.
+type PhaseSummary struct {
+	Passed     int    `json:"passed" yaml:"passed"`
+	Failed     int    `json:"failed" yaml:"failed"`
+	Skipped    int    `json:"skipped" yaml:"skipped"`
+	CTRFDigest string `json:"ctrfDigest" yaml:"ctrfDigest"`
+}
+
+// BOMRef records the CycloneDX BOM bundled alongside the predicate.
+//
+// When the BOM was auto-generated (no --bom path provided), the
+// cluster-observed images section lists refs in registry-stripped
+// "<name>:<tag>" form — the constraint-evaluation collector strips
+// registries for measurement-key stability across mirrors. Auditors
+// comparing the BOM against a specific registry should require operators
+// to ship an explicit --bom path, which carries fully-qualified refs.
+type BOMRef struct {
+	Format     string `json:"format" yaml:"format"`
+	Version    string `json:"version" yaml:"version"`
+	Digest     string `json:"digest" yaml:"digest"`
+	ImageCount int    `json:"imageCount" yaml:"imageCount"`
+}
+
+// ManifestRef binds the bundle's manifest.json to the signed predicate.
+// The manifest itself enumerates per-file sha256 hashes; this digest
+// closes the integrity chain so any other file in the bundle is bound
+// to the signature transitively.
+type ManifestRef struct {
+	Digest    string `json:"digest" yaml:"digest"`
+	FileCount int    `json:"fileCount" yaml:"fileCount"`
+}
+
+// Manifest is the bundle integrity inventory. Serialized as
+// manifest.json. The order of Files is sorted by Path for determinism.
+type Manifest struct {
+	SchemaVersion string         `json:"schemaVersion"`
+	Files         []ManifestFile `json:"files"`
+}
+
+// ManifestFile describes a single file in the bundle. Path is
+// bundle-relative and slash-separated.
+type ManifestFile struct {
+	Path      string `json:"path"`
+	Size      int64  `json:"size"`
+	SHA256    string `json:"sha256"`
+	MediaType string `json:"mediaType,omitempty"`
+}
+
+// Pointer is the on-disk file at recipes/evidence/<recipe>.yaml that
+// binds the repo to the OCI bundle by content hash.
+type Pointer struct {
+	SchemaVersion string `json:"schemaVersion" yaml:"schemaVersion"`
+	Recipe        string `json:"recipe" yaml:"recipe"`
+
+	// Profile is the exact name=value selection baked into the attested
+	// recipe (metadata.selectedProfile), or empty/omitted for an
+	// unprofiled recipe. The repo evidence gate replays it via
+	// `aicr evidence digest --profile <profile>` so the digest recompute
+	// hydrates the overlay with the same selection the bundle attested.
+	Profile string `json:"profile,omitempty" yaml:"profile,omitempty"`
+
+	Attestations []PointerAttestation `json:"attestations" yaml:"attestations"`
+}
+
+// PointerAttestation is one entry in the pointer's attestations list.
+// V1 always emits exactly one entry. The pointer is a locator, not a
+// denormalized cache of the signed predicate body — everything else
+// (fingerprint, per-phase counts, etc.) is reachable by pulling the
+// bundle from PointerBundle.OCI.
+type PointerAttestation struct {
+	Bundle PointerBundle `json:"bundle" yaml:"bundle"`
+
+	// Signer is nil for unsigned bundles.
+	Signer *PointerSigner `json:"signer,omitempty" yaml:"signer,omitempty"`
+
+	AttestedAt time.Time `json:"attestedAt" yaml:"attestedAt"`
+}
+
+// PointerBundle references the OCI artifact carrying the signed bundle.
+// OCI and Digest are empty strings when the bundle has been emitted
+// locally but not yet pushed.
+type PointerBundle struct {
+	OCI           string `json:"oci" yaml:"oci"`
+	Digest        string `json:"digest" yaml:"digest"`
+	PredicateType string `json:"predicateType" yaml:"predicateType"`
+}
+
+// KeySignerIssuer is the PointerSigner.Issuer of a bundle signed with a KMS
+// key rather than a keyless Fulcio certificate. A key signature carries no
+// OIDC issuer, so the pointer records this fixed value and identifies the
+// signer by its public key fingerprint instead.
+const KeySignerIssuer = "key"
+
+// PointerSigner records the attestation signer's identity claims. Present
+// only on signed bundles (see PointerAttestation.Signer for the unsigned
+// case). A keyless signature records the Fulcio certificate's OIDC identity
+// and issuer; a KMS key signature records Issuer KeySignerIssuer and, as
+// Identity, the key's "sha256:<hex>" fingerprint (SHA-256 of the PKIX DER
+// public key). RekorLogIndex is nil when no Rekor entry was created (e.g.,
+// signed with --tlog-upload=false); a nil pointer distinguishes that case
+// from a legitimate Rekor index 0 — the first-ever Rekor entry occupies that
+// position.
+type PointerSigner struct {
+	Identity      string `json:"identity" yaml:"identity"`
+	Issuer        string `json:"issuer" yaml:"issuer"`
+	RekorLogIndex *int64 `json:"rekorLogIndex,omitempty" yaml:"rekorLogIndex,omitempty"`
+}

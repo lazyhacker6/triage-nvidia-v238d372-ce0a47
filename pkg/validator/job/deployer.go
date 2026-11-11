@@ -1,0 +1,389 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package job
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/k8s"
+	"github.com/NVIDIA/aicr/pkg/k8s/pod"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+	"github.com/NVIDIA/aicr/pkg/validator/catalog"
+	"github.com/NVIDIA/aicr/pkg/validator/labels"
+	v1 "github.com/NVIDIA/aicr/pkg/validator/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+)
+
+// Config holds the immutable configuration for a Deployer.
+// Required: Clientset, Factory, Namespace, RunID, Entry.
+// Other fields are optional and carry orchestrator-wide settings forwarded
+// to the validator Job via env vars or pod spec fields.
+type Config struct {
+	// Clientset is the Kubernetes client used for Job/Pod operations.
+	Clientset kubernetes.Interface
+	// Factory is a namespace-scoped SharedInformerFactory started by the caller.
+	Factory informers.SharedInformerFactory
+	// Namespace is where the validator Job is deployed.
+	Namespace string
+	// RunID is the validation run identifier; used to derive Job/SA names.
+	RunID string
+	// Entry is the catalog entry describing the validator to deploy.
+	Entry catalog.ValidatorEntry
+
+	// CLIVersion is the CLI's own version string; empty is acceptable for dev
+	// builds. Forwarded to the validator container via AICR_CLI_VERSION so the
+	// validator can resolve images it references outside the catalog using the
+	// same rewriting rules as catalog.Load.
+	CLIVersion string
+	// CLICommit is the git commit SHA, forwarded via AICR_CLI_COMMIT for
+	// SHA-based image tag resolution in dev builds.
+	CLICommit string
+	// ServiceAccountName is the ServiceAccount the validator Job runs as.
+	// Empty selects the per-run ServiceAccountName(RunID) that EnsureRBAC
+	// creates.
+	ServiceAccountName string
+	// ImagePullSecrets are added to the validator pod spec.
+	ImagePullSecrets []string
+	// Tolerations are added to the validator pod spec.
+	Tolerations []corev1.Toleration
+	// NodeSelector is passed through to inner workloads via AICR_NODE_SELECTOR.
+	NodeSelector map[string]string
+	// ImageRegistryOverride overrides the image registry prefix for validator containers.
+	ImageRegistryOverride string
+	// ImageTagOverride overrides the resolved image tag for validator containers.
+	ImageTagOverride string
+	// ComponentRefs are resolved recipe components, used for dependencyAffinity resolution.
+	ComponentRefs []recipe.ComponentRef
+
+	// LogReader reads a finished validator container's stdout. Nil selects
+	// pod.GetPodLogs; tests substitute a reader because envtest runs no
+	// kubelet to serve logs.
+	LogReader PodLogReader
+}
+
+// PodLogReader reads one container's logs; pod.GetPodLogs has this shape.
+type PodLogReader func(ctx context.Context, client kubernetes.Interface, namespace, podName, containerName string) (string, error)
+
+// Deployer manages the lifecycle of a single validator Job.
+type Deployer struct {
+	config  Config
+	jobName string // Unique name generated client-side (set by DeployJob)
+	// jobStart is the apiserver-side moment Kubernetes began measuring the
+	// Job's activeDeadlineSeconds, read off the apply response by DeployJob.
+	// WaitForCompletion anchors its own deadline to it so both clocks share an
+	// origin; zero until DeployJob succeeds.
+	jobStart time.Time
+}
+
+// NewDeployer creates a Deployer for a single validator catalog entry.
+func NewDeployer(cfg Config) *Deployer {
+	return &Deployer{config: cfg}
+}
+
+// JobName returns the Kubernetes Job name assigned by the API server.
+// Empty until DeployJob is called.
+func (d *Deployer) JobName() string {
+	return d.jobName
+}
+
+// serviceAccountName returns the ServiceAccount the validator Job runs as.
+func (d *Deployer) serviceAccountName() string {
+	if d.config.ServiceAccountName != "" {
+		return d.config.ServiceAccountName
+	}
+	return ServiceAccountName(d.config.RunID)
+}
+
+// DeployJob creates the validator Job using server-side apply.
+// A unique name is generated and the Job is applied with the aicr-validator field manager.
+func (d *Deployer) DeployJob(ctx context.Context) error {
+	// Build JobPlan from deployer configuration
+	plan, err := v1.BuildJobPlan(
+		d.config.Entry,
+		d.config.RunID,
+		d.config.Namespace,
+		d.config.CLIVersion,
+		d.config.CLICommit,
+		d.serviceAccountName(),
+		d.config.ImagePullSecrets,
+		d.config.Tolerations,
+		d.config.NodeSelector,
+		d.config.ImageRegistryOverride,
+		d.config.ImageTagOverride,
+		d.config.ComponentRefs,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Use the job name from the plan
+	d.jobName = plan.JobName
+
+	// Best-effort: warn if any dependencyAffinity selector matches zero
+	// pods at deploy time. Catches silent label drift on dependency-chart
+	// bumps (e.g., kube-prometheus-stack relabels its Prometheus pods).
+	// Logging only — we don't block deploy, because the scheduler will
+	// surface a hard match miss as Pending if the affinity is `required`.
+	if plan.Affinity != nil && plan.Affinity.PodAffinity != nil {
+		for _, w := range scanMissingPodAffinityDeps(ctx, d.config.Clientset, plan.Affinity.PodAffinity) {
+			attrs := []any{
+				"validator", d.config.Entry.Name,
+				"namespace", w.Namespace,
+				"selector", w.Selector,
+				"reason", w.Reason,
+			}
+			if w.Err != nil {
+				attrs = append(attrs, "error", w.Err)
+			}
+			slog.Warn(w.Message, attrs...)
+		}
+	}
+
+	// Render Job ApplyConfiguration from plan
+	jobApply := v1.RenderPlanToApplyConfig(plan, plan.JobName)
+
+	// Apply the Job with server-side apply
+	applied, err := d.config.Clientset.BatchV1().Jobs(d.config.Namespace).Apply(
+		ctx, jobApply, metav1.ApplyOptions{FieldManager: labels.ValueAICR, Force: true})
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("failed to apply Job %s", plan.JobName), err)
+	}
+
+	d.jobName = applied.Name
+	d.jobStart = observedJobStart(applied)
+
+	slog.Debug("validator Job applied",
+		"job", d.jobName,
+		"validator", d.config.Entry.Name,
+		"namespace", d.config.Namespace,
+		"jobStart", d.jobStart)
+
+	return nil
+}
+
+// observedJobStart returns the apiserver-side moment Kubernetes started
+// measuring the Job's activeDeadlineSeconds.
+//
+// status.startTime is the field the Job controller measures against, but it
+// stamps it on its first reconcile, so it is normally still absent from the
+// response to the create/apply that produced the Job. creationTimestamp is the
+// fallback: it is never later than status.startTime, which keeps any deadline
+// derived from it on the earlier-expiring side. A nil Job, or one the apiserver
+// returned without either timestamp, yields the zero time — see
+// v1.OrchestratorWaitFor for how callers treat that.
+func observedJobStart(job *batchv1.Job) time.Time {
+	if job == nil {
+		return time.Time{}
+	}
+	if job.Status.StartTime != nil {
+		return job.Status.StartTime.Time
+	}
+	return job.CreationTimestamp.Time
+}
+
+// Stable reason codes for affinityScanWarning, suitable for log filtering
+// and metric labels. Kept short and ASCII so they round-trip through any
+// downstream sink without escaping.
+const (
+	affinityScanReasonZeroMatch         = "zero-match"
+	affinityScanReasonLookupFailed      = "lookup-failed"
+	affinityScanReasonMalformedSelector = "malformed-selector"
+)
+
+// affinityScanWarning is a structured record of a single dependencyAffinity
+// scan finding. Returned by scanMissingPodAffinityDeps so callers can emit
+// stable-message slog records with queryable attrs rather than embedding
+// namespace/selector inside the log message text.
+type affinityScanWarning struct {
+	// Message is the human-readable slog message. Stable across invocations
+	// so log aggregators can group by msg.
+	Message string
+	// Namespace is the namespace that was Listed. Empty when the warning is
+	// not namespace-scoped (e.g., a malformed selector skipped before any
+	// List call).
+	Namespace string
+	// Selector is the best-effort string form of the term's LabelSelector.
+	// Always populated (may be empty when the selector itself was malformed
+	// before formatting succeeded).
+	Selector string
+	// Reason is one of the affinityScanReason* constants.
+	Reason string
+	// Err is the underlying error for lookup-failed / malformed-selector
+	// reasons; nil for zero-match.
+	Err error
+}
+
+// scanMissingPodAffinityDeps lists pods for each PodAffinityTerm in pa and
+// returns one affinityScanWarning per term whose selector matched zero pods
+// in the listed namespace at deploy time, plus warnings for malformed
+// selectors and List errors. The returned slice is nil when every term
+// matches at least one pod or when pa has no terms.
+//
+// This is a defensive check against silent dependency-chart label drift —
+// if e.g. kube-prometheus-stack changes its pod labels in a future chart
+// release, the affinity term becomes a no-op (preferred) or blocks scheduling
+// (required) without an actionable error. The warning is intended for log
+// grep / triage. We do NOT fail closed because:
+//   - preferred affinity is best-effort by design; the orchestrator schedules
+//     wherever the scheduler picks if no match exists,
+//   - required affinity already surfaces a mismatch as Pending via the
+//     scheduler, which is more authoritative than this point-in-time list.
+//
+// Each List uses a short per-namespace timeout (defaults.PodAffinitySelectorLookupTimeout)
+// so a slow or unreachable apiserver doesn't delay Job deploy.
+//
+// Intentional coverage gaps (silent skips):
+//   - term.NamespaceSelector is not resolved. AICR's BuildOrchestratorAffinity
+//     always populates Namespaces from the resolved component ref's namespace,
+//     so this case is unreachable from the catalog path. External callers
+//     populating NamespaceSelector instead of Namespaces will get no scan
+//     coverage for those terms.
+//   - term.LabelSelector == nil is skipped without warning. Same reason —
+//     AICR always sets it; this guard is defense-in-depth against a malformed
+//     externally-built PodAffinity reaching the scanner.
+func scanMissingPodAffinityDeps(ctx context.Context, client kubernetes.Interface, pa *corev1.PodAffinity) []affinityScanWarning {
+	if pa == nil {
+		return nil
+	}
+
+	terms := make([]corev1.PodAffinityTerm, 0,
+		len(pa.RequiredDuringSchedulingIgnoredDuringExecution)+
+			len(pa.PreferredDuringSchedulingIgnoredDuringExecution))
+	terms = append(terms, pa.RequiredDuringSchedulingIgnoredDuringExecution...)
+	for _, w := range pa.PreferredDuringSchedulingIgnoredDuringExecution {
+		terms = append(terms, w.PodAffinityTerm)
+	}
+
+	var warnings []affinityScanWarning
+	for _, term := range terms {
+		// Stop early on cancellation. Continuing here would only emit a
+		// "selector lookup failed; error=context canceled" warning per
+		// remaining (term, namespace) pair, turning one cancellation into
+		// N misleading apiserver-flake warnings.
+		if ctx.Err() != nil {
+			return warnings
+		}
+		// See coverage-gap notes on the function doc: terms with nil
+		// LabelSelector or empty Namespaces are intentionally not scanned.
+		if term.LabelSelector == nil || len(term.Namespaces) == 0 {
+			continue
+		}
+		// Use LabelSelectorAsSelector (not FormatLabelSelector, which is a
+		// display helper that returns "<error>" / "<none>" sentinel strings
+		// the apiserver then rejects as malformed). This produces a string
+		// that round-trips through labels.Parse and is accepted as
+		// ListOptions.LabelSelector.
+		sel, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
+		if err != nil {
+			warnings = append(warnings, affinityScanWarning{
+				Message: "dependencyAffinity selector is malformed; skipping lookup",
+				Reason:  affinityScanReasonMalformedSelector,
+				Err:     err,
+			})
+			continue
+		}
+		selector := sel.String()
+		for _, ns := range term.Namespaces {
+			if ctx.Err() != nil {
+				return warnings
+			}
+			listCtx, cancel := context.WithTimeout(ctx, defaults.PodAffinitySelectorLookupTimeout)
+			pods, err := client.CoreV1().Pods(ns).List(listCtx, metav1.ListOptions{
+				LabelSelector: selector,
+				Limit:         1,
+			})
+			cancel()
+			if err != nil {
+				warnings = append(warnings, affinityScanWarning{
+					Message:   "dependencyAffinity selector lookup failed; affinity may not behave as intended",
+					Namespace: ns,
+					Selector:  selector,
+					Reason:    affinityScanReasonLookupFailed,
+					Err:       err,
+				})
+				continue
+			}
+			if len(pods.Items) == 0 {
+				warnings = append(warnings, affinityScanWarning{
+					Message:   "dependencyAffinity selector matched zero pods at deploy time; affinity term will be a no-op until matching pods appear",
+					Namespace: ns,
+					Selector:  selector,
+					Reason:    affinityScanReasonZeroMatch,
+				})
+			}
+		}
+	}
+	return warnings
+}
+
+// CleanupJob deletes the validator Job with foreground propagation
+// (waits for pod deletion).
+func (d *Deployer) CleanupJob(ctx context.Context) error {
+	if d.jobName == "" {
+		return nil
+	}
+	propagation := metav1.DeletePropagationForeground
+	err := d.config.Clientset.BatchV1().Jobs(d.config.Namespace).Delete(ctx, d.jobName, metav1.DeleteOptions{
+		PropagationPolicy: &propagation,
+	})
+	return k8s.IgnoreNotFound(err)
+}
+
+// WaitForCompletion watches the Job until it reaches a terminal state
+// (Complete or Failed). Returns nil for both — the caller uses ExtractResult
+// to determine pass/fail/skip from the exit code.
+//
+// Returns error only for infrastructure failures (watch error, timeout).
+// Job failure (exit != 0) is NOT an error return — that decision lives here
+// in the validator orchestrator, not in the shared pod.WaitForJobTerminal
+// helper, which intentionally treats both Complete and Failed Jobs as
+// legitimate completions and lets the caller classify them.
+//
+// The wait is anchored to the Job's observed start time rather than to the
+// moment this method was called, so it and the Job's own activeDeadlineSeconds
+// are measured from the same origin, and v1.OrchestratorWaitFor caps the result
+// short of that deadline. The orchestrator therefore stays the tighter clock
+// for every apply response that arrives while the Job deadline is still more
+// than defaults.ValidatorPreDeadlineMargin away. That function carries the
+// derivation, including what the wait is still good for once it is not.
+func (d *Deployer) WaitForCompletion(ctx context.Context, timeout time.Duration) error {
+	waitTimeout := v1.OrchestratorWaitFor(d.jobStart, time.Now(), timeout)
+	// pod.WaitForJobTerminal already returns structured errors with proper
+	// codes (ErrCodeTimeout, ErrCodeUnavailable, ErrCodeInternal). Propagate
+	// as-is so callers can distinguish retryable from terminal failures.
+	if _, err := pod.WaitForJobTerminal(ctx, d.config.Clientset, d.config.Namespace, d.jobName, waitTimeout); err != nil {
+		return err
+	}
+	return nil
+}
+
+// WaitForPodTermination waits until all pods of the Job are terminal or absent,
+// including pods in their deletion grace period and overlapping replacements,
+// so per-run RBAC is not revoked while a pod may still use it. The supplied
+// context bounds the entire wait; API failures remain errors. See
+// pod.WaitForJobPodsTermination.
+func (d *Deployer) WaitForPodTermination(ctx context.Context) error {
+	return pod.WaitForJobPodsTermination(ctx, d.config.Clientset, d.config.Namespace, d.jobName)
+}

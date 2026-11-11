@@ -1,0 +1,131 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+kind: RecipeMetadata
+apiVersion: aicr.run/v1beta1
+metadata:
+  name: gb200-eks-training
+
+spec:
+  # Inherits from eks-training recipe (EKS + training settings)
+  base: eks-training
+
+  criteria:
+    service: eks
+    accelerator: gb200
+    intent: training
+
+  # Specific constraints for GB200 on EKS training workloads
+  # Constraint names use fully qualified measurement paths: {type}.{subtype}.{key}
+  constraints:
+    # GB200 NVLS performance validation provisions the IMEX channel through a
+    # DRA ComputeDomain that requires the GA resource.k8s.io/v1 API, which
+    # ships in Kubernetes 1.34+. Floor the recipe there so a DRA-incapable
+    # cluster is rejected up front instead of failing the performance phase
+    # at runtime when the v1 ResourceClaimTemplate never reconciles.
+    - name: K8s.server.version
+      value: ">= 1.34"
+
+  componentRefs:
+    # GB200+EKS GPU Operator prerequisites. Keep in sync with the same block
+    # in gb200-eks-inference.yaml — the mixin system can't extend componentRefs
+    # already declared in the inheritance chain (gpu-operator comes from
+    # eks-training / eks-inference), so this lives per-leaf for now.
+    - name: gpu-operator
+      type: Helm
+      preManifestFiles:
+        # Ships a ConfigMap with options nvidia NVreg_GrdmaPciTopoCheckOverride=1.
+        # driver.kernelModuleConfig.name (below) points the ClusterPolicy at it,
+        # so the driver DaemonSet mounts nvidia.conf and the kernel loads with
+        # the flag set — required on GB200+EFA for EFA dma-buf attach to the
+        # Grace PCI topology. Without it, NCCL silently falls back to Socket.
+        #
+        # Must be preManifestFiles (applied before the chart): the chart's
+        # ClusterPolicy reconcile reads this ConfigMap during `helm install --wait`,
+        # so a post-install pass would deadlock until the chart times out (#859).
+        - components/gpu-operator/manifests/kernel-module-params.yaml
+      dependencyRefs:
+        - nfd
+        - cert-manager
+        - prometheus-operator-crds
+        - nodewright-customizations
+      overrides:
+        cdi:
+          enabled: true
+        gdrcopy:
+          enabled: true
+        driver:
+          kernelModuleConfig:
+            name: nvidia-kernel-module-params
+
+    # GB200 uses nodewright no-op: the H100 tuning packages (nvidia-setup,
+    # nvidia-tuned) are not compatible with GB200's ARM64 host CPU and
+    # Blackwell GPU architecture. Replace with tuning.yaml once GB200-specific
+    # packages are available.
+    - name: nodewright-customizations
+      type: Helm
+      manifestFiles:
+        - components/nodewright-customizations/manifests/tuning.yaml
+      overrides:
+        service: eks
+        accelerator: gb200
+        intent: multiNodeTraining
+      dependencyRefs:
+        - nodewright-operator
+
+    - name: nfd
+      type: Helm
+      overrides:
+        topologyUpdater:
+          enable: true
+
+  # Validation checks for GB200 on EKS training workloads.
+  # Defined at the intent layer (not OS-specific) so all OS variants inherit them.
+  validation:
+    deployment:
+      checks:
+        - operator-health
+        - expected-resources
+        - gpu-operator-version
+        - check-nvidia-smi
+      constraints:
+        # GB200 support stabilized in gpu-operator v25.10. The chart pin
+        # (resolved as v25.10.1 in the GB200/EKS recipes) sets the
+        # working version; this constraint is the supported floor.
+        - name: Deployment.gpu-operator.version
+          value: ">= v25.10.0"
+    performance:
+      # NET exercises EFA (the external interconnect) and NVLS exercises MNNVL
+      # across the NVL72 IMEX domain — each variant asserts its transport
+      # actually carried traffic, so a silent fallback to Socket or NET does
+      # not masquerade as a pass. Thresholds are sized for a 2-node GB200 pair
+      # and will be raised once production NVL72 data is available.
+      checks:
+        - nccl-all-reduce-bw-net
+        - nccl-all-reduce-bw-nvls
+      constraints:
+        - name: nccl-all-reduce-bw-net
+          value: ">= 40"
+        - name: nccl-all-reduce-bw-nvls
+          value: ">= 500"
+    conformance:
+      checks:
+        - platform-health
+        - gpu-operator-health
+        - dra-support
+        - accelerator-metrics
+        - ai-service-metrics
+        - gang-scheduling
+        - pod-autoscaling
+        - cluster-autoscaling

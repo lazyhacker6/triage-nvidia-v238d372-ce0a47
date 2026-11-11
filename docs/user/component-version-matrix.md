@@ -1,0 +1,93 @@
+<!--
+Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+-->
+
+# Component Version Matrix
+
+Which component version shipped in each AICR release, and what changed between them.
+
+Use this to work out what an upgrade actually moves. AICR does not track components release-for-release: a component may sit on one pin across several AICR releases and then move many versions at once, so the jump between two AICR releases is often larger than it looks.
+
+**This page is generated.** Run `make version-matrix-docs` to refresh it. Prose outside the markers is preserved.
+
+## How to read the change column
+
+Two categories deserve more attention than a version bump normally would:
+
+- **`chart-change`** means the chart's repository or name moved, so the two version strings belong to different version lines and cannot be compared. The pin looks like a downgrade but is not.
+- **`backwards`** means the version genuinely decreased.
+
+A jump of three or more major or minor versions is also flagged, because the further a pin moves in one step, the more upstream change a single upgrade has to absorb.
+
+<!-- BEGIN AICR-VERSION-MATRIX -->
+| Component | v0.17.0 | v0.18.0 | v0.19.0 | v0.20.0 | v0.21.0 | v0.21.1 | v0.22.0 | v1.0.0 |
+|---|---|---|---|---|---|---|---|---|
+| `agentgateway` | v1.3.1 | v1.3.1 | v1.3.1 | v1.3.1 | **v1.5.0** | v1.5.0 | v1.5.0 | v1.5.0 |
+| `agentgateway-crds` | v1.3.1 | v1.3.1 | v1.3.1 | v1.3.1 | **v1.5.0** | v1.5.0 | v1.5.0 | v1.5.0 |
+| `aws-ebs-csi-driver` | 2.59.0 | 2.59.0 | 2.59.0 | 2.59.0 | 2.59.0 | 2.59.0 | 2.59.0 | 2.59.0 |
+| `aws-efa` | v0.5.29 | v0.5.29 | v0.5.29 | v0.5.29 | v0.5.29 | v0.5.29 | v0.5.29 | v0.5.29 |
+| `cert-manager` | v1.20.2 | v1.20.2 | v1.20.2 | v1.20.2 | v1.20.2 | v1.20.2 | v1.20.2 | v1.20.2 |
+| `dynamo-platform` | 1.2.1 | 1.2.1 | 1.2.1 | 1.2.1 | **1.4.2** | 1.4.2 | 1.4.2 | 1.4.2 |
+| `gatekeeper` | 3.22.2 | 3.22.2 | 3.22.2 | 3.22.2 | 3.22.2 | 3.22.2 | 3.22.2 | 3.22.2 |
+| `gpu-operator` | v26.3.2 | **v26.3.3** | v26.3.3 | v26.3.3 | **v26.7.0** | v26.7.0 | v26.7.0 | **v26.7.1** |
+| `grove` | v0.1.0-alpha.8 | v0.1.0-alpha.8 | v0.1.0-alpha.8 | v0.1.0-alpha.8 | **v0.1.0-alpha.12** | v0.1.0-alpha.12 | v0.1.0-alpha.12 | **v0.1.0-alpha.13** |
+| `k8s-aibom` | – | – | – | 1.3.0 | 1.3.0 | 1.3.0 | 1.3.0 | **1.5.1** |
+| `k8s-ephemeral-storage-metrics` | 1.19.2 | 1.19.2 | 1.19.2 | 1.19.2 | 1.19.2 | 1.19.2 | 1.19.2 | 1.19.2 |
+| `k8s-nim-operator` | 3.1.0 | 3.1.0 | 3.1.0 | 3.1.0 | 3.1.0 | 3.1.0 | 3.1.0 | 3.1.0 |
+| `k8s-nim-operator-ocp` | – | – | 3.1.0 | 3.1.0 | 3.1.0 | 3.1.0 | 3.1.0 | 3.1.0 |
+| `kai-scheduler` | v0.14.1 | v0.14.1 | v0.14.1 | v0.14.1 | v0.14.1 | v0.14.1 | **v0.16.9** | v0.16.9 |
+| `kube-prometheus-stack` | 84.4.0 | 84.4.0 | 84.4.0 | 84.4.0 | 84.4.0 | 84.4.0 | 84.4.0 | 84.4.0 |
+| `kubeflow-trainer` | 2.2.0 | 2.2.0 | 2.2.0 | 2.2.0 | 2.2.0 | 2.2.0 | 2.2.0 | 2.2.0 |
+| `kueue` | 0.17.1 | **0.18.2** | 0.18.2 | 0.18.2 | 0.18.2 | 0.18.2 | **0.19.3** | 0.19.3 |
+| `mariadb-operator` | – | – | 26.6.0 | 26.6.0 | 26.6.0 | 26.6.0 | 26.6.0 | 26.6.0 |
+| `mariadb-operator-crds` | – | – | 26.6.0 | 26.6.0 | 26.6.0 | 26.6.0 | 26.6.0 | 26.6.0 |
+| `network-operator` | 26.1.1 | 26.1.1 | **26.4.1** | 26.4.1 | 26.4.1 | 26.4.1 | 26.4.1 | 26.4.1 |
+| `nfd` | 0.19.0 | 0.19.0 | 0.19.0 | 0.19.0 | 0.19.0 | 0.19.0 | 0.19.0 | 0.19.0 |
+| `node-problem-detector` | – | – | – | – | – | – | 2.4.1 | 2.4.1 |
+| `nodewright-operator` | v0.17.1 | v0.17.1 | v0.17.1 | v0.17.1 | v0.17.1 | v0.17.1 | **v0.19.0** | v0.19.0 |
+| `nvcre` | – | – | – | – | v0.2.0 | v0.2.0 | v0.2.0 | v0.2.0 |
+| `nvidia-dra-driver-gpu` | 0.4.1 | 0.4.1 | 0.4.1 | 0.4.1 | **0.5.0** | 0.5.0 | 0.5.0 | 0.5.0 |
+| `nvidia-dra-driver-gpu-ocp` | – | – | 0.4.1 | 0.4.1 | **0.5.0** | 0.5.0 | 0.5.0 | 0.5.0 |
+| `nvsentinel` | v1.9.0 | v1.9.0 | v1.9.0 | **v1.20.0** | v1.20.0 | v1.20.0 | v1.20.0 | **v1.25.0** |
+| `prometheus-adapter` | 5.3.0 | 5.3.0 | 5.3.0 | 5.3.0 | 5.3.0 | 5.3.0 | 5.3.0 | 5.3.0 |
+| `prometheus-adapter-ocp` | – | – | 5.3.0 | 5.3.0 | 5.3.0 | 5.3.0 | 5.3.0 | 5.3.0 |
+| `prometheus-operator-crds` | 28.0.1 | 28.0.1 | 28.0.1 | 28.0.1 | 28.0.1 | 28.0.1 | 28.0.1 | 28.0.1 |
+| `slinky-slurm` | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 |
+| `slinky-slurm-operator` | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 |
+| `slinky-slurm-operator-crds` | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 | 1.2.0 |
+| `slinky-topograph` | – | 0.5.0 | 0.5.0 | **1.0.0** | 1.0.0 | 1.0.0 | **1.0.0** | 1.0.0 |
+| `slurm-accounting-mariadb` | – | – | 26.6.0 | 26.6.0 | 26.6.0 | 26.6.0 | 26.6.0 | 26.6.0 |
+
+**bold** = changed from the previous release. 35 components across 8 releases.
+
+## Transitions
+
+| Component | Release | From | To | Change |
+|---|---|---|---|---|
+| `agentgateway` | v0.21.0 | `v1.3.1` | `v1.5.0` | minor +2 |
+| `agentgateway-crds` | v0.21.0 | `v1.3.1` | `v1.5.0` | minor +2 |
+| `dynamo-platform` | v0.21.0 | `1.2.1` | `1.4.2` | minor +2 |
+| `gpu-operator` | v0.18.0 | `v26.3.2` | `v26.3.3` | patch +1 |
+| `gpu-operator` | v0.21.0 | `v26.3.3` | `v26.7.0` | **minor +4** |
+| `gpu-operator` | v1.0.0 | `v26.7.0` | `v26.7.1` | patch +1 |
+| `k8s-aibom` | v1.0.0 | `1.3.0` | `1.5.1` | minor +2 |
+| `kai-scheduler` | v0.22.0 | `v0.14.1` | `v0.16.9` | minor +2 |
+| `kueue` | v0.18.0 | `0.17.1` | `0.18.2` | minor +1 |
+| `kueue` | v0.22.0 | `0.18.2` | `0.19.3` | minor +1 |
+| `network-operator` | v0.19.0 | `26.1.1` | `26.4.1` | **minor +3** |
+| `nodewright-operator` | v0.22.0 | `v0.17.1` | `v0.19.0` | minor +2 |
+| `nvidia-dra-driver-gpu` | v0.21.0 | `0.4.1` | `0.5.0` | minor +1 |
+| `nvidia-dra-driver-gpu-ocp` | v0.21.0 | `0.4.1` | `0.5.0` | minor +1 |
+| `nvsentinel` | v0.20.0 | `v1.9.0` | `v1.20.0` | **minor +11** |
+| `nvsentinel` | v1.0.0 | `v1.20.0` | `v1.25.0` | **minor +5** |
+| `slinky-topograph` | v0.20.0 | `0.5.0` | `1.0.0` | major +1 |
+| `slinky-topograph` | v0.22.0 | `1.0.0` | `1.0.0` | **chart-change** |
+
+18 transitions across 8 releases; **5 need scrutiny** (chart change, backwards move, or >= 3 major/minor apart).
+<!-- END AICR-VERSION-MATRIX -->

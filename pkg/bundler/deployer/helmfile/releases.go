@@ -1,0 +1,358 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package helmfile
+
+import (
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer"
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer/localformat"
+	"github.com/NVIDIA/aicr/pkg/errors"
+)
+
+// Helmfile is the top-level document marshaled to helmfile.yaml.
+// Field order in this struct controls field order in the rendered YAML
+// (gopkg.in/yaml.v3 walks struct fields in declaration order), so the
+// rendered file follows the layout used in helmfile community examples:
+// repositories → helmDefaults → releases.
+type Helmfile struct {
+	Repositories []Repository `yaml:"repositories,omitempty"`
+	HelmDefaults HelmDefaults `yaml:"helmDefaults"`
+	Releases     []Release    `yaml:"releases"`
+}
+
+// TopHelmfile is the multi-sub-helmfile orchestration document emitted
+// when the bundle's dependency DAG produces more than one topological
+// level. One sub-helmfile per non-empty level (`level-0.yaml` ...
+// `level-N.yaml`) is referenced in dependency order. helmfile processes
+// the helmfiles: list sequentially, so by the time level K renders,
+// every release in levels 0..K-1 has fully applied (CRDs registered,
+// REST mapper warm). This sidesteps the helm-diff render pass running
+// against a fresh cluster's empty REST mapper.
+//
+// See https://github.com/NVIDIA/aicr/issues/914.
+type TopHelmfile struct {
+	Helmfiles []SubHelmfileRef `yaml:"helmfiles"`
+}
+
+// SubHelmfileRef is one entry in TopHelmfile.Helmfiles. Helmfile resolves
+// path relative to the parent helmfile.yaml.
+type SubHelmfileRef struct {
+	Path string `yaml:"path"`
+}
+
+// Repository is one entry in helmfile's top-level repositories: list.
+// Helmfile resolves release.chart values of the form "<name>/<chart>"
+// against this list at apply time.
+type Repository struct {
+	Name string `yaml:"name"`
+	URL  string `yaml:"url"`
+	OCI  bool   `yaml:"oci,omitempty"`
+}
+
+// HelmDefaults carries the cluster-wide helm flags applied to every release
+// unless the release overrides them. Mirrors HELM_TIMEOUT="10m" in
+// pkg/bundler/deployer/helm/templates/deploy.sh.tmpl.
+type HelmDefaults struct {
+	Wait            bool `yaml:"wait"`
+	Timeout         int  `yaml:"timeout"`
+	CreateNamespace bool `yaml:"createNamespace"`
+}
+
+// Release is one entry in helmfile's releases: list. One Release is
+// emitted per NNN-<name>/ folder produced by localformat.Write —
+// including injected -pre and -post folders.
+type Release struct {
+	Name      string   `yaml:"name"`
+	Namespace string   `yaml:"namespace"`
+	Chart     string   `yaml:"chart"`
+	Version   string   `yaml:"version,omitempty"`
+	Values    []string `yaml:"values,omitempty"`
+	Needs     []string `yaml:"needs,omitempty"`
+	// Wait is rendered only when explicitly set to false (an async
+	// component); helmDefaults.wait: true applies otherwise.
+	Wait *bool `yaml:"wait,omitempty"`
+	// Timeout is rendered only when the release overrides
+	// helmDefaults.timeout (e.g., kai-scheduler 20m).
+	Timeout int `yaml:"timeout,omitempty"`
+	// CreateNamespace is rendered only when explicitly set to false —
+	// the chart ships its own Namespace template, so helm must not
+	// create the namespace out-of-band. helmDefaults.createNamespace
+	// (true) applies otherwise. Pointer so a deliberate false survives
+	// YAML marshaling and a nil value omits the field entirely.
+	CreateNamespace *bool `yaml:"createNamespace,omitempty"`
+	// DisableValidation tells helm-diff to skip the live-cluster
+	// REST-mapper check for this release, letting render succeed when
+	// a manifest creates a CR whose CRD is not yet present in the
+	// cluster. Emitted in two registry-driven cases: on the primary
+	// release when the chart self-references its own CRDs
+	// (HasSelfRefCRDs), and on the injected -post wrapper when its
+	// manifests instantiate CRs of CRDs the parent chart installs
+	// (ManifestsUseChartCRDs). All other wrappers keep the safety
+	// check. Issues #914, #929.
+	DisableValidation bool `yaml:"disableValidation,omitempty"`
+}
+
+// defaultHelmDefaults returns the cluster-wide defaults applied to every
+// release. Matches HELM_TIMEOUT="10m" + the helm deployer's implicit
+// --wait behavior.
+func defaultHelmDefaults() HelmDefaults {
+	return HelmDefaults{
+		Wait:            true,
+		Timeout:         10 * 60,
+		CreateNamespace: true,
+	}
+}
+
+// buildHelmfile walks the folders produced by localformat.Write in
+// deployment order and emits one Release per folder, plus the deduplicated
+// repositories: list referenced by upstream-helm releases.
+// namespaceByComponent maps the recipe ComponentRef.Name → namespace, so
+// injected -pre / -post folders inherit the parent component's namespace.
+// dynamicValues maps ComponentRef.Name → dynamic value paths; presence
+// drives whether cluster-values.yaml is referenced in the release values:.
+// flags maps ComponentRef.Name → registry-marked behavioral flags
+// (currently just HasSelfRefCRDs) and drives per-release
+// DisableValidation. A nil map disables those features.
+//
+// serial selects the needs: edge policy. When false (default), releases are
+// chained only within a component (its -pre -> primary -> -post folders), so
+// independent components in the same sub-helmfile carry no edge and helmfile
+// applies them concurrently. When true (--serial), every release also needs:
+// its immediate predecessor, forming one linear chain that helmfile applies
+// strictly one at a time.
+func buildHelmfile(folders []localformat.Folder, namespaceByComponent map[string]string, dynamicValues map[string][]string, flags map[string]componentFlags, serial bool) (Helmfile, error) {
+	releases := make([]Release, 0, len(folders))
+	repoSet := make(map[string]Repository) // keyed by URL for dedupe
+
+	// Carry the predecessor's namespace alongside its name so cross-namespace
+	// needs: entries are emitted as "<namespace>/<name>". Helmfile resolves a
+	// bare "<name>" only within the dependent release's own namespace, so a
+	// release in cert-manager/ pointing at agentgateway-crds-post (which
+	// lives in agentgateway-system/) silently fails to resolve.
+	// prevName/prevNamespace track the immediately-preceding release for the
+	// --serial linear chain. lastByParent tracks the last release emitted per
+	// component, so the mandatory intra-component edge (-pre -> primary ->
+	// -post) is keyed on the component rather than on folder adjacency —
+	// correct even if folder ordering ever interleaved another component's
+	// folder between a primary and its -post.
+	var prevName, prevNamespace string
+	lastByParent := make(map[string]struct{ name, ns string }, len(folders))
+	for _, f := range folders {
+		ns := namespaceByComponent[f.Parent]
+		rel := Release{
+			Name:      f.Name,
+			Namespace: ns,
+			Values:    valuesFilesForFolder(f, dynamicValues[f.Parent]),
+		}
+		// A needs: edge orders apply. Within a component the -pre -> primary ->
+		// -post order is mandatory, so chain to the component's previous
+		// release. Across independent components that share a sub-helmfile,
+		// chain them only in --serial mode; by default they carry no edge and
+		// helmfile applies them concurrently. Cross-tier ordering does not rely
+		// on needs at all — the stratified layout runs level-N's sub-helmfile
+		// only after level-(N-1) has fully applied (see writeHelmfileLayout).
+		switch {
+		case serial:
+			if prevName != "" {
+				rel.Needs = []string{needsRef(ns, prevNamespace, prevName)}
+			}
+		default:
+			if last, ok := lastByParent[f.Parent]; ok {
+				rel.Needs = []string{needsRef(ns, last.ns, last.name)}
+			}
+		}
+
+		switch f.Kind {
+		case localformat.KindUpstreamHelm:
+			if f.Upstream == nil {
+				return Helmfile{}, errors.New(errors.ErrCodeInternal,
+					fmt.Sprintf("folder %s is KindUpstreamHelm but Upstream is nil", f.Dir))
+			}
+			repo, alias := repositoryFor(f.Upstream)
+			repoSet[repo.URL] = repo
+			rel.Chart = alias + "/" + f.Upstream.Chart
+			rel.Version = f.Upstream.Version
+		case localformat.KindLocalHelm:
+			rel.Chart = "./" + f.Dir
+		default:
+			return Helmfile{}, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("unsupported folder kind %v for %s", f.Kind, f.Dir))
+		}
+
+		// Per-component overrides (async / longer timeout). Keyed by
+		// f.Parent so primary + injected -pre / -post inherit the same
+		// override as their parent component.
+		if ov, ok := deployer.ComponentOverrideFor(f.Parent); ok {
+			if !ov.Wait {
+				waitFalse := false
+				rel.Wait = &waitFalse
+			}
+			if ov.TimeoutSeconds > 0 {
+				rel.Timeout = ov.TimeoutSeconds
+			}
+		}
+
+		// Override the global helmDefaults.createNamespace when this
+		// folder's chart owns the target Namespace (Talos privileged-
+		// namespace pre-injection). Without this, helmfile passes
+		// --create-namespace and helm creates the namespace out-of-band;
+		// the chart's later Namespace template then collides because
+		// the existing namespace lacks the release's ownership labels.
+		// Only emit the override when false — the global default
+		// already covers the true case and we want helmfile.yaml
+		// minimal.
+		if !f.CreateNamespace {
+			falseVal := false
+			rel.CreateNamespace = &falseVal
+		}
+
+		// Registry-driven per-release flags. HasSelfRefCRDs emits
+		// disableValidation: true so helm-diff skips the live-cluster
+		// mapper check for charts whose own templates reference CRDs
+		// they ship in `crds/` (e.g., gpu-operator's clusterpolicy
+		// template). Scoped to the primary release (f.Name == f.Parent):
+		// injected -pre / -post wrapper folders are local-helm charts
+		// containing only raw manifests, so they have no `crds/` and
+		// no self-reference of their own. Letting them inherit the
+		// flag would silently drop helm-diff's mapper sanity check on
+		// the wrapper's manifests — a typo in a resource Kind would
+		// render at diff time and fail at apply. See issue #929.
+		if f.Name == f.Parent && flags[f.Parent].HasSelfRefCRDs {
+			rel.DisableValidation = true
+		}
+		// ManifestsUseChartCRDs is the post-manifest counterpart: the
+		// component's attached manifests instantiate CRs whose CRDs the
+		// component's own chart installs. The manifest-bearing folder
+		// shares the parent's DAG level, and helmfile diffs every
+		// release in a level before applying any — the `needs:` edge
+		// orders apply, not diff — so on a fresh cluster its mapper
+		// check can never pass (network-operator's NicClusterPolicy on
+		// AKS; kubeflow-trainer's ClusterTrainingRuntime). Keyed off
+		// Folder.CarriesPostManifests, which the injected -post wrapper
+		// sets for both vendored and non-vendored mixed components
+		// (#1835). A release-name suffix check alone is brittle when
+		// folder naming drifts; the marker travels with the manifests.
+		// Primaries without post manifests and -pre wrappers (whose
+		// manifests apply before the chart and cannot depend on its
+		// CRDs) keep the mapper sanity check per issue #929.
+		if f.CarriesPostManifests && flags[f.Parent].ManifestsUseChartCRDs {
+			rel.DisableValidation = true
+		}
+
+		releases = append(releases, rel)
+		prevName = rel.Name
+		prevNamespace = ns
+		lastByParent[f.Parent] = struct{ name, ns string }{rel.Name, ns}
+	}
+
+	// Stable repository ordering: by alias name.
+	repos := make([]Repository, 0, len(repoSet))
+	for _, r := range repoSet {
+		repos = append(repos, r)
+	}
+	sort.Slice(repos, func(i, j int) bool { return repos[i].Name < repos[j].Name })
+
+	return Helmfile{
+		Repositories: repos,
+		HelmDefaults: defaultHelmDefaults(),
+		Releases:     releases,
+	}, nil
+}
+
+// needsRef formats a release reference for the `needs:` list. Helmfile
+// resolves a bare "<name>" only within the dependent release's own
+// namespace, so cross-namespace edges must be qualified as
+// "<namespace>/<name>". Matching namespaces are emitted as bare names to
+// keep the helmfile.yaml minimal and to match the helmfile community
+// convention for in-namespace dependency chains.
+func needsRef(dependentNS, depNS, depName string) string {
+	if depNS == "" || depNS == dependentNS {
+		return depName
+	}
+	return depNS + "/" + depName
+}
+
+// valuesFilesForFolder returns the list of values files (relative to
+// helmfile.yaml's parent dir) for f. Always includes values.yaml; appends
+// cluster-values.yaml when the parent component has dynamic value paths
+// configured (matching the localformat split that wrote the file).
+//
+// Injected -pre / -post folders inherit the parent's DynamicValues lookup
+// by design: localformat.writeLocalHelmFolder copies the parent's split
+// cluster-values.yaml into each auxiliary folder so all three releases
+// (pre, primary, post) see the same per-cluster overrides. The dynamic
+// keys are usually only meaningful to the primary chart, but referencing
+// the file uniformly keeps a partial-cluster-values edit from being
+// silently ignored by the wrapped releases.
+//
+// Paths are written with an explicit "./" prefix to match the chart: form
+// used for KindLocalHelm folders. Helmfile accepts both forms; the prefix
+// is purely a stylistic choice for visual consistency in golden files.
+func valuesFilesForFolder(f localformat.Folder, dynamicPaths []string) []string {
+	values := []string{"./" + f.Dir + "/values.yaml"}
+	if len(dynamicPaths) > 0 {
+		values = append(values, "./"+f.Dir+"/cluster-values.yaml")
+	}
+	return values
+}
+
+// repositoryFor builds a Repository entry for the given upstream reference,
+// returning the entry plus the helmfile alias used in release.chart.
+// Aliases are derived from the URL so the same chart repository always
+// produces the same alias even when referenced by multiple components.
+//
+// Helmfile's OCI repository convention takes a bare host+path in `url` and
+// a separate `oci: true` flag — passing `oci://host/path` along with
+// `oci: true` causes helmfile to prepend the scheme a second time
+// (`oci://oci://...`), which fails chart resolution. Strip the scheme
+// when the repository is OCI so the rendered document matches what
+// `helmfile build` expects.
+func repositoryFor(u *localformat.Upstream) (Repository, string) {
+	alias := sanitizeRepoAlias(u.Repo)
+	oci := strings.HasPrefix(u.Repo, "oci://")
+	url := u.Repo
+	if oci {
+		url = strings.TrimPrefix(url, "oci://")
+	}
+	return Repository{Name: alias, URL: url, OCI: oci}, alias
+}
+
+// nonAlphanumericRe collapses runs of non-DNS characters into a single
+// hyphen for the alias slug.
+var nonAlphanumericRe = regexp.MustCompile(`[^a-z0-9-]+`)
+
+// sanitizeRepoAlias converts a chart-repo URL into a stable, helmfile-safe
+// alias. Mirrors the convention in pkg/bundler/deployer/flux
+// (sanitizeSourceName) so a helmfile bundle and a flux bundle for the
+// same recipe produce comparable identifiers.
+func sanitizeRepoAlias(rawURL string) string {
+	s := strings.ToLower(rawURL)
+	for _, prefix := range []string{"oci://", "https://", "http://"} {
+		s = strings.TrimPrefix(s, prefix)
+	}
+	s = strings.TrimSuffix(strings.TrimSuffix(s, "/"), ".git")
+	s = strings.Trim(nonAlphanumericRe.ReplaceAllString(s, "-"), "-")
+	if len(s) > 63 {
+		s = strings.TrimRight(s[:63], "-")
+	}
+	if s == "" {
+		return "default-repo"
+	}
+	return s
+}

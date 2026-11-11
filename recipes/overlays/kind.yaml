@@ -1,0 +1,271 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+kind: RecipeMetadata
+apiVersion: aicr.run/v1beta1
+metadata:
+  name: kind
+
+spec:
+  # Inherits from base (implicit when spec.base is empty)
+  # This recipe contains kind-specific settings for local development/testing
+
+  criteria:
+    service: kind
+
+  # Kind-specific constraints
+  constraints:
+    - name: K8s.server.version
+      value: ">= 1.32"
+
+  # Kind-specific component overrides
+  componentRefs:
+    # gpu-operator: configure for kind with GPU passthrough (nvkind)
+    # Assumes host has NVIDIA drivers and container toolkit pre-configured
+    - name: gpu-operator
+      type: Helm
+      overrides:
+        # hostPaths.driverInstallDir is intentionally NOT overridden here: it
+        # inherits the gpu-operator base default /run/nvidia/driver. This is
+        # the host path the operator-validator bind-mounts as the
+        # driver-validation container's rootfs target — setting it to "/"
+        # makes runc reject the mount ("mountpoint is on the top of rootfs"),
+        # crash-looping nvidia-operator-validator and stalling ClusterPolicy.
+        # nvidia-dra-driver-gpu.nvidiaDriverRoot stays "/" (host-installed
+        # driver userspace lives at the host root); the two fields are
+        # independent here because gpu-operator manages no driver
+        # (driver.enabled: false below). See TestDriverRootLockstep (#1087).
+        driver:
+          # Disable driver installation - use pre-installed host drivers
+          enabled: false
+          rdma:
+            # Disable RDMA - requires driver kernel modules not available in kind
+            enabled: false
+        toolkit:
+          # Disable toolkit - nvkind pre-configures the host container runtime
+          enabled: false
+        gdrcopy:
+          # Disable GDR copy - requires driver kernel modules not available in kind
+          enabled: false
+        migManager:
+          # Disable MIG manager - requires driver not available in kind
+          enabled: false
+        dcgm:
+          # Disable standalone DCGM hostengine in kind - use embedded exporter
+          enabled: false
+        # Use the exporter's built-in default metrics in kind — the custom
+        # metrics list targets real datacenter GPUs (NVLink/profiling/etc.),
+        # most of which are unavailable on the simulated devices kind uses.
+        dcgmExporter:
+          config:
+            create: false
+            name: ""
+            data: ""
+        # Use chart-default device plugin env in kind (no CDI overrides)
+        devicePlugin:
+          env: []
+        # Keep GPU Operator operand DaemonSets off kind control-plane nodes.
+        # The chart default `daemonsets.tolerations: [{operator: Exists}]`
+        # tolerates the control-plane `NoSchedule` taint; combined with NFD
+        # labeling the control-plane (shared host kernel exposes the NVIDIA
+        # PCI device) and GPU Operator setting `nvidia.com/gpu.deploy.*=true`,
+        # operand DaemonSets schedule onto the control-plane where they hang
+        # because there's no real device access, keeping ClusterPolicy
+        # notReady. Removing the catchall toleration restores the
+        # NoSchedule taint as the real exclusion mechanism.
+        # Note: per-operand `affinity` (dcgmExporter/devicePlugin/gfd/validator)
+        # is not exposed by ClusterPolicy and is silently dropped by the chart,
+        # so it cannot be used here.
+        daemonsets:
+          tolerations: []
+        # Reduce resource requests for local development
+        operator:
+          resources:
+            requests:
+              cpu: 100m
+              memory: 200Mi
+            limits:
+              cpu: 500m
+              memory: 500Mi
+
+    # kube-prometheus-stack: use emptyDir storage (default), reduce resources
+    - name: kube-prometheus-stack
+      type: Helm
+      overrides:
+        # CI only needs component health, not the full upstream alerting rule
+        # set. Skipping default rules reduces PrometheusRule churn during
+        # install on small kind control planes.
+        defaultRules:
+          create: false
+        prometheus:
+          prometheusSpec:
+            # Smaller storage for local testing
+            storageSpec:
+              emptyDir:
+                medium: ""
+                sizeLimit: 5Gi
+            # Reduced resources for local development
+            resources:
+              requests:
+                cpu: 250m
+                memory: 512Mi
+              limits:
+                cpu: 1
+                memory: 1Gi
+            # Shorter retention for local testing
+            retention: 7d
+        prometheusOperator:
+          # Keep operator-owned monitoring custom resources in the monitoring
+          # namespace for kind. Do not scope ServiceMonitor discovery here;
+          # GPU, Kubeflow, and Dynamo monitors may live in their own namespaces.
+          alertmanagerInstanceNamespaces:
+            - monitoring
+          alertmanagerConfigNamespaces:
+            - monitoring
+          prometheusInstanceNamespaces:
+            - monitoring
+          thanosRulerInstanceNamespaces:
+            - monitoring
+          # CI kind control planes can be slow under image pulls and controller
+          # startup. Avoid restarting the operator on short health probe stalls.
+          livenessProbe:
+            timeoutSeconds: 10
+            failureThreshold: 10
+          readinessProbe:
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+        grafana:
+          enabled: false
+        alertmanager:
+          alertmanagerSpec:
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                cpu: 250m
+                memory: 256Mi
+
+    # nvsentinel: reduce resources for local development, and assume the
+    # host-installed driver.
+    #
+    # nvkind preinstalls the driver on the host (gpu-operator driver.enabled
+    # is false above), so there is no driver pod for the NVSentinel labeler
+    # to watch. Without assumeDriverInstalled the
+    # nvsentinel.dgxc.nvidia.com/driver.installed label is never applied and
+    # metadata-collector plus both syslog-health-monitor DaemonSets sit at
+    # zero desired pods — silently, with no error and no event (#2175).
+    #
+    # Kind has no gpuStack profile, so this value is overlay-level and is NOT
+    # profile-owned — same asymmetry as OKE (#2181). The NVSentinel
+    # driver-label bundle gate still rejects bundle-time and declared-dynamic
+    # changes that would recreate #2175, but a manual post-generation edit to
+    # the rendered Helm values is outside that guarantee.
+    - name: nvsentinel
+      type: Helm
+      overrides:
+        labeler:
+          assumeDriverInstalled: true
+        # janitor's GPU reset Job chroots into the driver root to run
+        # nvidia-smi; with a host-installed driver that root is the host's.
+        # Inert unless the nvsentinel-remediation mixin enables janitor.
+        janitor:
+          config:
+            controllers:
+              gpuReset:
+                resetJob:
+                  hostDriverRootPath: /
+                # After a reset janitor waits for the GPU Operator operands it
+                # restarted. Kind runs no standalone DCGM (dcgm.enabled=false
+                # above), so the list omits it; the default would time out. A
+                # custom spec takes no default label values, so each is set.
+                serviceManager:
+                  name: gpu-operator
+                  spec:
+                    namespace: gpu-operator
+                    teardownTimeout: 5m
+                    restoreTimeout: 10m
+                    apps:
+                      - appSelector: {app: nvidia-device-plugin-daemonset}
+                        nodeLabel: nvidia.com/gpu.deploy.device-plugin
+                        enabledValue: "true"
+                        disabledValue: "false"
+                      - appSelector: {app: nvidia-dcgm-exporter}
+                        nodeLabel: nvidia.com/gpu.deploy.dcgm-exporter
+                        enabledValue: "true"
+                        disabledValue: "false"
+                      - appSelector: {app: gpu-feature-discovery}
+                        nodeLabel: nvidia.com/gpu.deploy.gpu-feature-discovery
+                        enabledValue: "true"
+                        disabledValue: "false"
+        platformConnector:
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 200m
+              memory: 512Mi
+
+    # nodewright-operator: reduce resources for local development
+    - name: nodewright-operator
+      type: Helm
+      overrides:
+        controllerManager:
+          manager:
+            resources:
+              requests:
+                cpu: 250m
+                memory: 512Mi
+              limits:
+                cpu: 500m
+                memory: 1Gi
+
+    # nvidia-dra-driver-gpu: override driver root for kind GPU passthrough
+    - name: nvidia-dra-driver-gpu
+      type: Helm
+      overrides:
+        # Use "/" for host-installed drivers (kind GPU passthrough)
+        nvidiaDriverRoot: "/"
+
+    # nfd-worker labels the NICs network-operator schedules onto
+    # (pci-15b3.present); see the values file.
+    - name: nfd
+      type: Helm
+      valuesFile: components/nfd/values-nvidia-nics.yaml
+
+    # network-operator: NVIDIA Network Operator for high-performance networking
+    - name: network-operator
+      type: Helm
+      source: https://helm.ngc.nvidia.com/nvidia
+      valuesFile: components/network-operator/values.yaml
+      dependencyRefs:
+        - nfd
+        - cert-manager
+
+  validation:
+    conformance:
+      checks:
+        - platform-health
+        - gpu-operator-health
+        - dra-support
+        - accelerator-metrics
+        - ai-service-metrics

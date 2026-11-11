@@ -1,0 +1,87 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# GPU Operator Helm values
+# AKS Training configuration overrides
+#
+# This file REPLACES values-aks.yaml in the merge chain (an overlay's
+# valuesFile supersedes its base's), so the AKS azure-managed ownership
+# profile is restated here: driver.enabled=false, toolkit.enabled=false,
+# operator.runtimeClass=nvidia-container-runtime — always the three
+# together. See values-aks.yaml and docs/integrator/aks-gpu-setup.md
+# for the full rationale and the GPU-Operator-managed alternative.
+
+cdi:
+  enabled: true
+  default: false
+
+# Network Operator supplies MOFED through its OFED driver container
+# (doca-driver, see network-operator/manifests/nic-cluster-policy-aks.yaml).
+# Although that container loads modules into the host kernel, this is NOT
+# host-preinstalled MOFED — useHostMofed describes how MOFED is installed
+# and coordinated, not where its modules execute. Keep useHostMofed false
+# so the GPU Operator driver container builds nvidia_peermem against the
+# containerized MOFED stack; true can cause an ib_core symbol mismatch
+# (modprobe nvidia-peermem: Invalid argument, observed on AKS).
+# This stays false regardless of driver ownership mode: with
+# driver.enabled=false it is inert, but the correct value prevents a
+# future ownership-mode change from reviving the bug.
+driver:
+  # AKS azure-managed profile: the node image preinstalls the driver.
+  enabled: false
+  rdma:
+    enabled: true
+    useHostMofed: false
+
+# The operator deploys gdrcopy as a sidecar container in the operator-managed
+# driver pod, so it is inert under driver.enabled=false; to enable it,
+# select the operator profile (aicr recipe ... --profile gpuStack=operator-managed)
+# and add --set gpuoperator:gdrcopy.enabled=true at bundle time — the path
+# is not profile-owned (see docs/integrator/aks-gpu-setup.md).
+gdrcopy:
+  enabled: false
+
+# The AKS node image preconfigures containerd with the
+# nvidia-container-runtime handler (see values-aks.yaml).
+operator:
+  runtimeClass: nvidia-container-runtime
+
+validator:
+  plugin:
+    env:
+      - name: WITH_WORKLOAD
+        value: "false"
+
+# AKS azure-managed profile: the node image preinstalls the container
+# toolkit and preconfigures containerd, so the operator's toolkit
+# DaemonSet stays off. The RUNTIME_CONFIG_SOURCE env is inert while
+# enabled=false but kept correct for a GPU-Operator-managed flip
+# (containerd 2.x drop-in version mismatch, issue #1688 — see
+# values-aks.yaml for the full story).
+toolkit:
+  enabled: false
+  # Device-isolation hardening for the operator-managed toolkit (the
+  # GPU-Operator-managed fallback profile, --gpu-driver none + toolkit.enabled
+  # =true). Inert while toolkit.enabled=false (the azure-managed default — there
+  # the node-image toolkit is hardened by nodewright nvidia-setup instead, see
+  # toolkit-hardening-aks.yaml). The toolkit installer reads these uppercase env names
+  # and writes the lowercase config.toml keys; RUNTIME_CONFIG_SOURCE=file does
+  # not suppress them.
+  env:
+    - name: RUNTIME_CONFIG_SOURCE
+      value: file
+    - name: ACCEPT_NVIDIA_VISIBLE_DEVICES_ENVVAR_WHEN_UNPRIVILEGED
+      value: "false"
+    - name: ACCEPT_NVIDIA_VISIBLE_DEVICES_AS_VOLUME_MOUNTS
+      value: "true"

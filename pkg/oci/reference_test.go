@@ -1,0 +1,576 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package oci
+
+import (
+	"context"
+	stderrors "errors"
+	"reflect"
+	"testing"
+
+	apperrors "github.com/NVIDIA/aicr/pkg/errors"
+)
+
+func TestParseOutputTarget(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		input     string
+		wantIsOCI bool
+		wantReg   string
+		wantRepo  string
+		wantTag   string
+		wantDir   string
+		wantErr   bool
+	}{
+		{
+			name:      "local directory relative",
+			input:     "./bundle-out",
+			wantIsOCI: false,
+			wantDir:   "./bundle-out",
+		},
+		{
+			name:      "local directory absolute",
+			input:     "/tmp/bundles",
+			wantIsOCI: false,
+			wantDir:   "/tmp/bundles",
+		},
+		{
+			name:      "local directory current",
+			input:     ".",
+			wantIsOCI: false,
+			wantDir:   ".",
+		},
+		{
+			name:      "OCI with tag",
+			input:     "oci://ghcr.io/nvidia/bundle:v1.0.0",
+			wantIsOCI: true,
+			wantReg:   "ghcr.io",
+			wantRepo:  "nvidia/bundle",
+			wantTag:   "v1.0.0",
+		},
+		{
+			name:      "OCI without tag returns empty (caller applies default)",
+			input:     "oci://ghcr.io/nvidia/bundle",
+			wantIsOCI: true,
+			wantReg:   "ghcr.io",
+			wantRepo:  "nvidia/bundle",
+			wantTag:   "",
+		},
+		{
+			name:      "OCI with port and tag",
+			input:     "oci://localhost:5000/test/bundle:v1",
+			wantIsOCI: true,
+			wantReg:   "localhost:5000",
+			wantRepo:  "test/bundle",
+			wantTag:   "v1",
+		},
+		{
+			name:      "OCI with port no tag returns empty (caller applies default)",
+			input:     "oci://localhost:5000/test/bundle",
+			wantIsOCI: true,
+			wantReg:   "localhost:5000",
+			wantRepo:  "test/bundle",
+			wantTag:   "",
+		},
+		{
+			name:      "OCI deeply nested repository",
+			input:     "oci://ghcr.io/org/team/project/bundle:latest",
+			wantIsOCI: true,
+			wantReg:   "ghcr.io",
+			wantRepo:  "org/team/project/bundle",
+			wantTag:   "latest",
+		},
+		{
+			name:    "OCI invalid reference",
+			input:   "oci://",
+			wantErr: true,
+		},
+		{
+			name:    "OCI invalid characters",
+			input:   "oci://ghcr.io/INVALID/Bundle:v1",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ref, err := ParseOutputTarget(tt.input)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseOutputTarget() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if tt.wantErr {
+				return
+			}
+
+			if ref.IsOCI != tt.wantIsOCI {
+				t.Errorf("ParseOutputTarget() IsOCI = %v, want %v", ref.IsOCI, tt.wantIsOCI)
+			}
+			if ref.Registry != tt.wantReg {
+				t.Errorf("ParseOutputTarget() Registry = %v, want %v", ref.Registry, tt.wantReg)
+			}
+			if ref.Repository != tt.wantRepo {
+				t.Errorf("ParseOutputTarget() Repository = %v, want %v", ref.Repository, tt.wantRepo)
+			}
+			if ref.Tag != tt.wantTag {
+				t.Errorf("ParseOutputTarget() Tag = %v, want %v", ref.Tag, tt.wantTag)
+			}
+			if ref.LocalPath != tt.wantDir {
+				t.Errorf("ParseOutputTarget() LocalPath = %v, want %v", ref.LocalPath, tt.wantDir)
+			}
+		})
+	}
+}
+
+func TestReference_String(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		ref  *Reference
+		want string
+	}{
+		{
+			name: "local path",
+			ref: &Reference{
+				IsOCI:     false,
+				LocalPath: "./bundle",
+			},
+			want: "./bundle",
+		},
+		{
+			name: "OCI with tag",
+			ref: &Reference{
+				IsOCI:      true,
+				Registry:   "ghcr.io",
+				Repository: "nvidia/bundle",
+				Tag:        "v1.0.0",
+			},
+			want: "oci://ghcr.io/nvidia/bundle:v1.0.0",
+		},
+		{
+			name: "OCI without tag",
+			ref: &Reference{
+				IsOCI:      true,
+				Registry:   "ghcr.io",
+				Repository: "nvidia/bundle",
+				Tag:        "",
+			},
+			want: "oci://ghcr.io/nvidia/bundle",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tt.ref.String(); got != tt.want {
+				t.Errorf("Reference.String() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReference_WithTag(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		ref     *Reference
+		newTag  string
+		wantTag string
+	}{
+		{
+			name: "local path unchanged",
+			ref: &Reference{
+				IsOCI:     false,
+				LocalPath: "./bundle",
+			},
+			newTag:  "v2.0.0",
+			wantTag: "",
+		},
+		{
+			name: "OCI reference gets new tag",
+			ref: &Reference{
+				IsOCI:      true,
+				Registry:   "ghcr.io",
+				Repository: "nvidia/bundle",
+				Tag:        "v1.0.0",
+			},
+			newTag:  "v2.0.0",
+			wantTag: "v2.0.0",
+		},
+		{
+			name: "OCI reference without tag gets tag",
+			ref: &Reference{
+				IsOCI:      true,
+				Registry:   "ghcr.io",
+				Repository: "nvidia/bundle",
+				Tag:        "",
+			},
+			newTag:  "v1.0.0",
+			wantTag: "v1.0.0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			result := tt.ref.WithTag(tt.newTag)
+			if result.Tag != tt.wantTag {
+				t.Errorf("Reference.WithTag() Tag = %v, want %v", result.Tag, tt.wantTag)
+			}
+			// Ensure original is not modified for OCI refs
+			if tt.ref.IsOCI && result != tt.ref && tt.ref.Tag == tt.wantTag {
+				t.Error("Reference.WithTag() modified original reference")
+			}
+		})
+	}
+}
+
+func TestReference_ChartName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		ref  *Reference
+		want string
+	}{
+		{
+			name: "local path returns empty",
+			ref:  &Reference{IsOCI: false, LocalPath: "./bundle"},
+			want: "",
+		},
+		{
+			name: "OCI with two-segment repository",
+			ref: &Reference{
+				IsOCI:      true,
+				Registry:   "ghcr.io",
+				Repository: "myorg/my-bundle",
+				Tag:        "v1.0.0",
+			},
+			want: "my-bundle",
+		},
+		{
+			name: "OCI with deeply nested repository",
+			ref: &Reference{
+				IsOCI:      true,
+				Registry:   "ghcr.io",
+				Repository: "myorg/subteam/sub/my-bundle",
+			},
+			want: "my-bundle",
+		},
+		{
+			name: "OCI with single-segment repository",
+			ref: &Reference{
+				IsOCI:      true,
+				Registry:   "localhost:5000",
+				Repository: "my-bundle",
+				Tag:        "latest",
+			},
+			want: "my-bundle",
+		},
+		{
+			name: "OCI with empty repository returns empty",
+			ref: &Reference{
+				IsOCI:      true,
+				Registry:   "ghcr.io",
+				Repository: "",
+			},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.ref.ChartName(); got != tt.want {
+				t.Errorf("Reference.ChartName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnsureScheme(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"already prefixed", "oci://ghcr.io/x/y", "oci://ghcr.io/x/y"},
+		{"already prefixed with tag", "oci://ghcr.io/x/y:v1", "oci://ghcr.io/x/y:v1"},
+		{"unprefixed registry/repo", "ghcr.io/x/y", "oci://ghcr.io/x/y"},
+		{"unprefixed with tag", "ghcr.io/x/y:v1", "oci://ghcr.io/x/y:v1"},
+		{"unprefixed with port", "localhost:5000/x/y", "oci://localhost:5000/x/y"},
+		{"empty string gets prefix", "", "oci://"},
+		{"https url left alone", "https://ghcr.io/v2/x/y", "https://ghcr.io/v2/x/y"},
+		{"http url left alone", "http://localhost:5000/x/y", "http://localhost:5000/x/y"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := EnsureScheme(tt.in); got != tt.want {
+				t.Errorf("EnsureScheme(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnsureScheme_Idempotent(t *testing.T) {
+	t.Parallel()
+	a := EnsureScheme("ghcr.io/x/y")
+	b := EnsureScheme(a)
+	if a != b {
+		t.Errorf("EnsureScheme not idempotent: first=%q second=%q", a, b)
+	}
+}
+
+func TestTrimScheme(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"strip prefix", "oci://ghcr.io/x/y", "ghcr.io/x/y"},
+		{"strip prefix with tag", "oci://ghcr.io/x/y:v1", "ghcr.io/x/y:v1"},
+		{"already trimmed passthrough", "ghcr.io/x/y", "ghcr.io/x/y"},
+		{"already trimmed with tag", "ghcr.io/x/y:v1", "ghcr.io/x/y:v1"},
+		{"empty string", "", ""},
+		{"only scheme", "oci://", ""},
+		// TrimPrefix is exact-match: a non-oci scheme is left intact (caller's intent unclear).
+		{"different scheme left alone", "https://ghcr.io/x/y", "https://ghcr.io/x/y"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := TrimScheme(tt.in); got != tt.want {
+				t.Errorf("TrimScheme(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTrimScheme_Idempotent(t *testing.T) {
+	t.Parallel()
+	a := TrimScheme("oci://ghcr.io/x/y")
+	b := TrimScheme(a)
+	if a != b {
+		t.Errorf("TrimScheme not idempotent: first=%q second=%q", a, b)
+	}
+}
+
+func TestEnsureTrimRoundTrip(t *testing.T) {
+	t.Parallel()
+	originals := []string{
+		"ghcr.io/x/y",
+		"ghcr.io/x/y:v1",
+		"localhost:5000/foo/bar:tag",
+	}
+	for _, ref := range originals {
+		t.Run(ref, func(t *testing.T) {
+			t.Parallel()
+			if got := TrimScheme(EnsureScheme(ref)); got != ref {
+				t.Errorf("round-trip mismatch: TrimScheme(EnsureScheme(%q)) = %q", ref, got)
+			}
+		})
+	}
+}
+
+func TestURIScheme_Constant(t *testing.T) {
+	t.Parallel()
+	if URIScheme != "oci://" {
+		t.Errorf("URIScheme = %q, want %q", URIScheme, "oci://")
+	}
+	if uriScheme != URIScheme {
+		t.Errorf("legacy uriScheme alias drifted from URIScheme: %q vs %q", uriScheme, URIScheme)
+	}
+}
+
+func TestOutputConfigSourceFilesThreeStateHandoff(t *testing.T) {
+	tests := []struct {
+		name        string
+		sourceFiles []string
+		subDir      string
+	}{
+		{name: "nil without subdir"},
+		{name: "nil with subdir", subDir: "nested"},
+		{name: "non-nil empty", sourceFiles: []string{}},
+		{name: "non-empty exact list", sourceFiles: []string{"z.txt", "a.txt"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sentinel := stderrors.New("stop after package option capture")
+			deps := defaultPackageAndPushDependencies()
+			called := false
+			deps.packageOperation = func(
+				_ context.Context,
+				got PackageOptions,
+			) (*packageOperation, error) {
+
+				called = true
+				if (got.SourceFiles == nil) != (tt.sourceFiles == nil) {
+					t.Fatalf("PackageOptions.SourceFiles nil = %v, want %v",
+						got.SourceFiles == nil, tt.sourceFiles == nil)
+				}
+				if !reflect.DeepEqual(got.SourceFiles, tt.sourceFiles) {
+					t.Fatalf("PackageOptions.SourceFiles = %#v, want %#v",
+						got.SourceFiles, tt.sourceFiles)
+				}
+				if got.SubDir != tt.subDir {
+					t.Fatalf("PackageOptions.SubDir = %q, want %q", got.SubDir, tt.subDir)
+				}
+				return nil, sentinel
+			}
+
+			cfg := OutputConfig{
+				SourceDir:   t.TempDir(),
+				OutputDir:   t.TempDir(),
+				SourceFiles: tt.sourceFiles,
+				SubDir:      tt.subDir,
+				Reference: &Reference{
+					IsOCI:      true,
+					Registry:   "ghcr.io",
+					Repository: "test/bundle",
+					Tag:        "v1",
+				},
+			}
+			result, err := packageAndPushWithDependencies(context.Background(), cfg, deps)
+			if !stderrors.Is(err, sentinel) {
+				t.Fatalf("packageAndPushWithDependencies() error = %v, want %v", err, sentinel)
+			}
+			if result != nil {
+				t.Fatalf("packageAndPushWithDependencies() result = %+v on capture stop", result)
+			}
+			if !called {
+				t.Fatal("package operation helper was not called")
+			}
+			if (cfg.SourceFiles == nil) != (tt.sourceFiles == nil) ||
+				!reflect.DeepEqual(cfg.SourceFiles, tt.sourceFiles) {
+
+				t.Fatalf("caller SourceFiles changed to %#v", cfg.SourceFiles)
+			}
+		})
+	}
+}
+
+func TestPackageAndPushRejectsDirectInvalidTagBeforePackaging(t *testing.T) {
+	sentinel := apperrors.New(apperrors.ErrCodeInternal, "package operation must not run")
+	deps := defaultPackageAndPushDependencies()
+	called := false
+	deps.packageOperation = func(context.Context, PackageOptions) (*packageOperation, error) {
+		called = true
+		return nil, sentinel
+	}
+
+	result, err := packageAndPushWithDependencies(context.Background(), OutputConfig{
+		SourceDir: t.TempDir(),
+		OutputDir: t.TempDir(),
+		Reference: &Reference{
+			IsOCI:      true,
+			Registry:   "ghcr.io",
+			Repository: "test/bundle",
+			Tag:        "bad/tag",
+		},
+	}, deps)
+	if result != nil {
+		t.Fatalf("packageAndPushWithDependencies() result = %+v for invalid tag", result)
+	}
+	if called {
+		t.Fatal("package operation ran before direct Reference tag validation")
+	}
+	assertErrorCode(t, err, apperrors.ErrCodeInvalidRequest)
+	if stderrors.Is(err, sentinel) {
+		t.Fatalf("packageAndPushWithDependencies() error = %v, want tag validation failure", err)
+	}
+}
+
+func TestHelmChartOptionsSourceFilesThreeStateHandoff(t *testing.T) {
+	tests := []struct {
+		name        string
+		sourceFiles []string
+		wantCalled  bool
+	}{
+		{name: "nil", wantCalled: true},
+		{name: "non-nil empty", sourceFiles: []string{}},
+		{name: "non-empty exact list", sourceFiles: []string{"values.yaml", "Chart.yaml"}, wantCalled: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sentinel := stderrors.New("stop after Helm source option capture")
+			deps := defaultHelmChartDependencies()
+			called := false
+			deps.packageOperation = func(
+				_ context.Context,
+				got HelmChartOptions,
+			) (*packageOperation, error) {
+
+				called = true
+				if (got.SourceFiles == nil) != (tt.sourceFiles == nil) {
+					t.Fatalf("prepareSource SourceFiles nil = %v, want %v",
+						got.SourceFiles == nil, tt.sourceFiles == nil)
+				}
+				if !reflect.DeepEqual(got.SourceFiles, tt.sourceFiles) {
+					t.Fatalf("prepareSource SourceFiles = %#v, want %#v", got.SourceFiles, tt.sourceFiles)
+				}
+				return nil, sentinel
+			}
+
+			opts := HelmChartOptions{
+				SourceDir:   t.TempDir(),
+				OutputDir:   t.TempDir(),
+				SourceFiles: tt.sourceFiles,
+				Reference: &Reference{
+					IsOCI:      true,
+					Registry:   "ghcr.io",
+					Repository: "test/chart",
+					Tag:        "1.2.3",
+				},
+			}
+			result, err := packageAndPushHelmChartWithDependencies(
+				context.Background(), opts, deps)
+			if tt.wantCalled {
+				if !stderrors.Is(err, sentinel) {
+					t.Fatalf("packageAndPushHelmChartWithDependencies() error = %v, want %v", err, sentinel)
+				}
+			} else {
+				assertErrorCode(t, err, apperrors.ErrCodeInvalidRequest)
+			}
+			if result != nil {
+				t.Fatalf("packageAndPushHelmChartWithDependencies() result = %+v on capture stop", result)
+			}
+			if called != tt.wantCalled {
+				t.Fatalf("Helm package helper called = %v, want %v", called, tt.wantCalled)
+			}
+			if (opts.SourceFiles == nil) != (tt.sourceFiles == nil) ||
+				!reflect.DeepEqual(opts.SourceFiles, tt.sourceFiles) {
+
+				t.Fatalf("caller Helm SourceFiles changed to %#v", opts.SourceFiles)
+			}
+		})
+	}
+}

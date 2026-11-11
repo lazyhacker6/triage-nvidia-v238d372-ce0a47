@@ -1,0 +1,115 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Slinky Slurm Operator Health Check
+#
+# Validates that the Slinky Slurm operator and its admission webhook are
+# running and healthy in the `slinky` namespace. Checks that both
+# deployments have at least one available replica and that no pods in
+# the namespace are stuck in Pending, Failed, or Unknown phases.
+#
+# No CRD Established=True block here (negative finding for #1246): the
+# slinky-slurm-operator chart is deployed with crds.enabled: false (see
+# the `crds.enabled: false` key in
+# components/slinky-slurm-operator/values.yaml; registry.yaml's
+# slinky-slurm-operator entry only carries the same flag as a prose
+# reminder to re-verify it on version bumps).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: slinky-slurm-operator-health-check
+spec:
+  timeouts:
+    assert: 5m
+  steps:
+    - name: validate-operator-deployment
+      try:
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: slurm-operator
+                namespace: slinky
+              status:
+                (availableReplicas > `0`): true
+    - name: validate-webhook-deployment
+      try:
+        # Webhook must be ready before any Slinky CR can be created.
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: slurm-operator-webhook
+                namespace: slinky
+              status:
+                (availableReplicas > `0`): true
+    - name: validate-all-pods-healthy
+      try:
+        # Catch Pending / Failed / Unknown phases AND pods stuck in
+        # Running with a known-bad container-waiting reason
+        # (CrashLoopBackOff, ImagePullBackOff, ErrImagePull,
+        # CreateContainerConfigError). Chainsaw `error` passes
+        # vacuously when no resource matches, so the preceding deployment-
+        # availability asserts are load-bearing: they guarantee the pods
+        # exist before this step runs.
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: slinky
+              status:
+                phase: Pending
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: slinky
+              status:
+                phase: Failed
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: slinky
+              status:
+                phase: Unknown
+        # JMESPath projection (not single-element match): kyverno-json's
+        # sliceNode.Assert gates on exact slice length before per-element
+        # comparison, so a `containerStatuses: - state: ...` shape only
+        # matches single-container pods and silently passes sidecars. Use
+        # `containerStatuses[?...] | length(@) > 0` to fire on any
+        # container at any index. Parallel initContainerStatuses block
+        # below catches init-container failures (invisible to
+        # containerStatuses). Per PR #1245 review (@ArangoGutierrez).
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: slinky
+              status:
+                ((containerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: slinky
+              status:
+                ((initContainerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true

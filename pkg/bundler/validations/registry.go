@@ -1,0 +1,218 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package validations
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/config"
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+)
+
+var (
+	registry     map[string]ValidationFunc
+	registryOnce sync.Once
+	registryMu   sync.RWMutex
+)
+
+// initRegistry initializes the validation function registry.
+// Functions are auto-registered via init() functions in their respective files.
+func initRegistry() {
+	registry = make(map[string]ValidationFunc)
+	// Functions are registered via init() functions in check files
+	// This ensures automatic discovery when new validation functions are added
+}
+
+// Register adds a validation function to the registry.
+// This allows components to register custom validation functions.
+// It's also called from init() functions in check files for auto-registration.
+func Register(name string, fn ValidationFunc) {
+	registryOnce.Do(initRegistry)
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	if _, exists := registry[name]; exists {
+		slog.Warn("validation function already registered, overwriting",
+			"name", name,
+		)
+	}
+	registry[name] = fn
+}
+
+// Get returns a validation function by name.
+// Returns nil if the function is not found.
+func Get(name string) ValidationFunc {
+	registryOnce.Do(initRegistry)
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	return registry[name]
+}
+
+// GetAll returns all registered validation function names.
+func GetAll() []string {
+	registryOnce.Do(initRegistry)
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	names := make([]string, 0, len(registry))
+	for name := range registry {
+		names = append(names, name)
+	}
+	return names
+}
+
+// RunValidations executes all validations for a component and returns warnings and errors.
+// The optional message from the validation config is appended to each warning/error.
+// Severity determines whether check results become warnings or errors.
+func RunValidations(ctx context.Context, componentName string, validations []recipe.ComponentValidationConfig, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config) (warnings []string, errors []error) {
+	for _, validation := range validations {
+		if err := ctx.Err(); err != nil {
+			return warnings, append(errors, aicrerrors.Wrap(aicrerrors.ErrCodeTimeout, "context cancelled during validation", err))
+		}
+
+		fn := Get(validation.Function)
+		if fn == nil {
+			// Fail closed: a typo in `function` (or a renamed/removed
+			// validator) for a severity:error validation would otherwise
+			// skip the safety check and ship a bundle as if it had passed.
+			errors = append(errors, aicrerrors.NewWithContext(
+				aicrerrors.ErrCodeInvalidRequest,
+				"unknown validation function",
+				map[string]any{
+					logKeyComponent: componentName,
+					"function":      validation.Function,
+				}))
+			continue
+		}
+
+		// Execute validation function
+		checkWarnings, checkErrors := fn(ctx, componentName, recipeResult, bundlerConfig, validation.Conditions)
+
+		// Process results based on severity:
+		//   "error"   — convert all check results to blocking errors
+		//   "info"    — log only (visible with --debug), not surfaced in deployment notes
+		//   "warning" — (default) non-blocking deployment notes
+		severity := strings.ToLower(validation.Severity)
+		switch severity {
+		case "error":
+			// Convert all check results to errors
+			for _, warning := range checkWarnings {
+				msg := warning
+				if validation.Message != "" {
+					msg = warning + ". " + validation.Message
+				}
+				errors = append(errors, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, msg))
+			}
+			for _, err := range checkErrors {
+				if validation.Message != "" {
+					errors = append(errors, aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest, validation.Message, err))
+				} else {
+					errors = append(errors, err)
+				}
+			}
+		case "info":
+			// Log as informational only — not surfaced in deployment notes.
+			// Visible when debug logging is enabled (--debug).
+			for _, warning := range checkWarnings {
+				msg := warning
+				if validation.Message != "" {
+					msg = warning + ". " + validation.Message
+				}
+				slog.Info(msg, logKeyComponent, componentName)
+			}
+			for _, err := range checkErrors {
+				slog.Info("validation check reported error",
+					logKeyComponent, componentName,
+					"function", validation.Function,
+					"message", validation.Message,
+					"error", err,
+				)
+			}
+		default:
+			// Default to warning severity
+			for _, warning := range checkWarnings {
+				if validation.Message != "" {
+					warnings = append(warnings, fmt.Sprintf("%s. %s", warning, validation.Message))
+				} else {
+					warnings = append(warnings, warning)
+				}
+			}
+			// Even if severity is warning, checkErrors should still be errors
+			for _, err := range checkErrors {
+				if validation.Message != "" {
+					errors = append(errors, aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest, validation.Message, err))
+				} else {
+					errors = append(errors, err)
+				}
+			}
+		}
+	}
+
+	return warnings, errors
+}
+
+// RunComponentValidations executes every registry-declared validation for
+// each component present in recipeResult, in ComponentRefs order. It is the
+// shared component preflight behind DefaultBundler.Make (which passes its
+// bundle config so --set/--set-json overrides participate) and
+// Client.BundleComponents (which passes a nil config — that path has no
+// bundle-time overrides, and every validation that acts solely on
+// bundle-time flags no-ops on a nil config). Returns the accumulated
+// non-blocking warnings and the first blocking error; warnings gathered
+// before a blocking error are still returned so the caller can surface
+// them alongside it.
+func RunComponentValidations(ctx context.Context, recipeResult *recipe.RecipeResult, bundlerConfig *config.Config) ([]string, error) {
+	if recipeResult == nil {
+		return nil, nil
+	}
+
+	// A registry-load failure would produce an unvalidated bundle — the
+	// opposite of what the preflight promises; surface it.
+	componentRegistry, err := recipe.GetComponentRegistryFor(recipeResult.DataProvider())
+	if err != nil {
+		return nil, aicrerrors.PropagateOrWrap(err, aicrerrors.ErrCodeInternal,
+			"failed to load component registry for validations")
+	}
+
+	var allWarnings []string
+	for _, ref := range recipeResult.ComponentRefs {
+		if err := ctx.Err(); err != nil {
+			return allWarnings, aicrerrors.Wrap(aicrerrors.ErrCodeTimeout, "context cancelled during validation", err)
+		}
+
+		comp := componentRegistry.Get(ref.Name)
+		if comp == nil {
+			continue // Unknown component, skip
+		}
+
+		componentValidations := comp.GetValidations()
+		if len(componentValidations) == 0 {
+			continue // No validations configured
+		}
+
+		warnings, validationErrors := RunValidations(ctx, ref.Name, componentValidations, recipeResult, bundlerConfig)
+		allWarnings = append(allWarnings, warnings...)
+
+		// First error is blocking, matching the bundler's historical behavior.
+		if len(validationErrors) > 0 {
+			return allWarnings, validationErrors[0]
+		}
+	}
+
+	return allWarnings, nil
+}

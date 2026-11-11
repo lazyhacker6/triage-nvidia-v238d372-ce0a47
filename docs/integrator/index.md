@@ -1,0 +1,83 @@
+# Integrator Documentation
+
+Documentation for engineers integrating AI Cluster Runtime (AICR) into CI/CD pipelines, GitOps workflows, or larger platforms.
+
+## Audience
+
+This section is for integrators who:
+- Build automation pipelines using the AICR API
+- Deploy and operate the AICR API server in Kubernetes
+- Create custom recipes for their environments
+- Integrate AICR into GitOps workflows (Argo CD, Flux)
+- Contribute GPU capacity to AICR's real-hardware validation
+
+## Documents
+
+| Document | Description |
+|----------|-------------|
+| [Public API Surface](public-api.md) | Stability tiers for every exported Go package; facade type ownership |
+| [Measurement Schema](measurement-api.md) | Cross-repo Measurement contract: Type cardinality, Subtype layout, NetworkTopology shape, constraint paths |
+| [Go Library Integration](go-library.md) | Using `github.com/NVIDIA/aicr/pkg/client/v1` as a Go library |
+| [Automation](automation.md) | CI/CD integration patterns for GitHub Actions, with a stage mapping for GitLab CI, CircleCI, and Terraform |
+| [Data Flow](data-flow.md) | Understanding snapshots, recipes, validation, and bundles data transformations |
+| [Kubernetes Deployment](kubernetes-deployment.md) | Self-hosted API server deployment with Kubernetes manifests |
+| [EKS Dynamo Networking](eks-dynamo-networking.md) | Security group prerequisites for Dynamo overlays on EKS |
+| [GKE TCPXO Networking](gke-tcpxo-networking.md) | GPUDirect TCPXO prerequisites for GKE training overlays |
+| [GKE GB200 Networking](gke-gb200-networking.md) | GPUDirect-RDMA prerequisites for GB200 (A4X) GKE overlays |
+| [GKE A4X Max Networking](gke-a4x-max-networking.md) | DRANET/MNNVL prerequisites for GB300 (A4X Max) GKE overlays |
+| [AKS GPU Setup](aks-gpu-setup.md) | AKS prerequisites: Kubernetes 1.34+ (DRA GA), GPU driver setup, DRA configuration |
+| [GKE GPU Setup](gke-gpu-setup.md) | GKE device-plugin ownership: the `gpuStack` profile, node-pool setup for both values, verification, and troubleshooting |
+| [OKE GPU Setup](oke-gpu-setup.md) | OKE GPU stack ownership: the `gpuStack` profile (two values), the device-plugin add-on / disable label, bring-your-own-image pools, and GB300 RoCE node preparation |
+| [RKE2 VR200 Setup](rke2-vr200-setup.md) | Bare-metal RKE2 setup for the VR200 (Vera Rubin) NVL72 Preview coordinates: cluster prerequisites (K8s window, StorageClass, LoadBalancer, host `nvidia-imex` mask), Skyhook reboot behavior, and known gaps |
+| [Nebius B300 Inference](nebius-b300.md) | MK8s reference configuration, operator ownership, shared RDMA and qualification limits |
+| [k0s H200 Setup](k0s-h200-setup.md) | k0s setup for the H200 training Preview coordinate: host-provided driver posture, k0s's bundled containerd wiring, StorageClass note, and known gaps |
+| [CoreWeave H100 Setup](cks-h100-setup.md) | CoreWeave-managed GPU stack for H100 Ubuntu training; Preview, awaiting live qualification |
+| [CoreWeave RTX PRO 6000 Setup](cks-rtx-pro-6000-setup.md) | CoreWeave-managed GPU stack for RTX PRO 6000 Ubuntu training; Preview, awaiting live qualification |
+| [NVKE GB200 Setup](nvke-gb200-setup.md) | NVKE (Forge/NICo) GB200 training Preview coordinate: inbox-driver posture (no DOCA-OFED, DMA-BUF GPUDirect), SR-IOV InfiniBand rails with IPoIB via nv-ipam, RDMA ULP module loading via nodewright, fabric P_Key prerequisite, and known gaps |
+| [Talos Integration](talos-integration.md) | Running AICR on Talos Linux |
+| [OpenShift Deployment](openshift.md) | OpenShift/OCP-specific Helm and OLM integration and two-phase operator deployment |
+| [Recipe Development](recipe-development.md) | Creating and modifying recipe metadata for custom environments |
+| [Data Extension](data-extension.md) | Extending the embedded catalog via `--data` — overlays, components, and runtime criteria values without a rebuild |
+| [Validator Extension](validator-extension.md) | Adding custom validators and overriding embedded ones via `--data` |
+| [Supply Chain Verification](supply-chain-verification.md) | Verifying SLSA provenance, SBOMs, and attestations; admission policies; offline verification |
+| [Contributing Validation Capacity](validation-capacity.md) | How to contribute GPU capacity or credits to AICR's real-hardware validation: requirements, OIDC access, evidence, and onboarding |
+| [Nodewright Component](components/nodewright.md) | Nodewright component reference and configuration |
+
+## Quick Start
+
+### API Server Deployment
+
+See [Kubernetes Deployment](kubernetes-deployment.md) for full manifests. After deployment:
+
+```shell
+# Generate recipe via API
+curl "http://aicrd.aicr.svc/v1/recipe?service=eks&accelerator=h100"
+```
+
+### CI/CD Integration
+
+```yaml
+# GitHub Actions example
+- name: Generate recipe
+  run: |
+    curl -s "http://aicrd.aicr.svc/v1/recipe?service=eks&accelerator=h100" \
+      -o recipe.json
+
+- name: Generate bundles
+  # recipe.json is the fully-hydrated RecipeResult from the GET above; the
+  # bundle endpoint adopts it as-is and bundles all of its componentRefs.
+  # To bundle a subset, add the `bundlers` query parameter (comma-delimited
+  # component names, e.g. "?bundlers=gpu-operator,network-operator") rather
+  # than hand-trimming componentRefs, which drops required dependencies.
+  # Unknown or disabled component names are rejected with HTTP 400.
+  run: |
+    curl -X POST "http://aicrd.aicr.svc/v1/bundle" \
+      -H "Content-Type: application/json" \
+      -d @recipe.json \
+      -o bundles.zip
+```
+
+## Related Documentation
+
+- **Users**: See [User Documentation](../user/index.md) for CLI usage and installation
+- **Contributors**: See [Contributor Documentation](../contributor/index.md) for architecture and development guides

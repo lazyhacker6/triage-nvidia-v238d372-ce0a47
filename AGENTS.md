@@ -1,0 +1,766 @@
+# AGENTS.md
+
+This file provides guidance to Codex and other coding agents when working with code in this repository.
+<!-- AUTO-SYNCED: canonical source is .claude/CLAUDE.md. Only the first 4 lines differ. CI enforced sync. -->
+
+## Local Overlay
+
+If present, also read `AGENTS.local.md` at the repo root. The file is gitignored repo-wide so personal overlays stay local — agents must check the exact path directly (e.g., `Read` or `cat`), not rely on ignore-respecting discovery tools such as `rg`, `fd`, or `git ls-files`. Treat it as a local overlay for this working copy: follow it when it does not conflict with higher-priority instructions or this shared `AGENTS.md`.
+
+## Role & Expertise
+
+Act as a Principal Distributed Systems Architect with deep expertise in Go and cloud-native architectures. Focus on correctness, resiliency, and operational simplicity. All code must be production-grade, not illustrative pseudo-code.
+
+## Project Overview
+
+NVIDIA AI Cluster Runtime (AICR) generates validated GPU-accelerated Kubernetes configurations.
+
+**Workflow:** Snapshot → Recipe → Validate → Bundle
+
+```
+┌─────────┐    ┌────────┐    ┌──────────┐    ┌────────┐
+│Snapshot │───▶│ Recipe │───▶│ Validate │───▶│ Bundle │
+└─────────┘    └────────┘    └──────────┘    └────────┘
+   │              │               │              │
+   ▼              ▼               ▼              ▼
+ Capture       Generate        Check         Create
+ cluster       optimized      constraints    Helm values,
+ state         config         vs actual     manifests
+```
+
+**Tech Stack:** Go 1.27, Kubernetes, golangci-lint, Ko for images (Go toolchain pinned in `.go-version`; other tool versions in `.settings.yaml`)
+
+## Commands
+
+```bash
+# IMPORTANT: goreleaser (used by make build, make qualify, e2e) fails if
+# GITLAB_TOKEN is set alongside GITHUB_TOKEN. Always unset it first:
+unset GITLAB_TOKEN
+
+# Development workflow
+make qualify      # Full check: test-coverage + lint + tuning-check + coverage-check + e2e + scan + license-check + api-diff + openapi-diff (run before PR)
+make test         # Unit tests with -race
+make lint         # golangci-lint + yamllint
+make scan         # Grype vulnerability scan
+make build        # Build binaries
+make tidy         # Format + update deps
+
+# Run single test
+go test -v ./pkg/recipe/... -run TestSpecificFunction
+
+# Run tests with race detector for specific package
+go test -race -v ./pkg/collector/...
+
+# Local development
+make server                 # Start API server locally (debug mode)
+make dev-env                # Create Kind cluster + start Tilt
+make dev-env-clean          # Stop Tilt + delete cluster
+
+# KWOK simulated cluster tests (no GPU hardware required)
+make kwok-test-all                    # All recipes
+make kwok-e2e RECIPE=eks-training     # Single recipe
+
+# E2E tests (unset GITLAB_TOKEN to avoid goreleaser conflicts)
+unset GITLAB_TOKEN && ./tools/e2e
+
+# Tools management
+make tools-setup  # Install all required tools
+make tools-check  # Verify versions match .settings.yaml
+
+# Local health check validation
+make check-health COMPONENT=nvsentinel  # Direct chainsaw against Kind
+make check-health-all                   # Registry-linked components only
+make validate-local RECIPE=recipe.yaml  # Full pipeline in Kind
+# Live-cluster performance phase (shipped EKS H100 training uses TrainJob NCCL)
+make validate-performance RECIPE=recipe.yaml SNAPSHOT=snapshot.yaml
+```
+
+## Non-Negotiable Rules
+
+1. **Read before writing** — Never modify code you haven't read
+2. **Tests must pass** — `make test` with race detector; never skip tests
+3. **Run `make qualify` often** — Run at every stopping point (after completing a phase, before commits, before moving on). Fix ALL lint/test failures before proceeding. Do not treat pre-existing failures as acceptable.
+4. **Use project patterns** — Learn existing code before inventing new approaches
+5. **3-strike rule** — After 3 failed fix attempts, stop and reassess
+6. **Structured errors** — Use `pkg/errors` with error codes (never `fmt.Errorf`)
+7. **Context timeouts** — All I/O operations need context with timeout
+8. **Check context in loops** — Always check `ctx.Done()` in long-running operations
+
+## Review Output Links
+
+When providing review findings, use global GitHub file links by default
+(`https://github.com/<org>/<repo>/blob/<sha>/<path>#L<line>`) instead of local
+workspace paths. Use local file paths only when explicitly requested.
+
+## Git Configuration
+
+- Commit to `main` branch (not `master`)
+- Sign every commit with both `-S` (cryptographic signature) and `-s` (DCO sign-off), authored as the human (the configured `git config user.name`/`user.email`), not the agent
+- Do NOT add `Co-Authored-By` lines or any agent attribution (e.g. Claude Code, Codex) — organization policy
+
+## Secrets and Credentials
+
+**Never commit a secret.** Credentials, API keys, tokens, passwords, private keys, certificates, kubeconfigs, and cloud service-account JSON do not belong in this repository: not in source, not in test fixtures, not in recipe or Helm values, not baked into a container image, and not in a commit message. That includes values you are only using locally, such as `GITHUB_TOKEN`, `GITLAB_TOKEN`, and `NGC_API_KEY`.
+
+**Never paste one where it is recorded.** Issues, pull requests, review comments, CI logs, `slog` output, error strings, and terminal transcripts copied into a report are all durable and mostly public. Redact before pasting: a token in a debug log is a leaked token.
+
+**Where a secret belongs instead.** Read it at run time from an environment variable, a Kubernetes Secret, or an external secret operator. Commit the *reference* (the env var name, or the Secret name and key), never the value. `.env` and `*.pem` are already gitignored; a kubeconfig or a downloaded service-account JSON is not, so keep those outside the working tree. Test fixtures use obviously fake values.
+
+**If a secret does get committed, rotate it.** Deleting the file or amending the commit is not a fix: the value is in the git history, in every clone that fetched it, and possibly in CI logs and forks. Revoke and reissue the credential first, then tell a maintainer, then clean the history. Report it even when the commit never left your machine, because you cannot prove that it did not.
+
+## Key Packages
+
+| Package | Purpose | Business Logic? |
+|---------|---------|-----------------|
+| `pkg/cli` | User interaction, input validation, output formatting | No |
+| `pkg/server` | aicrd HTTP server: middleware chain + REST handlers (thin adapters over `pkg/client/v1`) | No |
+| `pkg/client/v1` | aicr.Client facade (recipe + bundle entry points) — the shared SDK used by CLI, server, and external Go callers | No |
+| `pkg/recipe` | Recipe resolution, overlay system, component registry | Yes |
+| `pkg/bundler` | Per-component Helm bundle generation from recipes | Yes |
+| `pkg/component` | Bundler utilities and test helpers | Yes |
+| `pkg/collector` | System state collection | Yes |
+| `pkg/validator` | Constraint evaluation | Yes |
+| `pkg/chainsaw` | In-process Chainsaw Test executor (assert/error only) + read-only allowlist; no external chainsaw binary | Yes |
+| `pkg/errors` | Structured error handling with codes | Yes |
+| `pkg/manifest` | Shared Helm-compatible manifest rendering | Yes |
+| `pkg/upgrade` | ADR-021 component upgrade transition records: schema, fail-closed loader, well-formedness rules | Yes |
+| `pkg/inventory` | Installed component inventory read from a live cluster (Helm release records, Argo CD Applications) and the advisory at-risk scan, for `upgrade-check --from cluster` | Yes |
+| `pkg/evidence` | Conformance evidence capture and formatting | Yes |
+| `pkg/collector/topology` | Cluster-wide node taint/label topology collection | Yes |
+| `pkg/snapshotter` | System state snapshot orchestration | Yes |
+| `pkg/k8s/client` | Singleton Kubernetes client | Yes |
+| `pkg/k8s/pod` | Shared K8s Job/Pod utilities (wait, logs, ConfigMap URIs) | Yes |
+| `validators/helper` | Shared validator helpers (PodLifecycle, GPU/resource utilities) | Yes |
+| `pkg/defaults` | Centralized timeout and configuration constants | Yes |
+| `pkg/operator` | Opt-in AICR Operator (ADR-027): runs AICR only as a pinned image and imports no other AICR package (`operator-boundary` depguard rule), so `pkg/errors` and `pkg/defaults` do not apply | Yes |
+
+**Critical Architecture Principle:**
+- `pkg/cli` and `pkg/server` = user interaction only, no business logic
+- Business logic lives in functional packages (and the `pkg/client/v1` facade) so CLI and HTTP handlers can both use it
+
+## Required Patterns
+
+**Errors (always use pkg/errors):**
+```go
+import "github.com/NVIDIA/aicr/pkg/errors"
+
+// Simple error
+return errors.New(errors.ErrCodeNotFound, "GPU not found")
+
+// Wrap existing error
+return errors.Wrap(errors.ErrCodeInternal, "collection failed", err)
+
+// With context
+return errors.WrapWithContext(errors.ErrCodeTimeout, "operation timed out", ctx.Err(),
+    map[string]interface{}{"component": "gpu-collector", "timeout": "10s"})
+```
+
+**Error Codes:** `ErrCodeNotFound`, `ErrCodeUnauthorized`, `ErrCodeTimeout`, `ErrCodeInternal`, `ErrCodeInvalidRequest`, `ErrCodeUnavailable`, `ErrCodeMethodNotAllowed`, `ErrCodeRateLimitExceeded`, `ErrCodeConflict` (resource state conflict, e.g., already exists / version mismatch — distinct from `ErrCodeInvalidRequest` because the request itself is well-formed; maps to HTTP 409), `ErrCodeCanceled` (the caller or operator aborted the operation, e.g. Ctrl-C — distinct from `ErrCodeTimeout` because nothing should be retried; use `errors.WrapCtxErr(ctx.Err(), errors.ErrCodeTimeout, msg)` to classify a dead context).
+
+**Code-based matching with `errors.Is`:** `*StructuredError.Is` reports a match when the target is a `*StructuredError` with the same `Code`. Prefer this over `errors.As` + manual code comparison.
+
+In files that import `pkg/errors`, the stdlib `errors` package is aliased as `stderrors`, so the call site uses `stderrors.Is`:
+
+```go
+import (
+    stderrors "errors"
+    "github.com/NVIDIA/aicr/pkg/errors"
+)
+
+// GOOD - idiomatic, works through wrap chains
+if stderrors.Is(err, errors.New(errors.ErrCodeNotFound, "")) {
+    // ...
+}
+```
+
+**Tests asserting a reported code are the exception.** Consumers such as `ExitCodeFromError` read the outermost code, and `errors.Is` still passes when the expected code is buried under a wrap that reports a different one. Assert what a consumer reads with `errorstest.WantReportedCode(t, err, code)` or `errorstest.ReportedCode(err) != code` from `pkg/errors/errorstest`. Keep `errors.Is` for asserting that a code is absent, where matching anywhere in the chain is the stricter check.
+
+**Context with timeout (always):**
+```go
+// Collectors: 10s timeout
+func (c *Collector) Collect(ctx context.Context) (*measurement.Measurement, error) {
+    ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+    defer cancel()
+    // ...
+}
+
+// HTTP handlers: 30s timeout
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+    defer cancel()
+    // ...
+}
+```
+
+**Table-driven tests (required for multiple cases):**
+```go
+func TestFunction(t *testing.T) {
+    tests := []struct {
+        name     string
+        input    string
+        expected string
+        wantErr  bool
+    }{
+        {"valid input", "test", "test", false},
+        {"empty input", "", "", true},
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            result, err := Function(tt.input)
+            if (err != nil) != tt.wantErr {
+                t.Errorf("error = %v, wantErr %v", err, tt.wantErr)
+            }
+            if result != tt.expected {
+                t.Errorf("got %v, want %v", result, tt.expected)
+            }
+        })
+    }
+}
+```
+
+**Functional options (configuration):**
+```go
+builder := recipe.NewBuilder(
+    recipe.WithVersion(version),
+)
+server := server.New(
+    server.WithName("aicrd"),
+    server.WithVersion(version),
+)
+```
+
+**Concurrency (errgroup):**
+```go
+g, ctx := errgroup.WithContext(ctx)
+g.Go(func() error { return collector1.Collect(ctx) })
+g.Go(func() error { return collector2.Collect(ctx) })
+if err := g.Wait(); err != nil {
+    return errors.Wrap(errors.ErrCodeInternal, "collection failed", err)
+}
+```
+
+**Structured logging (slog):**
+```go
+slog.Debug("request started", "requestID", requestID, "method", r.Method)
+slog.Error("operation failed", "error", err, "component", "gpu-collector")
+```
+
+## Common Tasks
+
+| Task | Location | Key Points |
+|------|----------|------------|
+| New Helm component | `recipes/registry.yaml` | Add entry with name, displayName, class, helm settings, nodeScheduling; add its row to `docs/user/component-catalog.md` |
+| New Kustomize component | `recipes/registry.yaml` | Add entry with name, displayName, class, kustomize settings; add its row to `docs/user/component-catalog.md` |
+| Component values | `recipes/components/<name>/` | Create values.yaml with Helm chart configuration |
+| New collector | `pkg/collector/<type>/` | Implement `Collector` interface, add to factory |
+| New API endpoint | `pkg/server/` | Handler (thin adapter over `pkg/client/v1`) + middleware chain + OpenAPI spec update |
+| Fix test failures | Run `make test` | Check race conditions (`-race`), verify context handling |
+| New health check | `recipes/checks/<name>/` | Create `health-check.yaml`, register in `registry.yaml`, test with `make check-health` |
+
+**Adding a Helm component (declarative - no Go code needed):**
+```yaml
+# recipes/registry.yaml
+- name: my-operator
+  displayName: My Operator
+  class: ops  # core or ops (ADR-018); required for every embedded entry
+  valueOverrideKeys: [myoperator]
+  helm:
+    defaultRepository: https://charts.example.com
+    defaultChart: example/my-operator
+    defaultVersion: v1.0.0  # required: an unpinned Helm chart fails recipe resolution
+  nodeScheduling:
+    system:
+      nodeSelectorPaths: [operator.nodeSelector]
+```
+
+**Adding a Kustomize component (declarative - no Go code needed):**
+```yaml
+# recipes/registry.yaml
+- name: my-kustomize-app
+  displayName: My Kustomize App
+  class: ops  # core or ops (ADR-018); required for every embedded entry
+  valueOverrideKeys: [mykustomize]
+  kustomize:
+    defaultSource: https://github.com/example/my-app
+    defaultPath: deploy/production
+    defaultTag: v1.0.0
+```
+
+**Note:** A component must have either `helm` OR `kustomize` configuration, not both.
+
+**Note:** Every embedded registry entry declares `class` (`core` or `ops`, ADR-018) and has a row with that class in `docs/user/component-catalog.md`; `TestEmbeddedRegistryDeclaresClass` and `TestComponentCatalogClassColumnMatchesRegistry` fail `make qualify` otherwise. `core` is what a plain GPU pod needs to run, with its fabric and install prerequisites; `ops` is everything else, workload platforms included.
+
+**Note:** A Helm chart that renders no container images (a CRD-only chart) also needs an entry in `expectedNoImages` in `tools/bom/main.go`, or `make bom-docs` and the scheduled BOM refresh fail. No PR-time check renders charts, so run `make bom-docs` to catch it.
+
+**After any change to `recipes/registry.yaml`, a component's values file, or a chart version pin (in registry, overlay, or mixin):** run `make bom-docs` and commit the regenerated `docs/user/container-images.md` in the same PR. The BOM is rendered fresh from each Helm chart's actual templates, so an unbumped pin can still pick up upstream image drift — running it locally is the only reliable way to know whether the doc needs an update. The BOM's **version column and component set are gated**: `TestCommittedBOMVersionsMatchRegistry` (run by `make test` → `make qualify`, and by the `bom-freshness` merge-gate job on docs-only PRs) fails CI when a pinned version or the component set drifts from the registry, so a version change that forgets `make bom-docs` is caught. Not gated at PR time is *rendered-image drift* — an unbumped pin picking up a new image inside a chart's templates; `make bom-check` (a full re-render comparison) is its **opt-in** blocking check and is not wired into `make qualify`, `make lint`, or the merge gate, while the scheduled BOM-refresh workflow (`.github/workflows/bom-refresh.yaml`) auto-detects that drift weekly and opens a PR. So still run `make bom-docs` on any chart-touching change.
+
+**After any chart version pin bump (`defaultVersion` / `defaultTag`, in registry, overlay, or mixin):** the component's ADR-021 transition record must describe the boundary you just crossed. Records live at `recipes/components/<name>/upgrades.yaml`, referenced from the registry entry's `upgrades.file`. Two rules govern reach: a **`safe`** record's `to` ceiling may not reach past the current pin (only `safe` vouches, so only `safe` is held to what AICR ships — `manual` and `blocked` may describe a boundary above the pin, which is how upgrade guidance lands *before* the bump it describes), and the `from` domains may not leave a hole below the pin (so no operator version matches nothing). The second is what makes the obligation self-renewing: a bump leaving a hole below the new pin fails whatever any ceiling says. A coverage gate backs this: a component's record must cover every pin it has reached, a pin no record covers may not move (compared per source, so adding or dropping an overlay override counts), and a record may not disappear while its component remains. A record written ahead of its bump covers nothing until the pin reaches it, and a component that predates records needs one the first time its pin moves. `make lint` and every pull request run `check-upgrade-records`, which compares against the merge base with `upstream/main` if that remote exists, else `origin/main` (override with `AICR_UPGRADE_BASE_REF`).
+
+Author `safe` only with a `verifiedBy` naming a UAT lane, KWOK run, or upstream release note; `manual` and `blocked` need at least one step for every one of the seven deployers. A wrong `safe` is worse than no record, because it converts uncertainty into false confidence; when you do not know, leave it unwritten and let it report `unknown`. `summary` is not a changelog or release note: it names what breaks and by what mechanism, tightly, because it is read beside the steps at the moment someone decides whether to upgrade. Put upstream migration guides, release notes, and the component's own docs in `references` instead. Never add a Go test asserting a verdict for a real component: verdicts are validated empirically by KWOK and UAT, and pinning them in the unit suite turns "keep tests green" into pressure to weaken records. Full authoring guide: `docs/contributor/upgrade-records.md`.
+
+**After a pin bump (in registry, overlay, or mixin) or a values change of a component whose health check asserts a CRD, or after adding or removing a CRD assertion:** run `make crd-inventory` and commit the regenerated `recipes/components/<name>/crds.yaml` files, deletions included. The tool renders each pinned chart with `--include-crds` and the values of each recipe that asserts against it, and reports every asserted CRD the render for the asserting recipe does not install. `TestHealthCheckCRDAssertionsAnchored` fails `make test` when an inventory has no entry for a pin that a registry or leaf recipe health check is checked against, or a check asserts a CRD missing from both the list that entry gives the asserting recipe and the component's vendored manifests. See "CRD assertions" in `docs/contributor/validator.md`.
+
+**Using mixins for shared OS/platform content:**
+```yaml
+# Leaf overlay referencing mixins instead of duplicating content
+spec:
+  base: h100-eks-ubuntu-training
+  mixins:
+    - os-ubuntu          # Ubuntu constraints (defined once in recipes/mixins/)
+    - platform-kubeflow  # kubeflow-trainer component (defined once in recipes/mixins/)
+  criteria:
+    service: eks
+    accelerator: h100
+    os: ubuntu
+    intent: training
+    platform: kubeflow
+  constraints:
+    - name: K8s.server.version
+      value: ">= 1.32.4"
+```
+
+Mixins carry only `constraints` and `componentRefs` — no `criteria`, `base`, `mixins`, or `validation`. They live in `recipes/mixins/` with `kind: RecipeMixin`.
+
+## Error Wrapping Rules
+
+**Never return bare errors.** Every `return err` must wrap with context:
+```go
+// BAD - bare return loses context
+if err := doSomething(); err != nil {
+    return err
+}
+
+// GOOD - wrapped with context
+if err := doSomething(); err != nil {
+    return errors.Wrap(errors.ErrCodeInternal, "failed to do something", err)
+}
+```
+
+**Don't double-wrap errors that already have proper codes.** If a called function already returns a `pkg/errors` StructuredError with the right code, don't re-wrap and change its code:
+```go
+// BAD - overwrites inner ErrCodeNotFound with ErrCodeInternal
+content, err := readTemplateContent(ctx, path) // returns ErrCodeNotFound
+return errors.Wrap(errors.ErrCodeInternal, "read failed", err)
+
+// GOOD - propagate as-is when inner error already has correct code
+content, err := readTemplateContent(ctx, path)
+return err
+```
+
+**Exception:** Wrapping is unnecessary for read-only `Close()` returns and K8s helpers like `k8s.IgnoreNotFound(err)`.
+
+**Always use `errors.Is()` for sentinel error checks.** `golangci-lint` enforces the `errorlint` rule — comparing errors with `==` fails on wrapped errors and will be rejected by CI:
+
+```go
+// BAD - fails errorlint, breaks on wrapped errors
+if err == io.EOF {
+
+// GOOD - works with wrapped errors, passes linter
+if errors.Is(err, io.EOF) {
+```
+
+Note: in files that import `pkg/errors`, the standard library `errors` package is aliased as `stderrors`, so use `stderrors.Is(...)` there.
+
+**Writable file handles must check `Close()` errors.** If a file handle is writable (e.g., from `os.Create` or `os.OpenFile`), closing it may flush buffered data; always capture and check the error:
+```go
+// BAD - writable Close() error ignored
+defer f.Close()
+
+// GOOD - writable Close() error checked
+closeErr := f.Close()
+if err == nil {
+    err = closeErr
+}
+```
+
+## Context Propagation Rules
+
+**Never use `context.Background()` in I/O methods.** Use a timeout-bounded context:
+```go
+// BAD - unbounded context
+func (r *Reader) Read(url string) ([]byte, error) {
+    return r.ReadWithContext(context.Background(), url)
+}
+
+// GOOD - timeout-bounded
+func (r *Reader) Read(url string) ([]byte, error) {
+    ctx, cancel := context.WithTimeout(context.Background(), r.TotalTimeout)
+    defer cancel()
+    return r.ReadWithContext(ctx, url)
+}
+```
+
+**`context.Background()` is acceptable ONLY for:** cleanup in deferred functions (when parent context is canceled), graceful shutdown, and test setup.
+
+## HTTP Client Rules
+
+**Never use `http.DefaultClient`.** It has zero timeout. Always use a custom client with an explicit timeout:
+```go
+// BAD - no timeout, can hang indefinitely
+resp, err := http.DefaultClient.Do(req)
+
+// GOOD - bounded timeout from pkg/defaults
+client := &http.Client{Timeout: defaults.HTTPClientTimeout}
+resp, err := client.Do(req)
+```
+
+**Bound response bodies before `io.ReadAll`.** Outbound `io.ReadAll(resp.Body)` is unbounded by default; a hostile or buggy server can exhaust memory. Wrap with `io.LimitReader` against a `pkg/defaults` cap and reject anything that exceeds it:
+
+```go
+// GOOD
+limited := io.LimitReader(resp.Body, defaults.HTTPResponseBodyLimit+1)
+data, err := io.ReadAll(limited)
+if int64(len(data)) > defaults.HTTPResponseBodyLimit {
+    return nil, errors.New(errors.ErrCodeInvalidRequest, "response body exceeds limit")
+}
+```
+
+## HTTP Server Rules
+
+**Inbound HTTP servers must use the standard middleware chain in `pkg/server`.** It already wires:
+- `timeoutMiddleware` — per-request `context.WithTimeout(r.Context(), defaults.ServerHandlerTimeout)`. Required so a slow upstream cannot outlive `WriteTimeout`, which only kills the connection (not the goroutine).
+- `bodyLimitMiddleware` — `http.MaxBytesReader(w, r.Body, defaults.ServerMaxBodyBytes)`. Handlers may install a tighter cap (`MaxRecipePOSTBytes`, `MaxBundlePOSTBytes`).
+- `panicRecoveryMiddleware`, `requestIDMiddleware`, `rateLimitMiddleware`, `loggingMiddleware`, `metricsMiddleware`, `versionMiddleware`.
+
+**Do not leak internal error causes on 5xx responses.** Use `server.WriteErrorFromErr` — it embeds the underlying `Cause.Error()` in `details["error"]` only for 4xx (where it is typically validator feedback the client needs); 5xx responses log the cause server-side and withhold it from the response.
+
+## Logging Rules
+
+**Always use `slog` for output in production code.** Never use `fmt.Println`, `fmt.Printf`, or `fmt.Fprintln` for logging or streaming output:
+```go
+// BAD
+fmt.Println(scanner.Text())
+
+// GOOD
+slog.Info(scanner.Text())
+```
+
+**Exception:** `fmt.Fprintln(logWriter(), ...)` for agent log output to stderr is acceptable when structured logging would add noise to raw log streaming.
+
+**CLI user-facing output goes to `cmd.Root().Writer`, not stdout.** CLI commands write success messages and query results via `fmt.Fprint*(cmd.Root().Writer, ...)` (or `io.Writer` parameter) so output is testable and redirectable. `fmt.Println`/`fmt.Printf` directly to stdout breaks the test pattern in `pkg/cli` (root_test captures via `cmd.Writer`).
+
+**Log level env var:** `AICR_LOG_LEVEL` (only the prefixed name is honored; an unprefixed `LOG_LEVEL` was briefly documented as a legacy fallback but removed because it collides with system tooling). The CLI logger also honors `NO_COLOR` (de-facto standard, see <https://no-color.org/>) and TTY detection — color is suppressed when stderr is not a terminal or `NO_COLOR` is set.
+
+## Constants Rules
+
+**Use named constants from `pkg/defaults` instead of magic literals.** If a timeout, limit, or configuration value is used anywhere, it should be a named constant:
+```go
+// BAD - magic literal
+ExpectContinueTimeout: 1 * time.Second,
+
+// GOOD - named constant
+ExpectContinueTimeout: defaults.HTTPExpectContinueTimeout,
+```
+
+## Kubernetes Patterns
+
+**Use watch API instead of polling** for efficiency and reduced API server load:
+```go
+// BAD - polling with sleep
+ticker := time.NewTicker(500 * time.Millisecond)
+for {
+    select {
+    case <-ticker.C:
+        pod, err := client.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+        if pod.Status.Phase == v1.PodSucceeded {
+            return nil
+        }
+    }
+}
+
+// GOOD - watch API
+watcher, err := client.CoreV1().Pods(ns).Watch(ctx, metav1.ListOptions{
+    FieldSelector: "metadata.name=" + name,
+})
+defer watcher.Stop()
+for event := range watcher.ResultChan() {
+    pod := event.Object.(*v1.Pod)
+    if pod.Status.Phase == v1.PodSucceeded {
+        return nil
+    }
+}
+```
+
+**Use create-or-update semantics for mutable K8s resources** instead of `IgnoreAlreadyExists`:
+```go
+// BAD - stale resource silently kept from prior run
+_, err = clientset.RbacV1().Roles(ns).Create(ctx, role, metav1.CreateOptions{})
+if apierrors.IsAlreadyExists(err) {
+    return nil // stale rules persist!
+}
+
+// GOOD - create, then update if exists
+_, err = clientset.RbacV1().Roles(ns).Create(ctx, role, metav1.CreateOptions{})
+if apierrors.IsAlreadyExists(err) {
+    _, err = clientset.RbacV1().Roles(ns).Update(ctx, role, metav1.UpdateOptions{})
+    if err != nil {
+        return errors.Wrap(errors.ErrCodeInternal, "failed to update Role", err)
+    }
+    return nil
+}
+```
+
+**`IgnoreAlreadyExists` is acceptable ONLY for:** immutable resources (ServiceAccounts, Namespaces) where updates are not needed.
+
+**Use shared utilities from `pkg/k8s/pod`** instead of reimplementing:
+```go
+// Use for Job completion
+err := pod.WaitForJobCompletion(ctx, client, namespace, jobName, timeout)
+
+// Use for pod logs (empty containerName selects the pod's first container)
+logs, err := pod.GetPodLogs(ctx, client, namespace, podName, containerName)
+
+// Use for streaming logs
+err := pod.StreamLogs(ctx, client, namespace, podName, containerName, os.Stdout)
+
+// Use for ConfigMap URI parsing
+namespace, name, err := pod.ParseConfigMapURI("cm://gpu-operator/aicr-snapshot")
+```
+
+## Test Isolation
+
+**Always use `--no-cluster` flag in tests** to prevent production cluster access:
+```go
+// Unit tests: Use WithNoCluster(true)
+v := validator.New(
+    validator.WithNoCluster(true),
+    validator.WithVersion(version),
+)
+
+// E2E tests: Use --no-cluster flag
+aicr validate --recipe recipe.yaml --snapshot snapshot.yaml --no-cluster
+
+// Chainsaw tests: Always include --no-cluster
+${AICR_BIN} validate -r recipe.yaml -s snapshot.yaml --no-cluster
+```
+
+**Test mode behavior:** When `NoCluster` is true:
+- Validator skips RBAC creation (ServiceAccount, Role, ClusterRole)
+- Validator skips Job deployment for checks
+- All checks report status as "skipped - no-cluster mode (test mode)"
+- Constraints are still evaluated inline (no cluster access needed)
+
+## Documentation Style
+
+**Auto-anchors, no TOCs.** GitHub and the Fern docs site auto-generate anchor IDs from heading text (lowercase, spaces → hyphens). Do not add `## Table of Contents` blocks or explicit `<a name>` / `{#slug}` markup — they drift and duplicate what the platforms provide.
+
+**Promote `**Bold Label:**` to a heading sparingly** — only when it names a topic (feature, subsystem, pattern, named behavior) with ≥ ~8 content lines beneath it. Leave as bold paragraphs: recurring scaffolding (`Synopsis`, `Flags`, `Examples`, `Usage`, `Parameters`, `Returns`), generic structural labels (`Output`, `Benefits`, `Key Points`, `Installation`), thin sections (< 8 lines), FAQ-style entries under a collection heading, and paired short siblings (promote both or neither).
+
+**Slug gotchas when promoting** (GitHub keeps hyphens, strips other punctuation): trailing `(--flag)` → triple-hyphen slug (drop the parenthetical if the flag is already in the first paragraph); `+`, `&`, `/` between words → double-hyphen slugs (rewrite with `and`/`or`).
+
+**Anchor link hygiene.** Broken anchors are caught in CI by lychee on any PR touching `docs/**` (`.github/workflows/fern-docs-ci.yaml`, config `.lychee.toml`) — `make qualify` does NOT run it. When renaming/removing a heading, grep for `<filename>.md#<old-slug>` across the repo first (other docs, Helm templates, and `SECURITY.md` link into user-facing anchors), and update any inbound link in the same PR.
+
+## Code Comment Style
+
+**Go: follow [Go doc comment conventions](https://go.dev/doc/comment).** The violations that most often produce verbose comments:
+
+- Repo policy (stricter than Go's guidance, which permits short per-member comments under a group doc): a const/var group documented once at the top keeps its members bare — a lone multi-line comment on one member breaks the group.
+- A comparison between two values ("X is concrete, unlike wildcard Y") belongs on the *type's* doc comment, where readers of both see it — not on one member.
+- Don't document another subsystem's behavior in a declaration's comment, and don't restate an already-documented concept to set up a contrast — one defining sentence that references it is enough.
+- Keep enumerations inside existing doc comments accurate when adding values, instead of commenting the new line.
+
+**Python: conform to [PEP 8](https://peps.python.org/pep-0008/) with a 120-character line limit** (`pycodestyle --max-line-length=120` is the reference check), and follow [PEP 257](https://peps.python.org/pep-0257/) for docstrings on new or changed modules and functions — no retrofit of existing helpers is implied.
+
+**All languages:** a comment states what the code cannot show — a constraint, an absence ("no X because Y"), or provenance for a magic value. Comments that narrate the next line, restate the identifier, or justify the change to a reviewer are noise.
+
+## Anti-Patterns (Do Not Do)
+
+Process and unique findings below; the rule sections above (Error Wrapping, Context Propagation, HTTP Client/Server, Logging, Constants, Kubernetes Patterns, Test Isolation) are authoritative for everything they cover and are not repeated here.
+
+| Anti-Pattern | Correct Approach |
+|--------------|------------------|
+| Modify code without reading it first | Always `Read` files before `Edit` |
+| Skip or disable tests to make CI pass | Fix the actual issue |
+| Invent new patterns | Study existing code in same package first |
+| Ignore context cancellation | Always check `ctx.Done()` in loops/operations |
+| Add features not requested | Implement exactly what was asked |
+| Create new files when editing suffices | Prefer `Edit` over `Write` |
+| Guess at missing parameters | Ask for clarification |
+| Continue after 3 failed fix attempts | Stop, reassess approach, explain blockers |
+| Use boolean flags to track options | Use pointer pattern (nil = not set, &value = set) |
+| Hardcode resource names from templates | Extract to named constants to keep code and templates in sync |
+| Unbounded `io.ReadAll` on request bodies in HTTP handlers / public parsers | Wrap with `io.LimitReader` against `defaults.MaxRecipePOSTBytes` (or matching cap). Production callers use `http.MaxBytesReader`, but public APIs are reachable from CLI/library callers — bound defense-in-depth |
+| Unbounded `os.ReadFile(path)` before a size check | `os.Open` + `io.LimitReader(f, maxSize+1)` — `os.ReadFile` allocates the full file first, so attacker-influenced paths (`/proc` symlinks, network mounts) can OOM the process |
+| `yaml.Marshal` on `map[string]any` for output that feeds a digest/signature/OCI manifest/fingerprint | Use `serializer.MarshalYAMLDeterministic` — `yaml.v3` walks randomized Go map order, so two runs produce different bytes |
+| Negative test / presence check that passes on an ambiguous condition (`Get` error flattened to `NotFound`, `\|\| true` swallowing exit status, missing label → empty selector) | Fail closed — preserve `apierrors.IsNotFound` vs transient errors, capture `rc` and fail when `rc==0`, treat mixed/missing labels as an error. A spuriously-*passing* negative check is the dangerous direction (distinct from the validator-gate rule above) |
+| Chainsaw/kyverno-json assert with a literal one-element slice, or comparing an `omitempty` status field to `0` | Slice literals match exact length only — use a JMESPath projection (`x[?cond]`); `omitempty` fields (`NumberUnavailable`) are absent when healthy so `null==0` fails — assert non-omitempty fields (`numberReady == desiredNumberScheduled && desiredNumberScheduled > 0`) |
+| Security/read-only gate shaped as a denylist (enumerate the bad ops) | Invert to an allowlist — unknown or future-added ops must fail closed by default, not slip through (e.g. chainsaw's side-effecting `proxy` op under a cluster-admin SA) |
+| Deep-copy helper that recurses into maps but copies `[]any` by reference | Recurse into both `map[string]any` and `[]any`; scalars fall through the default branch by value. Slice aliasing leaks mutations across overlay merges |
+| Substring scan for `..` to defend against path traversal | Use `filepath.IsLocal(relPath)` — the substring check has false positives (`foo..bak`) and false negatives (after `filepath.Rel` cleans `..` segments) |
+| `sync.Once` caching state that depends on a settable global (e.g., a registry tied to a DataProvider) | Key the cache by a generation counter the setter increments; recompute on miss so late-bound configuration takes effect |
+| Returning a Go map from a function that releases its lock before the caller reads | Hold the lock for the full read (iterate inside the locked section), or return a defensive copy under lock |
+| Pre-flight / readiness gate that does `slog.Warn; continue` on evaluator errors | Fail closed — propagate the evaluator error. A malformed validation YAML must not masquerade as a passing constraint |
+| `slog.Warn` and continue on user `--set` / config-override parse or apply failure | Return `ErrCodeInvalidRequest` — a CLI flag typo must not ship a misconfigured artifact |
+| Type switch on `reading.Any()` that handles `int`/`int64` but not `float64` | Add a `case float64` branch (JSON decoders deliver integers as `float64`); reject when `float64(int64(v)) != v` to catch truncation |
+| Watch loop that returns "failed" when `watcher.ResultChan()` closes without context cancellation | Re-Get the resource (`Jobs().Get(...)`) before declaring failure — apiserver hiccups, LB drops, and rolling restarts commonly close watch channels |
+| Sequential calls to N independent read-only K8s APIs (e.g., `SelfSubjectAccessReview`) | Fan-out with `errgroup.WithContext`; preserve order via an indexed result slice. N×RTT → one RTT |
+| `pods.Items[0]` after a label-selector List | Filter `DeletionTimestamp != nil` and `PodFailed`; pick by youngest `CreationTimestamp`. An orphan pod from a prior run is the trap |
+| Background goroutine that swallows non-context errors silently (log streaming, watchers) | When `ctx.Err() == nil`, emit `slog.Warn` with the error — silent failures leave operators wondering why output is missing |
+| Artifact generators (BOM, SBOM, attestations) that bake `time.Now()` and a random UUID into output | Make both injectable via Metadata fields; provide a `Deterministic` mode that derives a UUIDv5 from input identity and omits the timestamp. Required for SLSA-reproducible builds |
+
+## Pull Request Requirements
+
+**Pre-push checklist:** Always run `make qualify` before pushing. This is the CI-equivalent gate that covers coverage-gated tests, linting (golangci-lint + yamllint + license headers, agents sync, docs filename/MDX/YAML/shell-placeholder/link gates, chart-version pins, vendored Go proxy action digests, upgrade records, runner labels), tuning-check, e2e, vulnerability scan, license allowlist check, API compatibility (api-diff), and REST contract compatibility (openapi-diff). Do not substitute a subset of commands. `make qualify` is the closest local equivalent of the CI gate. A few checks run only in CI (e.g. the lychee docs link check on `docs/**` PRs, CodeQL, and the GPU test lanes), so a green local `qualify` does not guarantee every CI job passes.
+
+**After any change to `.settings.yaml` or a `tools/update-*-checksums` script:** run `make check-settings-checksums`. It re-derives every pinned tool's SHA256 from upstream and fails when a version pin and its checksum pin disagree — the failure mode that ships a version bump with the previous release's digest. It is deliberately **not** part of `make qualify` (it needs network), but it *is* wired into the required merge gate, so skipping it locally means finding out on the PR. A digest that drifts under an *unchanged* version pin is reported separately and must not be "fixed" by re-running the refresher: that would overwrite a reviewed value with whatever upstream now serves.
+
+**Mandatory lint gate for Go changes:** If your PR changes any `.go` files, you MUST run `golangci-lint run -c .golangci.yaml` on each affected package path (e.g., `./pkg/recipe/...`, `./cmd/aicr/...`, `./tests/chainsaw/...`) and confirm zero issues before creating or pushing the PR. For a full module scan, use `./...`. Do not rely on CI to catch lint failures — fix them locally first. This applies even to PRs labeled as "documentation only" if they include Go code changes.
+
+**Branch hygiene.** The governing idea: the SHA a reviewer is reading should be the SHA you want reviewed.
+
+- **Keep the PR in draft while you are still changing it**; flip it to ready only when you want eyes on it. Draft PRs do not page reviewers, and that is the phase where rewriting history is free.
+- **While the PR is a draft, rebase and squash freely.** Do not key this on whether comments exist: CodeRabbit auto-reviews drafts here (`.coderabbit.yaml`, `auto_review.drafts: true`), so a bot comment lands minutes after the first push.
+- **Once the PR is not a draft — whether you flipped it or opened it that way — append commits instead of rewriting history.** Inline comments anchor to SHAs, and any rewrite outdates every one of them. Each appended commit dismisses approvals (`dismiss_stale_reviews_on_push` is on); that is the intended cost, since a force-push dismisses them too *and* destroys the anchors. Returning to draft stops paging reviewers and restores the draft phase's freedom to rewrite; if inline comments already exist, say on the PR that you rewrote and name the old and new SHA so reviewers know to restart.
+- **Do not hand-squash before merge.** `NVIDIA/aicr` is squash-merge-only, so GitHub composes the commit on `main` from the PR title; by default only the title and trailers reach `main`. Durable wording belongs in the PR title.
+- **Once the PR is not a draft, rebase only when the merge gate requires it** — but it does require it: the repo enforces up-to-date branches, so a PR behind `main` cannot merge. `git fetch origin main && git rebase origin/main`, never GitHub's "Update branch" button or a merge commit. A rebase is itself a force-push and can outdate anchors even when the content is unchanged, so treat it as one. To confirm it replayed your work cleanly, compare `git diff origin/main...HEAD` before and after, or use `git range-diff <old-sha>...HEAD`.
+- **Once the PR is not a draft, force-push only when you must** — a gate-required rebase, a missing signature or sign-off, a wrong base, a committed secret. Nothing else qualifies at that point; while it is still a draft the bullets above apply. **Default to the first form below**; never combine the two forms:
+  - `--force-with-lease --force-if-includes` — adds a reflog check that the remote tip was integrated locally, which is what closes the fail-open hole below. Enable it once per clone with `git config push.useForceIfIncludes true` — **per-repo, not `--global`**: the check also rejects in a fresh clone (the only reflog entry is the clone itself), and that friction belongs only where it is needed; or
+  - `--force-with-lease=<refname>:<sha-you-observed>` — pins the lease to a head you read and confirmed first. Use it where the reflog check cannot pass, such as a fresh clone. `<refname>` is the branch name as it exists on the remote, unprefixed, e.g. `git push origin my-branch --force-with-lease=my-branch:abc1234`.
+
+  `--force-if-includes` is a documented no-op when the lease already names an expected SHA, so pairing them leaves you trusting a guard git has disabled. A bare `--force-with-lease` alone can silently pass, because a background fetch or a concurrent session sharing the clone may have refreshed the remote-tracking ref its lease reads. Never plain `--force`. Say on the PR that you force-pushed, naming the old and new SHA. Both guards are a backstop, not the primary protection — they do not replace the rule against rebasing or force-pushing a branch you do not own.
+- Verify what you are about to push: `git log --oneline origin/main..HEAD` and `git diff --stat origin/main...HEAD`.
+- Sign every commit both ways: `git commit -S -s` (see Git Configuration above).
+
+**Responding to review:**
+- **Answer feedback on the thread, not only in code.** Reply with what changed and where — or why you disagreed or deferred. Do not make a reviewer diff two SHAs to find out, including when the feedback came via Slack.
+- Re-request review when you have finished responding to a round, and after any rewrite that changes the reviewed SHA. Not once per appended commit.
+
+**Documentation updates:** When a PR adds or changes user-visible behavior (new CLI flag, API endpoint, component, recipe field, deployment pattern, environment variable, error code), update the relevant page in `docs/` in the same PR — don't defer to a follow-up. Common targets by kind of change:
+- CLI flag / subcommand → `docs/user/cli-reference.md`
+- API endpoint / query parameter → `docs/user/api-reference.md`
+- Registry component → `docs/user/component-catalog.md`
+- Recipe / overlay / mixin structure → `docs/integrator/recipe-development.md` and `docs/contributor/recipe.md`
+- Internal package or architecture → `docs/contributor/<area>.md`
+- **Enum/constant value added** (e.g., new accelerator, service, OS, intent, platform, error code) → the value is usually enumerated in *many* files, not one, and grepping for the *new* value returns nothing. Start from the authoritative Go type (e.g., `pkg/recipe/criteria.go` for `CriteriaAccelerator*`), list every current value, and verify each appears wherever the enum is documented. Audit targets typically include: the OpenAPI contract at `api/aicr/v1/server.yaml` (every `enum:` block); doc pages `docs/README.md` (glossary), `docs/user/cli-reference.md`, `docs/user/api-reference.md`, `docs/contributor/api-server.md`, `docs/contributor/cli.md`, `docs/contributor/recipe.md`, `docs/contributor/validator.md`; Go-visible surfaces in the package that defines the type (package godoc in `pkg/<area>/doc.go`, field/type comments on the Go struct, and any urfave/cli `Description`/`Usage` strings that enumerate values, e.g., `pkg/cli/recipe.go`); and issue templates that surface the enum in dropdowns (`.github/ISSUE_TEMPLATE/*.yml`). Grepping `docs/` for an already-documented sibling value (e.g., `gb200`) catches forward additions but misses pre-existing drift — check against the Go type, not a known-good sibling.
+
+Follow the heading conventions in the `## Documentation Style` section above. Doc-only PRs (typically labeled `area/docs`) are still subject to the full `make qualify` gate.
+
+**PR description:** Use the template from `.github/PULL_REQUEST_TEMPLATE.md` exactly as defined there. Do not inline a modified copy — read and fill in the canonical template. The template covers: Summary, Motivation/Context (with Fixes/Related), Type of Change, Components Affected, Implementation Notes, Testing, Risk Assessment, and Checklist.
+
+**Test coverage gate (Go packages only; not YAML/docs/CI):**
+Before pushing a PR that changes Go source, check coverage on affected packages. Set `pkg` to the narrowest changed root — `$pkg/...` includes descendants (e.g. use `pkg=pkg/collector/topology`, not `pkg=pkg/collector`, unless you want a combined delta).
+1. Current: `go test -coverprofile=cover.out ./$pkg/...` on each changed package.
+2. Baseline (skip for new packages; commit changes first): `(git worktree add $TMPDIR/baseline origin/main && (cd $TMPDIR/baseline && go test -coverprofile=$TMPDIR/base.out ./$pkg/...); rc=$?; git worktree remove --force $TMPDIR/baseline; return $rc 2>/dev/null || (exit $rc))` — `$TMPDIR/base.out` survives cleanup and `rc` preserves test status. Compare with `go tool cover -func`.
+3. **Block** if `make test-coverage` fails (enforces the 83% floor from `.settings.yaml`, excluding `validators/` — see #1752; do not use per-package profiles for this check).
+4. **Flag** any package with per-package decrease > 0.5% (step 1 vs 2).
+5. **Block** if any new exported func/method (`git diff origin/main -- $pkg/`, added uppercase `func` lines) has 0% coverage — add tests first.
+6. Report the delta in the PR's Testing section (e.g. `pkg/recipe: 90.4% → 90.3% (-0.1%)`).
+CI also posts per-package deltas post-push via `go-coverage-report` (`on-push-comment.yaml`); this gate catches regressions before push.
+
+**PR policy:**
+- Link an issue assigned to the PR's human author (`Fixes:` or `Related:`, one line per issue); PRs an agent opens count toward that author's cap of 3 open PRs, drafts included. See `CONTRIBUTING.md` (Start with an issue, Claiming an Issue)
+- Do NOT add `Co-Authored-By` lines (organization policy)
+- Do NOT add "Generated with Claude Code", "Created by Codex", or similar attribution
+- Add a `theme/*` label matching the PR's primary concern: `theme/recipes`, `theme/validation`, `theme/deployer`, `theme/ci-dx`, `theme/community`, `theme/supply-chain`, `theme/resilience` (GPU resilience, mainly NVSentinel). Use `dependencies` for dependency bumps. (Bug/enhancement/documentation is an org-level *issue type*, which applies to issues, not PRs. There are no `bug` or `documentation` repo labels; an `enhancement` label exists but does not set the type. `gh pr create` aborts on a nonexistent `--label`, so check `gh label list` first.)
+- Area labels are auto-assigned by `.github/labeler.yml` based on changed file paths (e.g., `area/recipes`, `area/ci`, `area/api`, `area/cli`, `area/bundler`, `area/collector`, `area/validator`, `area/docs`, `area/infra`, `area/tests`). You may also add them manually when the auto-labeler wouldn't match (e.g., issue-only PRs or cross-cutting changes).
+- Do NOT add a priority label (`P0`, `P1`, `P2`) to PRs. Priority is a field on the AICR Project board (see **Issue policy** below), not a repo label, and the PR Label Guard workflow (`.github/workflows/pr-label-guard.yaml`) strips any `P<number>` label from a pull request
+- Do NOT add `size/*` labels (auto-assigned by bot)
+- **PR titles are linted.** CI enforces Conventional Commits format — `type: subject`, `type(scope): subject`, `type!: subject`, or `type(scope)!: subject`, where `!` marks a breaking change. Valid types: `build`, `chore`, `ci`, `docs`, `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, `test`. Scopes may be mixed case (`fix(GB200):`). A malformed title fails the check; editing the title re-runs it automatically. The title is the whole commit message on `main` (`squash_merge_commit_message: BLANK`) and cannot be corrected after merge
+- Keep the PR title to 70 characters or fewer; use the description for details. Over 70 warns but does not block — dependency-bot titles embed pseudo-versions that cannot be shortened
+
+**Issue policy:**
+- Set an **org issue type** on new issues. This is a GitHub-native field (shown in the standard issue view, distinct from repo `area/*`/`theme/*` labels) that categorizes the issue. Valid types: `Task`, `Bug`, `Enhancement`, `Epic`, `Initiative`, `Documentation`.
+  - Prefer `gh issue create --type Bug ...` (requires `gh` v2.94.0+); use `gh issue edit <n> --type Bug` for existing issues.
+  - With older `gh` versions, use the web UI or automation with the needed permissions. Current REST Issues create/edit endpoints also accept `type` for users with push access, but avoid stale ad hoc `gh api` examples because older clients or API versions may reject or silently drop the field.
+- Match the type to intent (a feature request → `Enhancement`, a docs gap → `Documentation`); the issue forms in `.github/ISSUE_TEMPLATE/` set a default type (`Bug`, `Enhancement`, `Documentation`), so only override when the template's choice is wrong.
+- The AICR Project board also has its own `Type` and `Priority` (P0–P2) fields — those are set on the *project board*, not the issue, and need a `project`-scoped token. Leave them to maintainers/automation unless explicitly asked.
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `CONTRIBUTING.md` | Contribution guidelines, PR process, DCO |
+| `DEVELOPMENT.md` | Development setup, architecture, Make targets |
+| `RELEASE.md` | Release process for maintainers |
+| `.settings.yaml` | Project settings: tool versions, quality thresholds, build/test config (single source of truth) |
+| `recipes/registry.yaml` | Declarative component configuration |
+| `recipes/overlays/*.yaml` | Recipe overlay definitions |
+| `recipes/mixins/*.yaml` | Composable mixin fragments (OS constraints, platform components) |
+| `recipes/components/*/values.yaml` | Component Helm values |
+| `api/aicr/v1/server.yaml` | OpenAPI spec |
+| `.goreleaser.yaml` | Release configuration |
+
+## Troubleshooting
+
+| Issue | Check |
+|-------|-------|
+| K8s connection fails | `~/.kube/config` or `KUBECONFIG` env |
+| GPU not detected | `nvidia-smi` in PATH |
+| Linter errors | Use `errors.Is()` not `==`; add `return` after `t.Fatal()` |
+| Race conditions | Run with `-race` flag |
+| Build failures | Run `make tidy` |
+
+## Design Principles
+
+**Operational:**
+- Partial failure is the steady state — design for partitions, timeouts, bounded retries
+- Boring first — default to proven, simple technologies
+- Observability is mandatory — structured logging, metrics, tracing
+
+**Foundational:**
+- Local development equals CI — `.settings.yaml` is single source of truth
+- Correctness must be reproducible — same inputs → same outputs, always
+- Metadata is separate from consumption — recipes define *what*, bundlers determine *how*
+- Recipe specialization requires explicit intent — never silently upgrade to specialized configs
+- Trust requires verifiable provenance — SLSA, SBOM, Sigstore
+
+## Decision Framework
+
+When choosing between approaches, prioritize in this order:
+1. **Testability** — Can it be unit tested without external dependencies?
+2. **Readability** — Can another engineer understand it quickly?
+3. **Consistency** — Does it match existing patterns in the codebase?
+4. **Simplicity** — Is it the simplest solution that works?
+5. **Reversibility** — Can it be easily changed later?
+
+## CLI Workflow Examples
+
+```bash
+# Capture system state
+aicr snapshot --output snapshot.yaml
+# AKS only: include the GPU pool projection or snapshot-qualified recipe
+# generation / validate readiness fails closed (ADR-015 gpuStack profile):
+#   az aks nodepool list -g <rg> --cluster-name <cluster> -o json > pools.json
+#   aicr snapshot --aks-gpu-pools pools.json --output snapshot.yaml
+# OKE only: include the add-on projection or snapshot-qualified recipe
+# generation / validate readiness fails closed (gpuStack profile):
+#   oci ce cluster list-addons --cluster-id <ocid> --all --output json > addons.json
+#   aicr snapshot --oke-addons addons.json --output snapshot.yaml
+# GKE bundle-installer and dra only: include the pool projection or
+# snapshot-qualified
+# recipe generation / validate readiness fails closed (gpuStack profile):
+#   gcloud container node-pools list --cluster <cluster> --format=json > pools.json
+#   aicr snapshot --gke-gpu-pools pools.json --output snapshot.yaml
+# The default gke-default value needs no pool dump.
+
+# Generate recipe from snapshot
+aicr recipe --snapshot snapshot.yaml --intent training --output recipe.yaml
+# (AKS with --gpu-driver none pools: add --profile gpuStack=operator-managed)
+
+# Generate recipe from query parameters
+aicr recipe --service eks --accelerator h100 --intent training --os ubuntu --platform kubeflow
+
+# Create deployment bundle
+aicr bundle --recipe recipe.yaml --output ./bundles
+
+# Query a specific hydrated value from a recipe
+aicr query --service eks --accelerator h100 --intent training \
+  --selector components.gpu-operator.values.driver.version
+
+# Validate recipe against snapshot
+aicr validate --recipe recipe.yaml --snapshot snapshot.yaml
+
+# Bundle with value overrides
+aicr bundle -r recipe.yaml \
+  --set gpuoperator:driver.version=570.86.16 \
+  --deployer argocd \
+  -o ./bundles
+```
+
+## Full Reference
+
+See `CONTRIBUTING.md`, `DEVELOPMENT.md`, `RELEASE.md`, and the `docs/` tree (`docs/contributor/` for architecture) for extended documentation including:
+- Detailed code examples for collectors, bundlers, API endpoints
+- GitHub Actions architecture (three-layer composite actions)
+- CI/CD workflows, supply chain security (SLSA, SBOM, Cosign)
+- E2E testing patterns and KWOK simulated cluster testing

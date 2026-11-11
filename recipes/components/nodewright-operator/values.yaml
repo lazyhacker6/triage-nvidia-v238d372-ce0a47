@@ -1,0 +1,40 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nodewright Helm values
+# Base configuration for all deployments
+
+# Override release name prefix to avoid aicr-stack- prefix in resource names
+fullnameOverride: skyhook-operator
+
+limitRange:
+  default:
+    cpu: "1"
+    memory: "1Gi"
+  defaultRequest:
+    cpu: "500m"
+    memory: "512Mi"
+
+controllerManager:
+  manager:
+    # The working set grows with node count (about 8.9Gi peak on the leader at
+    # 2500 GB300 nodes, #3148). The limit covers that; the request stays sized
+    # for small clusters, so raise it through valueOverrideKeys on large ones.
+    resources:
+      limits:
+        cpu: 1000m
+        memory: 12Gi
+      requests:
+        cpu: 1000m
+        memory: 2000Mi

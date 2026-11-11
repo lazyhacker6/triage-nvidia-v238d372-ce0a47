@@ -1,0 +1,74 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Reusable KWOK test runner shared by all three tiers (kwok-recipes.yaml).
+# Owns the single copy of the checkout -> load-versions -> kwok-test step
+# block; the deployer list itself lives once in the discover job's bash and
+# arrives here already expanded into {recipe, deployer} pairs (#1172).
+#
+# Tier 1 passes a flat pairs list (generic overlays on helm, plus one probe
+#   overlay on each other deployer, well under 256, so no batching needed).
+# Tier 2 passes a flat pairs list (helm-only, by deliberate policy -- see
+#   ADR-003 "Tier 2 deployer coverage").
+# Tier 3 passes one batch at a time from the discover job's tier3_batches
+#   output; the caller (test-tier3 in kwok-recipes.yaml) shards across
+#   batches to keep every shard's matrix under GitHub's 256-configuration cap.
+name: KWOK Test Run
+
+on:
+  workflow_call:
+    inputs:
+      pairs:
+        description: 'JSON array of {recipe, deployer} objects to test (<= 256 entries)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: '${{ matrix.pair.recipe }} (${{ matrix.pair.deployer }})'
+    runs-on: ubuntu-24.04
+    # Raised from 18→20: flux-oci lane's bounded readiness check alone takes ~7min.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: ${{ fromJSON(inputs.pairs) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load versions
+        id: versions
+        uses: ./.github/actions/load-versions
+
+      - name: Run KWOK test
+        uses: ./.github/actions/kwok-test
+        with:
+          recipe: ${{ matrix.pair.recipe }}
+          deployer: ${{ matrix.pair.deployer }}
+          kind_version: ${{ steps.versions.outputs.kind }}
+          helm_version: ${{ steps.versions.outputs.helm }}
+          kwok_version: ${{ steps.versions.outputs.kwok }}
+          kubectl_version: ${{ steps.versions.outputs.kubectl }}
+          yq_version: ${{ steps.versions.outputs.yq }}
+          flux_version: ${{ steps.versions.outputs.flux }}
+          chainsaw_version: ${{ steps.versions.outputs.chainsaw }}
+          chainsaw_sha256: ${{ steps.versions.outputs.chainsaw_sha256_linux_amd64 }}
+          kind_node_image: ${{ steps.versions.outputs.kind_node_image }}
+          job_timeout_minutes: '20'

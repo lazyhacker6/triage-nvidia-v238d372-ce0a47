@@ -1,0 +1,470 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package defaults
+
+import (
+	"testing"
+	"time"
+)
+
+func TestTimeoutConstants(t *testing.T) {
+	tests := []struct {
+		name     string
+		timeout  time.Duration
+		minValue time.Duration
+		maxValue time.Duration
+	}{
+		// Collector timeouts
+		{"CollectorTimeout", CollectorTimeout, 5 * time.Second, 30 * time.Second},
+		{"CollectorK8sTimeout", CollectorK8sTimeout, 30 * time.Second, 120 * time.Second},
+		{"NFDDetectionTimeout", NFDDetectionTimeout, 1 * time.Second, 15 * time.Second},
+		{"HostReadTimeout", HostReadTimeout, 100 * time.Millisecond, 5 * time.Second},
+		{"CollectorTopologyTimeout", CollectorTopologyTimeout, 60 * time.Second, 180 * time.Second},
+
+		// Handler timeouts
+		{"RecipeHandlerTimeout", RecipeHandlerTimeout, 10 * time.Second, 60 * time.Second},
+		{"RecipeBuildTimeout", RecipeBuildTimeout, 10 * time.Second, 30 * time.Second},
+		{"BundleHandlerTimeout", BundleHandlerTimeout, 30 * time.Second, 120 * time.Second},
+
+		// Server timeouts
+		{"ServerReadTimeout", ServerReadTimeout, 5 * time.Second, 30 * time.Second},
+		// ServerWriteTimeout must be ≥ longest per-handler timeout
+		// (BundleHandlerTimeout = 60s) plus headroom for error-path writes.
+		{"ServerWriteTimeout", ServerWriteTimeout, 60 * time.Second, 180 * time.Second},
+		{"ServerIdleTimeout", ServerIdleTimeout, 30 * time.Second, 300 * time.Second},
+		{"ServerShutdownTimeout", ServerShutdownTimeout, 10 * time.Second, 60 * time.Second},
+
+		// K8s timeouts
+		{"K8sJobCreationTimeout", K8sJobCreationTimeout, 10 * time.Second, 60 * time.Second},
+		{"K8sPodReadyTimeout", K8sPodReadyTimeout, 1 * time.Minute, 3 * time.Minute},
+		{"K8sJobCompletionTimeout", K8sJobCompletionTimeout, 1 * time.Minute, 10 * time.Minute},
+		{"AgentExitGracePeriod", AgentExitGracePeriod, 10 * time.Second, 2 * time.Minute},
+		{"K8sCleanupTimeout", K8sCleanupTimeout, 10 * time.Second, 60 * time.Second},
+		{"ClusterCleanupHelmUninstallTimeout", ClusterCleanupHelmUninstallTimeout, 1 * time.Minute, 5 * time.Minute},
+		{"ClusterCleanupNamespaceDeleteWait", ClusterCleanupNamespaceDeleteWait, 5 * time.Second, 60 * time.Second},
+		{"K8sServiceAccountVerifyTimeout", K8sServiceAccountVerifyTimeout, 10 * time.Second, 60 * time.Second},
+		{"K8sPodTerminationWaitTimeout", K8sPodTerminationWaitTimeout, 30 * time.Second, 120 * time.Second},
+
+		// HTTP client timeouts
+		{"HTTPClientTimeout", HTTPClientTimeout, 10 * time.Second, 60 * time.Second},
+		{"HTTPConnectTimeout", HTTPConnectTimeout, 1 * time.Second, 15 * time.Second},
+
+		// Validation phase timeouts
+		{"ResourceVerificationTimeout", ResourceVerificationTimeout, 5 * time.Second, 30 * time.Second},
+
+		// Conformance check execution timeout — parent ctx for all in-Job checks,
+		// sized for the slowest (cold-start inference benchmark).
+		{"CheckExecutionTimeout", CheckExecutionTimeout, 30 * time.Minute, 60 * time.Minute},
+
+		// Gang scheduling co-scheduling window
+		{"CoScheduleWindow", CoScheduleWindow, 10 * time.Second, 60 * time.Second},
+		{"GangNegativeWindow", GangNegativeWindow, 10 * time.Second, 60 * time.Second},
+		{"GangPositiveCompletionTimeout", GangPositiveCompletionTimeout, 1 * time.Minute, 5 * time.Minute},
+
+		// Trainer timeouts
+		{"TrainerControllerReadyTimeout", TrainerControllerReadyTimeout, 1 * time.Minute, 5 * time.Minute},
+
+		// Validator timeouts
+		{"ValidatorWaitBuffer", ValidatorWaitBuffer, 1 * time.Minute, 5 * time.Minute},
+		{"ValidatorJobDeadlineHeadroom", ValidatorJobDeadlineHeadroom, 1 * time.Minute, 10 * time.Minute},
+		{"ValidatorDefaultTimeout", ValidatorDefaultTimeout, 1 * time.Minute, 15 * time.Minute},
+		{"ValidatorTerminationGracePeriod", ValidatorTerminationGracePeriod, 10 * time.Second, 60 * time.Second},
+		{"ValidatorTerminationWaitMargin", ValidatorTerminationWaitMargin, 1 * time.Second, 15 * time.Second},
+		{"ValidatorMinCompletionWait", ValidatorMinCompletionWait, 10 * time.Second, 60 * time.Second},
+
+		// ConfigMap read/write budgets — held as distinct constants so the
+		// read path (serializer resolving cm:// URIs) and the write path
+		// (snapshot upload, which needs headroom for rate-limiter backoff)
+		// can move independently. Same value today; range guards a bad
+		// dependency bump from silently making either wildly short or long.
+		{"ConfigMapReadTimeout", ConfigMapReadTimeout, 10 * time.Second, 60 * time.Second},
+		{"ConfigMapWriteTimeout", ConfigMapWriteTimeout, 10 * time.Second, 60 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.timeout < tt.minValue {
+				t.Errorf("%s (%v) is below minimum expected value (%v)", tt.name, tt.timeout, tt.minValue)
+			}
+			if tt.timeout > tt.maxValue {
+				t.Errorf("%s (%v) is above maximum expected value (%v)", tt.name, tt.timeout, tt.maxValue)
+			}
+		})
+	}
+}
+
+// TestJobEnvelopeMarginInvariant guards the contract that the deployment
+// validator Job's activeDeadlineSeconds exceeds the inner
+// ChainsawAssertTimeout by enough headroom for chainsaw to terminate, clean
+// up its temp dir, and flush logs before SIGKILL. See issue #1220.
+func TestJobEnvelopeMarginInvariant(t *testing.T) {
+	if JobEnvelopeMargin < 60*time.Second {
+		t.Errorf("JobEnvelopeMargin (%v) must be >= 60s (30s default Pod terminationGracePeriodSeconds + 30s pre-chainsaw helper iteration headroom)",
+			JobEnvelopeMargin)
+	}
+	envelope := ChainsawAssertTimeout + JobEnvelopeMargin
+	if envelope <= ChainsawAssertTimeout {
+		t.Errorf("envelope (%v) must exceed ChainsawAssertTimeout (%v)", envelope, ChainsawAssertTimeout)
+	}
+}
+
+// TestSigstoreRetryBudgetInvariant guards the contract that the retry
+// budget fits inside the outer SigstoreSignTimeout ceiling: worst-case
+// wall-clock is SigstoreRetryBudget * SigstoreAttemptTimeout plus the
+// sum of backoffs between attempts, and that total must not exceed
+// SigstoreSignTimeout — otherwise the inner retry loop would race the
+// outer deadline. See issue #1249.
+//
+// Caveat: the Rekor v2 signing path (attestation.transparencyForOptions) may
+// prepend a cold-cache TUF signing-config fetch that draws from the same caller
+// budget before this retry loop runs, so a first-ever cold sign has less than
+// the full budget asserted here. It fails closed and release CI pre-warms the
+// cache via `aicr trust update`; see the budget note in transparencyForOptions.
+func TestSigstoreRetryBudgetInvariant(t *testing.T) {
+	if SigstoreRetryBudget <= 0 {
+		t.Fatalf("SigstoreRetryBudget must be > 0; got %d", SigstoreRetryBudget)
+	}
+	if SigstoreAttemptTimeout <= 0 {
+		t.Fatalf("SigstoreAttemptTimeout must be > 0; got %v", SigstoreAttemptTimeout)
+	}
+	if SigstoreRetryInitialBackoff <= 0 {
+		t.Fatalf("SigstoreRetryInitialBackoff must be > 0; got %v", SigstoreRetryInitialBackoff)
+	}
+	if SigstoreRetryBackoffFactor < 1 {
+		t.Fatalf("SigstoreRetryBackoffFactor must be >= 1; got %d", SigstoreRetryBackoffFactor)
+	}
+
+	// Compute worst-case: every attempt hits the per-attempt timeout,
+	// every backoff between attempts is taken in full.
+	totalAttempts := SigstoreRetryBudget * SigstoreAttemptTimeout
+	var totalBackoffs time.Duration
+	backoff := SigstoreRetryInitialBackoff
+	for range SigstoreRetryBudget - 1 {
+		totalBackoffs += backoff
+		backoff *= time.Duration(SigstoreRetryBackoffFactor)
+	}
+	worstCase := totalAttempts + totalBackoffs
+	if worstCase > SigstoreSignTimeout {
+		t.Errorf("worst-case retry budget %v exceeds SigstoreSignTimeout %v "+
+			"(attempts: %d × %v = %v, backoffs: %v) — raise SigstoreSignTimeout "+
+			"or tighten the per-attempt / backoff knobs in lockstep",
+			worstCase, SigstoreSignTimeout, SigstoreRetryBudget,
+			SigstoreAttemptTimeout, totalAttempts, totalBackoffs)
+	}
+}
+
+func TestRecipeBuildTimeoutLessThanHandler(t *testing.T) {
+	// Recipe build timeout should be less than handler timeout
+	// to allow for error handling before the request times out
+	if RecipeBuildTimeout >= RecipeHandlerTimeout {
+		t.Errorf("RecipeBuildTimeout (%v) should be less than RecipeHandlerTimeout (%v)",
+			RecipeBuildTimeout, RecipeHandlerTimeout)
+	}
+}
+
+func TestServerTimeoutRelationships(t *testing.T) {
+	// Read timeout should be shorter than write timeout
+	if ServerReadTimeout > ServerWriteTimeout {
+		t.Errorf("ServerReadTimeout (%v) should not exceed ServerWriteTimeout (%v)",
+			ServerReadTimeout, ServerWriteTimeout)
+	}
+
+	// Idle timeout should be longer than write timeout
+	if ServerIdleTimeout < ServerWriteTimeout {
+		t.Errorf("ServerIdleTimeout (%v) should be at least ServerWriteTimeout (%v)",
+			ServerIdleTimeout, ServerWriteTimeout)
+	}
+}
+
+func TestHTTPClientTimeoutRelationships(t *testing.T) {
+	// Connect timeout should be less than total timeout
+	if HTTPConnectTimeout >= HTTPClientTimeout {
+		t.Errorf("HTTPConnectTimeout (%v) should be less than HTTPClientTimeout (%v)",
+			HTTPConnectTimeout, HTTPClientTimeout)
+	}
+
+	// TLS handshake timeout should be less than total timeout
+	if HTTPTLSHandshakeTimeout >= HTTPClientTimeout {
+		t.Errorf("HTTPTLSHandshakeTimeout (%v) should be less than HTTPClientTimeout (%v)",
+			HTTPTLSHandshakeTimeout, HTTPClientTimeout)
+	}
+}
+
+func TestCheckExecutionTimeoutRelationships(t *testing.T) {
+	// Individual check timeouts must fit within the execution context.
+	childTimeouts := []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{"DRATestPodTimeout", DRATestPodTimeout},
+		{"GangPositiveCompletionTimeout", GangPositiveCompletionTimeout},
+		{"InferenceHealthTimeout", InferenceHealthTimeout},
+		{"InferencePerfJobTimeout", InferencePerfJobTimeout},
+		{"InferencePerfPodTimeout", InferencePerfPodTimeout},
+		{"InferenceRouteAcceptTimeout", InferenceRouteAcceptTimeout},
+		{"InferenceWorkloadReadyTimeout", InferenceWorkloadReadyTimeout},
+		{"ModelCachePopulateTimeout", ModelCachePopulateTimeout},
+	}
+	for _, c := range childTimeouts {
+		if c.timeout >= CheckExecutionTimeout {
+			t.Errorf("%s (%v) should be less than CheckExecutionTimeout (%v)",
+				c.name, c.timeout, CheckExecutionTimeout)
+		}
+	}
+
+	// All serial phases of the inference pipeline that consume the parent
+	// CheckExecutionTimeout must together fit under it. This mirrors the
+	// worst-case happy path inside validateInferencePerf:
+	//
+	//   InferenceNamespaceTerminationWait (5m)  — prior run's ns drain
+	//   + ModelCachePopulateTimeout       (13m) — model-cache populate (on by default)
+	//   + InferenceWorkloadReadyTimeout   (10m) — DynamoGraphDeployment ready
+	//   + InferenceRouteAcceptTimeout     (30s) — gateway-epp HTTPRoute accepted
+	//   + InferenceHealthTimeout          (5m)  — /v1/chat/completions readiness probe
+	//   + InferencePerfPodTimeout         (5m)  — AIPerf pod scheduling
+	//   + InferencePerfJobTimeout         (15m) — AIPerf benchmark runtime
+	//
+	// The cache-populate phase has its own budget (ModelCachePopulateTimeout, see
+	// model_cache.go) and is serial when the cache is enabled (the default).
+	// Cleanup (K8sCleanupTimeout) uses a fresh context.Background and does
+	// not consume this budget — documented via the separate assertion below.
+	inferenceSequential := InferenceNamespaceTerminationWait +
+		ModelCachePopulateTimeout + // model-cache populate
+		InferenceWorkloadReadyTimeout + // DynamoGraphDeployment ready
+		InferenceRouteAcceptTimeout + // gateway-epp HTTPRoute accepted
+		InferenceHealthTimeout +
+		InferencePerfPodTimeout +
+		InferencePerfJobTimeout
+	if inferenceSequential >= CheckExecutionTimeout {
+		t.Errorf("Inference sequential phases %v (NamespaceTermination + CachePopulate + WorkloadReady + RouteAccept + Health + PerfPod + PerfJob) must be less than CheckExecutionTimeout (%v)",
+			inferenceSequential, CheckExecutionTimeout)
+	}
+
+	// Cleanup runs post-ctx under its own background context, but we still
+	// want the parent ceiling plus cleanup to comfortably fit within the
+	// catalog's Job-level activeDeadlineSeconds ceiling (verified at the
+	// catalog-loading layer, not here) so a Job kill doesn't interrupt the
+	// cleanup path mid-delete.
+	if CheckExecutionTimeout+K8sCleanupTimeout >= 60*time.Minute {
+		t.Errorf("CheckExecutionTimeout (%v) + K8sCleanupTimeout (%v) should stay well under a 1h Job ceiling to leave room for scheduling delays",
+			CheckExecutionTimeout, K8sCleanupTimeout)
+	}
+}
+
+func TestCollectorTimeoutLessThanK8s(t *testing.T) {
+	// Individual collector timeout should be less than K8s collector timeout
+	// since K8s operations may involve multiple API calls
+	if CollectorTimeout > CollectorK8sTimeout {
+		t.Errorf("CollectorTimeout (%v) should not exceed CollectorK8sTimeout (%v)",
+			CollectorTimeout, CollectorK8sTimeout)
+	}
+}
+
+func TestValidatorTimeoutRelationships(t *testing.T) {
+	if ValidatorJobDeadlineHeadroom <= ValidatorTerminationGracePeriod {
+		t.Errorf("Job headroom %v must exceed termination grace %v", ValidatorJobDeadlineHeadroom, ValidatorTerminationGracePeriod)
+	}
+	for name, bound := range map[string]time.Duration{
+		"K8sCleanupTimeout":       K8sCleanupTimeout,
+		"PreflightCleanupTimeout": PreflightCleanupTimeout,
+	} {
+		if bound > ValidatorTerminationGracePeriod {
+			t.Errorf("%s (%v) exceeds termination grace (%v)", name, bound, ValidatorTerminationGracePeriod)
+		}
+	}
+	// The interrupted-run termination wait covers the pod's full SIGTERM grace
+	// from Job deletion plus a delivery margin. The margin is not a work budget,
+	// and the normal post-deletion wait must cover the same window so both
+	// paths keep RBAC alive for the whole grace.
+	if ValidatorTerminationWaitMargin <= 0 || ValidatorTerminationWaitMargin >= ValidatorTerminationGracePeriod {
+		t.Errorf("ValidatorTerminationWaitMargin (%v) must be positive and below termination grace (%v)",
+			ValidatorTerminationWaitMargin, ValidatorTerminationGracePeriod)
+	}
+	if K8sPodTerminationWaitTimeout < ValidatorTerminationGracePeriod+ValidatorTerminationWaitMargin {
+		t.Errorf("K8sPodTerminationWaitTimeout (%v) must cover termination grace + margin (%v)",
+			K8sPodTerminationWaitTimeout, ValidatorTerminationGracePeriod+ValidatorTerminationWaitMargin)
+	}
+	// Grace period must fit within the wait buffer so the orchestrator
+	// outlives the container's SIGTERM window.
+	if ValidatorTerminationGracePeriod > ValidatorWaitBuffer {
+		t.Errorf("ValidatorTerminationGracePeriod (%v) should not exceed ValidatorWaitBuffer (%v)",
+			ValidatorTerminationGracePeriod, ValidatorWaitBuffer)
+	}
+	// The orchestrator must outlive the pod's own clean exit, so the wait
+	// buffer has to cover pod-start latency (scheduling + image pull).
+	if ValidatorWaitBuffer < K8sPodReadyTimeout {
+		t.Errorf("ValidatorWaitBuffer (%v) must be at least K8sPodReadyTimeout (%v)",
+			ValidatorWaitBuffer, K8sPodReadyTimeout)
+	}
+	// The two checks above do not backstop a dropped summand: if
+	// ValidatorTerminationGracePeriod were dropped from ValidatorWaitBuffer's
+	// definition, the result (2m) would still pass both the bounds-range table
+	// test and the >= K8sPodReadyTimeout check above. Assert the sum of the two
+	// independently named constants directly so a dropped summand fails here.
+	if ValidatorWaitBuffer < K8sPodReadyTimeout+ValidatorTerminationGracePeriod {
+		t.Errorf("ValidatorWaitBuffer (%v) must be at least K8sPodReadyTimeout + ValidatorTerminationGracePeriod (%v)",
+			ValidatorWaitBuffer, K8sPodReadyTimeout+ValidatorTerminationGracePeriod)
+	}
+	// Kubernetes must be the LOOSEST clock. If the Job deadline is not
+	// strictly beyond the orchestrator's wait, the Job controller can kill and
+	// delete the pod before the orchestrator reads its logs — issue #2473.
+	if ValidatorJobDeadlineHeadroom <= ValidatorWaitBuffer {
+		t.Errorf("ValidatorJobDeadlineHeadroom (%v) must exceed ValidatorWaitBuffer (%v)",
+			ValidatorJobDeadlineHeadroom, ValidatorWaitBuffer)
+	}
+	// The floor on a start-time-rebased wait has to leave room for a Job past
+	// its deadline to stamp a terminal condition, which takes at least the
+	// pod's SIGTERM-to-SIGKILL window; and it must stay under the wait buffer,
+	// or a floor larger than the budget it clamps would extend every wait
+	// instead of bounding the clamped ones.
+	if ValidatorMinCompletionWait < ValidatorTerminationGracePeriod {
+		t.Errorf("ValidatorMinCompletionWait (%v) must be at least ValidatorTerminationGracePeriod (%v)",
+			ValidatorMinCompletionWait, ValidatorTerminationGracePeriod)
+	}
+	if ValidatorMinCompletionWait > ValidatorWaitBuffer {
+		t.Errorf("ValidatorMinCompletionWait (%v) must not exceed ValidatorWaitBuffer (%v)",
+			ValidatorMinCompletionWait, ValidatorWaitBuffer)
+	}
+	// Default timeout must be positive and reasonable.
+	if ValidatorDefaultTimeout < 1*time.Minute {
+		t.Errorf("ValidatorDefaultTimeout (%v) should be at least 1m", ValidatorDefaultTimeout)
+	}
+	// Max stdout lines must be positive.
+	if ValidatorMaxStdoutLines <= 0 {
+		t.Errorf("ValidatorMaxStdoutLines (%d) should be positive", ValidatorMaxStdoutLines)
+	}
+}
+
+func TestHostReadBudgetFitsCollectorTimeout(t *testing.T) {
+	if MaxStalledHostReads < 1 {
+		t.Fatalf("MaxStalledHostReads (%d) must be at least 1", MaxStalledHostReads)
+	}
+	// The sysctl sweep can stall MaxStalledHostReads times, and the grub and
+	// kmod subtypes once each. All of it must fit inside the OS collector's
+	// own deadline, or a wedged node loses every OS subtype instead of one.
+	worstCase := HostReadTimeout * time.Duration(MaxStalledHostReads+2)
+	if worstCase >= CollectorTimeout {
+		t.Errorf("HostReadTimeout (%v) x (MaxStalledHostReads (%d) + 2) = %v must be less than CollectorTimeout (%v)",
+			HostReadTimeout, MaxStalledHostReads, worstCase, CollectorTimeout)
+	}
+}
+
+func TestAgentExitGracePeriodLessThanJobCompletion(t *testing.T) {
+	// The grace only shortens a wait that would otherwise run to the Job
+	// timeout. A grace at or above it would never fire.
+	if AgentExitGracePeriod >= K8sJobCompletionTimeout {
+		t.Errorf("AgentExitGracePeriod (%v) must be less than K8sJobCompletionTimeout (%v)",
+			AgentExitGracePeriod, K8sJobCompletionTimeout)
+	}
+}
+
+func TestTopologyTimeoutGreaterThanK8s(t *testing.T) {
+	// Topology collector paginates through all nodes, so it needs more time
+	// than the standard K8s collector
+	if CollectorTopologyTimeout <= CollectorK8sTimeout {
+		t.Errorf("CollectorTopologyTimeout (%v) should exceed CollectorK8sTimeout (%v)",
+			CollectorTopologyTimeout, CollectorK8sTimeout)
+	}
+}
+
+func TestOCIPhaseBudgetConstants(t *testing.T) {
+	tests := []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{name: "source stage", got: OCISourceStageTimeout, want: 2 * time.Minute},
+		{name: "local package", got: OCILocalPackageTimeout, want: 4 * time.Minute},
+		{name: "registry attempt", got: RegistryPushTimeout, want: 7 * time.Minute},
+		{name: "image refs", got: OCIImageRefsWriteTimeout, want: 30 * time.Second},
+		{name: "whole publish", got: OCIBundlePublishTimeout, want: 35 * time.Minute},
+		{name: "recipe construction", got: OCIRecipeConstructionTimeout, want: 8 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Fatalf("timeout = %v, want %v", tt.got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOCIBundlePublishTimeoutWorstCaseInvariant(t *testing.T) {
+	const maximumJitterNumerator = 5
+	const maximumJitterDenominator = 4
+	worstBackoff := RegistryPushBackoff * maximumJitterNumerator / maximumJitterDenominator
+	worstBackoffs := worstBackoff + 2*worstBackoff
+	worstCase := 2*OCISourceStageTimeout + OCILocalPackageTimeout +
+		time.Duration(RegistryPushRetries)*RegistryPushTimeout +
+		worstBackoffs + OCIImageRefsWriteTimeout
+	want := 29*time.Minute + 33*time.Second + 750*time.Millisecond
+	if worstCase != want {
+		t.Fatalf("OCI worst-case budget = %v, want exact %v", worstCase, want)
+	}
+	if headroom := OCIBundlePublishTimeout - worstCase; headroom <= 5*time.Minute {
+		t.Fatalf("OCI whole-publish headroom = %v, want > 5m", headroom)
+	}
+}
+
+func TestOCIRecipePullBudgetInvariant(t *testing.T) {
+	const maximumJitterNumerator = 5
+	const maximumJitterDenominator = 4
+	const minimumMaterializationAndCatalogValidationHeadroom = 3 * time.Minute
+
+	worstCase := time.Duration(OCIRecipePullRetries) * OCIRecipePullAttemptTimeout
+	backoff := OCIRecipePullBackoff
+	for range OCIRecipePullRetries - 1 {
+		worstCase += backoff * maximumJitterNumerator / maximumJitterDenominator
+		backoff *= 2
+	}
+	wantWorstCase := 4*time.Minute + 33*time.Second + 750*time.Millisecond
+	if worstCase != wantWorstCase {
+		t.Fatalf("OCI recipe maximum-jitter pull retry budget = %v, want exact %v",
+			worstCase, wantWorstCase)
+	}
+	if worstCase > OCIRecipePullTimeout {
+		t.Fatalf("OCI recipe pull retry budget %v exceeds per-phase timeout %v",
+			worstCase, OCIRecipePullTimeout)
+	}
+	headroom := OCIRecipeConstructionTimeout - worstCase
+	if headroom < minimumMaterializationAndCatalogValidationHeadroom {
+		t.Fatalf("OCI recipe materialization and catalog-validation headroom = %v, want >= %v",
+			headroom, minimumMaterializationAndCatalogValidationHeadroom)
+	}
+}
+
+func TestOCIRecipeResourceLimitInvariants(t *testing.T) {
+	if MaxOCIRecipeManifestBytes <= 0 || MaxOCIRecipeLayerBytes <= 0 ||
+		MaxOCIRecipeDownloadBytes <= 0 || MaxOCIRecipeRetryTrafficBytes <= 0 ||
+		MaxOCIRecipeExtractedBytes <= 0 || MaxOCIRecipeFileBytes <= 0 ||
+		MaxOCIRecipeFiles <= 0 {
+
+		t.Fatal("all OCI recipe resource limits must be positive")
+	}
+	if MaxOCIRecipeLayerBytes > MaxOCIRecipeDownloadBytes {
+		t.Fatal("single-layer limit exceeds total-download limit")
+	}
+	if MaxOCIRecipeFileBytes != MaxExternalDataFileBytes ||
+		MaxOCIRecipeFileBytes > MaxOCIRecipeExtractedBytes {
+
+		t.Fatal("OCI recipe file limit must match the provider and fit extraction")
+	}
+	wantTraffic := int64(OCIRecipePullRetries) *
+		(MaxOCIRecipeManifestBytes + MaxOCIRecipeDownloadBytes + 1)
+	if MaxOCIRecipeRetryTrafficBytes != wantTraffic {
+		t.Fatalf("OCI recipe retry traffic limit = %d, want %d",
+			MaxOCIRecipeRetryTrafficBytes, wantTraffic)
+	}
+}

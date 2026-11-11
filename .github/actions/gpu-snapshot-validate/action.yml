@@ -1,0 +1,61 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: GPU Snapshot and Validate
+description: Run aicr snapshot and validate GPU detection
+
+inputs:
+  gpu_model:
+    description: 'Expected GPU model substring (e.g., T4, H100)'
+    required: true
+  min_gpu_count:
+    description: 'Minimum expected GPU count'
+    required: true
+    default: '1'
+  cluster_name:
+    description: 'Kind cluster name (for kubectl context)'
+    required: true
+  snapshot_timeout:
+    description: 'Timeout for aicr snapshot'
+    required: false
+    default: '5m'
+
+runs:
+  using: composite
+  steps:
+    - name: Build snapshot agent image
+      uses: ./.github/actions/aicr-build
+      env:
+        KIND_CLUSTER_NAME: ${{ inputs.cluster_name }}
+      with:
+        build_cli: 'false'
+        build_snapshot_agent: 'true'
+        validator_phases: 'none'
+    - name: Run aicr snapshot
+      shell: bash
+      env:
+        SNAPSHOT_TIMEOUT: ${{ inputs.snapshot_timeout }}
+      run: bash "${{ github.action_path }}/run-snapshot.sh"
+    - name: Validate snapshot detected GPU
+      shell: bash
+      env:
+        EXPECTED_GPU_MODEL: ${{ inputs.gpu_model }}
+        MIN_GPU_COUNT: ${{ inputs.min_gpu_count }}
+      run: bash "${{ github.action_path }}/validate-snapshot-gpu.sh"
+    - name: Debug snapshot Job
+      if: failure()
+      shell: bash
+      env:
+        KIND_CLUSTER_NAME: ${{ inputs.cluster_name }}
+      run: bash "${{ github.action_path }}/debug-snapshot-job.sh"

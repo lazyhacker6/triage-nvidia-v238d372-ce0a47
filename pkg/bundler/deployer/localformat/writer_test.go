@@ -1,0 +1,1297 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package localformat_test
+
+import (
+	"context"
+	stderrors "errors"
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer/localformat"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+)
+
+var update = flag.Bool("update", false, "update golden files")
+
+func TestWrite_UpstreamHelmOnly(t *testing.T) {
+	outDir := t.TempDir()
+
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       "nfd",
+			Namespace:  "node-feature-discovery",
+			Repository: "https://kubernetes-sigs.github.io/node-feature-discovery/charts",
+			ChartName:  "node-feature-discovery",
+			Version:    "v0.16.1",
+			Values:     map[string]any{"image": map[string]any{"tag": "v0.16.1"}},
+		}},
+	})
+	folders := res.Folders
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if len(folders) != 1 {
+		t.Fatalf("want 1 folder, got %d", len(folders))
+	}
+	if got, want := folders[0].Dir, "001-nfd"; got != want {
+		t.Errorf("folders[0].Dir = %q, want %q", got, want)
+	}
+	if got, want := folders[0].Kind, localformat.KindUpstreamHelm; got != want {
+		t.Errorf("folders[0].Kind = %v, want %v", got, want)
+	}
+
+	// Files written on disk
+	for _, rel := range []string{"install.sh", "values.yaml", "cluster-values.yaml", "upstream.env"} {
+		if _, err := os.Stat(filepath.Join(outDir, "001-nfd", rel)); err != nil {
+			t.Errorf("missing file %s: %v", rel, err)
+		}
+	}
+	// No Chart.yaml for upstream-helm
+	if _, err := os.Stat(filepath.Join(outDir, "001-nfd", "Chart.yaml")); !os.IsNotExist(err) {
+		t.Errorf("Chart.yaml must not exist for upstream-helm folder")
+	}
+
+	// Golden-file compare for install.sh + upstream.env
+	assertGolden(t, outDir, "testdata/upstream_helm_only", "001-nfd/install.sh")
+	assertGolden(t, outDir, "testdata/upstream_helm_only", "001-nfd/upstream.env")
+}
+
+// TestWrite_UpstreamHelmInstallScript_RejectsInjectedRecipeValues runs the
+// rendered install.sh for an upstream-helm folder with a hostile component
+// name and namespace and asserts helm receives each as a single, unevaluated
+// argv element.
+//
+// A strings.Contains on the rendered script proves nothing about quoting: it
+// would pass whether or not the value is actually safe to hand to bash. Only
+// running the script and inspecting what the invoked command received
+// answers that. Component names are validated only as path components
+// (deployer.IsSafePathComponent rejects separators, not shell
+// metacharacters) and the namespace is not validated at all on this path, so
+// install.sh has to neutralize both itself.
+func TestWrite_UpstreamHelmInstallScript_RejectsInjectedRecipeValues(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	// Each payload embeds a space (proves no word-splitting) and a command
+	// substitution (proves no evaluation) behind one interpolation.
+	nameCanary := "pwned-upstream-name"
+	namespaceCanary := "pwned-upstream-namespace"
+	hostileName := "nfd evil$(touch " + nameCanary + ")"
+	hostileNamespace := "ns evil$(touch " + namespaceCanary + ")"
+
+	outDir := t.TempDir()
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       hostileName,
+			Namespace:  hostileNamespace,
+			Repository: "https://kubernetes-sigs.github.io/node-feature-discovery/charts",
+			ChartName:  "node-feature-discovery",
+			Version:    "v0.16.1",
+			Values:     map[string]any{"image": map[string]any{"tag": "v0.16.1"}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	scriptPath := filepath.Join(outDir, res.Folders[0].Dir, "install.sh")
+
+	// Syntactic validity first: a bad escape surfacing as an unbalanced
+	// quote is a clearer failure here than as a confusing runtime error.
+	if out, perr := exec.Command("bash", "-n", scriptPath).CombinedOutput(); perr != nil {
+		t.Fatalf("generated script is not valid bash: %v\n%s", perr, out)
+	}
+
+	stub := t.TempDir()
+	argvFile := filepath.Join(stub, "argv")
+	if werr := os.WriteFile(filepath.Join(stub, "helm"), []byte(helmArgvStub(argvFile)), 0o755); werr != nil {
+		t.Fatalf("write helm stub: %v", werr)
+	}
+
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = append(os.Environ(), "PATH="+stub+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, runErr := cmd.CombinedOutput()
+	t.Logf("script output (exit=%v):\n%s", runErr, out)
+	if runErr != nil {
+		t.Fatalf("install.sh failed (exit %v); it must reach the helm upgrade call for the "+
+			"injection assertion below to mean anything\n%s", runErr, out)
+	}
+
+	assertHelmReceivedAsSingleArg(t, argvFile, hostileName, out)
+	assertHelmReceivedAsSingleArg(t, argvFile, hostileNamespace, out)
+
+	for _, canary := range []string{nameCanary, namespaceCanary} {
+		canaryPath := filepath.Join(outDir, res.Folders[0].Dir, canary)
+		if _, statErr := os.Stat(canaryPath); !os.IsNotExist(statErr) {
+			t.Errorf("injected command executed: %s exists (stat err %v)\nscript output:\n%s",
+				canaryPath, statErr, out)
+		}
+	}
+}
+
+func TestWrite_OmitsPreFolderWhenAllManifestsRenderEmpty(t *testing.T) {
+	conditional := []byte(`{{- $component := index .Values "foo" -}}
+{{- $storage := index $component "storage" -}}
+{{- if (index $storage "enabled") }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-home
+{{- end }}
+`)
+	always := []byte(`apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: slinky-slurm-imex
+`)
+
+	tests := []struct {
+		name          string
+		enabled       bool
+		includeAlways bool
+		wantDirs      []string
+		wantSharedPVC bool
+	}{
+		{
+			name:     "disabled conditional pre-manifest emits only primary",
+			wantDirs: []string{"001-foo"},
+		},
+		{
+			name:          "enabled conditional pre-manifest emits pre and primary",
+			enabled:       true,
+			wantDirs:      []string{"001-foo-pre", "002-foo"},
+			wantSharedPVC: true,
+		},
+		{
+			name:          "always-rendered pre-manifest preserves pre folder",
+			includeAlways: true,
+			wantDirs:      []string{"001-foo-pre", "002-foo"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outDir := t.TempDir()
+			preManifests := map[string][]byte{"shared-storage-pvcs.yaml": conditional}
+			if tt.includeAlways {
+				preManifests["compute-domain.yaml"] = always
+			}
+			result, err := localformat.Write(context.Background(), localformat.Options{
+				OutputDir: outDir,
+				Components: []localformat.Component{{
+					Name:       "foo",
+					Namespace:  "slurm",
+					Repository: "oci://example.invalid/charts/foo",
+					ChartName:  "foo",
+					Version:    "1.0.0",
+					Values: map[string]any{
+						"storage": map[string]any{"enabled": tt.enabled},
+					},
+				}},
+				ComponentPreManifests: map[string]map[string][]byte{"foo": preManifests},
+			})
+			if err != nil {
+				t.Fatalf("Write() error = %v", err)
+			}
+			gotDirs := make([]string, 0, len(result.Folders))
+			for _, folder := range result.Folders {
+				gotDirs = append(gotDirs, folder.Dir)
+			}
+			if !reflect.DeepEqual(gotDirs, tt.wantDirs) {
+				t.Fatalf("folder dirs = %v, want %v", gotDirs, tt.wantDirs)
+			}
+
+			preDir := filepath.Join(outDir, "001-foo-pre")
+			if len(tt.wantDirs) == 1 {
+				if _, statErr := os.Stat(preDir); !os.IsNotExist(statErr) {
+					t.Fatalf("empty pre folder must not exist, stat error = %v", statErr)
+				}
+				return
+			}
+			sharedPVCPath := filepath.Join(preDir, "templates", "shared-storage-pvcs.yaml")
+			_, statErr := os.Stat(sharedPVCPath)
+			if tt.wantSharedPVC && statErr != nil {
+				t.Fatalf("enabled shared PVC template missing: %v", statErr)
+			}
+			if !tt.wantSharedPVC && !os.IsNotExist(statErr) {
+				t.Fatalf("disabled shared PVC template must not exist, stat error = %v", statErr)
+			}
+			if tt.includeAlways {
+				computeDomainPath := filepath.Join(preDir, "templates", "compute-domain.yaml")
+				if _, statErr := os.Stat(computeDomainPath); statErr != nil {
+					t.Fatalf("always-rendered pre-manifest missing: %v", statErr)
+				}
+			}
+		})
+	}
+}
+
+func TestWrite_PreManifestRenderErrorPreservesCode(t *testing.T) {
+	_, err := localformat.Write(t.Context(), localformat.Options{
+		OutputDir: t.TempDir(),
+		Components: []localformat.Component{{
+			Name:      "foo",
+			Namespace: "slurm",
+			Values:    map[string]any{},
+		}},
+		ComponentPreManifests: map[string]map[string][]byte{
+			"foo": {"invalid.yaml": []byte("{{")},
+		},
+	})
+	if err == nil {
+		t.Fatal("Write() error = nil, want invalid pre-manifest error")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeInvalidRequest {
+		t.Fatalf("Write() error = %v, want %s", err, errors.ErrCodeInvalidRequest)
+	}
+}
+
+func TestWrite_LocalHelmManifestOnly(t *testing.T) {
+	outDir := t.TempDir()
+
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir:   outDir,
+		AICRVersion: "v1.0.0",
+		Components: []localformat.Component{{
+			Name:       "skyhook-customizations",
+			Namespace:  "skyhook",
+			Repository: "", // empty: manifest-only
+		}},
+		ComponentPostManifests: map[string]map[string][]byte{
+			"skyhook-customizations": {
+				// Realistic input: project recipe manifests carry a license header
+				// (see recipes/components/gpu-operator/manifests/kernel-module-params.yaml).
+				"components/skyhook-customizations/manifests/customization.yaml": []byte(`# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: x
+`),
+			},
+		},
+	})
+	folders := res.Folders
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(folders) != 1 || folders[0].Kind != localformat.KindLocalHelm {
+		t.Fatalf("want 1 local-helm folder, got %d folders kind=%v", len(folders), folders[0].Kind)
+	}
+
+	for _, rel := range []string{"install.sh", "values.yaml", "cluster-values.yaml", "Chart.yaml", "templates/customization.yaml"} {
+		if _, err := os.Stat(filepath.Join(outDir, "001-skyhook-customizations", rel)); err != nil {
+			t.Errorf("missing file %s: %v", rel, err)
+		}
+	}
+	// upstream.env MUST NOT exist for local-helm
+	if _, err := os.Stat(filepath.Join(outDir, "001-skyhook-customizations", "upstream.env")); !os.IsNotExist(err) {
+		t.Errorf("upstream.env must not exist for local-helm folder")
+	}
+
+	assertGolden(t, outDir, "testdata/local_helm_manifest_only", "001-skyhook-customizations/install.sh")
+	assertGolden(t, outDir, "testdata/local_helm_manifest_only", "001-skyhook-customizations/Chart.yaml")
+	assertGolden(t, outDir, "testdata/local_helm_manifest_only", "001-skyhook-customizations/templates/customization.yaml")
+}
+
+// TestWrite_LocalHelmInstallScript_RejectsInjectedRecipeValues is the
+// local-helm counterpart to
+// TestWrite_UpstreamHelmInstallScript_RejectsInjectedRecipeValues: same
+// hostile-value/argv-capture technique, against install-local-helm.sh.tmpl's
+// `helm upgrade --install ... ./` line instead of the upstream-helm one.
+func TestWrite_LocalHelmInstallScript_RejectsInjectedRecipeValues(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	nameCanary := "pwned-local-name"
+	namespaceCanary := "pwned-local-namespace"
+	hostileName := "skyhook evil$(touch " + nameCanary + ")"
+	hostileNamespace := "ns evil$(touch " + namespaceCanary + ")"
+
+	outDir := t.TempDir()
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir:   outDir,
+		AICRVersion: "v1.0.0",
+		Components: []localformat.Component{{
+			Name:       hostileName,
+			Namespace:  hostileNamespace,
+			Repository: "", // empty: manifest-only, routes through writeLocalHelmFolder
+		}},
+		ComponentPostManifests: map[string]map[string][]byte{
+			hostileName: {
+				"components/skyhook-customizations/manifests/customization.yaml": []byte(
+					"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n"),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	scriptPath := filepath.Join(outDir, res.Folders[0].Dir, "install.sh")
+
+	if out, perr := exec.Command("bash", "-n", scriptPath).CombinedOutput(); perr != nil {
+		t.Fatalf("generated script is not valid bash: %v\n%s", perr, out)
+	}
+
+	stub := t.TempDir()
+	argvFile := filepath.Join(stub, "argv")
+	if werr := os.WriteFile(filepath.Join(stub, "helm"), []byte(helmArgvStub(argvFile)), 0o755); werr != nil {
+		t.Fatalf("write helm stub: %v", werr)
+	}
+
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = append(os.Environ(), "PATH="+stub+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, runErr := cmd.CombinedOutput()
+	t.Logf("script output (exit=%v):\n%s", runErr, out)
+	if runErr != nil {
+		t.Fatalf("install.sh failed (exit %v); it must reach the helm upgrade call for the "+
+			"injection assertion below to mean anything\n%s", runErr, out)
+	}
+
+	assertHelmReceivedAsSingleArg(t, argvFile, hostileName, out)
+	assertHelmReceivedAsSingleArg(t, argvFile, hostileNamespace, out)
+
+	for _, canary := range []string{nameCanary, namespaceCanary} {
+		canaryPath := filepath.Join(outDir, res.Folders[0].Dir, canary)
+		if _, statErr := os.Stat(canaryPath); !os.IsNotExist(statErr) {
+			t.Errorf("injected command executed: %s exists (stat err %v)\nscript output:\n%s",
+				canaryPath, statErr, out)
+		}
+	}
+}
+
+// helmArgvStub returns a helm stub that records every argument following an
+// `upgrade` invocation into argvFile as a NUL-separated list, then exits 0.
+// Any other subcommand (install.sh's `helm version` probe) is a silent
+// no-op; HELM_MAJOR's `${:-0}` default handles the resulting empty output.
+func helmArgvStub(argvFile string) string {
+	return "#!/usr/bin/env bash\n" +
+		"if [[ \"$1\" == upgrade ]]; then\n" +
+		"  shift\n" +
+		"  printf '%s\\0' \"$@\" > \"" + argvFile + "\"\n" +
+		"fi\n" +
+		"exit 0\n"
+}
+
+// assertHelmReceivedAsSingleArg fails the test unless argvFile (written by
+// helmArgvStub) contains want as one exact, NUL-delimited element — proof
+// bash passed it through as a single opaque token rather than word-splitting
+// or evaluating a command substitution inside it. scriptOutput is included in
+// the failure so a syntax or early-exit problem is visible alongside the
+// mismatch.
+func assertHelmReceivedAsSingleArg(t *testing.T, argvFile, want string, scriptOutput []byte) {
+	t.Helper()
+	raw, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatalf("helm stub never recorded an `upgrade` invocation; install.sh did not reach "+
+			"the point under test\nscript output:\n%s", scriptOutput)
+	}
+	args := strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00")
+	if !slices.Contains(args, want) {
+		t.Errorf("helm upgrade did not receive %q as a single argv element.\ngot argv: %#v\n"+
+			"script output:\n%s", want, args, scriptOutput)
+	}
+}
+
+// TestWrite_ReadinessGate verifies that a component carrying ComponentReadiness
+// manifests emits a standalone "<name>-readiness" local-helm folder ordered
+// immediately after the component's primary chart, with {{ .Release.Namespace }}
+// resolved to the component namespace.
+func TestWrite_ReadinessGate(t *testing.T) {
+	outDir := t.TempDir()
+
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       "gpu-operator",
+			Namespace:  "privileged-gpu-operator", // exercises the relocated-namespace case
+			Repository: "https://nvidia.github.io/gpu-operator",
+			ChartName:  "nvidia/gpu-operator",
+			Version:    "v24.9.1",
+		}},
+		ComponentReadiness: map[string]map[string][]byte{
+			"gpu-operator": {
+				"readiness.yaml": []byte(`apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-operator-readiness-gate
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-operator-readiness-gate
+  namespace: {{ .Release.Namespace }}
+spec:
+  template:
+    spec:
+      containers:
+        - name: gate
+          image: ghcr.io/nvidia/aicr-gate:dev
+          args:
+            - --namespace={{ .Release.Namespace }}
+`),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	folders := res.Folders
+	if len(folders) != 2 {
+		t.Fatalf("want 2 folders (primary + readiness), got %d", len(folders))
+	}
+	if got, want := folders[0].Dir, "001-gpu-operator"; got != want {
+		t.Errorf("folders[0].Dir = %q, want %q", got, want)
+	}
+	if got, want := folders[1].Dir, "002-gpu-operator-readiness"; got != want {
+		t.Errorf("folders[1].Dir = %q, want %q", got, want)
+	}
+	if got, want := folders[1].Kind, localformat.KindLocalHelm; got != want {
+		t.Errorf("readiness folder kind = %v, want %v", got, want)
+	}
+
+	rendered, err := os.ReadFile(filepath.Join(outDir, "002-gpu-operator-readiness", "templates", "readiness.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered readiness manifest: %v", err)
+	}
+	got := string(rendered)
+	if strings.Contains(got, "{{") {
+		t.Errorf("rendered readiness manifest still contains template tokens:\n%s", got)
+	}
+	if !strings.Contains(got, "namespace: privileged-gpu-operator") {
+		t.Errorf("rendered readiness manifest missing resolved namespace:\n%s", got)
+	}
+	if !strings.Contains(got, "--namespace=privileged-gpu-operator") {
+		t.Errorf("rendered gate args missing resolved namespace:\n%s", got)
+	}
+	if !strings.Contains(got, "image: ghcr.io/nvidia/aicr-gate:dev") {
+		t.Errorf("rendered readiness manifest missing gate image:\n%s", got)
+	}
+}
+
+// TestWrite_HookExemptionIsScopedToReadiness pins both halves of the hook
+// exemption in one run, with a readiness folder and a post folder side by
+// side in the same bundle.
+//
+// The exemption is narrow on purpose. The readiness folder is the only one
+// localformat writes that localformat's own caller authored: it comes from
+// gatemanifest.Render, which already chose the annotations for the target
+// deployer. Every other folder carries RECIPE content, whose author cannot
+// know which deployer will consume it -- and the recipe's mandated
+// hook-delete-policy: before-hook-creation is precisely what made those
+// resources delete and recreate on every upgrade before #1835.
+//
+// So the post folder must still be stripped. A blanket exemption would pass
+// the readiness half of this test and reopen that bug.
+func TestWrite_HookExemptionIsScopedToReadiness(t *testing.T) {
+	outDir := t.TempDir()
+
+	const hookAnnotations = `  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation
+`
+
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       "gpu-operator",
+			Namespace:  "gpu-operator",
+			Repository: "https://nvidia.github.io/gpu-operator",
+			ChartName:  "nvidia/gpu-operator",
+			Version:    "v24.9.1",
+		}},
+		ComponentPostManifests: map[string]map[string][]byte{
+			"gpu-operator": {
+				"components/gpu-operator/manifests/policy.yaml": []byte(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-operator-policy
+  namespace: gpu-operator
+` + hookAnnotations + `data:
+  policy: default
+`),
+			},
+		},
+		ComponentReadiness: map[string]map[string][]byte{
+			"gpu-operator": {
+				"readiness.yaml": []byte(`apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-operator-readiness-gate
+  namespace: {{ .Release.Namespace }}
+` + hookAnnotations + `spec:
+  template:
+    spec:
+      containers:
+        - name: gate
+          image: ghcr.io/nvidia/aicr-gate:dev
+`),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(res.Folders) != 3 {
+		t.Fatalf("want 3 folders (primary + post + readiness), got %d", len(res.Folders))
+	}
+
+	gate, err := os.ReadFile(filepath.Join(outDir, "002-gpu-operator-post", "templates", "policy.yaml"))
+	if err != nil {
+		t.Fatalf("read post manifest: %v", err)
+	}
+	if strings.Contains(string(gate), "helm.sh/hook") {
+		t.Errorf("a post wrapper kept its hook annotations; the exemption is not phase-scoped:\n%s", gate)
+	}
+
+	readiness, err := os.ReadFile(filepath.Join(outDir, "003-gpu-operator-readiness", "templates", "readiness.yaml"))
+	if err != nil {
+		t.Fatalf("read readiness manifest: %v", err)
+	}
+	for _, want := range []string{
+		"helm.sh/hook: post-install,post-upgrade",
+		"helm.sh/hook-delete-policy: before-hook-creation",
+	} {
+		if !strings.Contains(string(readiness), want) {
+			t.Errorf("the gate lost %q; localformat is second-guessing gatemanifest:\n%s", want, readiness)
+		}
+	}
+
+	// The gate still goes through the YAML round-trip, which is this
+	// folder's only validity check. Template tokens resolving proves the
+	// render ran; re-encoded two-space indent proves the rewrite did.
+	if strings.Contains(string(readiness), "{{") {
+		t.Errorf("readiness manifest still contains template tokens:\n%s", readiness)
+	}
+}
+
+// TestWrite_NoReadinessGate verifies that, absent ComponentReadiness entries,
+// the writer emits exactly the primary folder — readiness emission is opt-in
+// and must not change default output.
+func TestWrite_NoReadinessGate(t *testing.T) {
+	outDir := t.TempDir()
+
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       "gpu-operator",
+			Namespace:  "gpu-operator",
+			Repository: "https://nvidia.github.io/gpu-operator",
+			ChartName:  "nvidia/gpu-operator",
+			Version:    "v24.9.1",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(res.Folders) != 1 {
+		t.Fatalf("want 1 folder (no readiness), got %d", len(res.Folders))
+	}
+}
+
+func TestWrite_Mixed(t *testing.T) {
+	outDir := t.TempDir()
+
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       "gpu-operator",
+			Namespace:  "gpu-operator",
+			Repository: "https://nvidia.github.io/gpu-operator",
+			ChartName:  "nvidia/gpu-operator",
+			Version:    "v24.9.1",
+		}},
+		ComponentPostManifests: map[string]map[string][]byte{
+			"gpu-operator": {
+				// Realistic: real project manifests carry a license header.
+				"components/gpu-operator/manifests/dcgm-exporter.yaml": []byte(`# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: dcgm
+`),
+			},
+		},
+	})
+	folders := res.Folders
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if len(folders) != 2 {
+		t.Fatalf("want 2 folders, got %d", len(folders))
+	}
+	if folders[0].Dir != "001-gpu-operator" || folders[0].Kind != localformat.KindUpstreamHelm {
+		t.Errorf("folders[0] = %+v, want 001-gpu-operator / upstream-helm", folders[0])
+	}
+	if folders[1].Dir != "002-gpu-operator-post" || folders[1].Kind != localformat.KindLocalHelm {
+		t.Errorf("folders[1] = %+v, want 002-gpu-operator-post / local-helm", folders[1])
+	}
+	if folders[1].Parent != "gpu-operator" {
+		t.Errorf("folders[1].Parent = %q, want gpu-operator", folders[1].Parent)
+	}
+	if folders[1].Name != "gpu-operator-post" {
+		t.Errorf("folders[1].Name = %q, want gpu-operator-post", folders[1].Name)
+	}
+	if folders[0].CarriesPostManifests {
+		t.Error("folders[0].CarriesPostManifests = true, want false — primary carries no post manifests")
+	}
+	if !folders[1].CarriesPostManifests {
+		t.Error("folders[1].CarriesPostManifests = false, want true — deployers key the helm-diff bypass off this marker")
+	}
+
+	// Primary has NO Chart.yaml (upstream-helm)
+	if _, err := os.Stat(filepath.Join(outDir, "001-gpu-operator", "Chart.yaml")); !os.IsNotExist(err) {
+		t.Errorf("primary must not have Chart.yaml")
+	}
+	// Post HAS Chart.yaml + templates/dcgm-exporter.yaml
+	if _, err := os.Stat(filepath.Join(outDir, "002-gpu-operator-post", "Chart.yaml")); err != nil {
+		t.Errorf("post must have Chart.yaml: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "002-gpu-operator-post", "templates", "dcgm-exporter.yaml")); err != nil {
+		t.Errorf("post must have templates/dcgm-exporter.yaml: %v", err)
+	}
+
+	// Post's upstream.env MUST NOT exist (wrapped chart, not upstream ref)
+	if _, err := os.Stat(filepath.Join(outDir, "002-gpu-operator-post", "upstream.env")); !os.IsNotExist(err) {
+		t.Errorf("post must not have upstream.env")
+	}
+}
+
+// TestWrite_PreFolderInstallOmitsCreateNamespace asserts that a
+// pre-injection folder's install.sh does NOT pass --create-namespace
+// to helm, while the primary and post folders still do. Helm 3 refuses
+// to import a pre-existing namespace lacking
+// app.kubernetes.io/managed-by=Helm + meta.helm.sh/release-name
+// annotations, so pre folders (which carry the Namespace manifest by
+// design) must let the chart's own Namespace template create it. See
+// pkg/bundler/deployer/localformat/local_helm.go writeLocalHelmFolder
+// docstring for the full rationale.
+func TestWrite_PreFolderInstallOmitsCreateNamespace(t *testing.T) {
+	outDir := t.TempDir()
+	const licenseHeader = `# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+`
+
+	if _, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       "foo",
+			Namespace:  "privileged-foo",
+			Repository: "https://example.invalid/charts",
+			ChartName:  "example/foo",
+			Version:    "v1.0.0",
+		}},
+		ComponentPreManifests: map[string]map[string][]byte{
+			"foo": {
+				"foo/manifests/talos-namespace.yaml": []byte(licenseHeader +
+					"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: privileged-foo\n"),
+			},
+		},
+		ComponentPostManifests: map[string]map[string][]byte{
+			"foo": {
+				"foo/manifests/cm.yaml": []byte(licenseHeader +
+					"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm\n"),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	tests := []struct {
+		name                 string
+		installPath          string
+		wantCreateNamespace  bool
+		wantNamespaceLiteral string
+	}{
+		{
+			name:                 "pre folder omits --create-namespace",
+			installPath:          "001-foo-pre/install.sh",
+			wantCreateNamespace:  false,
+			wantNamespaceLiteral: "--namespace 'privileged-foo' \\",
+		},
+		{
+			name:                 "primary folder keeps --create-namespace",
+			installPath:          "002-foo/install.sh",
+			wantCreateNamespace:  true,
+			wantNamespaceLiteral: "--namespace 'privileged-foo' --create-namespace \\",
+		},
+		{
+			name:                 "post folder keeps --create-namespace",
+			installPath:          "003-foo-post/install.sh",
+			wantCreateNamespace:  true,
+			wantNamespaceLiteral: "--namespace 'privileged-foo' --create-namespace \\",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := os.ReadFile(filepath.Join(outDir, tc.installPath))
+			if err != nil {
+				t.Fatalf("read install.sh: %v", err)
+			}
+			s := string(b)
+			if got := strings.Contains(s, "--create-namespace"); got != tc.wantCreateNamespace {
+				t.Errorf("--create-namespace present = %v, want %v\n%s", got, tc.wantCreateNamespace, s)
+			}
+			if !strings.Contains(s, tc.wantNamespaceLiteral) {
+				t.Errorf("install.sh missing literal %q; got:\n%s", tc.wantNamespaceLiteral, s)
+			}
+		})
+	}
+}
+
+// TestWrite_FolderLimit_CountsEmissionsNotComponents pins the
+// folder-prefix-exhaustion guard. The check budgets against the actual
+// number of NNN-* directories the bundle will emit (pre + primary +
+// post, per the same conditions the main loop applies) instead of a
+// worst-case 3*len(Components) multiplier. Without this, a recipe of
+// 400 pure upstream-Helm components — which produce 400 directories —
+// would be rejected before any work happens. The deploy.sh template
+// only globs three-digit prefixes, so the cap remains 999.
+func TestWrite_FolderLimit_CountsEmissionsNotComponents(t *testing.T) {
+	// Helper: build n primary-only upstream-Helm components.
+	makeComponents := func(n int) []localformat.Component {
+		out := make([]localformat.Component, n)
+		for i := range n {
+			name := fmt.Sprintf("c%04d", i)
+			out[i] = localformat.Component{
+				Name:       name,
+				Namespace:  name,
+				Repository: "https://example.invalid/charts",
+				ChartName:  name,
+				Version:    "v1.0.0",
+			}
+		}
+		return out
+	}
+
+	t.Run("400 primary-only components stay under the cap", func(t *testing.T) {
+		// Under the old 3x multiplier, 400 components would be rejected
+		// (3*400 = 1200 > 999). With per-emission counting, 400 primary
+		// folders is well under the limit.
+		_, err := localformat.Write(context.Background(), localformat.Options{
+			OutputDir:  t.TempDir(),
+			Components: makeComponents(400),
+		})
+		if err != nil {
+			t.Fatalf("400 primary-only components should fit under cap, got: %v", err)
+		}
+	})
+
+	t.Run("1000 primary-only components exceed the cap", func(t *testing.T) {
+		_, err := localformat.Write(context.Background(), localformat.Options{
+			OutputDir:  t.TempDir(),
+			Components: makeComponents(1000),
+		})
+		if err == nil {
+			t.Fatal("1000 primary folders must exceed the 999-prefix cap")
+		}
+		if !strings.Contains(err.Error(), "too many emitted folders") {
+			t.Errorf("error should mention emitted folder count; got: %v", err)
+		}
+	})
+}
+
+// TestWrite_PreManifestNamespaceDrift asserts that the writer rejects
+// a pre-manifest whose Namespace metadata.name disagrees with the
+// component's release namespace. Without this guard, the bundle would
+// pass type checks but blow up at `helm install` time with an opaque
+// "namespace not found" error because the chart creates one namespace
+// while the release targets another.
+func TestWrite_PreManifestNamespaceDrift(t *testing.T) {
+	_, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: t.TempDir(),
+		Components: []localformat.Component{{
+			Name:       "foo",
+			Namespace:  "privileged-foo",
+			Repository: "https://example.invalid/charts",
+			ChartName:  "example/foo",
+			Version:    "v1.0.0",
+		}},
+		ComponentPreManifests: map[string]map[string][]byte{
+			"foo": {
+				"foo/manifests/typo-namespace.yaml": []byte(
+					"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: privileged-foobar\n",
+				),
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("Write must reject pre-manifest Namespace name that drifts from ComponentRef.Namespace")
+	}
+	var se *errors.StructuredError
+	if !stderrors.As(err, &se) {
+		t.Fatalf("error is %T, want *errors.StructuredError: %v", err, err)
+	}
+	if se.Code != errors.ErrCodeInvalidRequest {
+		t.Errorf("error code = %v, want ErrCodeInvalidRequest", se.Code)
+	}
+	for _, want := range []string{"privileged-foo", "privileged-foobar", "typo-namespace.yaml"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error message missing %q; got: %v", want, err)
+		}
+	}
+}
+
+func TestWrite_Ordering(t *testing.T) {
+	outDir := t.TempDir()
+	mk := func(name, repo string) localformat.Component {
+		return localformat.Component{
+			Name:       name,
+			Namespace:  name,
+			Repository: repo,
+			ChartName:  name,
+			Version:    "v1.0.0",
+		}
+	}
+
+	// b is mixed: helm repo set + manifests → emits b primary + b-post injected
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{
+			mk("a", "https://a.example"),
+			mk("b", "https://b.example"),
+			mk("c", "https://c.example"),
+		},
+		ComponentPostManifests: map[string]map[string][]byte{
+			"b": {
+				"b/manifests/x.yaml": []byte(`# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: x
+`),
+			},
+		},
+	})
+	folders := res.Folders
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	got := make([]string, 0, len(folders))
+	for _, f := range folders {
+		got = append(got, f.Dir)
+	}
+	want := []string{"001-a", "002-b", "003-b-post", "004-c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("folder order = %v, want %v", got, want)
+	}
+
+	// Verify the primary/post relationship on b
+	if folders[1].Kind != localformat.KindUpstreamHelm {
+		t.Errorf("folders[1] (b) = %v, want KindUpstreamHelm", folders[1].Kind)
+	}
+	if folders[2].Kind != localformat.KindLocalHelm || folders[2].Parent != "b" || folders[2].Name != "b-post" {
+		t.Errorf("folders[2] (b-post) = %+v, want KindLocalHelm parent=b name=b-post", folders[2])
+	}
+
+	// Verify subsequent indices are correct on the Folder struct itself (not just the Dir)
+	wantIndices := []int{1, 2, 3, 4}
+	for i, f := range folders {
+		if f.Index != wantIndices[i] {
+			t.Errorf("folders[%d].Index = %d, want %d (dir=%s)", i, f.Index, wantIndices[i], f.Dir)
+		}
+	}
+}
+
+func TestWrite_Kustomize(t *testing.T) {
+	outDir := t.TempDir()
+
+	// Absolute path to the kustomize fixture. `filepath.Abs` resolves the
+	// test-relative "testdata/kustomize_input" to something buildKustomize
+	// can feed to kustomize's on-disk filesystem.
+	kustomizePath, err := filepath.Abs(filepath.Join("testdata", "kustomize_input"))
+	if err != nil {
+		t.Fatalf("abs path: %v", err)
+	}
+
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:      "my-kustomize",
+			Namespace: "mk",
+			// Local kustomize: Path only. Tag/Repository are only meaningful
+			// for git-sourced kustomizations and are validated as a pair by
+			// Write — a Tag without Repository would (correctly) be rejected.
+			Path: kustomizePath,
+		}},
+	})
+	folders := res.Folders
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(folders) != 1 || folders[0].Kind != localformat.KindLocalHelm {
+		t.Fatalf("want 1 local-helm folder (kustomize wrapped), got %d folders kind=%v", len(folders), folders[0].Kind)
+	}
+
+	// manifest.yaml is the single flattened output of kustomize build
+	manifestPath := filepath.Join(outDir, "001-my-kustomize", "templates", "manifest.yaml")
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Errorf("missing templates/manifest.yaml: %v", err)
+	}
+	// Chart.yaml should still exist (wrapped chart)
+	if _, err := os.Stat(filepath.Join(outDir, "001-my-kustomize", "Chart.yaml")); err != nil {
+		t.Errorf("missing Chart.yaml: %v", err)
+	}
+}
+
+func TestWrite_Deterministic(t *testing.T) {
+	kustomizePath, err := filepath.Abs(filepath.Join("testdata", "kustomize_input"))
+	if err != nil {
+		t.Fatalf("abs path: %v", err)
+	}
+	opts := func(dir string) localformat.Options {
+		return localformat.Options{
+			OutputDir: dir,
+			Components: []localformat.Component{
+				{
+					Name:       "a",
+					Namespace:  "a",
+					Repository: "https://a.example",
+					ChartName:  "a",
+					Version:    "v1",
+					Values:     map[string]any{"image": map[string]any{"tag": "v1"}},
+				},
+				{
+					Name:       "b",
+					Namespace:  "b",
+					Repository: "https://b.example",
+					ChartName:  "b",
+					Version:    "v1",
+				},
+				{
+					// Kustomize component to lock determinism on the
+					// kustomize build path (manifest.yaml ordering, etc.).
+					Name:      "k",
+					Namespace: "k",
+					Path:      kustomizePath,
+				},
+			},
+			// b is mixed — exercise the -post injection path in the determinism check
+			ComponentPostManifests: map[string]map[string][]byte{
+				"b": {
+					// Two manifests with distinct basenames to exercise sorted iteration
+					"b/manifests/m1.yaml": []byte("---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: m1\n"),
+					"b/manifests/m2.yaml": []byte("---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: m2\n"),
+				},
+			},
+		}
+	}
+	d1, d2 := t.TempDir(), t.TempDir()
+	if _, err := localformat.Write(context.Background(), opts(d1)); err != nil {
+		t.Fatalf("Write 1: %v", err)
+	}
+	if _, err := localformat.Write(context.Background(), opts(d2)); err != nil {
+		t.Fatalf("Write 2: %v", err)
+	}
+	assertDirsEqual(t, d1, d2)
+}
+
+func TestWrite_KustomizeWithManifestsRejected(t *testing.T) {
+	// Point Path at the existing kustomize fixture so Tag/Path are set
+	// realistically, but attach raw manifests alongside — bundle must refuse.
+	kustomizePath, err := filepath.Abs(filepath.Join("testdata", "kustomize_input"))
+	if err != nil {
+		t.Fatalf("abs path: %v", err)
+	}
+
+	_, err = localformat.Write(context.Background(), localformat.Options{
+		OutputDir: t.TempDir(),
+		Components: []localformat.Component{{
+			Name:      "busted-component",
+			Namespace: "ns",
+			Tag:       "v1.0.0",
+			Path:      kustomizePath,
+		}},
+		ComponentPostManifests: map[string]map[string][]byte{
+			"busted-component": {
+				"extra/m.yaml": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n"),
+			},
+		},
+	})
+	if err == nil {
+		t.Fatalf("want error rejecting kustomize + raw manifests, got nil")
+	}
+	// Must be a structured error with ErrCodeInvalidRequest
+	var structErr *errors.StructuredError
+	if !stderrors.As(err, &structErr) {
+		t.Fatalf("expected *errors.StructuredError, got %T: %v", err, err)
+	}
+	if structErr.Code != errors.ErrCodeInvalidRequest {
+		t.Errorf("error code = %s, want %s (full error: %v)", structErr.Code, errors.ErrCodeInvalidRequest, err)
+	}
+	// Message should name the component and reference the conflict
+	msg := err.Error()
+	if !strings.Contains(msg, "busted-component") || !strings.Contains(msg, "kustomize") || !strings.Contains(msg, "manifests") {
+		t.Errorf("error message should mention component name + conflict; got: %s", msg)
+	}
+}
+
+func TestWrite_ReadinessSuffixReserved(t *testing.T) {
+	// A component literally named "<x>-readiness" must be rejected: the helm
+	// deploy.sh applies gate wait-semantics to every release matching its
+	// static "*-readiness)" glob, so the suffix is reserved at bundle time.
+	_, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: t.TempDir(),
+		Components: []localformat.Component{{
+			Name:       "foo-readiness",
+			Namespace:  "ns",
+			Repository: "https://example.com",
+		}},
+	})
+	if err == nil {
+		t.Fatalf("want error rejecting reserved -readiness suffix, got nil")
+	}
+	var structErr *errors.StructuredError
+	if !stderrors.As(err, &structErr) {
+		t.Fatalf("expected *errors.StructuredError, got %T: %v", err, err)
+	}
+	if structErr.Code != errors.ErrCodeInvalidRequest {
+		t.Errorf("code = %v, want ErrCodeInvalidRequest", structErr.Code)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "foo-readiness") || !strings.Contains(msg, "reserved") {
+		t.Errorf("error should name the component and mention it is reserved; got: %s", msg)
+	}
+}
+
+func TestWrite_PathContainment(t *testing.T) {
+	_, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: t.TempDir(),
+		Components: []localformat.Component{{
+			Name:       "../escape",
+			Repository: "https://example.com",
+		}},
+	})
+	if err == nil {
+		t.Fatalf("want error rejecting unsafe component name, got nil")
+	}
+	var structErr *errors.StructuredError
+	if !stderrors.As(err, &structErr) {
+		t.Fatalf("expected *errors.StructuredError, got %T: %v", err, err)
+	}
+	if structErr.Code != errors.ErrCodeInvalidRequest {
+		t.Errorf("code = %v, want ErrCodeInvalidRequest", structErr.Code)
+	}
+	if !strings.Contains(err.Error(), "../escape") {
+		t.Errorf("error should name the offending component; got: %v", err)
+	}
+}
+
+func TestWrite_ContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before calling Write
+
+	_, err := localformat.Write(ctx, localformat.Options{
+		OutputDir: t.TempDir(),
+		Components: []localformat.Component{{
+			Name:       "a",
+			Repository: "https://a.example",
+			ChartName:  "a",
+			Version:    "v1",
+		}},
+	})
+	if err == nil {
+		t.Fatalf("want error on cancelled context, got nil")
+	}
+	var structErr *errors.StructuredError
+	if !stderrors.As(err, &structErr) {
+		t.Fatalf("expected *errors.StructuredError, got %T: %v", err, err)
+	}
+	if structErr.Code != errors.ErrCodeTimeout {
+		t.Errorf("code = %v, want ErrCodeTimeout", structErr.Code)
+	}
+}
+
+// assertDirsEqual walks d1 and compares each file to the corresponding file
+// in d2 (same relative path). Fails on missing files, extra files, or content
+// mismatch. Path-relative compare — absolute TempDir prefix is stripped.
+func assertDirsEqual(t *testing.T, d1, d2 string) {
+	t.Helper()
+	files1 := listFiles(t, d1)
+	files2 := listFiles(t, d2)
+	if !reflect.DeepEqual(files1, files2) {
+		t.Fatalf("file trees differ:\n  d1=%v\n  d2=%v", files1, files2)
+	}
+	for _, rel := range files1 {
+		b1, err := os.ReadFile(filepath.Join(d1, rel))
+		if err != nil {
+			t.Fatalf("read %s from d1: %v", rel, err)
+		}
+		b2, err := os.ReadFile(filepath.Join(d2, rel))
+		if err != nil {
+			t.Fatalf("read %s from d2: %v", rel, err)
+		}
+		if string(b1) != string(b2) {
+			t.Errorf("content differs at %s:\n--- d1 ---\n%s\n--- d2 ---\n%s", rel, b1, b2)
+		}
+	}
+}
+
+// listFiles returns sorted relative paths of all regular files under dir.
+func listFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	var files []string
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.Mode().IsRegular() {
+			rel, err := filepath.Rel(dir, path)
+			if err != nil {
+				return err
+			}
+			files = append(files, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
+	sort.Strings(files)
+	return files
+}
+
+// assertGolden reads outDir/relPath and diffs it against goldenDir/relPath.
+// With -update, writes the actual content to the golden path.
+func assertGolden(t *testing.T, outDir, goldenDir, relPath string) {
+	t.Helper()
+	got, err := os.ReadFile(filepath.Join(outDir, relPath))
+	if err != nil {
+		t.Fatalf("read actual %s: %v", relPath, err)
+	}
+	goldenPath := filepath.Join(goldenDir, relPath)
+	if *update {
+		if err = os.MkdirAll(filepath.Dir(goldenPath), 0o755); err != nil {
+			t.Fatalf("mkdir golden: %v", err)
+		}
+		if err = os.WriteFile(goldenPath, got, 0o644); err != nil {
+			t.Fatalf("write golden: %v", err)
+		}
+		return
+	}
+	want, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden %s: %v (run with -update to regenerate)", goldenPath, err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("%s differs from golden:\n--- got ---\n%s\n--- want ---\n%s", relPath, got, want)
+	}
+}
+
+// TestFilterEmptyPreManifests pins the exported filter the ADR-018 whole-set
+// identity check uses: a pre-manifest that renders an object is kept, one
+// that renders nothing is dropped, and a canceled context is reported.
+func TestFilterEmptyPreManifests(t *testing.T) {
+	t.Parallel()
+	comp := localformat.Component{Name: "foo", Namespace: "foo-ns", ChartName: "foo", Version: "1.0.0"}
+	withObject := map[string]map[string][]byte{"foo": {"ns.yaml": []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: foo-ns\n")}}
+	empty := map[string]map[string][]byte{"foo": {"empty.yaml": []byte("# nothing rendered\n---\n")}}
+
+	tests := []struct {
+		name    string
+		pre     map[string]map[string][]byte
+		wantKey bool
+	}{
+		{"manifest rendering an object is kept", withObject, true},
+		{"manifest rendering no object is dropped", empty, false},
+		{"no pre-manifests", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := localformat.FilterEmptyPreManifests(t.Context(), []localformat.Component{comp}, tt.pre)
+			if err != nil {
+				t.Fatalf("FilterEmptyPreManifests() error = %v", err)
+			}
+			if _, ok := got["foo"]; ok != tt.wantKey {
+				t.Errorf("foo kept = %v, want %v (got %v)", ok, tt.wantKey, got)
+			}
+		})
+	}
+
+	t.Run("canceled context is reported", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if _, err := localformat.FilterEmptyPreManifests(ctx, []localformat.Component{comp}, withObject); err == nil {
+			t.Fatal("FilterEmptyPreManifests() = nil error with a canceled context")
+		}
+	})
+}

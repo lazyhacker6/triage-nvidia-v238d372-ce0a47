@@ -1,0 +1,65 @@
+# Claude Skills
+
+AICR ships a set of **agent skills** under
+[`.agents/skills/`](https://github.com/NVIDIA/aicr/tree/main/.agents/skills)
+(`.claude/skills` is a symlink to it, so Claude Code discovers the same
+skills; other agents such as Codex and Cursor read `.agents/skills`
+directly).
+A skill is a self-contained, model-invocable procedure: a `SKILL.md` with
+YAML frontmatter (`name`, `description`) plus any supporting files
+(templates, skeletons). When a request matches a skill's description,
+Claude Code loads it and follows it directly — so the skills encode the
+project's preferred way to do recurring, judgment-heavy tasks instead of
+re-deriving the steps each time.
+
+These are repo-scoped: they live in the codebase, are versioned with it,
+and are available to any contributor running Claude Code in this working
+tree. They complement — they do not replace — the coding rules in
+[CLAUDE.md](https://github.com/NVIDIA/aicr/blob/main/.claude/CLAUDE.md).
+
+## Available Skills
+
+| Skill | Use it when you want to... |
+|-------|----------------------------|
+| [`aicr-analyzing-snapshots`](https://github.com/NVIDIA/aicr/blob/main/.agents/skills/aicr-analyzing-snapshots/SKILL.md) | Analyze a snapshot YAML — cluster identity, provider characteristics, GPU/network topology, node health, software stack — and produce a structured assessment report. |
+| [`aicr-auditing-docs`](https://github.com/NVIDIA/aicr/blob/main/.agents/skills/aicr-auditing-docs/SKILL.md) | Audit the Markdown docs for duplication, drift, bloat, and gaps, producing a prioritized findings report (research, not edits) across README, `docs/`, demos, and governance files. |
+| [`aicr-cross-review`](https://github.com/NVIDIA/aicr/blob/main/.agents/skills/aicr-cross-review/SKILL.md) | Multi-agent PR review using Claude Code, Codex, and CodeRabbit with integration impact analysis, 2-of-3 consensus, and adversarial verification. **Claude Code only** — uses Workflow/Agent tools unavailable in other agents. |
+| [`aicr-creating-guided-demos`](https://github.com/NVIDIA/aicr/blob/main/.agents/skills/aicr-creating-guided-demos/SKILL.md) | Scaffold an interactive guided demo script (`demos/*.sh`) — live or self-paced — using the Frame → Tell → Show → Close narrative pattern. |
+| [`aicr-creating-slide-decks`](https://github.com/NVIDIA/aicr/blob/main/.agents/skills/aicr-creating-slide-decks/SKILL.md) | Build a self-contained HTML slide deck (`demos/*.html`) — inline CSS/SVG, no build step — to present or teach a concept full-screen or projected. |
+| [`aicr-managing-openvex`](https://github.com/NVIDIA/aicr/blob/main/.agents/skills/aicr-managing-openvex/SKILL.md) | Add, update, or remove CVE/GHSA suppressions in `.openvex.json`, the OpenVEX document consumed by the weekly image vulnerability scan. |
+| [`aicr-release-notes`](https://github.com/NVIDIA/aicr/blob/main/.agents/skills/aicr-release-notes/SKILL.md) | Draft the human-readable GitHub release-notes summary for an upcoming release by grouping commits since the last tag into thematic highlights. |
+| [`aicr-reviewing-component-drift`](https://github.com/NVIDIA/aicr/blob/main/.agents/skills/aicr-reviewing-component-drift/SKILL.md) | Review the weekly component drift report — which `recipes/registry.yaml` chart pins moved upstream — gathering values-path, lockstep, BOM, CRD, and Kubernetes-compatibility evidence into a ranked take/hold/defer recommendation. |
+| [`aicr-triage`](https://github.com/NVIDIA/aicr/blob/main/.agents/skills/aicr-triage/SKILL.md) | Triage the NVIDIA AICR project board (project 248): classify new issues, promote P2→P1, demote Ready→Backlog, and propose closures — with per-bucket confirmation before applying. |
+| [`aicr-uat-report`](https://github.com/NVIDIA/aicr/blob/main/.agents/skills/aicr-uat-report/SKILL.md) | Report UAT health across service x GPU x intent combinations from the UAT Run workflow, classifying failures as product vs infra signal, and download the per-run cluster debug bundles to triage them. |
+
+## How Skills Are Invoked
+
+Skills are matched against their `description` frontmatter. There are two
+paths:
+
+- **Automatic.** When a request matches a skill's triggers, Claude Code
+  loads the skill before responding. The `description` field is the
+  matcher — it lists the phrases and intents that should activate the
+  skill, so write it for recall.
+- **Explicit.** A contributor can name a skill directly to force its use. The
+  syntax differs by agent: Claude Code uses `/skill-name` (for example,
+  `/aicr-triage`); Codex uses `$skill-name` (for example, `$aicr-triage`).
+
+Never read a `SKILL.md` with a plain file read to "follow it" — invoke it
+so its supporting files and conventions load as intended.
+
+## Adding a Skill
+
+1. Create `.agents/skills/<skill-name>/SKILL.md` with `name` and
+   `description` frontmatter. The `name` must match the directory.
+2. Write the `description` for matching: enumerate the triggers (phrases,
+   file paths, intents) that should activate it. This is the single most
+   important field — a skill that never matches is dead weight.
+3. Keep the body a procedure, not prose: when to use, when *not* to use,
+   and the concrete steps. Add supporting files (skeletons, templates)
+   alongside `SKILL.md` and reference them by relative path.
+4. Add a row to the [Available Skills](#available-skills) table above so
+   contributors can discover it.
+
+Skills are design-time tooling for working *on* AICR — they are not part
+of the shipped product and do not affect generated artifacts.

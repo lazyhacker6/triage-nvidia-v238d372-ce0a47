@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# UAT runner (GCP/GKE). Thin shim over tests/uat/lib/phases.sh, which holds the
+# cloud-agnostic phase implementations and the phase dispatcher. Codifies the
+# workflow demonstrated in demos/cuj1-gke-config.md and is invoked phase-by-phase
+# from .github/workflows/uat-gcp.yaml so per-phase failures surface in the
+# GitHub Actions UI. GKE needs no cloud-specific overrides: the workload-identity
+# session outlasts each phase, and the workflow refreshes it before teardown.
+#
+# Usage:
+#   AICR_BIN=./aicr RUN_ID=12345 ./run <phase> <test-config.yaml>
+# See tests/uat/lib/phases.sh for the phase list and the working files produced.
+
+set -euo pipefail
+
+# The GKE lane's training smoke runs on the shipped TCPXO runtime at full-node
+# shape. These defaults must be set BEFORE sourcing phases.sh: the shared file
+# initializes the same knobs with := defaults, and a later assignment would
+# never take effect (review of #2705 caught the previous ordering doing
+# exactly that).
+export TRAINJOB_RUNTIME="${TRAINJOB_RUNTIME:-torch-distributed-tcpxo}"
+export TRAINJOB_GPUS_PER_NODE="${TRAINJOB_GPUS_PER_NODE:-8}"
+
+# shellcheck source=../lib/phases.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/phases.sh"
+
+# Readiness census (issue #2096): tell the readiness gate how many GPU-worker
+# nodes this cluster-config declares so it can detect a still-GROWING node
+# census. A GPU node that joins late (autoscale backfill, a replaced instance)
+# re-opens Skyhook convergence mid-validate; without an expected count the gate
+# cannot distinguish a settled 2-node cluster from one still scaling up.
+# phases.sh reads EXPECTED_GPU_NODES (label selector defaults to
+# nodeGroup=gpu-worker); an absent/empty value degrades it to stability-only
+# mode. CLUSTER_CONFIG is exported job-wide by .github/workflows/uat-gcp.yaml, so
+# it is visible here with no workflow change; it is unset in local dev (degrade).
+if [[ -n "${CLUSTER_CONFIG:-}" ]]; then
+  if [[ -f "${CLUSTER_CONFIG}" ]]; then
+    # Select the GPU pool by its label (not a positional index, so reordering
+    # the pools cannot silently read the wrong count) and read GKE's fixed
+    # node-count field, autoscaling.minNodes (min == max == 2 for this pool).
+    expected_gpu_nodes="$(yq -r '[.compute.gke.nodePools.workers[] | select(.nodeConfig.labels.nodeGroup == "gpu-worker") | .autoscaling.minNodes] | .[0]' "${CLUSTER_CONFIG}" 2>/dev/null || true)"
+    if [[ "${expected_gpu_nodes}" =~ ^[1-9][0-9]*$ ]]; then
+      export EXPECTED_GPU_NODES="${expected_gpu_nodes}"
+    else
+      echo "::warning::could not derive EXPECTED_GPU_NODES from ${CLUSTER_CONFIG} (got '${expected_gpu_nodes:-<empty>}'); readiness census degrades to stability-only mode" >&2
+    fi
+  else
+    echo "::warning::could not derive EXPECTED_GPU_NODES from ${CLUSTER_CONFIG} (file not found); readiness census degrades to stability-only mode" >&2
+  fi
+fi
+
+# The TCPXO recipe input must name this run's provisioned GPU NIC networks.
+# The pinned provisioner derives them from deployment.id as
+# "<id>-gpu-nic-<0..7>" (provider/gke/terraform/main.tf), and the workflow
+# exports DEPLOYMENT_ID job-wide after overwriting .deployment.id in the
+# cluster config to the same value. Deriving here keeps recipe generation on
+# the provisioner's own naming instead of a committed placeholder. A config
+# written for a cluster provisioned by other means should carry its real
+# mapping and run with DEPLOYMENT_ID unset.
+# GKE caps Device-type Network names at 41 characters, so a very long
+# deployment ID (daytime lane: slug + slot + 13-digit run ID) would fail
+# recipe validation here — that failure is the intended signal, not something
+# to truncate away: the provisioner owns the names and would have created the
+# same over-limit objects.
+if [[ -n "${DEPLOYMENT_ID:-}" && -n "${2:-}" && -f "${2}" ]]; then
+  recipe_criteria="$(yq -r '[.spec.recipe.criteria.service, .spec.recipe.criteria.accelerator, .spec.recipe.criteria.platform] | join("/")' "${2}")"
+  if [[ "${recipe_criteria}" == "gke/h100/kubeflow" ]]; then
+    # One deterministic path per run, rewritten per phase — no temp-file
+    # accumulation across phases or repeated local runs.
+    derived_config="/tmp/aicr-uat-tcpxo-config.${DEPLOYMENT_ID}.yaml"
+    cp "${2}" "${derived_config}"
+    yq -i 'del(.spec.recipe.configuration.gke.tcpxoInterfaces)' "${derived_config}"
+    for i in 0 1 2 3 4 5 6 7; do
+      # DEPLOYMENT_ID flows to yq through the environment (strenv), never by
+      # interpolation into the yq program — a value is data, not expression.
+      NET_NAME="${DEPLOYMENT_ID}-gpu-nic-${i}" yq -i \
+        ".spec.recipe.configuration.gke.tcpxoInterfaces += [{\"interfaceName\": \"eth$((i + 1))\", \"network\": strenv(NET_NAME)}]" \
+        "${derived_config}"
+    done
+    set -- "$1" "${derived_config}"
+    echo "TCPXO interface mapping derived from DEPLOYMENT_ID (${DEPLOYMENT_ID}-gpu-nic-0..7)"
+  fi
+fi
+
+uat_main "$@"

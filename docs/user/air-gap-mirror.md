@@ -1,0 +1,373 @@
+# Air-Gapped Image Mirroring
+
+Discover every container image and Helm chart a recipe needs, then mirror them
+into a private registry for air-gapped deployment. For the per-flag reference,
+see [CLI reference: aicr mirror list](cli-reference.md#aicr-mirror-list). For
+the static image inventory across all registered components, see
+[Container Image Inventory](https://github.com/NVIDIA/aicr/blob/main/docs/user/container-images.md).
+
+## Overview
+
+`aicr mirror list` renders each component's Helm chart with recipe-resolved
+values, scans referenced manifests, and produces a deduplicated list of
+container images and chart references. Manifest reads honor the data source
+resolved for the `mirror list` invocation itself: pass `--data <dir>` to
+`aicr mirror list` and an overlay manifest shadowing an embedded path is used
+in place of the embedded copy. The data directory is **not** remembered from
+when the recipe was generated — a saved recipe carries no `--data` path, so
+you must supply `--data` again on each `mirror list` run that needs the
+overlay. The output is available in four formats — two general-purpose
+(YAML, JSON) and two tool-specific (Hauler, Zarf).
+
+> **Trust boundary:** Discovery shells out to `helm template`, which executes
+> the full Go template engine (`tpl`, `include`, `lookup`). AICR recipes
+> reference trusted, pinned charts from known repositories. Do not run
+> `mirror list` against untrusted or unvetted recipe files — doing so executes
+> arbitrary template code from those charts.
+
+```text
+                      ┌───────────────────────┐
+  aicr recipe ───────▶│  aicr mirror list     │
+  (or query params)   │  --format hauler|zarf │
+                      └──────────┬────────────┘
+                                 │
+              ┌──────────────────┼──────────────────┐
+              ▼                                     ▼
+     ┌────────────────┐                   ┌───────────────────┐
+     │  hauler store  │                   │  zarf package     │
+     │  sync → copy   │                   │  create → mirror  │
+     └───────┬────────┘                   └────────┬──────────┘
+             │                                     │
+             ▼                                     ▼
+     ┌────────────────────────────────────────────────────┐
+     │              Private Registry                      │
+     └────────────────────────────────────────────────────┘
+```
+
+**How this relates to chart vendoring:** `aicr bundle --vendor-charts` embeds
+Helm chart tarballs into a bundle so `helm install` needs no registry egress.
+`aicr mirror list` discovers the *container images* those charts reference plus
+the chart coordinates themselves. For a fully air-gapped deployment, use both:
+mirror images and charts into your private registry, then deploy the vendored
+bundle.
+
+**Enforcing signatures on the mirror:** to admit only images you have signed,
+sign the mirrored digests with your own key and enforce the signature at
+admission; see
+[Enforcing Your Signatures on Mirrored Images](../integrator/supply-chain-verification.md#enforcing-your-signatures-on-mirrored-images).
+With the Sigstore-bundle signatures cosign v3 writes by default, those policies
+need the registry to serve TLS, so the plain-HTTP examples below suit only a
+test registry. Those policies were measured on a cluster with outbound network
+access, not an air-gapped one.
+
+## Prerequisites
+
+- `aicr` CLI installed (see [Installation](installation.md))
+- A recipe file (`aicr recipe --output recipe.yaml`) or query parameters
+- `helm` v3+ on `$PATH` (required for chart rendering during discovery)
+- For the Hauler workflow: `hauler` CLI
+- For the Zarf workflow: `zarf` CLI
+- YAML/JSON output works without any additional tools
+
+## Output Formats
+
+| Format | Description | Consumable By |
+|--------|-------------|---------------|
+| `yaml` | Full mirror list with per-component breakdown, global image list, chart refs, and metadata (default) | Any YAML parser, CI/CD pipelines, custom scripts |
+| `json` | Same structure as YAML in JSON encoding | `jq`, programmatic tooling |
+| `hauler` | Hauler content manifest (`content.hauler.cattle.io/v1`) with `Images` and `Charts` documents | `hauler store sync` |
+| `zarf` | Zarf package config (`ZarfPackageConfig`) with images and charts in a single component | `zarf package create` |
+
+## Quick Start
+
+### Discover Images
+
+From an existing recipe file:
+
+```shell
+aicr mirror list --recipe recipe.yaml
+```
+
+Or resolve a recipe from query parameters:
+
+```shell
+aicr mirror list --service eks --accelerator h100 --intent training --os ubuntu
+```
+
+### Save to File
+
+```shell
+aicr mirror list --recipe recipe.yaml --format hauler --output hauler-manifest.yaml
+```
+
+## Hauler Workflow
+
+[Hauler](https://docs.hauler.dev/) syncs container images and Helm charts into
+a local store, then copies them to a target registry.
+
+### 1. Generate the Hauler manifest
+
+```shell
+aicr mirror list --recipe recipe.yaml --format hauler --output manifest.yaml
+```
+
+The output is a multi-document YAML with an `Images` document (and optionally a
+`Charts` document):
+
+```yaml
+apiVersion: content.hauler.cattle.io/v1
+kind: Images
+metadata:
+  name: aicr-images
+spec:
+  images:
+    - name: nvcr.io/nvidia/gpu-operator:v26.7.2
+    - name: registry.k8s.io/nfd/node-feature-discovery:v0.20.1
+    # ...
+---
+apiVersion: content.hauler.cattle.io/v1
+kind: Charts
+metadata:
+  name: aicr-charts
+spec:
+  charts:
+    - name: gpu-operator
+      repoURL: https://helm.ngc.nvidia.com/nvidia
+      version: v26.7.2
+    # ...
+```
+
+### 2. Sync into the Hauler store
+
+```shell
+hauler store sync \
+  --store ./hauler-store \
+  --filename manifest.yaml
+```
+
+To pull only a single platform (reduces download size):
+
+```shell
+hauler store sync \
+  --store ./hauler-store \
+  --platform linux/amd64 \
+  --filename manifest.yaml
+```
+
+### 3. Copy to your private registry
+
+```shell
+hauler store copy \
+  --store ./hauler-store \
+  registry://my-registry.example.com:5000
+```
+
+For registries using plain HTTP (e.g., local test registries):
+
+```shell
+hauler store copy \
+  --store ./hauler-store \
+  --plain-http \
+  registry://localhost:5001
+```
+
+## Zarf Workflow
+
+[Zarf](https://docs.zarf.dev/) packages container images into a single
+distributable tarball that can be carried to an air-gapped environment and
+mirrored into a registry.
+
+### 1. Generate the Zarf package config
+
+```shell
+aicr mirror list --recipe recipe.yaml --format zarf --output zarf.yaml
+```
+
+The output is a `ZarfPackageConfig`:
+
+```yaml
+apiVersion: zarf.dev/v1alpha1
+components:
+  - charts:
+      - name: gpu-operator
+        namespace: gpu-operator
+        repoName: gpu-operator
+        url: https://helm.ngc.nvidia.com/nvidia
+        version: v26.7.2
+      # ...
+    images:
+      - nvcr.io/nvidia/gpu-operator:v26.7.2
+      - registry.k8s.io/nfd/node-feature-discovery:v0.20.1
+      # ...
+    name: aicr-images
+    required: true
+kind: ZarfPackageConfig
+metadata:
+  description: NVIDIA AI Cluster Runtime container images and Helm charts for air-gapped deployment
+  name: aicr
+```
+
+Keys are sorted at every level: the renderer marshals through
+`serializer.MarshalYAMLDeterministic`, so given the same discovered inventory it
+produces byte-identical output. Discovery itself is best-effort and can omit a
+component's images without failing the command — see the completeness caveat
+under [Relationship to Container Image Inventory](#relationship-to-container-image-inventory).
+
+### 2. Create the Zarf package
+
+Place `zarf.yaml` in its own directory and create the package:
+
+```shell
+mkdir -p zarf-pkg && cp zarf.yaml zarf-pkg/
+cd zarf-pkg
+zarf package create . --confirm
+```
+
+This pulls every listed image and produces a `zarf-package-*.tar.zst` file.
+
+### 3. Mirror to your private registry
+
+Transfer the tarball to the air-gapped environment, then mirror:
+
+```shell
+zarf package mirror-resources zarf-package-aicr-*.tar.zst \
+  --registry-url my-registry.example.com:5000 \
+  --confirm
+```
+
+For registries using plain HTTP:
+
+```shell
+zarf package mirror-resources zarf-package-aicr-*.tar.zst \
+  --registry-url localhost:5001 \
+  --plain-http \
+  --confirm
+```
+
+## Overriding Component Values
+
+The `--set` flag overrides Helm values at discovery time, changing which images
+appear in the output. This is useful when you know certain sub-components will
+be disabled in your deployment and want to exclude their images from the mirror
+list.
+
+```shell
+# Exclude GPU driver images (pre-installed driver scenario)
+aicr mirror list --recipe recipe.yaml \
+  --set gpuoperator:driver.enabled=false
+
+# Pin a specific driver version
+aicr mirror list --recipe recipe.yaml \
+  --set gpuoperator:driver.version=570.86.16
+```
+
+The override key format is `component:path.to.field=value`, where the component
+name matches either the component name in the recipe or its `valueOverrideKeys`
+alias from the registry (e.g., `gpuoperator` for `gpu-operator`).
+
+## Relationship to Container Image Inventory
+
+The [Container Image Inventory](https://github.com/NVIDIA/aicr/blob/main/docs/user/container-images.md) is a static reference
+generated from `recipes/registry.yaml` with default values. It lists every
+image across all registered components regardless of recipe.
+
+`aicr mirror list` is recipe-specific: it renders charts with the actual
+resolved values for your target configuration (service, accelerator, intent,
+OS). The resulting image list is typically a subset of the full inventory,
+limited to the components and sub-components your recipe enables.
+
+Use the inventory for security audit and compliance. Use `mirror list` to
+generate the deployment-specific manifest for a specific deployment.
+
+> **Completeness caveat:** discovery is best-effort, not all-or-nothing. A
+> per-component failure to load values, render the chart (`helm template`), or
+> extract images from a manifest is **non-fatal** — the component's images are
+> omitted and the failure is recorded as a warning, but the command still
+> exits 0. The YAML and JSON outputs carry these warnings in a `warnings`
+> field; the Hauler and Zarf outputs **omit them entirely**. Treat a
+> tool-specific manifest as authoritative only after confirming the YAML/JSON
+> run reported no warnings — otherwise the mirrored set may be silently
+> incomplete. Invalid members in a recognized mapping-valued `image` or
+> `scalingPodImage` descriptor are the exception: `mirror list` exits nonzero
+> instead of emitting a known-incomplete image set.
+
+> **Runtime validation image:** `slinky-slurm-health` launches
+> `docker.io/library/alpine:3.23.3` dynamically through `srun` on GPU-backed
+> NodeSets. This image is already covered by `aicr mirror list`: it is the same
+> Alpine tag the slinky-slurm chart's initconf/logfile sidecars pin, so chart
+> rendering surfaces it for every Slurm recipe. Mirroring alone, however, does
+> not redirect the `srun` pull — set `AICR_VALIDATOR_IMAGE_REGISTRY` to your
+> destination registry so the runtime pull resolves there; the validator
+> preserves the `library/alpine:3.23.3` repository and tag. Without a registry
+> override, Slurm workers need Docker Hub egress for this check.
+
+## AICR agent and validator images
+
+`aicr mirror list` covers what the recipe's components deploy. It does not list
+the images AICR itself runs in the cluster, so mirror these separately:
+
+- The snapshot agent, `ghcr.io/nvidia/aicr`, run by `aicr snapshot` and by
+  `aicr validate` when no `--snapshot` is given.
+- The validator images under `ghcr.io/nvidia/aicr-validators/` (`deployment`,
+  `performance`, `conformance`, and `aiperf-bench` for inference performance
+  checks), run by `aicr validate`.
+
+A CNCF submission run (`aicr validate --cncf-submission`) cannot complete
+offline: its last step runs the upstream submission validator on the machine
+`aicr` runs on, which fetches the CNCF landscape from
+`raw.githubusercontent.com` and requests every vendor and documentation URL
+the submission cites. Without that egress the run exits 6
+(`SERVICE_UNAVAILABLE`); see
+[Exit status of a submission run](validation.md#exit-status-of-a-submission-run).
+
+Release builds use each image at the CLI's own version tag. Copy them into your
+registry, then point AICR at the copies:
+
+```shell
+AICR_VERSION=vX.Y.Z  # release tag; `aicr --version` prints it without the leading v
+REGISTRY=my-registry.example.com
+
+# Snapshot agent: --image takes the full reference
+aicr snapshot --image "${REGISTRY}/nvidia/aicr:${AICR_VERSION}"
+
+# Validators: the env var replaces the registry prefix of every validator image
+export AICR_VALIDATOR_IMAGE_REGISTRY="${REGISTRY}"
+aicr validate --recipe recipe.yaml \
+  --image "${REGISTRY}/nvidia/aicr:${AICR_VERSION}"
+```
+
+`AICR_VALIDATOR_IMAGE_REGISTRY` replaces the registry host and the first path
+segment, so `ghcr.io/nvidia/aicr-validators/conformance` resolves to
+`${REGISTRY}/aicr-validators/conformance`. If your mirroring tool keeps the
+source path (`${REGISTRY}/nvidia/aicr-validators/...`), set the variable to
+`${REGISTRY}/nvidia` instead. Add `--image-pull-secret` when the registry needs
+credentials; the conformance checks that create a per-run namespace copy the
+named Secrets into it for their probe pods, and the copies are deleted with the
+namespace. Some benchmark checks pin workload images the variable does not
+rewrite, such as the NCCL runtime image (override it with
+`AICR_NCCL_RUNTIME_IMAGE`) and the vanilla `docker.io/library/ubuntu:22.04`
+probe image of the `driver-runtime-management` and `workload-sandboxing`
+conformance checks (override it with `AICR_DRIVER_RUNTIME_IMAGE` and
+`AICR_SANDBOX_PROBE_IMAGE`, each a full reference to your copy); see
+[Validation](validation.md).
+
+The inference performance check also runs the Dynamo runtime images
+`nvcr.io/nvidia/ai-dynamo/vllm-runtime` and
+`nvcr.io/nvidia/ai-dynamo/dynamo-frontend`. The variable rewrites them by the
+same rule, so `nvcr.io/nvidia/ai-dynamo/vllm-runtime:<version>` resolves to
+`${REGISTRY}/ai-dynamo/vllm-runtime:<version>`. `<version>` is the
+`dynamo-platform` chart version your recipe deploys, which `aicr mirror list`
+reports. The check tags both images with that version, so an overlay or
+`--data` override of the chart moves them with it. Mirror both images to that
+path at that tag. The check copies the Secrets named by `--image-pull-secret`
+that exist in the validator namespace into its per-run namespace, so the Dynamo
+pods and the model-cache Job pull with the same credentials. A named Secret
+missing from the validator namespace is skipped with a warning in the check's
+log, and those pods then pull without it. If the check times out while one of
+those pods is still failing to pull, the error names the pod and the image it
+could not pull.
+`AICR_VALIDATOR_IMAGE_TAG` does not retag the Dynamo images, because their tag
+follows the `dynamo-platform` chart the recipe deploys, so a retag would run a
+runtime that differs from the operator. Registry redirection does not make the
+check fully offline, since its model-cache Job still downloads weights from
+Hugging Face.

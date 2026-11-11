@@ -1,0 +1,461 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Transparency-log monitoring for AICR's release supply chain, on Rekor v2.
+#
+# Hourly, this runs our own monitor (tools/rekor-monitor) to do both checks in a
+# single job:
+#   - Consistency: prove the Rekor v2 log stays append-only between runs (Merkle
+#     consistency from the last checkpoint to the current tree head). O(log n),
+#     finishes in seconds. The checkpoint (cursor) is persisted as the
+#     `rekor-v2-checkpoint` artifact between runs.
+#   - Identity: scan entries added since the last checkpoint for AICR's release
+#     signing identity. An entry under that identity that a release did not
+#     produce signals OIDC/key compromise. The scan is resumable: a large backlog
+#     window (from a multi-hour outage or a held cursor) is scanned in bounded
+#     slices across several runs, persisting progress in a checkpoint companion,
+#     rather than re-scanning (and timing out on) the whole window every pass. The
+#     signed checkpoint advances only once the scan has caught up to head.
+# The monitor exits non-zero on any failure and prints a CLASSIFICATION line, and
+# this workflow branches notifications on it so infra flakiness never pages like a
+# security event:
+#   - tamper / identity (a real consistency break or an unexplained identity hit):
+#     open a security tracking issue (mentioning the maintainers group) and post a
+#     Slack alert (via the SLACK_SERVICE webhook).
+#   - operational (Sigstore/Rekor/TUF/GitHub-API trouble, or a crash before any
+#     classification) or degraded (the identity catch-up is not converging: the
+#     log is outpacing the bounded per-run scan, so `remaining` is not shrinking):
+#     no page. Only after three consecutive failed scheduled runs does it open a
+#     low-urgency "degraded" issue; a single blip stays quiet.
+# The job still goes red on every failure. A later clean run closes both the
+# security and degraded issues. The tags a real release actually signed are fetched
+# first from the RELEASE_WORKFLOW_FILE (on-tag.yaml) run history and passed to the
+# tool (--known-tags-file), so an entry under the release identity that a real
+# release produced is not flagged. Run history is used rather than the repo's
+# current tags/releases because those are deleted for ephemeral release candidates
+# (NVIDIA/aicr#1902) while run history persists, and runs count in ANY lifecycle
+# state so a release that is still signing is not briefly invisible to the scan
+# (NVIDIA/aicr#2153). Note: a workflow that fails to *start* (startup_failure)
+# cannot alert on itself, so an external liveness check (dead-man's-switch) is
+# tracked as a follow-up.
+#
+# Why our own tool, not upstream sigstore/rekor-monitor (NVIDIA/aicr#1623).
+# Identity monitoring is a linear scan of every entry added since the last
+# checkpoint (Rekor's index cannot be queried by certificate SAN, and our keyless
+# release identity has no email or fixed key). On the Rekor **v1** firehose that
+# scan runs ~50x slower than the log grows, so it can never keep up in a bounded
+# CI job. Rekor **v2** is tile-based: bulk 256-entry reads make a single-worker
+# scan outpace the log, so the whole thing is one cheap job. This rides on
+# release signing having moved to v2 in NVIDIA/aicr#1650.
+#
+# The catch: the upstream reusable workflow selects its Rekor version and shards
+# from Sigstore's *default* signing config (`signing_config.v0.2.json`), which is
+# v1-only and stays that way "for the foreseeable future". AICR opted into v2
+# early via the separate `signing_config_rekor_v2.v0.2.json` TUF target, which
+# upstream never reads and cannot be pointed at. So we run tools/rekor-monitor:
+# it reads the v2 signing config AICR actually signs against (pkg/trust) and
+# reuses the upstream rekor-monitor *library* packages for the verification. When
+# Sigstore makes v2 the ecosystem default, upstream can monitor v2 directly and
+# this tool can be retired. See docs/contributor/maintaining.md and the tool's
+# package doc for the full rationale.
+#
+# The monitored identity is AICR's release signer (see .goreleaser.yaml and
+# .github/workflows/on-tag.yaml): the GitHub Actions OIDC SAN for on-tag.yaml,
+# issued by token.actions.githubusercontent.com.
+#
+# Triage, by classification:
+#   - Identity hit (security issue + page): known release tags are already
+#     excluded via --known-tags-file, so a hit means an entry under the release
+#     identity for a tag with *no corresponding release* (or an entry that failed
+#     verification). Cross-check the entry's log index and timestamp against known
+#     release runs; if unrecognized, treat as potential OIDC/key compromise and
+#     begin incident response. Residual gap: an attacker re-signing an *existing*
+#     release tag would be suppressed (a per-tag entry-count/provenance check is a
+#     follow-up).
+#   - Tamper / consistency failure (security issue + page): the Merkle consistency
+#     proof failed. Re-run once to rule out a corrupt cached proof; a persistent
+#     break is a tamper signal: escalate to Sigstore.
+#   - Operational (no page): a red hourly job with no issue is a transient infra
+#     blip (Sigstore/Rekor/TUF/GitHub-API) that self-heals; the "degraded" issue
+#     appears only after three consecutive failed runs and needs no action unless
+#     it persists.
+#   - Degraded (no page, but real): the same issue title also covers a catch-up
+#     that is NOT converging (the log outpacing the bounded per-run scan). Here the
+#     monitor completed every pass; it will NOT self-heal. The issue body says so
+#     and gives the remediation (more scan budget per run, or triage a held finding
+#     pinning the cursor).
+
+name: Rekor Monitor
+
+on:
+  schedule:
+    - cron: "17 * * * *"  # hourly, offset off the top of the hour
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: rekor-monitor
+  cancel-in-progress: false
+
+env:
+  CHECKPOINT_FILE: checkpoint_v2.txt
+  # Cross-run cursor. A fresh name (not the old v1 `checkpoint`) means the stale
+  # v1 checkpoint is simply ignored; no migration needed.
+  ARTIFACT_NAME: rekor-v2-checkpoint
+  ALERT_TITLE: "Rekor v2 monitor: release identity / log consistency alert"
+  DEGRADED_TITLE: "Rekor v2 monitor: degraded"
+  # Maintainers group notified on an alert (GitHub team; issues cannot be
+  # assigned to a team, so it is @-mentioned in the issue body instead).
+  MAINTAINERS_TEAM: "@nvidia/aicr-maintainer"
+  # AICR release signer identity (see .goreleaser.yaml and on-tag.yaml). Kept in
+  # the workflow so it is the auditable source of truth for what is monitored.
+  CERT_SUBJECT: '^https://github\.com/NVIDIA/aicr/\.github/workflows/on-tag\.yaml@refs/tags/.*$'
+  CERT_ISSUER: '^https://token\.actions\.githubusercontent\.com$'
+  # The release signing workflow whose run history is the correlation source for
+  # "which tags a real release actually signed" (see the "Fetch signed release
+  # tags" step). MUST name the same workflow as CERT_SUBJECT above: the cert SAN
+  # is <this-workflow>@refs/tags/<tag>, so its run history is the authoritative,
+  # deletion-proof record of legitimate signings. Change both together.
+  RELEASE_WORKFLOW_FILE: on-tag.yaml
+
+jobs:
+  monitor:
+    name: AICR release identity + log consistency (Rekor v2)
+    # Upstream only: forks that enable Actions would otherwise run this hourly,
+    # burning minutes and going red (no checkpoint history, no release identity
+    # to monitor) and opening alert/degraded issues in the fork.
+    if: github.repository == 'nvidia/aicr'
+    runs-on: ubuntu-24.04
+    # Backstop the per-pass context timeout in the tool (defaultTimeout, 45m):
+    # the job is killed if a network stall somehow outlives it. Sized so the
+    # tool's own 45m deadline (which classifies as operational) fires first, and
+    # so the post-monitor notification steps still have room, rather than a hard
+    # job kill. Paranoid worst case: three gh-api-retry fetches each exhausting
+    # 3 x 180s attempts (~27m), the 45m monitor pass, checkout/setup-go (~3m), and
+    # the post-monitor issue/Slack/degraded steps (~a few min of gh/curl). Note
+    # the fetch-outage (~27m) and backlog-scan (45m) worst cases do not actually
+    # stack (an outage that slows fetches also makes the monitor fail fast), so
+    # 90m leaves generous headroom for the realistic large-backlog case.
+    timeout-minutes: 90
+    permissions:
+      contents: read  # checkout to build tools/rekor-monitor
+      actions: read   # read the prior checkpoint artifact via the Actions API
+      issues: write   # open/close the alert issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Fetch previous checkpoint artifact
+        # Cross-run artifact fetch via the API (download-artifact only sees the
+        # current run). A missing artifact is the expected first-run state, and
+        # leaves checkpoint.zip absent so the monitor baselines. The monitor
+        # reads the zip natively (--restore-zip); no unzip here.
+        #
+        # SECURITY: the repo-wide `artifacts?name=` list also returns same-named
+        # artifacts uploaded by *any* run, including a fork pull_request run whose
+        # GITHUB_TOKEN can upload under any name. A poisoned checkpoint (a genuine
+        # one copied from the live log head) would pass the consistency proof
+        # while collapsing the identity-scan window to empty, silently skipping
+        # entries. We therefore accept only artifacts whose producing run was in
+        # THIS repository on `main`:
+        #   - head_repository_id == repository_id rejects every fork run (a fork's
+        #     head repo differs), even one whose branch is named "main";
+        #   - head_branch == "main" limits to the scheduled/dispatched main runs.
+        # The whole artifact history is paginated (not just recent runs) so an
+        # older valid cursor survives a long stretch of artifact-less runs
+        # (startup failures, outages); a failed API call aborts the step (set -e /
+        # pipefail on the assignment) rather than falling through to a re-baseline.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # .github/scripts/gh-api-retry.sh writes each attempt to OUTFILE.part and
+          # publishes it only on success (recovers 5xx/429, round-trips the binary
+          # zip, never leaks a failed attempt's error body). A total failure aborts
+          # the step (operational, never a security signal).
+          .github/scripts/gh-api-retry.sh artifacts.json --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100"
+          id="$(jq -rs '[.[].artifacts[]
+                | select(.expired == false)
+                | select(.workflow_run.head_branch == "main")
+                | select(.workflow_run.head_repository_id == .workflow_run.repository_id)]
+              | sort_by(.created_at) | last | .id // empty' artifacts.json)"
+          if [ -z "${id}" ]; then
+            echo "No prior checkpoint artifact from this repository on main; treating this as the first run."
+            exit 0
+          fi
+          .github/scripts/gh-api-retry.sh checkpoint.zip "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip"
+          echo "Fetched checkpoint artifact ${id}."
+
+      - name: Fetch signed release tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The correlation source is the RELEASE_WORKFLOW_FILE run history, NOT
+          # the repo's current tags. The identity SAN is <workflow>@refs/tags/<tag>,
+          # so a tag-push run of that workflow is the authoritative proof that a
+          # real release signed <tag>. Unlike /tags or /releases, run history
+          # PERSISTS after a tag/release is deleted, so an ephemeral release
+          # candidate (e.g. vX.Y.Z-rc1, whose tag+release are cleaned up once the
+          # final ships) is still recognised and does not trip the identity alarm
+          # (NVIDIA/aicr#1902). head_branch is the tag for a tag-push run.
+          #
+          # Runs count in ANY lifecycle state and with any conclusion; the query is
+          # deliberately unfiltered on `status`. GitHub mints the SAN only while a
+          # run of this workflow is executing at refs/tags/<tag>, so the run's
+          # existence at that ref IS the proof; its lifecycle state is not part of
+          # the identity. Filtering on status=completed hid a release for the ~32
+          # minutes it takes to run while its signing jobs were already writing
+          # entries ~20 minutes in, which is exactly where the hourly scan lands
+          # (NVIDIA/aicr#2153). It also let a re-run of a job that signs nothing
+          # (a flaky post-publish deploy) revoke a tag's allowlist entry by
+          # flipping the run back to in_progress. Gating on conclusion=success is
+          # likewise not viable: signing happens mid-run, so a real release whose
+          # later step flakes concludes "failure" while still having produced a
+          # legitimate entry (e.g. v0.18.0 itself), and gating would re-create the
+          # #1902 false positive. Widening to in-flight runs does not weaken the
+          # control: under the old gate, anyone able to push a tag could already
+          # allowlist it by waiting for the run to finish. Per-signing-step
+          # correlation would be tighter but needs per-run job inspection; see the
+          # maintaining.md residual note.
+          # De-duplicate. The reusable retry is already factored into the shared
+          # gh-api-retry.sh; this fetch+jq is specific to this monitor's
+          # correlation, so it stays inline (a composite action for one call site
+          # would add indirection without reuse).
+          .github/scripts/gh-api-retry.sh runs.json --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/${RELEASE_WORKFLOW_FILE}/runs?event=push&per_page=100"
+          jq -rs '[.[].workflow_runs[] | select(.head_branch != null) | .head_branch] | unique | .[]' \
+            runs.json > known-tags.txt
+          echo "Fetched $(wc -l < known-tags.txt) signed release tags from ${RELEASE_WORKFLOW_FILE} run history."
+
+      - name: Monitor Rekor v2 (consistency + identity)
+        id: monitor
+        run: |
+          set -uo pipefail
+          set +e
+          go run ./tools/rekor-monitor \
+            --file "${CHECKPOINT_FILE}" \
+            --restore-zip checkpoint.zip \
+            --cert-subject "${CERT_SUBJECT}" \
+            --cert-issuer "${CERT_ISSUER}" \
+            --known-tags-file known-tags.txt | tee monitor.out
+          code=${PIPESTATUS[0]}
+          class="$(grep -oE '^CLASSIFICATION=[a-z]+' monitor.out | tail -n1 | cut -d= -f2)"
+          # A crash before any CLASSIFICATION line (build error, OOM) is treated
+          # as operational: infra trouble must never masquerade as a security hit.
+          [ -n "${class}" ] || class="operational"
+          echo "classification=${class}" >> "$GITHUB_OUTPUT"
+          exit "${code}"
+
+      - name: Persist checkpoint
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          # The signed checkpoint plus its two companions (<file>.scan and
+          # <file>.stall): the tool advances the checkpoint only once the identity
+          # scan has caught up to head, persists partial progress in .scan so a
+          # large backlog is scanned across several runs, and tracks catch-up
+          # convergence in .stall so a diverging (non-converging) catch-up can page.
+          # All must travel in the artifact so the next run resumes and the trend
+          # continues. Every advance path writes .scan (advanceCheckpoint resets it
+          # to 0) and clears .stall, so the files are absent only when the run fails
+          # before it can advance the cursor or save a chunk (e.g. a first run whose
+          # consistency check errors); if-no-files-found: ignore covers that so a
+          # pre-advance failure does not fail the upload.
+          path: |
+            ${{ env.CHECKPOINT_FILE }}
+            ${{ env.CHECKPOINT_FILE }}.scan
+            ${{ env.CHECKPOINT_FILE }}.stall
+          # Must exceed the hourly cadence so the cursor never expires between
+          # runs; wide enough to survive a brief scheduling pause.
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Open security alert issue
+        id: alert_issue
+        if: ${{ failure() && (steps.monitor.outputs.classification == 'tamper' || steps.monitor.outputs.classification == 'identity') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLASSIFICATION: ${{ steps.monitor.outputs.classification }}
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
+            --search "in:title \"${ALERT_TITLE}\"" --json title,url \
+            | jq -r --arg t "${ALERT_TITLE}" '[.[] | select(.title == $t)] | .[0].url // empty')"
+          if [ -n "${existing}" ]; then
+            echo "Alert issue already open: ${existing}"
+            echo "url=${existing}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [ "${CLASSIFICATION}" = "tamper" ]; then
+            detail="the Rekor v2 **consistency proof failed** (the log's Merkle root did not verify as append-only)."
+            detail="${detail} This is a tamper signal: **escalate to Sigstore** and do not advance the checkpoint."
+            detail="${detail} Re-run once to rule out a corrupt cached proof; a persistent failure is a genuine break."
+          else
+            detail="an entry was found under **AICR's release signing identity for a tag with no corresponding release** (or an entry that failed verification)."
+            detail="${detail} Known release tags are already excluded, so treat this as potential **OIDC/key compromise** and begin incident response:"
+            detail="${detail} cross-check the entry's log index and timestamp in the run logs against known release runs."
+          fi
+          {
+            echo "${MAINTAINERS_TEAM}: the Rekor v2 monitor flagged a security signal on [run ${GITHUB_RUN_ID}](${run_url})."
+            echo
+            echo "${detail}"
+            echo
+            echo "See the run logs and the triage notes in the workflow header (\`.github/workflows/rekor-monitor.yaml\`)."
+            echo
+            echo "This issue auto-closes on the next clean run."
+          } > alert-body.md
+          url="$(gh issue create --repo "${GITHUB_REPOSITORY}" \
+            --title "${ALERT_TITLE}" \
+            --label "area/security,theme/supply-chain" \
+            --body-file alert-body.md)"
+          echo "Opened alert issue: ${url}"
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+
+      - name: Post Slack alert on security finding
+        if: ${{ failure() && (steps.monitor.outputs.classification == 'tamper' || steps.monitor.outputs.classification == 'identity') }}
+        env:
+          # Slack incoming-webhook path suffix; same secret the release and
+          # vuln-scan workflows use. Unset in forks, so this no-ops there.
+          SLACK_SERVICE: ${{ secrets.SLACK_SERVICE }}
+          ISSUE_URL: ${{ steps.alert_issue.outputs.url }}
+          CLASSIFICATION: ${{ steps.monitor.outputs.classification }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SLACK_SERVICE:-}" ]; then
+            echo "::warning::SLACK_SERVICE not set; skipping Slack notification"
+            exit 0
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # To ping a Slack usergroup, prepend "<!subteam^GROUP_ID> " below.
+          text=":rotating_light: *Rekor v2 monitor: ${CLASSIFICATION} signal*: needs maintainer triage."
+          text="${text} <${run_url}|View run>"
+          if [ -n "${ISSUE_URL:-}" ]; then
+            text="${text} · <${ISSUE_URL}|tracking issue>"
+          fi
+          jq -n --arg t "${text}" '{text: $t}' > slack-payload.json
+          curl -sSf -X POST -H 'Content-type: application/json' \
+            --data @slack-payload.json \
+            "https://hooks.slack.com/services/${SLACK_SERVICE}"
+          echo "Posted Slack alert."
+
+      - name: Open degraded issue if a non-security failure is persistent
+        # Inverse of the security allowlist: any failure that is NOT a confirmed
+        # tamper/identity signal is operational. This deliberately also covers an
+        # EMPTY classification, i.e. a step BEFORE the monitor failed (tags fetch,
+        # checkpoint fetch) so the monitor never ran and printed no CLASSIFICATION.
+        # Those GitHub-API/upstream outages are exactly what the degraded path is
+        # for; without this they would keep the job red hourly yet never surface a
+        # calm tracking issue. The two gates stay mutually exclusive and together
+        # partition every failure() case.
+        if: ${{ failure() && steps.monitor.outputs.classification != 'tamper' && steps.monitor.outputs.classification != 'identity' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLASSIFICATION: ${{ steps.monitor.outputs.classification }}
+        run: |
+          set -euo pipefail
+          # Persistence via run history: only escalate once this run plus the two
+          # prior scheduled runs all concluded failure. A single blip stays quiet
+          # (job is red, but no issue/Slack) and self-heals next hour. The artifact
+          # API is one of the flaky deps we are hardening, so we intentionally do
+          # NOT use a state-file counter here.
+          # The API returns completed runs most-recent-first (this in-progress run
+          # is excluded), so index("success") is the count of consecutive leading
+          # failures; `// length` handles the all-failures window. This is a true
+          # consecutive streak, not a plain failure count: [fail,success,fail]
+          # yields 1 (stays quiet), not 2.
+          streak="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/rekor-monitor.yaml/runs?event=schedule&status=completed&per_page=3" \
+            | jq -r '[.workflow_runs[].conclusion] | (index("success") // length)')"
+          # This run is not yet "completed" in the API, so 2 consecutive prior
+          # failures + this one = 3 consecutive = persistent.
+          if [ "${streak}" -lt 2 ]; then
+            echo "Operational failure but not yet persistent (prior failures: ${streak}); staying quiet."
+            exit 0
+          fi
+          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
+            --search "in:title \"${DEGRADED_TITLE}\"" --json title,url \
+            | jq -r --arg t "${DEGRADED_TITLE}" '[.[] | select(.title == $t)] | .[0].url // empty')"
+          if [ -n "${existing}" ]; then
+            echo "Degraded issue already open: ${existing}"
+            exit 0
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # The degraded sink covers two very different states; write the body for
+          # the one that actually happened. A catch-up stall is NOT an upstream blip
+          # that self-heals -- the monitor is completing every pass -- so its
+          # remediation is concrete, not "wait for upstream".
+          if [ "${CLASSIFICATION}" = "degraded" ]; then
+            opening="The Rekor v2 monitor's identity catch-up is **not converging** (latest: [run ${GITHUB_RUN_ID}](${run_url}))."
+            opening="${opening} The transparency log is growing faster than the bounded per-run scan, so \`remaining\` is not shrinking;"
+            opening="${opening} the monitor **is** completing each pass and persisting progress."
+            detail="This is **not** a security finding (no tamper or identity signal). It will **not** self-heal on its own."
+            detail="${detail} Remediate by giving the scan more budget per run (raise the pass \`--timeout\` or lower \`scanBudgetHeadroom\`),"
+            detail="${detail} or by triaging a held identity finding that is pinning the cursor. See the catch-up notes in \`docs/contributor/maintaining.md\`."
+          else
+            opening="The Rekor v2 monitor has been **unable to complete** for 3+ consecutive hourly runs (latest: [run ${GITHUB_RUN_ID}](${run_url}))."
+            detail="This is an **operational** problem (Sigstore/Rekor/TUF reachability or the GitHub API), **not** a security finding: no tamper or identity signal was detected."
+            detail="${detail} No maintainer action is required unless it persists; the check will resume automatically when upstream recovers."
+          fi
+          {
+            echo "${opening}"
+            echo
+            echo "${detail}"
+            echo
+            echo "This issue auto-closes on the next clean run."
+          } > degraded-body.md
+          gh issue create --repo "${GITHUB_REPOSITORY}" \
+            --title "${DEGRADED_TITLE}" \
+            --label "area/ci" \
+            --body-file degraded-body.md
+
+      - name: Close alert issue on success
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Exact-title filter: title search is phrase-based, so never close an
+          # issue whose title merely contains the alert text.
+          gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
+            --search "in:title \"${ALERT_TITLE}\"" --json number,title \
+            | jq -r --arg t "${ALERT_TITLE}" '.[] | select(.title == $t) | .number' \
+            | while read -r n; do
+                [ -n "$n" ] || continue
+                # Tolerate a per-issue close failure (transient API error, rate
+                # limit, already-closed race): it must not abort the loop or fail
+                # this step and flip a clean monitor run to "failed".
+                gh issue close "$n" --repo "${GITHUB_REPOSITORY}" \
+                  --comment "Rekor v2 monitor completed cleanly on run ${GITHUB_RUN_ID}; auto-closing." \
+                  || echo "::warning::failed to close alert issue #${n}"
+              done
+          # Same for the degraded (operational) issue: a clean run means the
+          # monitor completed, so any open degraded tracker is stale.
+          gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
+            --search "in:title \"${DEGRADED_TITLE}\"" --json number,title \
+            | jq -r --arg t "${DEGRADED_TITLE}" '.[] | select(.title == $t) | .number' \
+            | while read -r n; do
+                [ -n "$n" ] || continue
+                # Tolerate a per-issue close failure (transient API error, rate
+                # limit, already-closed race): it must not abort the loop or fail
+                # this step and flip a clean monitor run to "failed".
+                gh issue close "$n" --repo "${GITHUB_REPOSITORY}" \
+                  --comment "Rekor v2 monitor completed cleanly on run ${GITHUB_RUN_ID}; auto-closing." \
+                  || echo "::warning::failed to close degraded issue #${n}"
+              done

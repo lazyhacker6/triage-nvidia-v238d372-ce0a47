@@ -1,0 +1,991 @@
+# Development Guide
+
+Project setup, architecture, development workflows, and tooling for AI Cluster Runtime (AICR) contributors.
+
+## Quick Start
+
+Set environment variable `AUTO_MODE=true` to avoid having to approve each tool install.
+
+```bash
+# Handy alias for installing/upgrading aicr to ~/.local/bin
+alias aicrup='curl -sfL https://get.aicr.run | bash -s -- -d ~/.local/bin'
+```
+
+```bash
+# 1. Clone and setup
+#    Without write access to NVIDIA/aicr, fork it on GitHub, clone your fork
+#    instead, then: git remote add upstream https://github.com/NVIDIA/aicr.git
+git clone https://github.com/NVIDIA/aicr.git && cd aicr
+make tools-setup    # Install all required tools (first-time)
+make tools-update   # Upgrade existing tools to versions in .settings.yaml
+make tools-check    # Verify versions match .settings.yaml
+
+# 2. Develop
+make test           # Run tests with race detector
+make lint           # Run linters
+make build          # Build binaries
+
+# 3. Before submitting PR
+make qualify        # Full check: test-coverage + lint + tuning-check + coverage-check + e2e + scan + license-check + api-diff + openapi-diff
+```
+
+## Prerequisites
+
+### Required Tools
+
+| Tool | Purpose | Installation |
+|------|---------|--------------|
+| **Go 1.27+** | Language runtime (exact CI toolchain pinned in `.go-version`) | [golang.org/dl](https://golang.org/dl/) |
+| **make** | Build automation | Pre-installed on macOS; `apt install make` on Ubuntu/Debian |
+| **git** | Version control | Pre-installed on most systems |
+| **Docker** | Container builds | [docs.docker.com/get-docker](https://docs.docker.com/get-docker/) |
+| **yq** | YAML processing | Installed by `make tools-setup`: the pinned version on Linux, via Homebrew on macOS. `make tools-check` needs it |
+
+### Development Tools (installed by `make tools-setup`)
+
+| Tool | Purpose |
+|------|---------|
+| golangci-lint | Go linting |
+| oasdiff | REST contract breaking-change detection (`make openapi-diff`) |
+| yamllint | YAML linting (requires Python/pip) |
+| addlicense | License header management |
+| grype | Vulnerability scanning |
+| ko | Container image building |
+| goreleaser | Release automation |
+| helm | Kubernetes package manager |
+| kind | Local Kubernetes clusters |
+| ctlptl | Local cluster + registry management (for Tilt) |
+| tilt | Local Kubernetes dev environment with hot reload |
+| kubectl | Kubernetes CLI |
+| chainsaw | Declarative Kubernetes e2e testing |
+| cosign | Artifact signing and attestation |
+| helmfile | Declarative Helm release management |
+
+This table is a summary — run `make tools-check` for the full pinned set from `.settings.yaml`.
+
+### Linux-Specific Setup
+
+On Ubuntu 24.04+ and other systems using PEP 668, system-wide pip installs are blocked. Use `pipx` for yamllint:
+
+```bash
+# Ubuntu/Debian prerequisites
+sudo apt-get install -y make git curl pipx
+pipx ensurepath
+pipx install yamllint
+```
+
+`make tools-setup` installs yq itself, at the version pinned in `.settings.yaml`, checksum-verified. It keeps a yq that is already on `PATH`, so run `make tools-update` to replace a hand-installed one.
+
+## Development Setup
+
+### Automated Setup (Recommended)
+
+The project uses `.settings.yaml` as a single source of truth for tool versions. This ensures consistency between local development and CI.
+
+```bash
+# Install all required tools (first-time, interactive mode)
+make tools-setup
+
+# Or skip prompts for CI/scripts
+AUTO_MODE=true make tools-setup
+
+# Upgrade existing tools to the pinned versions in .settings.yaml
+# (run periodically — see "Keeping the toolchain in sync" below)
+make tools-update
+
+# Verify installation
+make tools-check
+```
+
+#### Keeping the toolchain in sync
+
+CI uses the versions pinned in `.settings.yaml`. When Renovate bumps a pinned version (e.g. `golangci-lint`), your local install drifts behind CI until you run `make tools-update`. The most painful symptom is **silent false-negative lint runs locally**: a newer `golangci-lint` may default-enable a check (e.g. tighter `goconst` thresholds) that your older local version doesn't flag, so `make qualify` passes locally and fails in CI on the same code.
+
+Run `make tools-update` after a `git pull` that touches `.settings.yaml`, or whenever `make tools-check` shows a `⚠` for a lint-sensitive tool.
+
+Example `make tools-check` output:
+
+```
+=== Tool Version Check ===
+
+Tool                 Expected        Installed       Status
+----                 --------        ---------       ------
+go                   <pinned>        <installed>     ✓
+golangci-lint        <pinned>        <installed>     ✓
+grype                <pinned>        <installed>     ✓
+ko                   <pinned>        <installed>     ✓
+...
+
+(Expected versions come from `.settings.yaml` — the single source of truth.)
+
+Legend: ✓ = installed, ⚠ = version mismatch, ✗ = missing
+```
+
+### Version Management
+
+All tool versions are centrally managed in `.settings.yaml`, the single source of truth used by:
+- `make tools-setup` - Local development setup (first-time install)
+- `make tools-update` - Upgrade existing tools to the pinned versions
+- `make tools-check` - Version verification
+- GitHub Actions CI - Ensures CI uses identical versions
+
+Edit `.settings.yaml` to update versions; changes propagate everywhere automatically.
+
+### Finalize Setup
+
+After installing tools:
+
+```bash
+# Format code and tidy dependencies
+make tidy
+
+# Run full qualification to ensure setup is correct
+make qualify
+```
+
+## Project Architecture
+
+### Directory Structure
+
+```
+aicr/
+├── cmd/
+│   ├── aicr/          # CLI binary
+│   └── aicrd/         # API server binary
+├── pkg/
+│   ├── bundler/        # Bundle generation framework
+│   ├── cli/            # CLI commands and flags
+│   ├── client/v1/      # aicr.Client SDK facade
+│   ├── collector/      # System state collectors
+│   ├── component/      # Bundler utilities
+│   ├── errors/         # Structured error handling
+│   ├── k8s/            # Kubernetes client
+│   ├── recipe/         # Recipe resolution engine
+│   ├── server/         # HTTP server (aicrd) + REST handlers
+│   ├── snapshotter/    # Snapshot orchestration
+│   └── validator/      # Constraint evaluation
+├── docs/
+│   ├── contributor/    # System design docs (architecture)
+│   ├── integrator/     # CI/CD and API integration docs
+│   └── user/           # User documentation (CLI)
+├── tools/              # Development scripts
+└── tilt/               # Local dev environment
+```
+
+Binaries live in `cmd/` (`aicr` CLI, `aicrd` API server); business logic and the
+collectors, recipe engine, snapshotter, bundler framework, and validator live in
+the `pkg/` subdirectories shown above. For per-package responsibilities, the data
+flow between them, and component-level design, see the architecture documentation
+linked below rather than restating it here.
+
+### Architecture Principle
+
+Business logic lives in `pkg/*` packages. The `pkg/cli` and `pkg/server` packages handle user interaction only — both delegate to the `pkg/client/v1` facade (and the functional packages it composes) so CLI and HTTP surfaces share the same logic.
+
+For detailed architecture documentation, see [docs/contributor/index.md](docs/contributor/index.md).
+
+## Development Workflow
+
+### 1. Create a Branch
+
+```bash
+# For new features
+git checkout -b feat/add-gpu-collector
+
+# For bug fixes
+git checkout -b fix/snapshot-crash-on-empty-gpu
+
+# For documentation
+git checkout -b docs/update-contributing-guide
+```
+
+### 2. Make Changes
+
+- **Small, focused commits**: Each commit should address one logical change
+- **Clear commit messages**: Use imperative mood ("Add feature" not "Added feature")
+- **Test as you go**: Write tests alongside your code
+
+### 3. Run Tests
+
+```bash
+# Run unit tests with race detector
+make test
+
+# Run with coverage threshold enforcement
+make test-coverage
+```
+
+### 4. Lint Your Code
+
+```bash
+# Run all linters (Go, YAML, license headers, agents sync, docs gates, chart-version pins,
+# vendored Go proxy action digests, upgrade records, Dynamo runtime image tag)
+make lint
+
+# Or run individually for a faster loop (all of these already run as part of `make lint`)
+make lint-go      # Go linting only
+make lint-yaml    # YAML linting only
+make license      # Add/verify license headers (may modify files)
+
+# Docs published to Fern are parsed as MDX; both checks gate the merge
+make check-docs-mdx        # fast pattern approximation (no dependencies)
+make check-docs-mdx-parse  # real MDX parser, authoritative (needs Node 20+)
+
+# YAML-labelled code blocks throughout docs/ must contain parseable YAML
+make check-docs-yaml       # syntax only; partial YAML fragments are valid
+
+# Shell code blocks in docs/ must not use <placeholder>s that bash reads as redirection
+make check-docs-shell
+```
+
+`check-docs-mdx-parse` warns and skips when Node is unavailable locally, but
+hard-fails in CI. See
+[Docs MDX Gate](docs/contributor/tests.md#docs-mdx-gate).
+
+`check-docs-yaml` and `check-docs-shell` have the same local-warning and
+CI-hard-fail behavior for a missing Node runtime. See
+[Docs YAML Fence Gate](docs/contributor/tests.md#docs-yaml-fence-gate) and
+[Docs Shell Placeholder Gate](docs/contributor/tests.md#docs-shell-placeholder-gate).
+
+### 5. Run E2E Tests
+
+```bash
+# CLI end-to-end tests
+make e2e
+
+# With local Kubernetes cluster (requires make dev-env first)
+make e2e-tilt
+
+# KWOK simulated cluster tests (no GPU hardware required)
+make kwok-test-all                    # All recipes
+make kwok-e2e RECIPE=eks-training     # Single recipe
+```
+
+### 6. Security Scan
+
+```bash
+make scan
+```
+
+### 7. Full Qualification
+
+Before submitting a PR, run everything:
+
+```bash
+make qualify
+```
+
+This runs: `test-coverage` → `lint` → `tuning-check` → `coverage-check` → `e2e` → `scan` → `license-check` → `api-diff` → `openapi-diff`
+
+## Local Kubernetes Development
+
+AICR includes a full local development environment using Kind and Tilt for rapid iteration with hot reload.
+
+### Prerequisites
+
+Ensure these tools are installed (included in `make tools-setup`):
+
+- **kind** - Local Kubernetes clusters
+- **ctlptl** - Cluster + registry management for Tilt
+- **tilt** - Local dev environment with hot reload
+- **ko** - Fast Go container builds
+
+### Quick Start
+
+```bash
+# Create cluster and start Tilt (opens browser UI at http://localhost:10350)
+make dev-env
+
+# Stop Tilt and delete cluster
+make dev-env-clean
+```
+
+### Step-by-Step Tilt Workflow
+
+#### 1. Create the Local Cluster
+
+```bash
+# Create Kind cluster with local registry
+make cluster-create
+
+# Verify cluster is running
+make cluster-status
+kubectl get nodes
+```
+
+This creates:
+- A Kind cluster named `kind-aicr`
+- A local container registry at `localhost:5001`
+
+#### 2. Start Tilt
+
+```bash
+# Start Tilt (opens browser UI automatically)
+make tilt-up
+```
+
+The Tilt UI at http://localhost:10350 shows:
+- Build status for `aicrd`
+- Pod logs and status
+- Port forward (API and metrics: 8080)
+
+#### 3. Develop with Hot Reload
+
+Tilt watches for changes in `cmd/aicrd/` and `pkg/`. When you save a file:
+1. Tilt rebuilds the container using `ko` (fast Go builds)
+2. Pushes to the local registry
+3. Kubernetes rolls out the new pod
+4. Port forwards reconnect automatically
+
+#### 4. Test the API
+
+```bash
+# Health check
+curl http://localhost:8080/health
+
+# Readiness check
+curl http://localhost:8080/ready
+
+# Generate a recipe
+curl "http://localhost:8080/v1/recipe?os=ubuntu&service=eks&accelerator=h100&intent=training"
+
+# View metrics
+curl http://localhost:8080/metrics
+```
+
+#### 5. View Logs
+
+```bash
+# Stream logs from Tilt UI, or use kubectl
+kubectl logs -f -n aicr deployment/aicrd
+
+# Or view in Tilt UI at http://localhost:10350
+```
+
+#### 6. Clean Up
+
+```bash
+# Stop Tilt but keep cluster (for quick restart)
+make tilt-down
+
+# Full cleanup (removes cluster and registry)
+make dev-env-clean
+```
+
+### Individual Commands
+
+```bash
+# Cluster management
+make cluster-create   # Create Kind cluster with registry
+make cluster-delete   # Delete cluster and registry
+make cluster-status   # Show cluster info
+
+# Tilt management
+make tilt-up          # Start Tilt
+make tilt-down        # Stop Tilt
+make tilt-ci          # Run Tilt in CI mode (no UI)
+
+# Combined targets
+make dev-restart      # Restart Tilt without recreating cluster
+make dev-reset        # Full reset (tear down and recreate)
+```
+
+### Running E2E Tests with Tilt
+
+```bash
+# Start the dev environment
+make dev-env
+
+# In another terminal, run E2E tests against the Tilt cluster
+make e2e-tilt
+```
+
+### Testing the API Server Locally (without Kubernetes)
+
+For quick iteration without Kubernetes:
+
+```bash
+# Start API server in debug mode
+make server
+
+# In another terminal, test endpoints
+curl http://localhost:8080/health
+curl http://localhost:8080/ready
+curl "http://localhost:8080/v1/recipe?os=ubuntu&service=eks&accelerator=h100&intent=training"
+```
+
+### Tilt Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Developer Machine                    │
+├─────────────────────────────────────────────────────────┤
+│  ┌─────────┐    ┌──────────┐    ┌───────────────────┐   │
+│  │  Tilt   │───▶│    ko    │───▶│ localhost:5001    │   │
+│  │ (watch) │    │ (build)  │    │ (local registry)  │   │
+│  └─────────┘    └──────────┘    └─────────┬─────────┘   │
+│       │                                   │             │
+│       │         ┌─────────────────────────┘             │
+│       ▼         ▼                                       │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │              Kind Cluster (kind-aicr)           │    │
+│  │  ┌─────────────────────────────────────────┐    │    │
+│  │  │           Namespace: aicr               │    │    │
+│  │  │  ┌─────────────┐  ┌─────────────────┐   │    │    │
+│  │  │  │   aicrd     │  │    Service      │   │    │    │
+│  │  │  │ Deployment  │◀─│  (ClusterIP)    │   │    │    │
+│  │  │  └─────────────┘  └─────────────────┘   │    │    │
+│  │  └─────────────────────────────────────────┘    │    │
+│  └─────────────────────────────────────────────────┘    │
+│       │                                                 │
+│       │ Port Forwards                                   │
+│       ▼                                                 │
+│  localhost:8080 (API and /metrics)                      │
+└─────────────────────────────────────────────────────────┘
+```
+
+## KWOK Simulated Cluster Testing
+
+KWOK (Kubernetes WithOut Kubelet) tests recipe configurations and bundle scheduling without GPU hardware.
+
+```bash
+make kwok-test-all                      # Test all recipes (serial, shared cluster)
+make kwok-e2e RECIPE=gb200-eks-training # Test single recipe
+```
+
+Recipes with `spec.criteria.service` defined are auto-discovered. KWOK validates scheduling (node selectors, tolerations, resource requests) but not runtime behavior (no container execution or GPU functionality).
+
+For the deployer matrix (Argo CD and Flux, OCI and Git source lanes), see [Deployer Coverage Matrix](docs/contributor/tests.md#deployer-coverage-matrix).
+
+| Command | Description |
+|---------|-------------|
+| `make kwok-test-all` | Test all recipes in shared cluster (serial) |
+| `make kwok-e2e RECIPE=<name>` | Full e2e: cluster, nodes, validate |
+| `make kwok-test-deployer RECIPE=<name> DEPLOYER=<name>` | Validate single recipe under a specific deployer (`helm`, `argocd-oci`, `argocd-helm-oci`, `argocd-git`, `flux-oci`, `flux-git`) |
+| `make kwok-test RECIPE=<name>` | Validate bundle scheduling on an existing KWOK cluster |
+| `make kwok-cluster` | Create Kind cluster with KWOK |
+| `make kwok-nodes RECIPE=<name>` | Create KWOK nodes from a recipe overlay |
+| `make kwok-nodes-delete` | Delete all KWOK-simulated nodes |
+| `make kwok-status` | Show cluster and node status |
+| `make kwok-cluster-delete` | Delete cluster |
+
+See [kwok/README.md](kwok/README.md) for adding recipes, profiles, and troubleshooting.
+
+## AICR Operator
+
+The opt-in AICR Operator ([ADR-027](docs/design/027-aicr-operator.md)) lives in `cmd/aicr-operator`, `cmd/kubectl-aicr`, `api/operator`, `pkg/operator`, `charts/aicr-operator` and `tests/operator`. It runs AICR only as a pinned image: the `operator-boundary` depguard rule in `.golangci.yaml` rejects any import of another AICR package. Its pins live under `operator:` in `.settings.yaml`, and its user documentation is in [docs/operator](docs/operator/index.md).
+
+Its unit and envtest suites run in `make test`. The targets below cover the rest; the kind suites need Docker, kind, Helm, yq and envsubst.
+
+| Command | Description |
+|---------|-------------|
+| `make operator-build` | Build `dist/aicr-operator` and `dist/kubectl-aicr` (development version, with the `aicr_operator_development` tag) |
+| `make generate` | Regenerate deep copies and CRDs after an API type change |
+| `make operator-check-generated` | Fail when generated code or CRDs are stale |
+| `make operator-envtest-floor` | CRD validation and chart suites on the Kubernetes floor |
+| `make operator-kind-up` / `operator-kind-up-floor` | Create the two-node `aicr-operator` kind cluster with an in-cluster registry |
+| `make operator-kind-down` | Delete it |
+| `make operator-e2e` | Run the pinned AICR images as operator-built Jobs |
+| `make operator-skeleton` | Run the operator with the pinned Argo CD, one release end to end |
+| `CANDIDATE_VERSION=<version> make operator-candidate` | Build a release candidate of the current commit into `dist/candidate` (clean tree required) |
+| `make operator-candidate-verify` | Build the candidate twice and require identical bytes |
+| `make operator-qualify` | Fault-injection suite against `dist/candidate`, upgraded to `dist/candidate-next` |
+| `make operator-qualify-published` | Lifecycle scenarios from the newest published release (attestations verified), upgraded to `dist/candidate` |
+
+The operator accepts development settings (`development.bypassApprovals`, `development.skipDiscovery`) only when built with the `aicr_operator_development` build tag and without a release version. A plain `go build` or `ko build` refuses them. `ko` adds the tag when `AICR_OPERATOR_DEVELOPMENT=true`, which `make operator-skeleton` sets.
+
+The merge gate runs `make operator-check-generated` and `make operator-envtest-floor` on every push to `main`, and on pull requests that change `api/operator`, `pkg/operator`, `tests/operator`, `charts/aicr-operator`, the generator, the Go module or `.settings.yaml`. CI runs each kind suite on its own cluster. Locally, recreate the cluster between suites (`make operator-kind-down operator-kind-up`), or set `OPERATOR_ADOPT=1` to install over another suite's objects. Set `OPERATOR_E2E_REQUIRED=1` to make a suite fail, not skip, when no cluster is reachable. `make operator-qualify` needs both candidates, built as `.github/workflows/operator-e2e.yaml` builds them. `make operator-qualify-published` needs only `dist/candidate`, plus `gh` signed in to verify the published release's attestations. It picks the newest published, non-prerelease release; set `PUBLISHED_VERSION` to pin one (for example `PUBLISHED_VERSION=1.2.0`), or `PUBLISHED_BELOW` to stay older than a version, as the release does with its own tag; `PUBLISHED_DIR` (default `dist/published`) receives it. It sets `AICR_OPERATOR_QUALIFY_LIFECYCLE_ONLY=1`, which skips the qualify suite's fault scenarios: they test the installed release against this commit's code.
+
+## Make Targets Reference
+
+### Quality & Testing
+
+| Target | Description |
+|--------|-------------|
+| `make qualify` | Full qualification (test-coverage, lint, tuning-check, coverage-check, e2e, scan, license-check, api-diff, openapi-diff) |
+| `make test` | Unit tests with race detector and coverage |
+| `make test-coverage` | Tests with coverage threshold (from `.settings.yaml` `quality.coverage_threshold`) |
+| `make lint` | Lint Go and YAML; verify license headers, agents sync, docs gates, chart-version pins, vendored Go proxy action digests, upgrade records, and the Dynamo runtime image tag |
+| `make lint-go` | Go linting only |
+| `make lint-yaml` | YAML linting only |
+| `make e2e` | CLI end-to-end tests |
+| `make e2e-tilt` | E2E tests with Tilt cluster |
+| `make scan` | Vulnerability scan with grype |
+| `make bench` | Run benchmarks |
+| `make kwok-test-all` | Test all recipes with KWOK (serial, shared cluster) |
+| `make kwok-e2e RECIPE=<name>` | Test single recipe with KWOK (e.g., gb200-eks-training) |
+| `make check-health COMPONENT=<name>` | Run chainsaw health check directly against Kind cluster |
+| `make check-health-all` | Run chainsaw health checks for every registry-linked component against Kind cluster (opt-in-only checks like `nvsentinel-observability` run via `check-health COMPONENT=<name>`) |
+| `make validate-local RECIPE=<path>` | Build validator image, load into Kind, run deployment validation |
+
+### Build & Release
+
+| Target | Description |
+|--------|-------------|
+| `make build` | Build binaries for current OS/arch |
+| `make image` | Build and push aicr container image (Ko) |
+| `make image-validators` | Build and push per-phase validator images (Docker) |
+| `make release` | Full release with goreleaser (includes all images) |
+| `make bump-major` | Bump major version (1.2.3 → 2.0.0) |
+| `make bump-minor` | Bump minor version (1.2.3 → 1.3.0) |
+| `make bump-patch` | Bump patch version (1.2.3 → 1.2.4) |
+| `make bump-rc` | Tag RC pre-release (v1.2.3 → v1.3.0-rc1 → v1.3.0-rc2) |
+| `make bump-promote TAG=<rc-tag>` | Promote a pre-release to stable on the same SHA |
+
+### Binary Attestation
+
+Release binaries are attested with SLSA Build Provenance v1 via a GoReleaser build
+hook that calls `cosign attest-blob`. The hook is guarded by the `$SLSA_PREDICATE`
+environment variable — it only runs when a workflow explicitly generates the predicate.
+Local `make build` is unaffected.
+
+To produce attested binaries without a release tag, use the **Build Attested Binaries**
+workflow (`.github/workflows/build-attested.yaml`) from the Actions tab. It runs
+`goreleaser release --snapshot` with cosign and uploads tar.gz archives as artifacts.
+
+#### Bundle Attestation
+
+`aicr bundle` can attest bundles using Sigstore keyless OIDC signing (opt-in via `--attest`):
+
+- **GitHub Actions**: Uses the ambient OIDC token automatically (requires `id-token: write`)
+- **Local**: Opens a browser for Sigstore OIDC authentication (GitHub, Google, or Microsoft)
+- **Opt-in**: Use `--attest` to enable signing (not required for local development)
+
+Verify a bundle with `aicr verify <dir>`. Update the trusted root cache with
+`aicr trust update` (run automatically by the install script).
+
+### Local Development
+
+| Target | Description |
+|--------|-------------|
+| `make dev-env` | Create cluster and start Tilt |
+| `make dev-env-clean` | Stop Tilt and delete cluster |
+| `make dev-restart` | Restart Tilt without recreating cluster |
+| `make dev-reset` | Full reset (tear down and recreate) |
+| `make server` | Start local API server with debug logging |
+| `make cluster-create` | Create Kind cluster with registry |
+| `make cluster-delete` | Delete Kind cluster and registry |
+| `make cluster-status` | Show cluster and registry status |
+
+### Code Maintenance
+
+| Target | Description |
+|--------|-------------|
+| `make tidy` | Format code and tidy dependencies |
+| `make notices` | Generate `THIRD_PARTY_NOTICES.md` (untracked; `make release` runs it) |
+| `make fmt-check` | Check code formatting (CI-friendly) |
+| `make upgrade` | Upgrade all dependencies |
+| `make generate` | Run go generate |
+| `make license` | Add/verify license headers |
+| `make license-check` | Verify license allowlist compliance (verify-only, CI-friendly) |
+
+### Tools
+
+| Target | Description |
+|--------|-------------|
+| `make tools-check` | Check tools and compare versions |
+| `make tools-setup` | Install all development tools (first-time) |
+| `make tools-update` | Upgrade existing tools to versions pinned in `.settings.yaml` |
+
+### Utilities
+
+| Target | Description |
+|--------|-------------|
+| `make info` | Print project info (version, commit, tools) |
+| `make docs` | Serve Go documentation on localhost:6060 |
+| `make clean` | Clean build artifacts |
+| `make clean-all` | Deep clean including module cache |
+| `make cleanup` | Clean up AICR Kubernetes resources |
+| `make help` | Show all available targets |
+
+## Debugging
+
+### Common Issues
+
+| Issue | Solution |
+|-------|----------|
+| `make tools-check` shows version mismatch | Run `make tools-update` to upgrade tools to versions pinned in `.settings.yaml` |
+| `make qualify` passes locally but lint fails in CI | Local toolchain has drifted behind CI; run `make tools-update` and re-run `make qualify` |
+| Tests fail with race conditions | Ensure `context.Done()` is checked in loops |
+| Linter errors about `errors.Is()` | Use `errors.Is()` instead of `==` for error comparison |
+| Build failures | Run `make tidy` to update dependencies |
+| K8s connection fails | Check `~/.kube/config` or `KUBECONFIG` env |
+
+### Redeploying on Driver-Managed Clusters
+
+On clusters where gpu-operator installs the NVIDIA kernel driver
+(`driver.enabled: true` — e.g. EKS; GKE COS is host-managed and unaffected),
+running `make cleanup` (`tools/cleanup`) can leave the `nvidia_uvm` kernel
+module wedged mid-unload on GPU nodes. The symptom appears on the *next*
+install: the driver validation init container crashes
+(`Init:CrashLoopBackOff`, logs show `failed to create device node
+nvidia-uvm`). The cleanup tool detects driver-managed mode (via the
+`nvidia-driver-daemonset` or `driver.enabled` in the release values) and
+prints this guidance; the fix is to reboot the GPU nodes before reinstalling:
+
+```bash
+NODE="my-gpu-node"                 # replace with a GPU node; repeat for each one
+INSTANCE_ID="i-0123456789abcdef0"  # replace with the instance ID at the end of its .spec.providerID
+
+kubectl cordon "${NODE}"
+# reboot the instances, e.g. on EKS:
+aws ec2 reboot-instances --instance-ids "${INSTANCE_ID}"
+# wait for the nodes to report Ready, then
+kubectl uncordon "${NODE}"
+```
+
+### Excluding Out-of-Band Installs from Cleanup
+
+On shared or bring-up clusters, a registry component may be deliberately
+installed and owned outside AICR (for example, nodewright/skyhook installed
+out-of-band by the platform team, with the AICR recipe intentionally excluding
+it). Stock `tools/cleanup` would otherwise destroy such an install three ways:
+the Helm uninstall in its namespace, the CRD group match, and the namespace
+deletion. Fence it out of all three phases:
+
+```bash
+go run ./tools/cleanup --exclude-ns skyhook --exclude-crd skyhook.nvidia.com,nodewright.nvidia.com
+```
+
+Both flags are repeatable and accept comma-separated values. `--exclude-ns`
+protects a namespace from Helm uninstall and namespace deletion; `--exclude-crd`
+protects CRDs whose name contains the given match from deletion. It is applied
+*after* group matching, so it can fence out a group AICR otherwise owns
+(`skyhook.nvidia.com`, and its v0.18.0 rename `nodewright.nvidia.com`). Run
+with `--dry-run` first to confirm what will and will not be removed.
+
+Phase 3 only deletes CRDs whose API group exactly matches a group AICR
+components install (`aicrCRDGroups` in `tools/cleanup/cleaner.go`). An unrelated
+`*.nvidia.com` group, such as a third-party harness, is never matched and needs
+no `--exclude-crd`.
+
+Some namespaces are kept without any flag:
+
+- A namespace holding a Helm release AICR does not own (see below). Phase 1
+  skips that release, and phase 4 keeps its namespace so the release can still
+  be removed with `helm uninstall`.
+- A namespace holding an AICR release that Flux's helm-controller manages.
+  Phase 1 skips it, because helm-controller reinstalls a release removed
+  behind its back. Delete the `HelmRelease` in the Flux namespace
+  (`flux-system` by default) instead, which uninstalls it.
+- `openshift-nfd` and `cert-manager-operator`, unless phase 1 finds an AICR
+  release in them that is not in `uninstalled` status. On OpenShift the
+  platform team often installs these operators through OperatorHub. The list
+  is `sharedNamespaces` in `tools/cleanup/namespaces.go`.
+- Every phase 4 namespace, when helm is not installed or `helm list` fails. Without the
+  release list, cleanup cannot tell which namespaces hold releases it would
+  orphan.
+
+`--keep-namespaces` keeps `aicr-validation` too, but still deletes what
+`aicr validate` left there: the validator Jobs and ConfigMaps, and the snapshot
+agent's Job, ServiceAccount, Role and RoleBinding. The snapshot agent's
+staging ConfigMap (`aicr-agent-snapshot-<runID>`) is left in place.
+
+### How Cleanup Decides Which Releases AICR Owns
+
+Phase 1 uninstalls a Helm release only when AICR owns it. Without `--bundle`,
+a release is owned when any of these recognizes it:
+
+- The installed-component inventory (`pkg/inventory`), read once per naming
+  scheme. Helm, helmfile, Terraform and Fleet releases carry the component
+  name. Flux releases are named `<targetNamespace>-<component>` and are
+  recognized but left to helm-controller. Argo CD Applications are not Helm
+  releases, so cleanup only warns that Argo CD re-syncs what it removes.
+  Delete the Applications or their parent Application first.
+- The AICR stamp (`aicr.run/generated-by`) on a Helm release, for
+  releases no component name matches, such as an injected manifest folder.
+- The registry's release names, plus the few retired components in
+  `legacyComponents` (`tools/cleanup/helm.go`), which predate the stamp. This
+  is also the fallback when an inventory read fails.
+
+### Limiting Cleanup to One Bundle
+
+```bash
+go run ./tools/cleanup --bundle ./bundles --dry-run
+```
+
+`--bundle` reads the release index in the bundle's `bundle-info.yaml`
+(`layout.releases`). Phase 1 uninstalls only those releases, matched by name
+and namespace. Phase 4 deletes only the namespaces those releases install
+into, so namespaces no bundle names, such as `gang-scheduling-test`, are left
+alone. A directory with no `bundle-info.yaml` is an error, so pass the root
+of a `--split` bundle set, not one of its class directories. For a bundle
+that predates the index, omit `--bundle`. An Argo CD bundle installs Applications, not
+Helm releases, so phase 1 uninstalls nothing and cleanup warns to delete the
+Applications first. `--bundle` does not limit phase 3, which still deletes
+CRDs in AICR's API groups cluster-wide, and with them every custom resource
+of those kinds. On a cluster shared with another tenant, add `--keep-crds`.
+
+### Workloads That Outlive Their Operator
+
+A user workload can hold objects of an AICR CRD in a namespace AICR does not
+own, for example a `DynamoGraphDeployment` or Grove `PodClique` in a serving
+namespace. Phase 1 uninstalls the operator that serves the CRD's conversion
+webhook and removes its finalizers, so deleting the CRD in phase 3 would hang:
+
+- the instances keep finalizers nothing will remove, so the CRD stays
+  `Terminating` and the next install of that operator fails on it;
+- every list of the kind fails on the dead webhook, so an AICR namespace that
+  phase 4 deletes stays `Terminating` with `NamespaceDeletionContentFailure`,
+  even when it is empty.
+
+Phase 3 therefore sets a webhook-converted CRD's conversion strategy to `None`
+before deleting it. After a short wait, for each CRD still `Terminating`, it
+clears the finalizers of the instances its deletion has already marked, except
+in `--exclude-ns` namespaces. Those objects are already being deleted with the
+CRD.
+
+`--keep-crds` changes neither, since a kept CRD must keep its webhook for the
+reinstalled operator. Instead, cleanup warns about each kept CRD whose webhook
+Service is gone: deleting any namespace hangs until its operator is
+reinstalled. Reinstall the operator before deleting namespaces, or run with
+`--keep-namespaces` as well.
+
+Cleanup ends by checking once more for CRDs and namespaces it deleted that are
+still `Terminating`. It names each one, with the namespace's deletion-failure
+condition, and finishes with "AICR cleanup finished with resources still
+terminating" instead of "AICR cleanup complete". A namespace whose delete was
+refused, for example by RBAC or admission, is reported as not deleted rather
+than as `Terminating`. Its exit status stays 0.
+
+### Debugging Tests
+
+```bash
+# Run specific test with verbose output
+go test -v ./pkg/recipe/... -run TestSpecificFunction
+
+# Run tests with race detector (already included in make test)
+go test -race ./...
+
+# Generate coverage report
+go test -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out
+```
+
+### Debugging the API Server
+
+```bash
+# Start with debug logging
+AICR_LOG_LEVEL=debug go run cmd/aicrd/main.go
+
+# Or use make target
+make server
+```
+
+### Debugging Tilt Issues
+
+```bash
+# Check cluster status
+make cluster-status
+
+# View Tilt logs
+tilt logs -f
+
+# Reset everything
+make dev-reset
+```
+
+## Local Health Check Validation
+
+Health checks are Chainsaw test YAMLs in `recipes/checks/<component>/health-check.yaml` that assert component health (deployments exist, pods are running). Two workflows let you validate these locally without a release build.
+
+### Prerequisites
+
+- Kind cluster running: `make dev-env` (or `make cluster-create` for cluster only)
+- Component deployed to the cluster (the health check asserts against live resources)
+- Chainsaw installed: `make tools-setup` (or `make tools-check` to verify)
+
+### Quick Check (Direct Chainsaw)
+
+Runs chainsaw directly against the Kind cluster. Fast (~5s), validates YAML syntax and assertions.
+
+```bash
+# Run health check for a single component
+make check-health COMPONENT=nvsentinel
+
+# Run health checks for every registry-linked component
+# (opt-in-only checks are excluded; run those with check-health COMPONENT=<name>)
+make check-health-all
+
+# List available components
+make check-health
+```
+
+**When to use:** Iterating on health check YAML — writing new checks or modifying existing ones. This validates your Chainsaw assertions work against the live cluster.
+
+### Full Pipeline Validation
+
+Builds the validator image, loads it into Kind, and runs the real validation pipeline (Job creation, RBAC, ConfigMap mounts, chainsaw execution inside the container).
+
+```bash
+# Build validator image and run deployment validation
+make validate-local RECIPE=path/to/recipe.yaml
+
+# With custom image tag
+make validate-local RECIPE=recipe.yaml IMAGE_TAG=dev
+```
+
+**When to use:** Before pushing changes, to confirm health checks work through the full validator pipeline — not just the chainsaw assertions but the entire Job-based execution.
+
+### Workflow for New Health Checks
+
+1. **Create the check file:**
+
+   ```bash
+   mkdir -p recipes/checks/my-component/
+   ```
+
+   Create `recipes/checks/my-component/health-check.yaml`:
+
+   ```yaml
+   apiVersion: chainsaw.kyverno.io/v1alpha1
+   kind: Test
+   metadata:
+     name: my-component-health-check
+   spec:
+     timeouts:
+       assert: 5m
+     steps:
+       - name: validate-deployment-exists
+         try:
+           - assert:
+               resource:
+                 apiVersion: apps/v1
+                 kind: Deployment
+                 metadata:
+                   name: my-component
+                   namespace: my-namespace
+                 status:
+                   (availableReplicas > `0`): true
+       - name: validate-all-pods-healthy
+         try:
+           - error:
+               resource:
+                 apiVersion: v1
+                 kind: Pod
+                 metadata:
+                   namespace: my-namespace
+                 status:
+                   phase: Pending
+           - error:
+               resource:
+                 apiVersion: v1
+                 kind: Pod
+                 metadata:
+                   namespace: my-namespace
+                 status:
+                   phase: Failed
+           - error:
+               resource:
+                 apiVersion: v1
+                 kind: Pod
+                 metadata:
+                   namespace: my-namespace
+                 status:
+                   phase: Unknown
+   ```
+
+2. **Register in registry:**
+
+   Add to `recipes/registry.yaml` on the component entry:
+
+   ```yaml
+   healthCheck:
+     assertFile: checks/my-component/health-check.yaml
+   ```
+
+3. **Deploy component to Kind cluster:**
+
+   ```bash
+   make dev-env  # if not already running
+   helm install my-component <chart> -n my-namespace --create-namespace
+   ```
+
+4. **Iterate with quick check:**
+
+   ```bash
+   make check-health COMPONENT=my-component
+   # Edit health-check.yaml, re-run, repeat
+   ```
+
+5. **Verify full pipeline:**
+
+   ```bash
+   make validate-local RECIPE=path/to/recipe.yaml
+   ```
+
+6. **Run qualify before pushing:**
+
+   ```bash
+   make qualify
+   ```
+
+## Testing a New Component
+
+The component test harness validates that a component deploys and passes its
+health check in an isolated Kind cluster. No GPU hardware required for most
+components.
+
+### Quick Start
+
+```bash
+# Build aicr, then test your component
+make build
+make component-test COMPONENT=cert-manager
+```
+
+The harness auto-detects the test tier (`scheduling`, `deploy`, or `gpu-aware`),
+creates a Kind cluster, deploys the component, and runs its health check.
+
+### Available Targets
+
+```bash
+make component-test COMPONENT=cert-manager              # Full end-to-end test
+make component-detect COMPONENT=cert-manager            # Show detected tier
+make component-cluster                            # Create/reuse cluster
+make component-deploy COMPONENT=cert-manager            # Deploy only
+make component-health COMPONENT=cert-manager            # Health check only
+make component-cleanup COMPONENT=cert-manager           # Uninstall component
+```
+
+### Debugging
+
+```bash
+# Keep cluster for inspection
+KEEP_CLUSTER=true make component-test COMPONENT=cert-manager
+
+# Inspect and re-run
+kubectl -n cert-manager get pods
+make component-health COMPONENT=cert-manager
+```
+
+See [tools/component-test/README.md](tools/component-test/README.md) for full
+environment variable reference and troubleshooting.
+
+## Validator Development
+
+For detailed information on adding validation checks and constraint validators, see:
+
+**[docs/contributor/validator.md](docs/contributor/validator.md)**
+
+This comprehensive guide covers:
+- Declarative constraints and the constraint evaluation algorithm
+- Quick start for adding a container-per-validator check
+- The container contract and the `validators.Context` API
+- Component validations (bundle-time)
+- Chainsaw health checks
+- Testing checklist and common pitfalls
+
+## Additional Resources
+
+### Project Documentation
+- [Architecture Overview](docs/contributor/index.md) - System design and components
+- [CLI Architecture](docs/contributor/cli.md) - CLI command structure
+- [Data Architecture](docs/contributor/recipe.md) - Recipe data model
+- [Components](docs/contributor/component.md) - Adding components to the registry
+
+### External Resources
+- [Go Documentation](https://golang.org/doc/)
+- [Effective Go](https://golang.org/doc/effective_go.html)
+- [Go Code Review Comments](https://github.com/golang/go/wiki/CodeReviewComments)
+- [urfave/cli Documentation](https://cli.urfave.org/)

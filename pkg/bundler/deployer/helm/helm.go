@@ -1,0 +1,628 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package helm
+
+import (
+	"context"
+	_ "embed"
+	stderrors "errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/checksum"
+	"github.com/NVIDIA/aicr/pkg/bundler/config"
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer"
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer/localformat"
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+)
+
+//go:embed templates/README.md.tmpl
+var readmeTemplate string
+
+//go:embed templates/deploy.sh.tmpl
+var deployScriptTemplate string
+
+// criteriaAny is the wildcard value for criteria fields.
+const criteriaAny = "any"
+
+// fileDeployScript is the orchestration script this deployer writes at the
+// bundle root. Named so the write site (GenerateFromTemplate) and the
+// reported deployer.Output.Entrypoint can't drift apart into referencing two
+// different filenames.
+const fileDeployScript = "deploy.sh"
+
+// ComponentData contains data for rendering per-component template blocks.
+// The helm deployer no longer owns per-component folder content (localformat
+// does). ComponentData now carries only the fields needed by the orchestration
+// templates: README.md's component table and deploy.sh's name-matched
+// special-case blocks.
+type ComponentData struct {
+	Name       string
+	Namespace  string
+	Repository string
+	ChartName  string
+	Version    string // Original version string (preserves 'v' prefix) for helm install --version
+	IsOCI      bool
+	Tag        string // Git ref for Kustomize-typed components (tag/branch/commit)
+	Path       string // Path within the repository to the kustomization
+
+	// DriverOwnership records who installs the NVIDIA driver for this
+	// bundle: driverOwnershipOperator when a gpu-operator or
+	// gpu-operator-ocp component has not disabled its driver (which
+	// includes leaving driver.enabled at the chart default of true),
+	// driverOwnershipHost on an explicit driver.enabled: false, and
+	// driverOwnershipUnknown when the bundle carries no gpu-operator
+	// component at all. deploy.sh's DRA migration-wait block (see
+	// #2135, #973) uses this to tell "no migration is possible" apart
+	// from "a migration is underway but not yet observable", which live
+	// cluster state alone cannot distinguish. Unknown has no
+	// bundle-time answer and falls back to that live state.
+	DriverOwnership string
+}
+
+// compile-time interface check
+var _ deployer.Deployer = (*Generator)(nil)
+
+// Generator creates per-component Helm bundles from recipe results.
+// Configure it with the required fields, then call Generate.
+type Generator struct {
+	// RecipeResult contains the recipe metadata and component references.
+	RecipeResult *recipe.RecipeResult
+
+	// ComponentValues maps component names to their values.
+	// These are collected from individual bundlers.
+	ComponentValues map[string]map[string]any
+
+	// Version is the bundler version (from CLI/bundler version).
+	Version string
+
+	// IncludeChecksums indicates whether to generate a checksums.txt file.
+	IncludeChecksums bool
+
+	// RecipeFile is the resolved recipe path relative to the output directory.
+	// When set, the file is included in the generated output and checksums.
+	RecipeFile string
+
+	// ComponentPreManifests maps component name → manifest path → content
+	// for manifests that apply BEFORE each component's primary chart.
+	// Forwarded to localformat.Options.ComponentPreManifests. Populated
+	// from ComponentRef.PreManifestFiles.
+	ComponentPreManifests map[string]map[string][]byte
+
+	// ComponentPostManifests maps component name → manifest path → content
+	// for manifests that apply AFTER each component's primary chart.
+	// Each component's manifests are placed in its own manifests/ subdirectory.
+	// Populated from ComponentRef.ManifestFiles.
+	ComponentPostManifests map[string]map[string][]byte
+
+	// ComponentReadiness maps component name → manifest path → content for the
+	// per-component readiness gate chart emitted after each component's
+	// primary chart. Populated by the bundler from readiness.yaml when
+	// --readiness-hooks is set; empty otherwise. Forwarded to
+	// localformat.Options.ComponentReadiness. See #904.
+	ComponentReadiness map[string]map[string][]byte
+
+	// DataFiles lists additional file paths (relative to output dir) to include
+	// in checksum generation. Used for external data files copied into the bundle.
+	DataFiles []string
+
+	// DynamicValues maps component names to their dynamic value paths.
+	// These paths are removed from values.yaml and written to cluster-values.yaml.
+	DynamicValues map[string][]string
+
+	// VendorCharts pulls upstream Helm chart bytes into the bundle at
+	// bundle time so the resulting artifact is air-gap deployable.
+	// Off by default. See pkg/bundler/deployer/localformat for the
+	// vendoring shape (single wrapped folder per Helm component, with
+	// charts/<chart>-<version>.tgz adjacent to a wrapper Chart.yaml).
+	VendorCharts bool
+
+	// Puller fetches upstream chart bytes when VendorCharts is set. nil
+	// resolves to a default *CLIChartPuller; tests inject a stub here
+	// without touching package state. Ignored when VendorCharts is false.
+	Puller localformat.ChartPuller
+
+	// UpgradeNotice is upgrade.WriteNotice output, inserted verbatim before the
+	// first deployment heading of README.md. Empty adds nothing.
+	UpgradeNotice string
+
+	// Split, when set, renders this output as one class directory of an
+	// ADR-018 bundle set: deploy.sh keys its orphaned-CRD scan by the
+	// component that ships the CRDs, and README.md states the class install
+	// and teardown order and the namespaces and CRD groups shared with an
+	// earlier class. nil renders an ordinary bundle, byte-identical to before
+	// the field existed.
+	Split *SplitContext
+
+	// vendorRecords is populated by Generate when VendorCharts is on.
+	// Captured here so generateProvenanceFile can write provenance.yaml
+	// without re-threading the slice through every helper call. The
+	// field is unset (nil) when VendorCharts is off.
+	vendorRecords []localformat.VendorRecord
+}
+
+// Generate creates a per-component Helm bundle from the configured generator fields.
+// Per-component folder content (Chart.yaml, values.yaml, install.sh, templates/*)
+// is delegated to pkg/bundler/deployer/localformat. The helm deployer owns only
+// the top-level orchestration: README.md, deploy.sh, and checksums. Bundle
+// teardown is delegated to the deployer-native uninstall path (helm uninstall);
+// see docs/user/cli-reference.md for the per-deployer walkthrough.
+func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.Output, error) {
+	start := time.Now()
+
+	output := &deployer.Output{
+		Files: make([]string, 0),
+	}
+
+	if g.RecipeResult == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "RecipeResult is required")
+	}
+
+	// Create output directory
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal,
+			"failed to create output directory", err)
+	}
+
+	// Remove any stale undeploy.sh left from a pre-removal bundle in the
+	// same output directory. localformat.Write only prunes NNN-* folders;
+	// without this an executable, unchecksummed undeploy.sh would survive
+	// regeneration and contradict the new README's uninstall guidance.
+	if err := os.Remove(filepath.Join(outputDir, "undeploy.sh")); err != nil && !stderrors.Is(err, os.ErrNotExist) {
+		return nil, errors.Wrap(errors.ErrCodeInternal,
+			"failed to remove stale undeploy.sh", err)
+	}
+
+	// Build sorted component data list (validates component names)
+	components, err := g.buildComponentDataList()
+	if err != nil {
+		return nil, err
+	}
+
+	// Map ComponentData to localformat.Component and write per-component folders.
+	// localformat owns: folder naming, values.yaml/cluster-values.yaml split,
+	// Chart.yaml, templates/*, install.sh. The helm deployer just orchestrates.
+	// Which components may have their CRDs applied ahead of `helm upgrade`.
+	// Helm never updates a chart's crds/ directory on upgrade, so without
+	// this the bundle pairs a bumped chart with its day-one CRD schema.
+	crdOwners, crdExclusions, err := deployer.ResolveCRDPolicy(ctx, g.RecipeResult.DataProvider(), g.RecipeResult.ComponentRefs)
+	if err != nil {
+		return nil, err
+	}
+	var chartDigests map[string]string
+	if g.VendorCharts {
+		chartDigests, err = deployer.ResolveChartDigests(ctx, g.RecipeResult.DataProvider(), g.RecipeResult.ComponentRefs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	requiredDynamic, err := deployer.ResolveRequiredDynamicPaths(ctx, g.RecipeResult.DataProvider(), g.RecipeResult.ComponentRefs, g.DynamicValues)
+	if err != nil {
+		return nil, err
+	}
+	lfComponents := toLocalformatComponents(components, g.ComponentValues, g.DynamicValues, requiredDynamic, crdOwners, crdExclusions, chartDigests)
+	writeResult, err := localformat.Write(ctx, localformat.Options{
+		OutputDir:              outputDir,
+		Components:             lfComponents,
+		AICRVersion:            g.Version,
+		ComponentPreManifests:  g.ComponentPreManifests,
+		ComponentPostManifests: g.ComponentPostManifests,
+		ComponentReadiness:     g.ComponentReadiness,
+		VendorCharts:           g.VendorCharts,
+		Puller:                 g.Puller,
+	})
+	if err != nil {
+		// localformat.Write returns StructuredErrors; propagate as-is.
+		return nil, err
+	}
+	g.vendorRecords = writeResult.VendoredCharts
+	output.Entrypoint = fileDeployScript
+	output.Releases = writeResult.Releases()
+	for _, f := range writeResult.Folders {
+		// localformat returns paths relative to outputDir. Downstream consumers
+		// (checksum.WriteChecksums, output.TotalSize, deployment reporting) all
+		// expect absolute paths, so resolve each entry via SafeJoin before
+		// appending. SafeJoin also enforces containment.
+		for _, rel := range f.Files {
+			abs, joinErr := deployer.SafeJoin(outputDir, rel)
+			if joinErr != nil {
+				return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("path from localformat escapes outputDir: %s", rel), joinErr)
+			}
+			output.Files = append(output.Files, abs)
+			if info, statErr := os.Stat(abs); statErr == nil {
+				output.TotalSize += info.Size()
+			}
+		}
+	}
+
+	// Generate root README.md
+	readmePath, readmeSize, err := g.generateRootREADME(ctx, components, writeResult.Folders, outputDir)
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal,
+			"failed to generate README.md", err)
+	}
+	output.Files = append(output.Files, readmePath)
+	output.TotalSize += readmeSize
+
+	// Generate deploy.sh
+	deployPath, deploySize, err := g.generateDeployScript(ctx, components, outputDir)
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal,
+			"failed to generate deploy.sh", err)
+	}
+	output.Files = append(output.Files, deployPath)
+	output.TotalSize += deploySize
+
+	// Include the resolved recipe written by the bundler before generation so
+	// checksums.txt covers the configuration used to produce this bundle.
+	if g.RecipeFile != "" {
+		if err := output.AddDataFiles(outputDir, []string{g.RecipeFile}); err != nil {
+			return nil, err
+		}
+	}
+
+	// Include external data files in the file list (for checksums)
+	if err := output.AddDataFiles(outputDir, g.DataFiles); err != nil {
+		return nil, err
+	}
+
+	// Generate provenance.yaml for vendored bundles. Written before
+	// checksums.txt so the audit file is itself checksummed.
+	if len(g.vendorRecords) > 0 {
+		provPath, provSize, provErr := localformat.WriteProvenance(ctx, outputDir, g.vendorRecords)
+		if provErr != nil {
+			return nil, errors.Wrap(errors.ErrCodeInternal,
+				"failed to generate provenance.yaml", provErr)
+		}
+		output.Files = append(output.Files, provPath)
+		output.TotalSize += provSize
+		output.Provenance = localformat.ProvenanceFileName
+	}
+
+	// Generate checksums.txt if requested
+	if g.IncludeChecksums {
+		if err := checksum.WriteChecksums(ctx, outputDir, output); err != nil {
+			return nil, err
+		}
+	}
+
+	output.Duration = time.Since(start)
+
+	// Populate deployment steps for CLI output
+	output.DeploymentSteps = []string{
+		fmt.Sprintf("cd %s", outputDir),
+		"chmod +x deploy.sh",
+		"./deploy.sh",
+	}
+
+	slog.Debug("helm bundle generated",
+		"files", len(output.Files),
+		"total_size", output.TotalSize,
+		"duration", output.Duration,
+	)
+
+	return output, nil
+}
+
+// Values of ComponentData.DriverOwnership. deploy.sh.tmpl compares
+// against these spellings, so they are pinned by
+// TestGenerate_DeployScript_DRARestartGatedOnDriverOwnership rather than
+// shared with the template.
+const (
+	driverOwnershipOperator = "operator"
+	driverOwnershipHost     = "host"
+	driverOwnershipUnknown  = "unknown"
+)
+
+// driverOwnership reports who installs the NVIDIA driver for this
+// bundle. Checks every gpu-operator component name, from
+// config.GPUOperatorDriverOwnership, since only one is ever enabled in a
+// given recipe.
+//
+// Unknown is a distinct state, not a synonym for host-managed: a bundle
+// carrying no gpu-operator component at all (a bundlers filter, or
+// --set gpuoperator:enabled=false) says nothing about who owns the
+// driver, and calling that host-managed would skip the migration wait
+// against an externally managed one.
+func (g *Generator) driverOwnership() string {
+	operatorPresent := false
+	for _, name := range config.GPUOperatorDriverOwnership.ComponentNames {
+		values, ok := g.ComponentValues[name]
+		if !ok {
+			continue
+		}
+		operatorPresent = true
+		if gpuOperatorDriverEnabled(values) {
+			return driverOwnershipOperator
+		}
+	}
+	if operatorPresent {
+		return driverOwnershipHost
+	}
+	return driverOwnershipUnknown
+}
+
+// gpuOperatorDriverEnabled reports whether one gpu-operator component's
+// effective values select an operator-installed driver. Only a bare
+// boolean false does not: the chart defaults driver.enabled to true, so
+// an absent section or key still leaves the operator owning the driver,
+// and every other spelling is rejected before bundling by
+// CheckDriverOwnershipCoherence (registered severity error on
+// gpu-operator) because the chart interpolates the value unquoted into
+// the ClusterPolicy and YAML re-types it at install time.
+//
+// Duplicates pkg/bundler/bundler.go's identically named function: this
+// package cannot import pkg/bundler, which imports it.
+func gpuOperatorDriverEnabled(values map[string]any) bool {
+	driver, isMap := values["driver"].(map[string]any)
+	if !isMap {
+		return true
+	}
+	enabled, isBool := driver["enabled"].(bool)
+	return !isBool || enabled
+}
+
+// buildComponentDataList builds a sorted list of ComponentData from the recipe.
+// It validates that all component names are safe for use as directory names.
+// Only the fields consumed by the orchestration templates are populated.
+func (g *Generator) buildComponentDataList() ([]ComponentData, error) {
+	// Sort by deployment order
+	sorted := deployer.SortComponentRefsByDeploymentOrder(
+		g.RecipeResult.ComponentRefs,
+		g.RecipeResult.DeploymentOrder,
+	)
+
+	driverOwnership := g.driverOwnership()
+
+	components := make([]ComponentData, 0, len(sorted))
+	for _, ref := range sorted {
+		if !deployer.IsSafePathComponent(ref.Name) {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("invalid component name %q: must not contain path separators or parent directory references", ref.Name))
+		}
+
+		chartName := ref.EffectiveChart()
+
+		components = append(components, ComponentData{
+			Name:            ref.Name,
+			Namespace:       ref.Namespace,
+			Repository:      ref.Source,
+			ChartName:       chartName,
+			Version:         ref.Version,
+			IsOCI:           strings.HasPrefix(ref.Source, "oci://"),
+			Tag:             ref.Tag,
+			Path:            ref.Path,
+			DriverOwnership: driverOwnership,
+		})
+	}
+
+	return components, nil
+}
+
+// toLocalformatComponents maps the orchestration ComponentData list to the
+// per-component inputs consumed by localformat.Write. Values, DynamicPaths,
+// OwnsCRDs, CRD exclusions and chart digests are looked up by component name
+// from the caller's maps.
+func toLocalformatComponents(
+	components []ComponentData,
+	values map[string]map[string]any,
+	dynamic map[string][]string,
+	requiredDynamic map[string][]string,
+	crdOwners map[string]bool,
+	crdExclusions map[string][]string,
+	chartDigests map[string]string,
+) []localformat.Component {
+
+	out := make([]localformat.Component, 0, len(components))
+	for _, c := range components {
+		out = append(out, localformat.Component{
+			Name:                 c.Name,
+			Namespace:            c.Namespace,
+			Repository:           c.Repository,
+			ChartName:            c.ChartName,
+			Version:              c.Version,
+			IsOCI:                c.IsOCI,
+			ChartDigest:          chartDigests[c.Name],
+			Tag:                  c.Tag,
+			Path:                 c.Path,
+			Values:               values[c.Name],
+			DynamicPaths:         dynamic[c.Name],
+			RequiredDynamicPaths: requiredDynamic[c.Name],
+			OwnsCRDs:             crdOwners[c.Name],
+			CRDExcludeSubcharts:  crdExclusions[c.Name],
+		})
+	}
+	return out
+}
+
+// generateRootREADME creates the root README.md with deployment instructions.
+// folders is the localformat.Write output in install order; the README's
+// uninstall block iterates it in reverse so every NNN-* release (including
+// injected *-pre / *-post folders) is enumerated.
+func (g *Generator) generateRootREADME(ctx context.Context, components []ComponentData, folders []localformat.Folder, outputDir string) (string, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+
+	// Build criteria lines
+	criteriaLines := []string{}
+	if g.RecipeResult.Criteria != nil {
+		c := g.RecipeResult.Criteria
+		if c.Service != "" && c.Service != criteriaAny {
+			criteriaLines = append(criteriaLines, fmt.Sprintf("- **Service**: %s", c.Service))
+		}
+		if c.Accelerator != "" && c.Accelerator != criteriaAny {
+			criteriaLines = append(criteriaLines, fmt.Sprintf("- **Accelerator**: %s", c.Accelerator))
+		}
+		if c.Intent != "" && c.Intent != criteriaAny {
+			criteriaLines = append(criteriaLines, fmt.Sprintf("- **Intent**: %s", c.Intent))
+		}
+		if c.OS != "" && c.OS != criteriaAny {
+			criteriaLines = append(criteriaLines, fmt.Sprintf("- **OS**: %s", c.OS))
+		}
+	}
+
+	data := readmeTemplateData{
+		RecipeVersion:    g.RecipeResult.Metadata.Version,
+		BundlerVersion:   g.Version,
+		Components:       components,
+		ReleasesReversed: reverseReleases(folders),
+		ReadinessGates:   slices.ContainsFunc(folders, localformat.Folder.IsReadiness),
+		Criteria:         criteriaLines,
+		Constraints:      g.RecipeResult.Constraints,
+		UpgradeNotice:    g.UpgradeNotice,
+		Split:            g.Split,
+	}
+
+	readmePath, readmeSize, err := deployer.GenerateFromTemplate(readmeTemplate, data, outputDir, "README.md")
+	if err != nil {
+		return "", 0, err
+	}
+
+	return readmePath, readmeSize, nil
+}
+
+// generateDeployScript creates the deploy.sh automation script.
+func (g *Generator) generateDeployScript(ctx context.Context, components []ComponentData, outputDir string) (string, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+
+	data := deployTemplateData{
+		BundlerVersion:      g.Version,
+		Components:          components,
+		Split:               g.Split,
+		MonitoringCRDsOwner: "kube-prometheus-stack",
+		// Helm cannot wait indefinitely on the readiness gate Job, so derive
+		// its --timeout from the gate's own deadline (max-wait) plus a buffer.
+		// Keeping this a derived value — rather than a second hand-tuned knob —
+		// guarantees helm --timeout > gate --max-wait can never silently drift.
+		ReadinessHelmTimeout: (defaults.ReadinessGateMaxWait + defaults.ReadinessGateHelmTimeoutBuffer).String(),
+	}
+
+	if g.Split != nil {
+		data.MonitoringCRDsOwner = "prometheus-operator-crds"
+	}
+
+	deployPath, deploySize, err := deployer.GenerateFromTemplate(deployScriptTemplate, data, outputDir, fileDeployScript)
+	if err != nil {
+		return "", 0, err
+	}
+
+	// Make executable
+	if err := os.Chmod(deployPath, 0755); err != nil {
+		return "", 0, errors.Wrap(errors.ErrCodeInternal, "failed to set deploy.sh permissions", err)
+	}
+
+	return deployPath, deploySize, nil
+}
+
+// readmeTemplateData is the template data for root README.md generation.
+type readmeTemplateData struct {
+	RecipeVersion    string
+	BundlerVersion   string
+	Components       []ComponentData
+	ReleasesReversed []releaseRef
+	ReadinessGates   bool
+	Criteria         []string
+	Constraints      []recipe.Constraint
+	UpgradeNotice    string
+	Split            *SplitContext
+}
+
+// SplitContext describes the class directory a bundle set renders this
+// output as (ADR-018). ClassOrder is every class the set contains, in
+// install order; teardown is the reverse. SharedNamespaces are the
+// namespaces this class uses that an earlier class also uses;
+// SharedCRDGroups are the CRD groups earlier classes install. Teardown of
+// this class leaves both in place: the earliest class using them removes
+// them, and it is torn down last.
+type SplitContext struct {
+	Class            string
+	ClassOrder       []string
+	SharedNamespaces []string
+	SharedCRDGroups  []string
+}
+
+// crdGroupsByComponent is the CRD group table deploy.sh's orphaned-CRD
+// scan uses, keyed by the component that ships the CRDs. The ordinary
+// deploy.sh keeps its historical literal list (which attributes
+// monitoring.coreos.com to kube-prometheus-stack) so non-split bundles stay
+// byte-identical; a class directory keys that group by
+// prometheus-operator-crds, the component that installs it, so an earlier
+// class's CRDs are not reported as orphans when a later class deploys.
+var crdGroupsByComponent = map[string][]string{
+	"kai-scheduler":            {"kai.scheduler", "scheduling.run.ai"},
+	"gpu-operator":             {"nvidia.com", "nfd.k8s-sigs.io"},
+	"dynamo-platform":          {"grove.io", "scheduler.grove.io"},
+	"prometheus-operator-crds": {"monitoring.coreos.com"},
+	"k8s-nim-operator":         {"apps.nvidia.com"},
+	"kubeflow-trainer":         {"trainer.kubeflow.org", "jobset.x-k8s.io"},
+}
+
+// CRDGroupsInstalledBy returns the CRD groups the named component installs,
+// per the table deploy.sh scans in a class directory, in a fixed order.
+func CRDGroupsInstalledBy(component string) []string {
+	return slices.Clone(crdGroupsByComponent[component])
+}
+
+// releaseRef pairs a helm release name with its target namespace. The
+// README's uninstall block iterates these in reverse-install order so users
+// can run `helm uninstall <Name> -n <Namespace>` for every release the
+// bundle actually emits — including injected *-pre and *-post folders.
+type releaseRef struct {
+	Name      string
+	Namespace string
+}
+
+// reverseReleases projects localformat.Folder entries (in install order)
+// into releaseRef values in reverse-install order. Folder.Name is the helm
+// release name (component name, or "<name>-pre" / "<name>-post" for
+// injected auxiliary folders), and Folder.Namespace mirrors the parent
+// Component.Namespace.
+func reverseReleases(folders []localformat.Folder) []releaseRef {
+	out := make([]releaseRef, len(folders))
+	for i, f := range folders {
+		out[len(folders)-1-i] = releaseRef{Name: f.Name, Namespace: f.Namespace}
+	}
+	return out
+}
+
+// deployTemplateData is the template data for deploy.sh generation.
+type deployTemplateData struct {
+	BundlerVersion string
+	Components     []ComponentData
+	// ReadinessHelmTimeout is the helm --timeout the deploy.sh applies to
+	// readiness gate folders, derived from defaults.ReadinessGateMaxWait +
+	// defaults.ReadinessGateHelmTimeoutBuffer (Go duration string, e.g.
+	// "1h35m0s"). See #904.
+	ReadinessHelmTimeout string
+	// Split is set for a class directory of a bundle set; nil otherwise.
+	Split *SplitContext
+	// MonitoringCRDsOwner is the component name the orphaned-CRD scan keys
+	// the monitoring.coreos.com group on: kube-prometheus-stack in an
+	// ordinary bundle (the historical table), prometheus-operator-crds in a
+	// class directory, since that is the component that ships the CRDs.
+	MonitoringCRDsOwner string
+}

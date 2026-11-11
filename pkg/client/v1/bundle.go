@@ -1,0 +1,614 @@
+// Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package aicr
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/NVIDIA/aicr/pkg/bundler"
+	"github.com/NVIDIA/aicr/pkg/bundler/attestation"
+	"github.com/NVIDIA/aicr/pkg/bundler/config"
+	"github.com/NVIDIA/aicr/pkg/bundler/result"
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+)
+
+// BundleConfig is the bundler configuration — deployer mode, value
+// overrides, node selectors, tolerations, vendoring, app/chart names,
+// etc. Deliberate transparent alias of pkg/bundler/config.Config. Construct one
+// with config.NewConfig(config.WithDeployer(...), ...) — the same builder the
+// CLI bundle command and the REST /v1/bundle handler use, so MakeBundle
+// reproduces their exact output byte-for-byte.
+type BundleConfig = config.Config
+
+// BundleAttester signs bundle content. Deliberate transparent alias of
+// pkg/bundler/attestation.Attester. The zero value of BundleOptions
+// leaves this nil, in which case MakeBundle uses the bundler's
+// no-op attester (the same default bundler.New applies when --attest
+// is not set).
+type BundleAttester = attestation.Attester
+
+// BundleArtifact summarizes a completed bundle generation: file count,
+// total size, duration, per-bundler results, and the output directory
+// the files were written to. Deliberate transparent alias of
+// pkg/bundler/result.Output. Inspect HasErrors() for
+// non-fatal per-bundler failures; the bundle files themselves are on
+// disk under OutputDir.
+type BundleArtifact = *result.Output
+
+// BundleOptions configures a MakeBundle call. It mirrors exactly what
+// bundler.New / (*DefaultBundler).Make accept so the facade reproduces
+// the same full deployer-mode bundle artifact the CLI bundle command
+// and REST /v1/bundle handler produce today.
+//
+// # Two ways to supply the bundler configuration
+//
+// The 19 flat fields below (Deployer through ArgoCD) are what
+// Config.BundleOptions derives from spec.bundle, field by field, so a
+// config-driven caller (the CLI in particular) can read and override
+// individual settings with its own flag precedence instead of reaching into
+// an opaque built Config. bundlerConfig assembles them into a *BundleConfig
+// via the same bundlerconfig.With* options the CLI and the REST handler use.
+//
+// Config remains as an escape hatch for a caller that already has a fully
+// built *BundleConfig from a source the flat fields cannot express — the
+// CLI's own bundle-generation call (Version, TargetRevision, ReadinessHooks,
+// Serial, Flux/OCI naming, typed value overrides — all CLI-flag-only, no
+// spec.bundle counterpart) and the aicrd /v1/bundle handler (built from HTTP
+// query parameters via bundler.ParseBundleConfig, then mutated in place with
+// bundlercfg.WithAttest once the request's signing decision is known). When
+// Config is non-nil, it WINS outright over the 19 flat fields it supersedes
+// (Deployer through ArgoCD — bundlerConfig's own inputs) — the same
+// derive-don't-apply precedence Attester already documents against
+// OIDCResolve. Config.BundleOptions never sets Config, so a config-driven
+// derivation always routes through the flat fields.
+//
+// Config does NOT reach Attester, OIDCResolve, BinaryAttestation, OutputDir
+// or Timeout: bundlerConfig() only ever reads Config in place of the 19
+// bundler-config fields, so these five stay caller-supplied regardless of
+// Config. The REST /v1/bundle handler depends on this split — it sets Config
+// and OutputDir/Timeout in the same BundleOptions literal and requires both
+// to take effect.
+//
+// # Config's Attest must agree with OIDCResolve.Attest
+//
+// The split above has one guarded exception. Config's baked-in Attest and
+// OIDCResolve.Attest are independent gates — one reaches the bundler's
+// attestBundle check, the other decides whether MakeBundle derives a signer
+// — and when Attester is nil (so OIDCResolve is actually consulted) MakeBundle
+// rejects a Config and OIDCResolve.Attest that disagree, with
+// ErrCodeInvalidRequest naming both values, rather than silently producing
+// unsigned "signed" output or burning an OIDC/KMS round trip whose result
+// Config then discards. Supplying Attester directly sidesteps the check
+// entirely — it wins outright and neither gate is consulted. Both current
+// callers keep the two in lockstep already: the CLI always supplies Attester
+// (so OIDCResolve is never consulted), and the REST handler sets Config's
+// Attest and Attester together.
+type BundleOptions struct {
+	// Config carries an already-built bundler configuration and, when
+	// non-nil, wins over the 19 flat fields below (Deployer through ArgoCD)
+	// and over Split: a split set then needs config.WithSplit on the Config,
+	// and MakeBundle rejects Split=true with a Config that lacks it rather
+	// than silently producing an ordinary bundle.
+	// It does NOT override Attester, OIDCResolve, BinaryAttestation,
+	// OutputDir or Timeout — see "Two ways to supply the bundler
+	// configuration" above. When both Config and every flat field are unset,
+	// MakeBundle uses config.NewConfig() — the same default bundler.New
+	// applies (Helm deployer, no overrides).
+	Config *BundleConfig
+
+	// Deployer selects the bundle output format (Helm, Argo CD, Argo CD Helm
+	// chart, Flux, Helmfile, Fleet, or Terraform). The zero value is DeployerType(""), which
+	// bundlerConfig treats as "not set" and leaves at bundler config.NewConfig's
+	// own default (Helm) — unlike every other flat field here, an empty
+	// DeployerType is not a safe pass-through: WithDeployer("") would
+	// overwrite that default with an empty deployer, which fails bundling
+	// with "unsupported deployer type" instead of defaulting to Helm.
+	Deployer config.DeployerType
+
+	// Repo is the deployment repository URL: the Argo CD Application source,
+	// or (for --deployer argocd with OCI output) the origin baked into
+	// argocd-helm's values.yaml default repoURL.
+	Repo string
+
+	// ValueOverrides are parsed "component:path=value" Helm value overrides.
+	ValueOverrides []config.ComponentPath
+
+	// DynamicValues declares component:path value paths supplied at install
+	// time rather than baked into the bundle.
+	DynamicValues []config.ComponentPath
+
+	// SystemNodeSelector / SystemNodeTolerations schedule non-accelerated
+	// (system) component workloads.
+	SystemNodeSelector    map[string]string
+	SystemNodeTolerations []corev1.Toleration
+
+	// AcceleratedNodeSelector / AcceleratedNodeTolerations schedule
+	// GPU-accelerated component workloads.
+	AcceleratedNodeSelector    map[string]string
+	AcceleratedNodeTolerations []corev1.Toleration
+
+	// DRAEvictionNodeLabel is the singular DRA eviction contract label. Nil
+	// means "not requested" — bundlerConfig leaves the bundler's own
+	// NVIDIA-documented default in place rather than overwriting it with a
+	// zero label. See issue #2469.
+	DRAEvictionNodeLabel *config.NodeLabel
+
+	// WorkloadGate is the taint applied to prevent eviction of running
+	// workloads while the gate is active. Nil means no gate is configured;
+	// WithWorkloadGateTaint treats nil as a no-op, so passing it through
+	// unconditionally is safe.
+	WorkloadGate *corev1.Taint
+
+	// WorkloadSelector labels the workloads WorkloadGate protects.
+	WorkloadSelector map[string]string
+
+	// Nodes is the estimated node count used for capacity-aware rendering.
+	// 0 means unset.
+	Nodes int
+
+	// StorageClass / SharedStorageClass name the Kubernetes StorageClasses
+	// components request for local and RWX-shared volumes respectively.
+	StorageClass       string
+	SharedStorageClass string
+
+	// Attest enables bundle attestation and binary verification. Off
+	// (false) by default — the same default bundler.New applies when
+	// --attest is not passed, so the zero value stays a true no-op.
+	Attest bool
+
+	// CertIDRegexp overrides the expected certificate identity pattern for
+	// binary attestation verification.
+	CertIDRegexp string
+
+	// VendorCharts pulls upstream Helm chart bytes into the bundle so the
+	// artifact is air-gap deployable. Off (false) by default.
+	VendorCharts bool
+
+	// AppName overrides the parent Argo Application's metadata.name for the
+	// argocd and argocd-helm deployers, or names the GitRepo and prefixes
+	// every bundle and HelmOp for fleet, where it must be a DNS-1123 label.
+	// Empty means each deployer applies its own default. See #1011.
+	AppName string
+
+	// ArgoCD carries the Argo CD bundle settings for the argocd and
+	// argocd-helm deployers: child Application name prefix, destination,
+	// project, cascade delete, and sync retry. A nil field is unset. They
+	// replace the deprecated `deployer:<key>` entries in ValueOverrides;
+	// giving the same setting both ways fails MakeBundle with
+	// ErrCodeInvalidRequest. See #3264.
+	ArgoCD config.ArgoCDSettings
+
+	// Split renders a class-partitioned bundle set (ADR-018): one directory
+	// per registry class with enabled components, under a set root holding
+	// recipe.yaml, split.yaml, bundle-info.yaml, checksums.txt and, with
+	// Attest, the attestation. Requires an absent OutputDir whose parent
+	// exists; the set is published there with one atomic move. Supported only
+	// with the helm deployer. Off by default. Unlike the flat fields above, no
+	// config file setting derives it: SDK callers set it here, while the CLI
+	// and REST surfaces carry it through config.WithSplit on Config. A non-nil
+	// Config supersedes this field; MakeBundle rejects Split=true when that
+	// Config does not carry it.
+	Split bool
+
+	// Attester signs bundle content. When nil, MakeBundle derives one from
+	// OIDCResolve; when both are unset, the no-op attester applies (matching
+	// bundler.New's default when --attest is not set).
+	//
+	// A non-nil Attester WINS over OIDCResolve. That precedence is the
+	// facade's derive-don't-apply rule applied to signing: an explicitly
+	// supplied signer is a caller decision, and silently rebuilding one from
+	// config would discard it. The aicrd server relies on this to inject its
+	// own attester; the CLI sets it via attestation.ResolveAttesterLazy when
+	// --attest is passed, so both keep working unchanged.
+	Attester BundleAttester
+
+	// OIDCResolve configures keyless/KMS signing when Attester is nil and
+	// OIDCResolve.Attest is true, letting a committed spec.bundle.attestation
+	// reach the bundler without the caller constructing an Attester itself.
+	// Config.BundleOptions derives it.
+	//
+	// Ignored when Attest is false, so the zero value stays a true no-op
+	// rather than resolving a signer nobody asked for. Mirrors the
+	// OIDCResolve field EvidenceOptions and SignOptions already carry.
+	OIDCResolve OIDCResolveOptions
+
+	// BinaryAttestation, when non-empty, is a pre-verified binary attestation
+	// (Sigstore bundle bytes) embedded into attested bundles as tool provenance.
+	// The caller (e.g. the aicrd server, which verifies its in-image attestation
+	// once at startup) is responsible for having verified these bytes. Empty
+	// leaves the bundler's default per-run discover-and-verify path unchanged
+	// (the CLI passes nil and relies on the attestation shipped next to its
+	// install-script binary).
+	BinaryAttestation []byte
+
+	// OutputDir is the directory bundle files are written to. Empty
+	// means the current directory ("."), matching Make's default.
+	OutputDir string
+
+	// Timeout optionally caps the bundle run. When > 0, MakeBundle wraps
+	// the caller's context with context.WithTimeout(ctx, Timeout) so the
+	// run is bounded by the smaller of this and any tighter parent
+	// deadline. When 0 (the zero value), MakeBundle imposes NO
+	// facade-level deadline and runs under the caller's ctx as-is —
+	// large bundles, --vendor-charts, and attestation/signing can each
+	// exceed a fixed cap. The REST /v1/bundle handler sets this to
+	// defaults.BundleHandlerTimeout to preserve its 60s request boundary;
+	// the CLI bundle command leaves it 0 so long bundles are uncapped.
+	Timeout time.Duration
+}
+
+// bundlerConfig converts BundleOptions into the bundler's own config. It is
+// the single place the facade's field names meet bundlerconfig's With*
+// options; MakeBundle and Config.BundleOptions both route through it (the
+// latter indirectly, by deriving the flat fields this reads) so the two
+// cannot disagree about what a field means.
+//
+// A non-nil Config wins outright — see "Two ways to supply the bundler
+// configuration" on BundleOptions. That escape hatch is why this method
+// exists at all: the CLI's own bundle-generation call and the aicrd
+// /v1/bundle handler both need settings (Version, Serial, ReadinessHooks,
+// Flux/OCI naming, typed value overrides, ...) that have no spec.bundle
+// counterpart and so cannot be flat BundleOptions fields, and the server
+// additionally mutates its Config in place after construction. Falling
+// through to the flat fields when Config is set would silently discard a
+// fully-built configuration a caller explicitly supplied.
+func (o BundleOptions) bundlerConfig() *BundleConfig {
+	if o.Config != nil {
+		return o.Config
+	}
+
+	opts := []config.Option{
+		config.WithRepoURL(o.Repo),
+		config.WithValueOverridePaths(o.ValueOverrides),
+		config.WithDynamicValuePaths(o.DynamicValues),
+		config.WithSystemNodeSelector(o.SystemNodeSelector),
+		config.WithSystemNodeTolerations(o.SystemNodeTolerations),
+		config.WithAcceleratedNodeSelector(o.AcceleratedNodeSelector),
+		config.WithAcceleratedNodeTolerations(o.AcceleratedNodeTolerations),
+		config.WithWorkloadGateTaint(o.WorkloadGate),
+		config.WithWorkloadSelector(o.WorkloadSelector),
+		config.WithEstimatedNodeCount(o.Nodes),
+		config.WithStorageClass(o.StorageClass),
+		config.WithSharedStorageClass(o.SharedStorageClass),
+		config.WithVendorCharts(o.VendorCharts),
+		config.WithSplit(o.Split),
+		config.WithAppName(o.AppName),
+		config.WithArgoCDSettings(o.ArgoCD),
+		config.WithAttest(o.Attest),
+		config.WithCertificateIdentityRegexp(o.CertIDRegexp),
+	}
+	// Deployer is the one flat field whose zero value is NOT the same as
+	// "unset": NewConfig defaults to DeployerHelm, but WithDeployer("") sets
+	// the deployer to the empty string unconditionally, and an empty deployer
+	// fails bundling with "unsupported deployer type" rather than falling
+	// back to Helm. Appending only when set preserves NewConfig's default for
+	// a caller — direct or config-derived — that never chose a deployer.
+	if o.Deployer != "" {
+		opts = append(opts, config.WithDeployer(o.Deployer))
+	}
+	// Pointer field: nil means the document said nothing, and passing a zero
+	// NodeLabel would write an empty label rather than leaving the default.
+	if o.DRAEvictionNodeLabel != nil {
+		opts = append(opts, config.WithDRAEvictionNodeLabel(*o.DRAEvictionNodeLabel))
+	}
+	return config.NewConfig(opts...)
+}
+
+// adoptRecipe wraps a raw, externally-supplied pkg/recipe.RecipeResult (e.g.
+// decoded from a /v1/bundle POST body) into a Client-owned facade
+// *RecipeResult ready for MakeBundle. It binds the Client's own
+// DataProvider onto the recipe so provider-scoped lookups (values files,
+// manifest files, external data files) resolve against the Client's recipe
+// source rather than the package global, and stamps the owner token so the
+// result passes MakeBundle's assertOwns check. This is the REST analog of
+// LoadRecipe: LoadRecipe reads from a path through the provider, adoptRecipe
+// takes an already-decoded RecipeResult and binds the same provider.
+//
+// Synchronization mirrors LoadRecipe: snapshot the per-Client provider under
+// the read lock and register in the inflight WaitGroup so Close drains before
+// evicting the cache. PrepareAndValidate reads the component registry (to
+// back-fill missing types), so — unlike before #1584 — this path does do
+// cache-using work of its own and must register, not only rely on the
+// subsequent MakeBundle call.
+//
+// Errors:
+//   - ErrCodeInvalidRequest when the Client, ctx, or recipe is nil, or when
+//     the Client has been Closed.
+func (c *Client) adoptRecipe(ctx context.Context, rec *recipe.RecipeResult) (*RecipeResult, error) {
+	if c == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "aicr client not initialized")
+	}
+	if ctx == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "context is required (got nil)")
+	}
+	if rec == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "nil RecipeResult")
+	}
+
+	// Snapshot the provider and register as an in-flight cache user under the
+	// read lock: PrepareAndValidate below reads the component registry (to
+	// back-fill missing types), so Close must drain this before evicting the
+	// cache — otherwise a concurrent Close could evict, this call repopulate,
+	// and we would return a result owned by a closed Client. Same protocol as
+	// the resolve/load paths.
+	c.mu.RLock()
+	if c.builder == nil {
+		c.mu.RUnlock()
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "aicr client not initialized (or already closed)")
+	}
+	dp := c.dp
+	c.inflight.Add(1)
+	c.mu.RUnlock()
+	defer c.inflight.Done()
+
+	// Profile-bearing artifacts hydrate their owned component values during
+	// adoption. Bound that provider-backed I/O even when an SDK caller passes
+	// context.Background; a tighter caller deadline remains authoritative.
+	ctx, cancel := context.WithTimeout(ctx, defaults.RecipeOperationTimeout)
+	defer cancel()
+
+	// Validate the no-I/O profile contract before DeepCopy. In particular,
+	// canonical inline maps and slices must be acyclic because DeepCopy
+	// recursively copies those containers.
+	if err := rec.ValidateProfileContract(); err != nil {
+		return nil, err
+	}
+
+	// Deep-copy the caller-supplied recipe BEFORE binding the provider.
+	// BindDataProvider mutates the receiver's unexported provider field, and
+	// the input is caller-owned: a caller reusing one recipe.RecipeResult
+	// across two Clients would otherwise have the second adopt overwrite
+	// the first's binding, breaking per-Client isolation. DeepCopy leaves
+	// the copy's provider nil for BindDataProvider to set, so the original
+	// is untouched.
+	cp := rec.DeepCopy()
+	cp.BindDataProvider(dp)
+
+	// Canonicalize the artifact kind before anything serializes the copy. The
+	// decoded body may carry an absent, empty, or legacy "Recipe" kind (all
+	// accepted by the /v1/bundle contract), and Kind has no omitempty, so
+	// without this the legacy value is echoed verbatim into the generated
+	// bundle's recipe.yaml — an artifact the CLI file loader then rejects,
+	// making the bundle non-reloadable via "aicr bundle -r" / "aicr validate
+	// -r". Accept liberally, emit canonically. See issue #1953.
+	if err := cp.NormalizeKind(); err != nil {
+		return nil, err
+	}
+
+	// An adopted RecipeResult is decoded from an external source (e.g. the
+	// POST /v1/bundle body) and never passes through the resolver, so
+	// canonicalize its component types and validate coherence here — otherwise
+	// an incoherent ref (e.g. Helm + Kustomize tag/path) would deploy as a
+	// different type than declared and mismatch the attestation BOM, and a
+	// lowercase type would deploy inconsistently downstream. PrepareAndValidate
+	// back-fills missing types from the registry first (this boundary does not
+	// run ApplyRegistryDefaults) so a type-less registry ref — valid before
+	// #1584 — still resolves rather than being rejected. See issue #1584.
+	if err := cp.PrepareAndValidateWithContext(ctx); err != nil {
+		return nil, err
+	}
+
+	result, err := loadedResultFromInternal(cp)
+	if err != nil {
+		return nil, err
+	}
+	result.owner = c
+	return result, nil
+}
+
+// AdoptRecipe wraps a raw pkg/recipe.RecipeResult — typically decoded from an
+// external source such as a REST /v1/bundle POST body — into a Client-owned
+// *RecipeResult ready for MakeBundle. The returned RecipeResult is bound to
+// this Client's DataProvider and owner-stamped, so it passes MakeBundle's
+// ownership and provider-isolation checks exactly as a LoadRecipe result does.
+//
+// Use this when the caller already holds a fully-hydrated RecipeResult (not a
+// criteria request or a file path) and needs to bundle it through the facade.
+// In-process consumers that resolve via ResolveRecipe / LoadRecipe should use
+// those results directly; AdoptRecipe is for the decode-then-bundle boundary.
+func (c *Client) AdoptRecipe(ctx context.Context, rec *recipe.RecipeResult) (*RecipeResult, error) {
+	return c.adoptRecipe(ctx, rec)
+}
+
+// MakeBundle generates the full deployer-mode bundle for a previously
+// resolved or loaded RecipeResult, writing the bundle files under
+// opts.OutputDir and returning a BundleArtifact summary. Unlike
+// BundleComponents (which returns per-component Helm values + manifests
+// in memory), MakeBundle produces the SAME complete artifact the CLI
+// bundle command emits — README, deploy.sh, per-component directories,
+// checksums — in the deployer layout selected by opts.Config.Deployer()
+// (helm, argocd, argocd-helm, flux, helmfile, fleet, terraform).
+//
+// # When to call
+//
+// Call AFTER Client.ResolveRecipe or Client.LoadRecipe; pass that call's
+// *RecipeResult unchanged. MakeBundle bundles from recipe.Resolved() (the
+// full pkg/recipe.RecipeResult), which carries this Client's own
+// DataProvider — so provider-scoped lookups (values files, manifest
+// files) resolve against the Client's recipe source rather than the
+// package global.
+//
+// # Allowlist enforcement
+//
+// When the Client was constructed WithAllowLists, MakeBundle validates
+// the recipe's criteria against the allowlist before bundling — same
+// fencing the resolve path and the REST /v1/bundle handler apply. A
+// recipe whose criteria fall outside the allowlist is rejected with the
+// allowlist's structured error. A recipe with nil Criteria (a loaded,
+// already-hydrated or bare RecipeResult file) skips the check, matching
+// the handler's `recipeResult.Criteria != nil` guard.
+//
+// # Synchronization
+//
+// Read-locks Client.mu so a concurrent Close can't race the bundle, and
+// registers in the inflight WaitGroup so Close drains before evicting
+// caches — the same protocol as BundleComponents. A facade-level timeout
+// is opt-in via opts.Timeout: when set (> 0) it bounds the run by the
+// smaller of opts.Timeout and any tighter caller deadline; when unset
+// (0) MakeBundle runs under the caller's context with NO added cap. The
+// REST /v1/bundle handler sets opts.Timeout = defaults.BundleHandlerTimeout
+// to keep its 60s request boundary; the CLI bundle command leaves it 0 so
+// large bundles, --vendor-charts, and attestation/signing are uncapped.
+//
+// Errors:
+//   - ErrCodeInvalidRequest when the Client, ctx, or recipe is nil, when
+//     recipe lacks internal state (constructed outside Resolve/Load), when
+//     the recipe was produced by a different Client, or when the Client
+//     has been Closed.
+//   - Allowlist and bundler errors propagate with their structured codes.
+func (c *Client) MakeBundle(ctx context.Context, recipe *RecipeResult, opts BundleOptions) (BundleArtifact, error) {
+	if c == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "aicr client not initialized")
+	}
+	if ctx == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "context is required (got nil)")
+	}
+	if recipe == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "nil RecipeResult")
+	}
+	if recipe.internal == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			"RecipeResult has no internal recipe state — call Client.ResolveRecipe or Client.LoadRecipe to obtain a bundle-able RecipeResult")
+	}
+	if err := c.assertOwns(recipe); err != nil {
+		return nil, err
+	}
+
+	// Snapshot Client state under the read lock — same pattern as
+	// BundleComponents. The closed-Client check reads c.builder; the
+	// bundle itself runs unlocked off recipe.internal (which carries
+	// this Client's bound DataProvider).
+	c.mu.RLock()
+	if c.builder == nil {
+		c.mu.RUnlock()
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "aicr client not initialized (or already closed)")
+	}
+	c.inflight.Add(1)
+	c.mu.RUnlock()
+	defer c.inflight.Done()
+
+	// Apply a facade-level deadline only when the caller opts in via
+	// opts.Timeout. context.WithTimeout honors the smaller of the parent
+	// deadline and ours, so a caller with a tighter deadline keeps it.
+	// When opts.Timeout is 0 the caller's ctx governs unchanged — the CLI
+	// bundle path runs uncapped (large bundles, --vendor-charts, and
+	// signing can exceed any fixed cap), while the REST handler passes
+	// defaults.BundleHandlerTimeout to retain its 60s boundary. Placed
+	// after the guards so already-canceled-context tests flow through the
+	// same error paths.
+	if opts.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		defer cancel()
+	}
+
+	// Enforce the Client's allowlists against the recipe criteria, mirroring
+	// the REST /v1/bundle handler's `AllowLists != nil && Criteria != nil`
+	// gate. A loaded recipe with nil Criteria skips the check (it carries no
+	// criteria to validate); a resolved recipe always has criteria.
+	if recipe.internal.Criteria != nil {
+		if err := c.enforceAllowLists(recipe.internal.Criteria); err != nil {
+			return nil, err
+		}
+	}
+
+	cfg := opts.bundlerConfig()
+	// Config supersedes the flat fields, Split included. A caller who sets
+	// both and disagrees would otherwise get an ordinary bundle with none
+	// of the split checks and no error.
+	if opts.Config != nil && opts.Split && !cfg.Split() {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			"BundleOptions.Split=true is superseded by BundleOptions.Config, which does not enable split; "+
+				"build the Config with config.WithSplit(true) or leave Config unset")
+	}
+
+	bundlerOpts := []bundler.Option{bundler.WithConfig(cfg)}
+	// Attester wins when supplied; otherwise derive one from OIDCResolve. The
+	// Attest gate matters: ResolveAttesterLazy returns a no-op attester when
+	// it is false, so deriving unconditionally would replace "caller wants no
+	// signing" with an attester that merely behaves like none — same result
+	// today, but it makes the zero value depend on resolver internals.
+	attester := opts.Attester
+	if attester == nil {
+		// Reconcile the two independent Attest gates before deriving. cfg
+		// (== opts.Config when it is set — bundlerConfig() returns it
+		// outright) is what actually reaches the bundler's attestBundle
+		// gate; OIDCResolve.Attest is what decides, right here, whether a
+		// signer gets derived at all. A hand-built BundleOptions that sets
+		// both and disagrees — e.g. WithAttest(false) baked into Config
+		// while OIDCResolve.Attest is true — would otherwise fail silently
+		// in either direction: Config says sign but no signer is derived
+		// (attestBundle falls back to the no-op attester, producing
+		// unsigned output that looks attested), or OIDCResolve derives a
+		// real signer that Config's Attest()==false then discards (a
+		// wasted OIDC/KMS round trip). Fail closed instead — this is a
+		// supply-chain-adjacent signal, and only reachable when Attester is
+		// nil: a caller-supplied Attester wins outright and never consults
+		// either gate, which is why neither current caller (the CLI always
+		// supplies Attester; the REST handler sets Config's Attest and
+		// Attester together) can trip this.
+		// Applies to BOTH ways of supplying the gate, not just Config. With
+		// flat fields alone, Attest:true makes cfg.Attest() true via
+		// WithAttest while an OIDCResolve.Attest of false derives no signer —
+		// the same silent no-op-attester outcome, reached without Config
+		// being set at all.
+		if cfg.Attest() != opts.OIDCResolve.Attest {
+			source := "BundleOptions.Attest"
+			if opts.Config != nil {
+				source = "BundleOptions.Config.Attest()"
+			}
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("%s=%t disagrees with "+
+					"BundleOptions.OIDCResolve.Attest=%t; set both to the same "+
+					"value or supply BundleOptions.Attester directly",
+					source, cfg.Attest(), opts.OIDCResolve.Attest))
+		}
+		if opts.OIDCResolve.Attest {
+			resolved, rerr := attestation.ResolveAttesterLazy(ctx, opts.OIDCResolve)
+			if rerr != nil {
+				// Already coded; the message names the signing input that failed.
+				return nil, rerr
+			}
+			attester = resolved
+		}
+	}
+	if attester != nil {
+		bundlerOpts = append(bundlerOpts, bundler.WithAttester(attester))
+	}
+	if len(opts.BinaryAttestation) > 0 {
+		bundlerOpts = append(bundlerOpts, bundler.WithVerifiedBinaryAttestation(opts.BinaryAttestation))
+	}
+	b, err := bundler.New(bundlerOpts...)
+	if err != nil {
+		// Don't re-wrap — bundler.New returns structured errors with the
+		// right code (ErrCodeNotFound for a missing binary attestation,
+		// ErrCodeInternal for executable-path resolution failures).
+		return nil, err
+	}
+
+	out, err := b.Make(ctx, recipe.internal, opts.OutputDir)
+	if err != nil {
+		// Propagate as-is: Make returns structured errors (validation,
+		// timeout, internal) with the appropriate codes.
+		return nil, err
+	}
+	return out, nil
+}

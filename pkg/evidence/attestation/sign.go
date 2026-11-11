@@ -1,0 +1,261 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package attestation
+
+import (
+	"context"
+	"log/slog"
+	"strings"
+
+	bundleattest "github.com/NVIDIA/aicr/pkg/bundler/attestation"
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/oci"
+)
+
+// SignExistingOptions controls SignExisting. It signs a bundle that has
+// already been pushed to a registry (e.g. by `--no-sign`) and attaches the
+// Sigstore Bundle as an OCI referrer — the Fulcio-bound leg the fork-based
+// CI workflow runs after a contributor commits an unsigned pointer.
+type SignExistingOptions struct {
+	// Pointer is the loaded, validated unsigned pointer. Its first
+	// attestation's bundle.oci names the in-toto subject and registry; on
+	// success its signer block is filled in and the pointer is written back
+	// to PointerPath. Required.
+	Pointer *Pointer
+
+	// PointerPath is the file the patched pointer is written back to —
+	// typically the committed recipes/evidence/<recipe>.yaml the caller
+	// read. Required.
+	PointerPath string
+
+	// BundleDir is a local copy of the already-pushed bundle (typically a
+	// freshly pulled temp dir). Only the unsigned in-toto Statement is read
+	// from it — to reconstruct the exact predicate the signature binds — so
+	// the bundle is never re-emitted. May be the summary-bundle dir or a
+	// parent containing it (mirrors loadOnDiskBundle / publish).
+	BundleDir string
+
+	// Artifact is the subject descriptor of the already-pushed artifact:
+	// the manifest Digest, MediaType, and Size resolved at pull time. All
+	// three are required to attach a spec-compliant referrer; a pointer
+	// alone carries only the digest.
+	Artifact MainArtifactDescriptor
+
+	PlainHTTP   bool
+	InsecureTLS bool
+
+	// OIDCResolve selects the signing mode: the KMS key SigningKey names,
+	// or otherwise keyless, with token resolution deferred until adjacent to
+	// SignStatement so Fulcio's nonce-binding window is respected.
+	OIDCResolve bundleattest.ResolveOptions
+}
+
+// SignExisting signs an already-pushed, unsigned evidence bundle, attaches
+// the resulting Sigstore Bundle as an OCI referrer of that artifact, and
+// patches the pointer's signer block in place — writing it back to
+// PointerPath. It does not push or re-emit the bundle: the predicate is read
+// verbatim from the local copy's statement.intoto.json so the signature
+// binds the same bytes the unsigned push produced.
+//
+// Like Publish, it returns only an error and writes its artifact (the
+// patched pointer) as a side effect: the populated success path needs a live
+// Fulcio sign + registry attach that unit tests cannot reach, so only the
+// guard paths are unit-tested.
+func SignExisting(ctx context.Context, opts SignExistingOptions) error {
+	if opts.PointerPath == "" {
+		return errors.New(errors.ErrCodeInvalidRequest, "pointer path is required")
+	}
+	// Enforce the signable-pointer invariant in the domain function itself, not
+	// just the CLI: patching Attestations[0] on a multi-attestation or
+	// already-signed pointer would clobber provenance for any non-CLI caller.
+	if err := ValidateSignablePointer(opts.Pointer); err != nil {
+		return err
+	}
+	if err := validateEvidenceSigningMode(opts.OIDCResolve); err != nil {
+		return err
+	}
+	reference := opts.Pointer.Attestations[0].Bundle.OCI
+	if opts.Artifact.Digest == "" || opts.Artifact.MediaType == "" || opts.Artifact.Size <= 0 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"artifact descriptor (digest, mediaType, size) is required to sign an existing bundle")
+	}
+
+	bundle, _, err := loadOnDiskBundle(ctx, opts.BundleDir)
+	if err != nil {
+		return err
+	}
+	// The pointer's recorded predicateType (from Publish) and the bundle's
+	// (read back from the same on-disk statement) must agree before an OIDC
+	// round-trip and a Fulcio cert are spent. A divergence means the
+	// signature that follows would bind a predicateType the verifier
+	// rejects on digest mismatch.
+	pointerType := opts.Pointer.Attestations[0].Bundle.PredicateType
+	if pointerType != "" && pointerType != bundle.PredicateType {
+		return errors.New(errors.ErrCodeConflict,
+			"pointer predicateType "+pointerType+" does not match the pushed bundle's statement predicateType "+
+				bundle.PredicateType+". Re-publish the bundle before signing")
+	}
+
+	artifactDigestHex := strings.TrimPrefix(opts.Artifact.Digest, "sha256:")
+	artifactStmt, err := BuildArtifactStatement(oci.TrimScheme(reference), artifactDigestHex, bundle.PredicateType, bundle.Predicate)
+	if err != nil {
+		return err
+	}
+
+	signRes, err := signEvidenceStatement(ctx, artifactStmt, opts.OIDCResolve)
+	if err != nil {
+		return err
+	}
+
+	attachCtx, attachCancel := context.WithTimeout(ctx, defaults.EvidenceBundlePushTimeout)
+	defer attachCancel()
+	referrer, attachErr := AttachSigstoreBundleAsReferrer(attachCtx, AttachReferrerOptions{
+		Reference:     reference,
+		BundleJSON:    signRes.BundleJSON,
+		MainArtifact:  opts.Artifact,
+		ExcludedRoots: []string{bundle.SummaryDir},
+		PlainHTTP:     opts.PlainHTTP,
+		InsecureTLS:   opts.InsecureTLS,
+	})
+	if attachErr != nil {
+		return attachErr
+	}
+
+	// Patch the signer block and write the pointer back. Revert the in-memory
+	// mutation if the write fails, so the caller's pointer is never left marked
+	// signed while the file on disk stays unsigned — otherwise a retry with the
+	// same object would trip the already-signed guard.
+	opts.Pointer.Attestations[0].Signer = PointerSignerFromSignature(signRes)
+	if _, err := WritePointerFile(opts.PointerPath, opts.Pointer); err != nil {
+		opts.Pointer.Attestations[0].Signer = nil
+		return err
+	}
+
+	slog.Info("evidence bundle signed and pointer patched in place",
+		"referrerDigest", referrer.Digest,
+		"mainArtifactDigest", opts.Artifact.Digest,
+		"recipe", bundle.RecipeName,
+		"signer", opts.Pointer.Attestations[0].Signer.Identity)
+
+	return nil
+}
+
+// signEvidenceStatement signs an evidence artifact Statement in the mode opts
+// selects: with the KMS key opts.SigningKey names, or otherwise keylessly with
+// a Fulcio certificate for an OIDC token resolved here, adjacent to the sign,
+// so Fulcio's nonce-binding window is respected. Both modes map the signing
+// target through the shared bundle helpers, keeping evidence signing in
+// lockstep with bundle signing, including the Rekor v2 signing-config
+// selection (ResolveOptions.UseTUFSigningConfig).
+func signEvidenceStatement(ctx context.Context, statementJSON []byte, opts bundleattest.ResolveOptions) (*bundleattest.SignedAttestation, error) {
+	if err := validateEvidenceSigningMode(opts); err != nil {
+		return nil, err
+	}
+	if opts.SigningKey != "" {
+		signCtx, cancel := context.WithTimeout(ctx, defaults.EvidenceBundleSignTimeout)
+		defer cancel()
+		return bundleattest.SignStatementWithKey(signCtx, statementJSON, opts)
+	}
+
+	logOIDCResolveMode(opts)
+	// OIDCAuthTimeout caps interactive browser / device-code flows so a
+	// stalled user does not hold the parent (sign) context open
+	// indefinitely; pre-fetched and ambient paths complete well below this
+	// bound, so the cap only kicks in on the genuinely interactive paths
+	// that match defaults.OIDCAuthTimeout's intent.
+	resolveCtx, resolveCancel := context.WithTimeout(ctx, defaults.OIDCAuthTimeout)
+	token, err := bundleattest.ResolveOIDCToken(resolveCtx, opts)
+	resolveCancel()
+	if err != nil {
+		return nil, err
+	}
+
+	signCtx, cancel := context.WithTimeout(ctx, defaults.EvidenceBundleSignTimeout)
+	defer cancel()
+	return bundleattest.SignStatement(signCtx, statementJSON, bundleattest.SignOptionsFromResolve(token, opts))
+}
+
+// validateEvidenceSigningMode rejects a signing request no evidence signature
+// could satisfy, so callers can fail before pushing or pulling anything: a
+// signing key that names no supported KMS scheme or comes with keyless-only
+// options, or DisableTLogUpload without a signing key. A keyless signature without a transparency entry has no
+// timestamp inside its certificate's ten-minute validity window, so it could
+// never verify.
+func validateEvidenceSigningMode(opts bundleattest.ResolveOptions) error {
+	if opts.SigningKey != "" {
+		if opts.IdentityToken != "" || opts.DeviceFlow || opts.FulcioURL != "" {
+			return errors.New(errors.ErrCodeInvalidRequest,
+				"a signing key selects KMS signing and cannot be combined with an identity token, "+
+					"the OIDC device flow, or a Fulcio URL")
+		}
+		return bundleattest.ValidateSigningKeyRef(opts.SigningKey)
+	}
+	if opts.DisableTLogUpload {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"disabling the transparency log upload requires a signing key: "+
+				"a keyless signature cannot be verified without a Rekor entry")
+	}
+	return nil
+}
+
+// ValidateSignablePointer reports whether a pointer is in the exact state
+// `aicr evidence sign` operates on: exactly one attestation, already pushed
+// (bundle.oci + bundle.digest set), and not yet signed (nil Signer). It is the
+// single source of truth for this domain rule — the CLI calls it for fail-fast
+// validation before the registry pull, and SignExisting calls it before
+// patching the signer block — so the two cannot drift. Failing closed here
+// prevents re-signing (which would clobber an existing signature) or signing a
+// pointer that has nothing pushed to sign.
+func ValidateSignablePointer(p *Pointer) error {
+	if p == nil || len(p.Attestations) != 1 {
+		return errors.New(errors.ErrCodeInvalidRequest, "pointer must carry exactly one attestation to sign")
+	}
+	att := p.Attestations[0]
+	if att.Signer != nil {
+		return errors.New(errors.ErrCodeConflict,
+			"pointer is already signed; refusing to overwrite its signer block")
+	}
+	if att.Bundle.OCI == "" || att.Bundle.Digest == "" {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"pointer has no pushed bundle to sign (bundle.oci/bundle.digest are empty); "+
+				"push it first with `aicr evidence publish --no-sign`")
+	}
+	return nil
+}
+
+// PointerSignerFromSignature builds the pointer's signer block from a
+// signing result. A key signature (non-empty KeyFingerprint) records
+// KeySignerIssuer and the key fingerprint rather than the KMS key URI, which
+// names a cloud account and is not recoverable from the signed bundle. It
+// applies the same zero-Rekor rule as the emit path:
+// SignedAttestation.RekorLogIndex uses 0 as the "no Rekor entry" sentinel
+// (e.g. --tlog-upload=false), so this maps 0 to a nil index. A genuine Rekor
+// index 0 is therefore indistinguishable from "no entry" at this boundary — an
+// accepted limitation, since the index is informational, not the trust anchor.
+func PointerSignerFromSignature(sig *bundleattest.SignedAttestation) *PointerSigner {
+	if sig == nil {
+		return nil
+	}
+	signer := &PointerSigner{Identity: sig.Identity, Issuer: sig.Issuer}
+	if sig.KeyFingerprint != "" {
+		signer = &PointerSigner{Identity: sig.KeyFingerprint, Issuer: KeySignerIssuer}
+	}
+	if sig.RekorLogIndex > 0 {
+		idx := sig.RekorLogIndex
+		signer.RekorLogIndex = &idx
+	}
+	return signer
+}

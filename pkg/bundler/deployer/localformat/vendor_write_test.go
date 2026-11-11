@@ -1,0 +1,574 @@
+// Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package localformat_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer/localformat"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+)
+
+// vendorFetchTimeout bounds the vendor path's kustomize subprocess when the
+// source is an unresolvable .invalid host: NXDOMAIN comes back in
+// milliseconds, so reaching this bound means an internal retry loop wedged.
+const vendorFetchTimeout = 5 * time.Second
+
+// fakePuller is a black-box ChartPuller that returns canned bytes per
+// component. Used by vendor-path Write tests so we never depend on a
+// real `helm` binary.
+type fakePuller struct {
+	bytesByName map[string][]byte
+	tarballName string
+}
+
+func (f *fakePuller) Pull(_ context.Context, c localformat.Component) ([]byte, localformat.VendorRecord, string, error) {
+	tgz := f.bytesByName[c.Name]
+	if tgz == nil {
+		tgz = []byte("FAKE TGZ for " + c.Name)
+	}
+	tarball := f.tarballName
+	if tarball == "" {
+		tarball = c.ChartName + "-" + c.Version + ".tgz"
+	}
+	return tgz, localformat.VendorRecord{
+		Name:        c.Name,
+		Chart:       c.ChartName,
+		Version:     c.Version,
+		Repository:  c.Repository,
+		SHA256:      "deadbeef",
+		TarballName: tarball,
+	}, tarball, nil
+}
+
+func TestWrite_VendorCharts_PureHelm(t *testing.T) {
+	outDir := t.TempDir()
+
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       "nfd",
+			Namespace:  "node-feature-discovery",
+			Repository: "https://kubernetes-sigs.github.io/node-feature-discovery/charts",
+			ChartName:  "node-feature-discovery",
+			Version:    "0.16.1",
+			Values:     map[string]any{"image": map[string]any{"repository": "registry.k8s.io/nfd/nfd-master"}},
+		}},
+		VendorCharts: true,
+		Puller:       &fakePuller{},
+	})
+	folders := res.Folders
+	recs := res.VendoredCharts
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(folders) != 1 {
+		t.Fatalf("got %d folders, want 1", len(folders))
+	}
+	if len(recs) != 1 {
+		t.Fatalf("got %d vendor records, want 1", len(recs))
+	}
+	want := folders[0].Dir
+	if !strings.HasPrefix(want, "001-") {
+		t.Errorf("dir prefix = %q, want 001-", want)
+	}
+	if folders[0].CarriesPostManifests {
+		t.Error("folders[0].CarriesPostManifests = true, want false — pure-Helm vendored folder has no post manifests")
+	}
+
+	// Wrapper Chart.yaml present and references the vendored subchart.
+	chartYAML, err := os.ReadFile(filepath.Join(outDir, folders[0].Dir, "Chart.yaml"))
+	if err != nil {
+		t.Fatalf("read Chart.yaml: %v", err)
+	}
+	for _, want := range []string{"name: nfd", "- name: node-feature-discovery", "version: 0.16.1", `repository: ""`} {
+		if !strings.Contains(string(chartYAML), want) {
+			t.Errorf("Chart.yaml missing %q\n--- got:\n%s", want, chartYAML)
+		}
+	}
+
+	// Tarball at charts/<chart>-<version>.tgz with the canned bytes.
+	tgzPath := filepath.Join(outDir, folders[0].Dir, "charts", "node-feature-discovery-0.16.1.tgz")
+	tgz, err := os.ReadFile(tgzPath)
+	if err != nil {
+		t.Fatalf("read tarball: %v", err)
+	}
+	if !strings.Contains(string(tgz), "FAKE TGZ") {
+		t.Errorf("tarball content unexpected: %q", tgz)
+	}
+
+	// values.yaml nested under the subchart name.
+	valuesYAML, err := os.ReadFile(filepath.Join(outDir, folders[0].Dir, "values.yaml"))
+	if err != nil {
+		t.Fatalf("read values.yaml: %v", err)
+	}
+	if !strings.Contains(string(valuesYAML), "node-feature-discovery:") {
+		t.Errorf("values.yaml not nested under subchart name:\n%s", valuesYAML)
+	}
+
+	// No upstream.env, and no -post folder: this component is pure Helm,
+	// so there are no recipe-side manifests to wrap.
+	if _, err := os.Stat(filepath.Join(outDir, folders[0].Dir, "upstream.env")); err == nil {
+		t.Error("upstream.env should not exist in vendored folder")
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "002-nfd-post")); err == nil {
+		t.Error("pure-Helm vendored component should not emit a -post folder")
+	}
+}
+
+// TestWrite_VendorCharts_Mixed pins the #1835 contract: a vendored mixed
+// component emits the same primary + "<name>-post" release pair as the
+// non-vendored path. Recipe-side manifests are tracked members of the -post
+// release (three-way-merge on upgrade, removed on uninstall) instead of
+// helm.sh/hook resources, which Helm treats as fire-and-forget: skipped by
+// helm upgrade, left behind by helm uninstall, and mapped to an Argo CD
+// PostSync hook that never fires under syncPolicy.automated.
+func TestWrite_VendorCharts_Mixed(t *testing.T) {
+	outDir := t.TempDir()
+
+	manifests := map[string]map[string][]byte{
+		"alloy": {
+			"clusterrole.yaml": []byte("apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: alloy-extra\n"),
+		},
+	}
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       "alloy",
+			Namespace:  "alloy",
+			Repository: "https://grafana.github.io/helm-charts",
+			ChartName:  "alloy",
+			Version:    "1.2.3",
+		}},
+		ComponentPostManifests: manifests,
+		VendorCharts:           true,
+		Puller:                 &fakePuller{},
+	})
+	folders := res.Folders
+	recs := res.VendoredCharts
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(folders) != 2 {
+		t.Fatalf("got %d folders, want 2 (vendored primary + injected -post)", len(folders))
+	}
+	if len(recs) != 1 {
+		t.Fatalf("got %d vendor records, want 1 (the -post wrapper has no upstream provenance)", len(recs))
+	}
+	if got, want := folders[0].Dir, "001-alloy"; got != want {
+		t.Errorf("Folders[0].Dir = %q, want %q", got, want)
+	}
+	if got, want := folders[1].Dir, "002-alloy-post"; got != want {
+		t.Errorf("Folders[1].Dir = %q, want %q", got, want)
+	}
+	if folders[0].CarriesPostManifests {
+		t.Error("Folders[0].CarriesPostManifests = true, want false — the vendored primary no longer embeds post manifests")
+	}
+	if !folders[1].CarriesPostManifests {
+		t.Error("Folders[1].CarriesPostManifests = false, want true — deployers key the helm-diff bypass off this marker")
+	}
+
+	// The vendored primary must carry only the wrapper chart, no recipe templates.
+	if _, statErr := os.Stat(filepath.Join(outDir, folders[0].Dir, "templates")); statErr == nil {
+		t.Error("vendored primary must not contain a templates/ directory; manifests belong to the -post release")
+	}
+	if _, statErr := os.Stat(filepath.Join(outDir, folders[0].Dir, "charts", "alloy-1.2.3.tgz")); statErr != nil {
+		t.Errorf("vendored primary missing chart tarball: %v", statErr)
+	}
+
+	// The -post folder is a self-contained local chart whose manifests are
+	// ordinary templates — no hook annotations at all.
+	postTmpl := filepath.Join(outDir, folders[1].Dir, "templates", "clusterrole.yaml")
+	tmpl, err := os.ReadFile(postTmpl)
+	if err != nil {
+		t.Fatalf("read -post templates/clusterrole.yaml: %v", err)
+	}
+	if strings.Contains(string(tmpl), "helm.sh/hook") {
+		t.Errorf("-post template must not carry helm.sh/hook annotations:\n%s", tmpl)
+	}
+	if _, statErr := os.Stat(filepath.Join(outDir, folders[1].Dir, "Chart.yaml")); statErr != nil {
+		t.Errorf("-post folder missing Chart.yaml: %v", statErr)
+	}
+}
+
+// TestWrite_VendorCharts_MixedCascadeDeleteKinds is the regression guard for
+// the data-loss path that blocked the earlier post-upgrade hook approach: a
+// CRD or Namespace routed through the vendored mixed path must never receive
+// helm.sh/hook + helm.sh/hook-delete-policy: before-hook-creation, because
+// firing that hook on every helm upgrade deletes the resource first and the
+// apiserver garbage-collects everything it owns (CRs of the CRD, objects in
+// the Namespace). As tracked -post release members they are patched in place
+// instead. Author-declared hooks are stripped for the same reason the
+// non-vendored path strips them: NNN- folder ordering already sequences the
+// releases, and a leftover hook annotation would make Argo CD treat the
+// resource as a PostSync hook that never fires under syncPolicy.automated.
+func TestWrite_VendorCharts_MixedCascadeDeleteKinds(t *testing.T) {
+	tests := []struct {
+		name     string
+		fileName string
+		manifest string
+	}{
+		{
+			name:     "crd without author hook",
+			fileName: "gateway-api-crds.yaml",
+			manifest: "apiVersion: apiextensions.k8s.io/v1\n" +
+				"kind: CustomResourceDefinition\nmetadata:\n  name: gateways.gateway.networking.k8s.io\n",
+		},
+		{
+			name:     "crd with author-declared upgrade hook",
+			fileName: "nic-cluster-policy.yaml",
+			manifest: "apiVersion: apiextensions.k8s.io/v1\n" +
+				"kind: CustomResourceDefinition\nmetadata:\n  name: nicclusterpolicies.mellanox.com\n" +
+				"  annotations:\n    helm.sh/hook: post-install,post-upgrade\n" +
+				"    helm.sh/hook-delete-policy: before-hook-creation\n",
+		},
+		{
+			name:     "namespace",
+			fileName: "namespace.yaml",
+			manifest: "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: owned-ns\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outDir := t.TempDir()
+			res, err := localformat.Write(context.Background(), localformat.Options{
+				OutputDir: outDir,
+				Components: []localformat.Component{{
+					Name:       "network-operator",
+					Namespace:  "nvidia-network-operator",
+					Repository: "https://helm.ngc.nvidia.com/nvidia",
+					ChartName:  "network-operator",
+					Version:    "24.7.0",
+				}},
+				ComponentPostManifests: map[string]map[string][]byte{
+					"network-operator": {tt.fileName: []byte(tt.manifest)},
+				},
+				VendorCharts: true,
+				Puller:       &fakePuller{},
+			})
+			if err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if len(res.Folders) != 2 {
+				t.Fatalf("got %d folders, want 2 (vendored primary + -post)", len(res.Folders))
+			}
+			got, err := os.ReadFile(filepath.Join(outDir, res.Folders[1].Dir, "templates", tt.fileName))
+			if err != nil {
+				t.Fatalf("read -post template: %v", err)
+			}
+			for _, forbidden := range []string{"helm.sh/hook", "before-hook-creation"} {
+				if strings.Contains(string(got), forbidden) {
+					t.Errorf("cascade-delete kind must not carry %q — a firing hook with "+
+						"before-hook-creation deletes it on every upgrade and GCs owned objects:\n%s",
+						forbidden, got)
+				}
+			}
+		})
+	}
+}
+
+func TestWrite_VendorCharts_OCIPrefixedVersion(t *testing.T) {
+	// Pins the version-normalization contract for OCI sources, where
+	// tags are literal and a `v` prefix on the recipe version must not
+	// silently disappear from the audit log.
+	//
+	// VendorRecord.Version preserves the recipe form (load-bearing for
+	// yank-list lookups against the upstream registry), the wrapper
+	// Chart.yaml's dependency version uses the normalized form (no `v`
+	// prefix, per deployer.NormalizeVersionWithDefault), and the tarball
+	// is named by whatever the puller returns. The test asserts all
+	// three are present and internally consistent.
+	outDir := t.TempDir()
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       "gpu-operator",
+			Namespace:  "gpu-operator",
+			Repository: "oci://nvcr.io/nvidia",
+			ChartName:  "gpu-operator",
+			Version:    "v25.3.0",
+			IsOCI:      true,
+		}},
+		VendorCharts: true,
+		Puller:       &fakePuller{},
+	})
+	folders := res.Folders
+	recs := res.VendoredCharts
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(folders) != 1 {
+		t.Fatalf("got %d folders, want 1", len(folders))
+	}
+	if len(recs) != 1 {
+		t.Fatalf("got %d vendor records, want 1", len(recs))
+	}
+
+	// VendorRecord.Version preserves the recipe form for audit/yank lookups.
+	if recs[0].Version != "v25.3.0" {
+		t.Errorf("VendorRecord.Version = %q, want %q (raw recipe form preserved for yank-list lookups)",
+			recs[0].Version, "v25.3.0")
+	}
+
+	// Wrapper Chart.yaml's dependency version is normalized (no `v`).
+	chartYAML, err := os.ReadFile(filepath.Join(outDir, folders[0].Dir, "Chart.yaml"))
+	if err != nil {
+		t.Fatalf("read Chart.yaml: %v", err)
+	}
+	if !strings.Contains(string(chartYAML), "version: 25.3.0") {
+		t.Errorf("wrapper Chart.yaml does not declare normalized dependency version 25.3.0:\n%s", chartYAML)
+	}
+
+	// Tarball name should match whatever the puller reported in the record.
+	tarballPath := filepath.Join(outDir, folders[0].Dir, "charts", recs[0].TarballName)
+	if _, statErr := os.Stat(tarballPath); statErr != nil {
+		t.Errorf("expected tarball at %s: %v", tarballPath, statErr)
+	}
+}
+
+// TestWrite_VendorCharts_PreManifests pins the contract that pre
+// injection runs even when --vendor-charts is on: the pre folder is
+// independent of the primary's chart shape and must always be emitted
+// ahead of it — the os-talos mixin's privileged-Namespace manifest
+// needs to exist before any vendored chart's pods schedule.
+//
+// Asserts: two folders (pre + primary), pre is a local-helm wrapper,
+// primary is the vendored Helm folder with the chart tarball; the
+// VendorRecord count covers the primary only (pre folders are
+// always-local and never recorded).
+func TestWrite_VendorCharts_PreManifests(t *testing.T) {
+	outDir := t.TempDir()
+
+	preManifests := map[string]map[string][]byte{
+		"gpu-operator": {
+			"components/gpu-operator/manifests/talos-namespace.yaml": []byte(
+				"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: privileged-gpu-operator\n",
+			),
+		},
+	}
+	res, err := localformat.Write(context.Background(), localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       "gpu-operator",
+			Namespace:  "privileged-gpu-operator",
+			Repository: "https://nvidia.github.io/gpu-operator",
+			ChartName:  "gpu-operator",
+			Version:    "v24.9.1",
+		}},
+		ComponentPreManifests: preManifests,
+		VendorCharts:          true,
+		Puller:                &fakePuller{},
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if got, want := len(res.Folders), 2; got != want {
+		t.Fatalf("folder count = %d, want %d (pre + vendored primary)", got, want)
+	}
+	if got, want := res.Folders[0].Dir, "001-gpu-operator-pre"; got != want {
+		t.Errorf("Folders[0].Dir = %q, want %q", got, want)
+	}
+	if got, want := res.Folders[0].Kind, localformat.KindLocalHelm; got != want {
+		t.Errorf("Folders[0].Kind = %v, want %v (pre folders are always local)", got, want)
+	}
+	if got, want := res.Folders[1].Dir, "002-gpu-operator"; got != want {
+		t.Errorf("Folders[1].Dir = %q, want %q", got, want)
+	}
+
+	// Pre folder install.sh must omit --create-namespace.
+	preInstall, err := os.ReadFile(filepath.Join(outDir, "001-gpu-operator-pre", "install.sh"))
+	if err != nil {
+		t.Fatalf("read pre install.sh: %v", err)
+	}
+	if strings.Contains(string(preInstall), "--create-namespace") {
+		t.Errorf("pre folder install.sh must not pass --create-namespace:\n%s", preInstall)
+	}
+
+	// Pre folder must carry the Namespace manifest template.
+	if _, err := os.Stat(filepath.Join(outDir, "001-gpu-operator-pre", "templates", "talos-namespace.yaml")); err != nil {
+		t.Errorf("pre folder missing templates/talos-namespace.yaml: %v", err)
+	}
+
+	// Primary folder must be the vendored shape: chart tarball + values nested under subchart name.
+	if _, err := os.Stat(filepath.Join(outDir, "002-gpu-operator", "charts", "gpu-operator-v24.9.1.tgz")); err != nil {
+		t.Errorf("primary folder missing vendored tarball: %v", err)
+	}
+
+	// VendorRecord covers the primary only; pre folders are always-local
+	// wrappers and have no upstream provenance to record.
+	if got, want := len(res.VendoredCharts), 1; got != want {
+		t.Errorf("vendor record count = %d, want %d (pre folders not recorded)", got, want)
+	}
+}
+
+func TestWrite_VendorCharts_KustomizeFallthrough(t *testing.T) {
+	// Kustomize-typed components are already local after #662 and must
+	// fall through to the existing path even when --vendor-charts is on.
+	// The routing decision (kustomize → no vendor record) must hold
+	// regardless of whether the downstream kustomize build succeeds in
+	// this test environment.
+	//
+	// kustomize build may shell out to a git fetch when Repository is a
+	// remote URL. Two hermeticity guards:
+	//
+	//  1. GIT_TERMINAL_PROMPT=0 — on macOS with a credential helper
+	//     installed, git falls through to a `Username for 'https://
+	//     github.com':` prompt instead of failing fast on missing
+	//     creds; that prompt blocks `make qualify` until the helper
+	//     times out. Setting this env var makes git exit immediately
+	//     so the test stays deterministic regardless of developer git
+	//     config.
+	//
+	//  2. The Repository points at the RFC-2606 reserved `.invalid`
+	//     TLD so DNS fails before any HTTP round trip — no chance of
+	//     accidentally reaching a real github.com 404 (which would
+	//     trigger the credential-helper path again on some setups).
+	//
+	// Bound the overall call so a stalled subprocess can't hang the
+	// suite even if both guards fail somehow. 5s is plenty — DNS for
+	// .invalid resolves to NXDOMAIN in milliseconds and the only
+	// reason this would approach the budget is a misbehaving
+	// kustomize/git-library internal retry loop.
+	t.Setenv("GIT_TERMINAL_PROMPT", "0")
+	ctx, cancel := context.WithTimeout(context.Background(), vendorFetchTimeout)
+	defer cancel()
+
+	outDir := t.TempDir()
+	res, err := localformat.Write(ctx, localformat.Options{
+		OutputDir: outDir,
+		Components: []localformat.Component{{
+			Name:       "kpack",
+			Namespace:  "kpack",
+			Repository: "https://kpack-overlay.invalid",
+			Path:       "config/default",
+			Tag:        "v0.1.0",
+		}},
+		VendorCharts: true,
+		Puller:       &fakePuller{},
+	})
+	recs := res.VendoredCharts
+	// Unconditional: kustomize must never produce a vendor record,
+	// build success or not. (The kustomize build itself fails fast
+	// because the .invalid TLD doesn't resolve, but the routing
+	// decision is what we're pinning here.)
+	if len(recs) != 0 {
+		t.Errorf("kustomize component should not produce vendor records, got %d (err=%v)", len(recs), err)
+	}
+}
+
+// TestVerifyChartDigest pins the comparison a vendored chart passes before it
+// is written: the SHA-256 of the pulled bytes against the registry pin. The
+// puller's own VendorRecord is not consulted, so a puller that misreports
+// its digest cannot vouch for bytes that do not match.
+func TestVerifyChartDigest(t *testing.T) {
+	tgz := []byte("chart archive bytes")
+	sum := sha256.Sum256(tgz)
+	match := "sha256:" + hex.EncodeToString(sum[:])
+	other := "sha256:" + strings.Repeat("0", 64)
+
+	tests := []struct {
+		name    string
+		pinned  string
+		wantErr bool
+	}{
+		{name: "no pin verifies nothing", pinned: ""},
+		{name: "matching pin", pinned: match},
+		{name: "mismatching pin", pinned: other, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := localformat.VerifyChartDigest(localformat.Component{
+				Name: "nfd", ChartName: "node-feature-discovery", Version: "0.16.1", ChartDigest: tt.pinned,
+			}, tgz)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("VerifyChartDigest() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr {
+				return
+			}
+			errorstest.WantReportedCode(t, err, errors.ErrCodeConflict)
+			for _, want := range []string{`"nfd"`, match, other} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %v, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestWrite_VendorCharts_DigestPin covers the pin on the Write path: a match
+// vendors as usual, and a mismatch fails the bundle before the tarball is
+// written, so a substituted chart never lands in the bundle.
+func TestWrite_VendorCharts_DigestPin(t *testing.T) {
+	tgz := []byte("FAKE TGZ for nfd")
+	sum := sha256.Sum256(tgz)
+	match := "sha256:" + hex.EncodeToString(sum[:])
+
+	for _, tt := range []struct {
+		name    string
+		pinned  string
+		wantErr bool
+	}{
+		{name: "matching pin vendors", pinned: match},
+		{name: "mismatching pin fails before writing", pinned: "sha256:" + strings.Repeat("0", 64), wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			outDir := t.TempDir()
+			res, err := localformat.Write(context.Background(), localformat.Options{
+				OutputDir: outDir,
+				Components: []localformat.Component{{
+					Name:        "nfd",
+					Namespace:   "node-feature-discovery",
+					Repository:  "https://kubernetes-sigs.github.io/node-feature-discovery/charts",
+					ChartName:   "node-feature-discovery",
+					Version:     "0.16.1",
+					ChartDigest: tt.pinned,
+				}},
+				VendorCharts: true,
+				Puller:       &fakePuller{bytesByName: map[string][]byte{"nfd": tgz}},
+			})
+			tgzPath := filepath.Join(outDir, "001-nfd", "charts", "node-feature-discovery-0.16.1.tgz")
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+				if _, statErr := os.Stat(tgzPath); statErr != nil {
+					t.Errorf("vendored tarball missing: %v", statErr)
+				}
+				// fakePuller reports "deadbeef"; provenance must name the
+				// bytes actually written instead.
+				if got := res.VendoredCharts[0].SHA256; "sha256:"+got != match {
+					t.Errorf("VendorRecord.SHA256 = %q, want the written archive's %q", got, match)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Write() error = nil, want the digest mismatch")
+			}
+			errorstest.WantReportedCode(t, err, errors.ErrCodeConflict)
+			if _, statErr := os.Stat(tgzPath); !os.IsNotExist(statErr) {
+				t.Errorf("tarball stat error = %v, want it never written", statErr)
+			}
+		})
+	}
+}

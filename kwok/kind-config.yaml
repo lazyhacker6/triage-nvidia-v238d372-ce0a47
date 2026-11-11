@@ -1,0 +1,70 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kind configuration for KWOK scheduling validation
+#
+# Features:
+# - DRA (Dynamic Resource Allocation) enabled for GPU scheduling tests
+# - CoreDNS enabled — required by the Argo CD deployer-matrix lanes so
+#   in-cluster pods (argocd-server, repo-server, redis, etc.) can resolve
+#   each other via Service DNS. Costs ~15s extra boot vs the historical
+#   skip; trivial for KWOK CI. Issue #843.
+# - Control-plane tainted to prevent test workloads from scheduling there
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+featureGates:
+  DynamicResourceAllocation: true
+runtimeConfig:
+  "resource.k8s.io/v1beta1": "true"
+nodes:
+  - role: control-plane
+    # Host port 5500 → NodePort 30500 exposes the in-cluster OCI registry
+    # (registry.aicr-registry.svc) to the runner for `aicr bundle --output oci://...`
+    # pushes during the KWOK deployer-matrix lanes. Plain HTTP — gated by
+    # `--plain-http` on the bundler side and `insecureOCIForceHttp` on the
+    # Argo CD repo secret.
+    #
+    # Why 5500 and not 5000: on macOS, Apple ControlCenter (AirPlay /
+    # Handoff) listens on host port 5000 by default, and `kind create
+    # cluster` then fails to bind the extraPortMapping. Linux CI
+    # runners have port 5500 free as well, so the unconventional
+    # choice costs nothing there. The Service `containerPort: 5000`
+    # and NodePort `30500` are unchanged — Argo CD's repo-server
+    # reaches the registry in-cluster via Service DNS on port 5000
+    # regardless of the host-side mapping. Issue #843.
+    extraPortMappings:
+      - containerPort: 30500
+        hostPort: 5500
+        protocol: TCP
+      # Host port 3300 → NodePort 30300 exposes the in-cluster Gitea
+      # (gitea.aicr-registry.svc) to the runner so the flux-git lane can
+      # `git push` the filesystem bundle. Host 3300 (not Gitea's default
+      # 3000) for the same collision-avoidance reason as 5500 above —
+      # port 3000 is commonly held by Grafana / local dev servers.
+      # In-cluster consumers (Flux source-controller) use Service DNS on
+      # port 3000 regardless of the host-side mapping. Issue #963.
+      - containerPort: 30300
+        hostPort: 3300
+        protocol: TCP
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          ignorePreflightErrors:
+            - SystemVerification
+          taints:
+            # Standard control-plane taint - system components tolerate this
+            - key: "node-role.kubernetes.io/control-plane"
+              effect: "NoSchedule"

@@ -1,0 +1,272 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package localformat
+
+import (
+	"embed"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"text/template"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/manifest"
+)
+
+// kindNamespaceRE matches a top-level YAML "kind: Namespace" line. Used to
+// detect whether a local-helm folder ships its own Namespace template, in
+// which case install.sh must omit --create-namespace: Helm 3 refuses to
+// import a namespace it created out-of-band via --create-namespace because
+// that namespace lacks the release's ownership annotations.
+var kindNamespaceRE = regexp.MustCompile(`(?m)^kind:\s+Namespace\s*$`)
+
+// hasYAMLObjects returns true if content contains at least one YAML object
+// (a non-comment, non-blank, non-separator line). Used to skip writing
+// fully-conditional manifests that rendered to nothing once values were
+// applied. Mirrors the helper that lived in the old helm deployer.
+func hasYAMLObjects(content []byte) bool {
+	for line := range strings.SplitSeq(string(content), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || trimmed == "---" {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+//go:embed templates/install-local-helm.sh.tmpl templates/chart.yaml.tmpl
+var localHelmTemplates embed.FS
+
+var (
+	localHelmInstallTmpl = template.Must(
+		template.New("install-local-helm.sh.tmpl").
+			Funcs(deployer.TemplateFuncs).
+			Funcs(shellFuncs).
+			ParseFS(localHelmTemplates, "templates/install-local-helm.sh.tmpl"),
+	)
+	localHelmChartTmpl = template.Must(
+		template.New("chart.yaml.tmpl").
+			Funcs(deployer.TemplateFuncs).
+			ParseFS(localHelmTemplates, "templates/chart.yaml.tmpl"),
+	)
+)
+
+// writeLocalHelmFolder writes Chart.yaml + templates/* + values.yaml +
+// cluster-values.yaml + install.sh into outputDir/dir. name is the folder
+// and release name ("<name>" for primary, "<name>-post" for injected mixed);
+// parent is the originating component name (== name for primary). manifests
+// is the per-path rendered bytes map for this folder; may be empty (a
+// manifest-only component with no manifests still yields a valid empty
+// templates/ directory).
+//
+// createNamespace controls whether the rendered install.sh passes
+// --create-namespace to helm. Callers express intent ("yes, the chart
+// expects to land in a namespace that may not exist yet"); the function
+// downgrades the flag to false automatically when any rendered manifest
+// defines its own Namespace resource — Helm 3 refuses to import a
+// namespace it created out-of-band via --create-namespace because that
+// namespace lacks the release's ownership annotations.
+//
+// The detection covers two real call shapes:
+//   - Talos pre-injection folder: ships a privileged Namespace template.
+//     Caller asks for createNamespace=true; detection downgrades to false
+//     so the chart's own Namespace template owns the resource.
+//   - Bare-resource pre-injection folder (e.g., a ConfigMap consumed by
+//     the primary chart's reconcile): no Namespace template. Caller asks
+//     for createNamespace=true; detection leaves it true so install.sh
+//     creates the target namespace before applying the ConfigMap. The
+//     primary chart's later `helm install --create-namespace` is a no-op
+//     against the existing namespace.
+//
+// stamp carries the two versions written into the generated Chart.yaml.
+//
+// If clusterValuesFrom is non-empty, install.sh layers that folder-relative
+// file in place of the folder's own cluster-values.yaml, which is written
+// empty.
+//
+// Returns the Folder manifest with Files listed in deterministic order.
+func writeLocalHelmFolder(
+	outputDir, dir string, idx int, c Component,
+	manifests map[string][]byte, renderInput manifest.RenderInput,
+	name, parent string, createNamespace bool, stamp chartStamp,
+	keepHookAnnotations bool, clusterValuesFrom string,
+) (Folder, error) {
+
+	folderDir, err := deployer.SafeJoin(outputDir, dir)
+	if err != nil {
+		return Folder{}, errors.Wrap(errors.ErrCodeInvalidRequest, "folder path unsafe", err)
+	}
+	if err = os.MkdirAll(folderDir, 0o755); err != nil {
+		return Folder{}, errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("create folder %s", dir), err)
+	}
+	// templates/ is created lazily, only when the first non-empty manifest is
+	// written. A component whose manifests all render empty (e.g. a
+	// single-package tuning manifest with tuningEnabled=false) must NOT leave an
+	// empty templates/ directory behind — the inventory verifier rejects it as
+	// an unexpected directory, and a template-less Helm chart (Chart.yaml +
+	// values only) is valid and installs as a harmless no-op.
+	templatesDir, err := deployer.SafeJoin(folderDir, "templates")
+	if err != nil {
+		return Folder{}, errors.Wrap(errors.ErrCodeInvalidRequest, "templates dir path unsafe", err)
+	}
+	templatesDirCreated := false
+
+	// Chart.yaml
+	chartData := struct {
+		Name             string
+		Parent           string
+		AICRVersion      string
+		ComponentVersion string
+	}{name, parent, stamp.AICRVersion, stamp.PayloadVersion}
+	if err = renderTemplateToFile(localHelmChartTmpl, chartData, folderDir, "Chart.yaml", 0o644); err != nil {
+		return Folder{}, err
+	}
+
+	// values.yaml + cluster-values.yaml
+	if err = writeValueFiles(folderDir, c, clusterValuesFrom == ""); err != nil {
+		return Folder{}, err
+	}
+
+	// templates/* from manifests (sorted for determinism; basename-collision is
+	// an error so two manifests with the same file name cannot silently overwrite).
+	sortedPaths := make([]string, 0, len(manifests))
+	for p := range manifests {
+		sortedPaths = append(sortedPaths, p)
+	}
+	sort.Strings(sortedPaths)
+
+	seen := make(map[string]string, len(sortedPaths))
+	templateRelPaths := make([]string, 0, len(sortedPaths))
+	// hasNamespaceTemplate is set when any rendered manifest declares a
+	// top-level Namespace resource. When true, install.sh below suppresses
+	// --create-namespace to avoid the Helm 3 ownership collision.
+	hasNamespaceTemplate := false
+	for _, p := range sortedPaths {
+		baseName := filepath.Base(p)
+		if prev, ok := seen[baseName]; ok {
+			return Folder{}, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("manifest basename collision in component %q: %q and %q both resolve to %q",
+					c.Name, prev, p, baseName))
+		}
+		seen[baseName] = p
+
+		rendered, rerr := manifest.Render(manifests[p], renderInput)
+		if rerr != nil {
+			return Folder{}, errors.Wrap(errors.ErrCodeInternal,
+				fmt.Sprintf("render manifest %s for %s", p, c.Name), rerr)
+		}
+		// Both branches run the same YAML round-trip; only the filter
+		// differs. keepHookAnnotations skips the FILTER, never the
+		// rewrite -- the round-trip is also this folder's only
+		// YAML-validity check, and what keeps its bytes stable. See
+		// normalizeYAMLDocs.
+		if keepHookAnnotations {
+			normalized, normErr := normalizeYAMLDocs(rendered)
+			if normErr != nil {
+				return Folder{}, errors.PropagateOrWrap(normErr, errors.ErrCodeInternal,
+					fmt.Sprintf("normalize manifest %s for %s", p, c.Name))
+			}
+			rendered = normalized
+		} else {
+			// Strip helm.sh/hook* annotations: NNN-folder ordering at the
+			// bundle layer subsumes their role, and leaving them in causes
+			// Argo CD to treat the resource as a PostSync hook that never
+			// fires under syncPolicy.automated for path-based sources. See
+			// stripHelmHooks for the full rationale.
+			stripped, stripErr := stripHelmHooks(rendered)
+			if stripErr != nil {
+				return Folder{}, errors.PropagateOrWrap(stripErr, errors.ErrCodeInternal,
+					fmt.Sprintf("strip helm hooks from manifest %s for %s", p, c.Name))
+			}
+			rendered = stripped
+		}
+		// Skip writing if the rendered output has no YAML objects (only
+		// comments / blanks / separators) — typical for fully-conditional
+		// manifests when the relevant value was set false at bundle time.
+		// Mirrors the OLD helm deployer's hasYAMLObjects check.
+		if !hasYAMLObjects(rendered) {
+			slog.Debug("skipping empty manifest after render",
+				"component", c.Name, "manifest", baseName)
+			continue
+		}
+		if !hasNamespaceTemplate && kindNamespaceRE.Match(rendered) {
+			hasNamespaceTemplate = true
+		}
+		outPath, jerr := deployer.SafeJoin(templatesDir, baseName)
+		if jerr != nil {
+			return Folder{}, errors.Wrap(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("template file path unsafe: %s", baseName), jerr)
+		}
+		if !templatesDirCreated {
+			if mkErr := os.MkdirAll(templatesDir, 0o755); mkErr != nil {
+				return Folder{}, errors.Wrap(errors.ErrCodeInternal,
+					fmt.Sprintf("create templates dir for %s", dir), mkErr)
+			}
+			templatesDirCreated = true
+		}
+		if werr := writeFile(outPath, rendered, 0o644); werr != nil {
+			return Folder{}, werr
+		}
+		templateRelPaths = append(templateRelPaths, filepath.Join(dir, "templates", baseName))
+	}
+
+	// install.sh — suppress --create-namespace if a chart template owns the
+	// target namespace (see createNamespace doc comment for the full
+	// rationale and call shapes).
+	effectiveCreateNamespace := createNamespace && !hasNamespaceTemplate
+	// OwnsCRDs is always false here. This path emits AICR-rendered wrappers
+	// (manifest-only, kustomize, and the injected -pre/-post/-readiness
+	// folders), none of which carry an upstream chart's crds/ directory. The
+	// vendored primary shares this template but renders it from
+	// writeVendoredHelmFolder.
+	installData := struct {
+		Name                 string
+		Namespace            string
+		CreateNamespace      bool
+		OwnsCRDs             bool
+		ClusterValuesFile    string
+		RequiredDynamicPaths []string
+	}{name, c.Namespace, effectiveCreateNamespace, false, clusterValuesFrom, nil}
+	if err = renderTemplateToFile(localHelmInstallTmpl, installData, folderDir, "install.sh", 0o755); err != nil {
+		return Folder{}, err
+	}
+
+	files := make([]string, 0, 3+len(templateRelPaths)+1)
+	files = append(files,
+		filepath.Join(dir, "Chart.yaml"),
+		filepath.Join(dir, "values.yaml"),
+		filepath.Join(dir, "cluster-values.yaml"),
+	)
+	files = append(files, templateRelPaths...)
+	files = append(files, filepath.Join(dir, "install.sh"))
+
+	return Folder{
+		Index:           idx,
+		Dir:             dir,
+		Kind:            KindLocalHelm,
+		Name:            name,
+		Namespace:       c.Namespace,
+		Parent:          parent,
+		Files:           files,
+		CreateNamespace: effectiveCreateNamespace,
+	}, nil
+}

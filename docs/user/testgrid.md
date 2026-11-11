@@ -1,0 +1,146 @@
+{/*
+Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+*/}
+
+# AICR TestGrid
+
+The AICR TestGrid is the planned **live validation-posture** board: it will show the actual pass/fail of AICR recipes from real validation runs against real clusters, organized so you can navigate straight from a cloud service provider down to a single check. It will answer *"is this recipe passing right now, against which Kubernetes version, and who signed the result?"*
+
+The board has not shipped yet, and there is no public TestGrid URL. Until it ships, the [interim evidence dashboard](#interim-evidence-dashboard) at [`https://validation.aicr.run`](https://validation.aicr.run) publishes the same evidence and already addresses recipes with the coordinate scheme described below.
+
+It is the live complement to two **offline, structural** surfaces:
+
+- [Recipe Health](./recipe-health.md) — the catalog-wide structural state of every recipe, computed hermetically with no cluster.
+- [Recipe & CLI Coverage Matrix](./coverage-matrix.md) — which journeys and CLI verbs are exercised in-repo, and how often.
+
+Neither of those reports live pass/fail; the TestGrid will. The three surfaces coexist and never duplicate each other — see [How it relates to recipe health](#how-it-relates-to-recipe-health) below. The full design contract is recorded in [ADR-012](https://github.com/NVIDIA/aicr/blob/main/docs/design/012-recipe-coordinate-mapping.md).
+
+## How to read it — CSP-first navigation
+
+The board is a five-level addressing space. You navigate it the way you reason about a deployment: start from your cloud, narrow to your hardware and OS, then your workload.
+
+| Level | Value | Example |
+|-------|-------|---------|
+| **Group** | service (the CSP) | `eks` |
+| **Dashboard** | accelerator + OS | `h100-ubuntu` |
+| **Tab** | intent, optionally with platform | `training-kubeflow` |
+| **Row** | validation `<phase>/<check>` | `conformance/gpu-operator-health` |
+| **Column** | one build | one validation run |
+
+The first three levels (group, dashboard, tab) come from the **recipe** — they identify *which cell* a result belongs in. The last two (row, column) come from the **validation run** — they describe *what is in that cell*: which checks ran, in which build. A recipe never decides its own rows or columns.
+
+This split is why the board is CSP-first even though recipe names are accelerator-first: the recipe `h100-eks-ubuntu-training-kubeflow` lands at the coordinate `eks/h100-ubuntu/training-kubeflow`. The mapping is derived from the recipe's resolved criteria, never from string-parsing its name, so the two stay independently correct.
+
+### The coordinate
+
+Every cell has a stable, canonical address:
+
+```text
+<group>/<dashboard>/<tab>
+```
+
+For example `eks/h100-ubuntu/training-kubeflow` (with a platform) or `eks/h100-ubuntu/training` (bare intent — when a recipe declares no platform, the segment is dropped, never filled with a placeholder).
+
+Treat the coordinate as a **stable opaque identity**, not a key you take apart: a dimension value can itself contain `-` (for example `rtx-pro-6000`), so the path has no reliable positional split point. It is something to link to and compare for equality, not to decompose.
+
+## The Kubernetes version facet
+
+The Kubernetes version is deliberately **not** part of the coordinate. It lives **in the column** — one build is one K8s version. This keeps a coordinate (`eks/h100-ubuntu/training`) invariant as clusters upgrade, so links into the board do not churn every time a new K8s minor ships.
+
+The trade-off is that one tab can hold columns for the *same* coordinate at *different* K8s versions. Two countermeasures keep a stale result from being read as a current one:
+
+- a **K8s-version facet / filter**, so you can scope the view to a version; and
+- a **latest-per-signer default scope**, so the default view does not mix stale and current results from the same signer.
+
+Each column also carries the recipe's declared K8s constraint alongside the observed version, so you can tell at a glance whether the cluster the build ran on actually satisfied what the recipe asked for.
+
+## Provenance columns — who produced the result
+
+Trust in a column comes from its provenance metadata. Each build column carries a fixed set of keys so you can weigh a result before relying on it:
+
+| Key | Meaning |
+|-----|---------|
+| `aicr_version` | the `aicr` release that produced the result |
+| `k8s_version` | the cluster version actually observed (`major.minor`) |
+| `k8s_constraint` | the K8s version the recipe declared it needs |
+| `signer_identity` | the signing identity (workflow / subject) that attested the result |
+| `signer_issuer` | the OIDC issuer that vouched for that identity |
+| `source_class` | verified origin class: NVIDIA `uat`, or allowlisted `community`/partner evidence |
+| `evidence_digest` | the digest of the underlying signed evidence artifact |
+| `aicr_run_url` | a link to the GitHub Actions run (and attempt) the publisher reports for the result, shown as the build's run link; checked only for format, **not** verified against the signed evidence; empty when none is supplied |
+
+`signer_identity` and `signer_issuer` together identify **community-submitted** results versus **NVIDIA UAT** runs and key the latest-per-signer default scope. The publisher verifies those certificate claims against the checked-in signer allowlist and derives `source_class`; callers cannot assign their own trust class. Allowlisted partner evidence is represented as `community` because TestGrid's wire contract distinguishes first-party UAT from external evidence. `evidence_digest` is the verifiable anchor: every cell traces back to a signed [conformance evidence](https://github.com/NVIDIA/aicr/blob/main/docs/design/007-recipe-evidence.md) artifact you can verify independently with [artifact verification](./artifact-verification.md). `aicr_run_url` is a convenience link supplied by whoever publishes the build, so rely on `evidence_digest`, not the link, for proof of origin.
+
+## Interim evidence dashboard
+
+The [Evidence Corroboration Dashboard](./evidence-dashboard.md) is the
+**interim static GitHub Pages surface** for the same evidence. It reads the
+same verified, source-keyed evidence tree (in the same layout) and
+derives recipe coordinates using the same shared mapping function
+(`pkg/recipe.CoordinateFor`, [ADR-012](https://github.com/NVIDIA/aicr/blob/main/docs/design/012-recipe-coordinate-mapping.md)).
+It is published at [`https://validation.aicr.run`](https://validation.aicr.run)
+and rebuilt on every merge to `main` by a deterministic Go generator —
+no live workers, no GKE cluster.
+
+The TestGrid (this page) is the **live stack**: live upstream TestGrid
+workers, an AICR-native read-only API, a greenfield SPA, and an always-on
+GKE host cluster. Both surfaces are built in parallel; neither defers the
+other.
+
+The two surfaces share the same foundation:
+
+- The same verified source-keyed evidence tree, in the same layout. (Whether
+  the two surfaces share one GCS bucket or stand up their own is an open
+  GP3/TG1 deconfliction tracked in ADR-012; the shared contract is the
+  evidence tree, not a specific bucket.)
+- Same recipe→coordinate mapping (`pkg/recipe.CoordinateFor`) as the
+  shared criteria-only base — the anti-drift guarantee for both surfaces.
+  (Profile-bearing recipes refine it per consumer: the Golden Path route
+  appends the `-<name>-<value>` profile segment to the tab, while TestGrid
+  keeps the unsuffixed coordinate and separates values via the digest-bound
+  build ID — see ADR-012/ADR-015.) Both surfaces anchor every recipe to the
+  same criteria-only `<group>/<dashboard>/<tab>` base; for profiled recipes
+  the complete coordinates diverge by design (suffixed GP tab segment vs
+  unsuffixed, digest-partitioned TG builds).
+- The GP dashboard's JSON contract (`data/index.json` + `data/series/<recipe>.json`)
+  uses coordinate-keyed layouts that are forward-compatible with the
+  TestGrid workers, API, and UI. It is not a throwaway interim format.
+
+RQ1 (#1283) — the follow-on to #1224's `pending` Evidence column — targets
+the evidence dashboard specifically: it is the link
+target today because TG4a/TG4b's live API and UI have not shipped yet — not
+because TG work is deferred; the two surfaces are being built in parallel
+(see above). The Recipe Health generator (`tools/health/markdown.go`)
+deep-links the Evidence column to the dashboard's coordinate URL today,
+gated on a committed dashboard presence —
+`https://validation.aicr.run/#/<group>/<dashboard>/<tab>` — built offline
+from resolved criteria via `pkg/recipe.CoordinateFor`. Recipes without a
+committed presence stay `pending`, and profiled families' presence entries
+are deliberately withheld until profile-aware links land (the lowercase
+`-<name>-<value>` tab segment for a profiled recipe cannot yet be derived
+by the criteria-only generator). The link is stable
+across Kubernetes upgrades because the Kubernetes version lives in the
+column, not the path. Once TG4a's own coordinate-presence endpoint ships, the
+same criteria-only base (`Coordinate.Path()`) resolves on this board too. The
+bases are addressed identically; only the profile refinement differs per
+surface — the Golden Path route appends the profile segment to the tab, while
+TestGrid stays at the unsuffixed base and separates profile values via the
+digest-bound build ID — so how a link is derived does not change when the
+live board comes up.
+
+## How it relates to recipe health
+
+The TestGrid and the [Recipe Health](./recipe-health.md) matrix are **two surfaces that coexist; neither is a richer rendering of the other**:
+
+- **Recipe Health** owns the **offline structural / freshness** signal — does the recipe resolve cleanly, are its charts pinned — computed without a live cluster.
+- **The TestGrid** owns the **live validation-posture** signal — derived from real runs against real clusters.
+
+AICR keeps these axes deliberately separate so a "resolves cleanly" verdict never gets fused with a "validated and performant" one. The two surfaces share exactly one thing: the criteria-only base coordinate (`pkg/recipe.CoordinateFor`) by which both address the same recipe family — for profile-bearing recipes the Golden Path refines it with the `-<name>-<value>` tab segment (and the evidence recipe name carries the same segment), while TestGrid stays at the base, separating values by digest-bound build ID.
+
+The Recipe Health **Evidence** column is the cross-link between them. When a recipe has a **committed presence** on the [interim evidence dashboard](#interim-evidence-dashboard), the column **links** into its coordinate — the dashboard is the link target today because TG4a/TG4b's live board hasn't shipped yet, not because TG work is deferred — and the link is automatically checkable so it can never point at a coordinate that does not exist. A recipe with no committed dashboard presence stays `pending` (profiled families' entries are deliberately withheld until profile-aware links land). It links, it never copies either board's content.

@@ -1,0 +1,76 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+kind: RecipeMetadata
+apiVersion: aicr.run/v1beta1
+metadata:
+  name: h100-gke-cos-inference
+
+spec:
+  # Inherits from gke-cos-inference recipe (GKE COS + inference settings)
+  base: gke-cos-inference
+
+  criteria:
+    service: gke
+    accelerator: h100
+    os: cos
+    intent: inference
+
+  # Specific constraints for H100 on GKE COS inference workloads
+  constraints:
+    - name: K8s.server.version
+      value: ">= 1.32"
+
+  componentRefs:
+    - name: gpu-operator
+      type: Helm
+      dependencyRefs:
+        - nfd
+        - cert-manager
+        - prometheus-operator-crds
+        - nodewright-customizations
+      overrides:
+        cdi:
+          enabled: true
+
+    - name: nodewright-customizations
+      type: Helm
+      manifestFiles:
+        - components/nodewright-customizations/manifests/tuning-gke.yaml
+      overrides:
+        accelerator: h100
+        intent: inference
+      dependencyRefs:
+        - nodewright-operator
+
+    - name: nfd
+      type: Helm
+      overrides:
+        topologyUpdater:
+          enable: true
+
+    # Runtime AI-workload inventory (ADR-019, amendment section C). This
+    # recipe and its descendant h100-gke-cos-inference-dynamo, which inherits
+    # the ref, are the only stock recipes that carry the component by default;
+    # do not lift it to gke-cos-inference, gke-cos, or base -- that would
+    # default every descendant into the component instead of leaving adoption
+    # to explicit per-recipe opt-in. Any GKE recipe can now receive the
+    # component that way, with `aicr recipe --runtime-inventory enabled`
+    # (#2962). Namespace opt-in is the chart default, so nothing is
+    # inventoried until an operator labels a namespace
+    # aibom.k8saibom.dev/enabled=true. Decline at generation time with
+    # `aicr recipe --runtime-inventory disabled`.
+    - name: k8s-aibom
+      type: Helm
+      valuesFile: components/k8s-aibom/values.yaml

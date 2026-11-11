@@ -1,0 +1,102 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+kind: RecipeMetadata
+apiVersion: aicr.run/v1beta1
+metadata:
+  name: a100-aks-training
+
+spec:
+  # Inherits from aks-training recipe (AKS + training settings)
+  base: aks-training
+
+  criteria:
+    service: aks
+    accelerator: a100
+    intent: training
+
+  # DRA (nvidia-dra-driver-gpu) is inherited via base.yaml on every AKS
+  # recipe, and DRA graduated to GA in Kubernetes 1.34 — restate that floor
+  # here rather than relying on inheritance (see aks.yaml and #1772).
+  # Constraint names use fully qualified measurement paths: {type}.{subtype}.{key}
+  constraints:
+    - name: K8s.server.version
+      value: ">= 1.34"
+
+  componentRefs:
+    # GPU Operator dependency ordering (inherits valuesFile from aks-training;
+    # gdrcopy stays disabled there — inert under the azure-managed profile).
+    - name: gpu-operator
+      type: Helm
+      dependencyRefs:
+        - nfd
+        - cert-manager
+        - prometheus-operator-crds
+        - nodewright-customizations
+
+    # A100 reuses the h100 nodewright tuning profile (tuning.yaml), mirroring
+    # a100-eks-training: nvidia-setup's only accelerator-specific aks config is
+    # aks-h100 (aks-any carries only the toolkit hardening), and
+    # per the nodewright maintainer the h100 tuning is the correct profile for
+    # A100 (the A100-vs-H100 deltas pertain only to baremetal). The recipe
+    # criteria above stays a100; only this tuning profile selector is h100.
+    - name: nodewright-customizations
+      type: Helm
+      manifestFiles:
+        - components/nodewright-customizations/manifests/tuning.yaml
+      overrides:
+        service: aks
+        accelerator: h100
+        intent: multiNodeTraining
+        # Azure-managed driver profile: skip the nvidia-tuned package (no
+        # nvidia-tuned-triggered reboot; nvidia-setup-full still reboots for
+        # host prep); re-enable with --set nodewrightcustomizations:tuningEnabled=true.
+        tuningEnabled: false
+      dependencyRefs:
+        - nodewright-operator
+
+    - name: nfd
+      type: Helm
+      overrides:
+        topologyUpdater:
+          enable: true
+
+  # Validation checks for A100 on AKS training workloads.
+  # Defined at the intent layer (not OS-specific) so all OS variants inherit them.
+  #
+  # The deployment-phase floor (4 standard checks + gpu-operator version pin)
+  # is contributed by the a100-any cross-cutting overlay and is not duplicated
+  # here.
+  #
+  # Performance gating is intentionally omitted until an empirical A100-on-Azure
+  # NCCL baseline is established. The validator's AKS NCCL runtime path covers
+  # H100 only (supportedNCCLCombinations in
+  # validators/performance/nccl_all_reduce_bw_constraint.go; h100-aks-training
+  # declares nccl-all-reduce-bw with a floor calibrated on ND96isr_H100_v5).
+  # A100 on Azure is unmeasured and needs its own fabric-aware baseline (#1256)
+  # plus an aks/a100 support-table entry (#1337), so carrying any floor here
+  # would only false-fail healthy runs.
+  validation:
+    conformance:
+      checks:
+        - platform-health
+        - gpu-operator-health
+        - dra-support
+        - accelerator-metrics
+        - ai-service-metrics
+        - gang-scheduling
+        - pod-autoscaling
+        - cluster-autoscaling
+        - secure-accelerator-access
+        - driver-runtime-management

@@ -1,0 +1,508 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package recipe
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"path"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/manifest"
+	"gopkg.in/yaml.v3"
+)
+
+// nodewrightTuningManifest is the shared nodewright-customizations manifest
+// (EKS and AKS) carrying the nvidia-setup/nvidia-tuned Skyhook packages.
+const nodewrightTuningManifest = "components/nodewright-customizations/manifests/tuning.yaml"
+
+// Single-package tuning manifests: their only Skyhook package IS the tuning
+// package, so the tuningEnabled gate suppresses the whole CR instead of one
+// package.
+const (
+	nodewrightTuningGKEManifest     = "components/nodewright-customizations/manifests/tuning-gke.yaml"
+	nodewrightTuningGenericManifest = "components/nodewright-customizations/manifests/tuning-generic.yaml"
+	nodewrightTuningRKE2Manifest    = "components/nodewright-customizations/manifests/tuning-rke2.yaml"
+	nodewrightTuningGB300Manifest   = "components/nodewright-customizations/manifests/tuning-gb300.yaml"
+)
+
+// nodewrightTuningOKEGB300Manifest carries the CRI-O Multus and RDMA VF settle
+// packages beside nvidia-tuned, so tuningEnabled=false leaves the CR in place.
+const nodewrightTuningOKEGB300Manifest = "components/nodewright-customizations/manifests/tuning-oke-gb300.yaml"
+
+// renderNodewrightTuning renders the tuning manifest with the given component
+// values and returns the parsed Skyhook packages map plus the dependsOn map of
+// the nvidia-setup-full package.
+func renderNodewrightTuning(t *testing.T, content []byte, values map[string]any) (packages, fullDependsOn map[string]any) {
+	t.Helper()
+
+	rendered, err := manifest.Render(content, manifest.RenderInput{
+		ComponentName: "nodewright-customizations",
+		Namespace:     "skyhook",
+		ChartName:     "nodewright-customizations",
+		ChartVersion:  "0.1.0",
+		Values:        values,
+	})
+	if err != nil {
+		t.Fatalf("render tuning manifest: %v", err)
+	}
+	var skyhook map[string]any
+	if err := yaml.Unmarshal(rendered, &skyhook); err != nil {
+		t.Fatalf("unmarshal rendered tuning manifest: %v\n%s", err, rendered)
+	}
+	packages = valueAtPath[map[string]any](t, skyhook, "spec", "packages")
+	fullDependsOn = valueAtPath[map[string]any](t, skyhook, "spec", "packages", "nvidia-setup-full", "dependsOn")
+	return packages, fullDependsOn
+}
+
+// TestNodewrightTuningGateAcrossCatalog renders the shared nodewright
+// tuning.yaml manifest for every leaf recipe that wires it and pins the
+// per-service tuningEnabled contract:
+//
+//   - AKS leaves ship tuningEnabled: false under the Azure-managed driver
+//     profile: the rendered Skyhook omits the nvidia-tuned package (no
+//     tuning-triggered node reboot) and nvidia-setup-full depends directly on
+//     nvidia-setup-kernel. nvidia-setup itself stays enabled — on AKS it
+//     carries the RDMA host prep (MEMLOCK limits + IB module loading).
+//   - Non-AKS leaves (EKS) are unchanged: nvidia-tuned renders and
+//     nvidia-setup-full depends on it.
+//
+// A final subtest pins the documented re-enable path: rendering an AKS leaf's
+// values with tuningEnabled flipped to true restores the full package chain
+// (--set nodewrightcustomizations:tuningEnabled=true).
+func TestNodewrightTuningGateAcrossCatalog(t *testing.T) {
+	ctx := context.Background()
+	leaves, err := ResolveLeaves(ctx, ResolveLeavesOptions{})
+	if err != nil {
+		t.Fatalf("ResolveLeaves: %v", err)
+	}
+
+	var sawAKS, sawNonAKS bool
+	var aksContent []byte
+	var aksValues map[string]any
+	for _, leaf := range leaves {
+		if leaf.Err != nil || leaf.Result == nil || leaf.Entry.Criteria == nil {
+			continue
+		}
+		// AL2023 leaves intentionally disable nodewright-customizations
+		// (nvidia-setup is Debian/Ubuntu-only); skip them here.
+		if leaf.Entry.Criteria.OS == CriteriaOSAmazonLinux {
+			continue
+		}
+		ref := leaf.Result.GetComponentRef("nodewright-customizations")
+		if ref == nil || !slices.Contains(ref.ManifestFiles, nodewrightTuningManifest) {
+			continue
+		}
+		t.Run(leaf.Entry.Name, func(t *testing.T) {
+			values, verr := leaf.Result.GetValuesForComponentWithContext(ctx, "nodewright-customizations")
+			if verr != nil {
+				t.Fatalf("GetValuesForComponentWithContext(nodewright-customizations): %v", verr)
+			}
+			content, cerr := GetManifestContentWithContext(ctx, leaf.Result.DataProvider(), nodewrightTuningManifest)
+			if cerr != nil {
+				t.Fatalf("GetManifestContentWithContext(%q): %v", nodewrightTuningManifest, cerr)
+			}
+			packages, fullDependsOn := renderNodewrightTuning(t, content, values)
+
+			// nvidia-setup renders for every service: on AKS it carries the
+			// RDMA host prep that replaced the ib-node-config DaemonSet.
+			for _, pkg := range []string{"nvidia-setup-kernel", "nvidia-setup-full"} {
+				if _, ok := packages[pkg]; !ok {
+					t.Errorf("rendered packages missing %q: %v", pkg, sortedKeys(packages))
+				}
+			}
+
+			if leaf.Entry.Criteria.Service == CriteriaServiceAKS {
+				sawAKS = true
+				aksContent, aksValues = content, values
+				if got, ok := values["tuningEnabled"]; !ok || got != false {
+					t.Errorf("AKS leaf tuningEnabled = %v (present=%v), want false", got, ok)
+				}
+				if _, ok := packages["nvidia-tuned"]; ok {
+					t.Error("AKS rendering must omit the nvidia-tuned package (tuningEnabled: false)")
+				}
+				if _, ok := fullDependsOn["nvidia-setup-kernel"]; !ok {
+					t.Errorf("AKS nvidia-setup-full.dependsOn = %v, want nvidia-setup-kernel", fullDependsOn)
+				}
+				if _, ok := fullDependsOn["nvidia-tuned"]; ok {
+					t.Errorf("AKS nvidia-setup-full.dependsOn = %v, must not reference the omitted nvidia-tuned", fullDependsOn)
+				}
+				// On AKS nvidia-setup-kernel is a no-op with no interrupt, so its Job
+				// runs on an undrained node bound by nodeName. Keep it small: a GPU
+				// node whose workloads leave less than the request free rejects it.
+				kernel := valueAtPath[map[string]any](t, packages, "nvidia-setup-kernel")
+				if _, ok := kernel["interrupt"]; ok {
+					t.Error("AKS nvidia-setup-kernel declares an interrupt; the package is a no-op there")
+				}
+				if got := fmt.Sprint(valueAtPath[any](t, kernel, "resources", "cpuLimit")); got != "4" {
+					t.Errorf("AKS nvidia-setup-kernel resources.cpuLimit = %s, want 4 (undrained node)", got)
+				}
+				// Admission is decided by the requests, so pin those too.
+				if got := fmt.Sprint(valueAtPath[any](t, kernel, "resources", "cpuRequest")); got != "2" {
+					t.Errorf("AKS nvidia-setup-kernel resources.cpuRequest = %s, want 2 (undrained node)", got)
+				}
+				if got := fmt.Sprint(valueAtPath[any](t, kernel, "resources", "memoryRequest")); got != "4Gi" {
+					t.Errorf("AKS nvidia-setup-kernel resources.memoryRequest = %s, want 4Gi (undrained node)", got)
+				}
+			} else {
+				sawNonAKS = true
+				if _, ok := packages["nvidia-tuned"]; !ok {
+					t.Errorf("non-AKS rendering must keep the nvidia-tuned package: %v", sortedKeys(packages))
+				}
+				if _, ok := fullDependsOn["nvidia-tuned"]; !ok {
+					t.Errorf("non-AKS nvidia-setup-full.dependsOn = %v, want nvidia-tuned", fullDependsOn)
+				}
+				// The packages form a chain, kernel then tuned then full. nodewright
+				// hands a node's merged reboot to the first runnable package in name
+				// order and fires it as soon as no package Job is running
+				// (NVIDIA/nodewright#934), so nvidia-tuned must not be runnable in the
+				// same pass as nvidia-setup-kernel: the kernel package's reboot could
+				// land between nvidia-tuned's apply and config Jobs. nvidia-tuned keeps
+				// its own reboot, which boots the command line its config stage writes
+				// and runs its post-interrupt checks.
+				tuned := valueAtPath[map[string]any](t, packages, "nvidia-tuned")
+				if got := valueAtPath[string](t, tuned, "interrupt", "type"); got != "reboot" {
+					t.Errorf("nvidia-tuned interrupt.type = %q, want reboot", got)
+				}
+				tunedDependsOn, _ := tuned["dependsOn"].(map[string]any)
+				if _, ok := tunedDependsOn["nvidia-setup-kernel"]; !ok {
+					t.Errorf("nvidia-tuned.dependsOn = %v, want nvidia-setup-kernel", tuned["dependsOn"])
+				}
+				if _, ok := fullDependsOn["nvidia-setup-kernel"]; !ok {
+					t.Errorf("non-AKS nvidia-setup-full.dependsOn = %v, want nvidia-setup-kernel as well", fullDependsOn)
+				}
+				if leaf.Entry.Criteria.Service == CriteriaServiceEKS {
+					// The kernel package's reboot is what drains the node before its EFA
+					// and kernel work on EKS, and that work is what needs the larger pod.
+					if got := valueAtPath[string](t, packages, "nvidia-setup-kernel", "interrupt", "type"); got != "reboot" {
+						t.Errorf("EKS nvidia-setup-kernel interrupt.type = %q, want reboot", got)
+					}
+					if got := fmt.Sprint(valueAtPath[any](t, packages, "nvidia-setup-kernel", "resources", "cpuLimit")); got != "8" {
+						t.Errorf("EKS nvidia-setup-kernel resources.cpuLimit = %s, want 8 for the EFA DKMS build", got)
+					}
+				}
+			}
+		})
+	}
+	if !sawAKS {
+		t.Error("no AKS leaf wiring the nodewright tuning manifest was resolved")
+	}
+	if !sawNonAKS {
+		t.Error("no non-AKS leaf wiring the nodewright tuning manifest was resolved")
+	}
+
+	t.Run("re-enable via tuningEnabled=true restores nvidia-tuned", func(t *testing.T) {
+		if aksContent == nil {
+			t.Skip("no AKS leaf resolved; covered by the catalog assertions above")
+		}
+		values := make(map[string]any, len(aksValues))
+		maps.Copy(values, aksValues)
+		values["tuningEnabled"] = true
+		packages, fullDependsOn := renderNodewrightTuning(t, aksContent, values)
+		if _, ok := packages["nvidia-tuned"]; !ok {
+			t.Errorf("tuningEnabled=true must restore the nvidia-tuned package: %v", sortedKeys(packages))
+		}
+		if _, ok := fullDependsOn["nvidia-tuned"]; !ok {
+			t.Errorf("tuningEnabled=true nvidia-setup-full.dependsOn = %v, want nvidia-tuned", fullDependsOn)
+		}
+	})
+}
+
+// renderNodewrightTuningRaw renders a nodewright tuning manifest and returns
+// the raw output, so callers can assert on whole-CR presence/absence (the
+// single-package manifests gate the entire Skyhook CR, not one package).
+func renderNodewrightTuningRaw(t *testing.T, content []byte, values map[string]any) string {
+	t.Helper()
+
+	rendered, err := manifest.Render(content, manifest.RenderInput{
+		ComponentName: "nodewright-customizations",
+		Namespace:     "skyhook",
+		ChartName:     "nodewright-customizations",
+		ChartVersion:  "0.1.0",
+		Values:        values,
+	})
+	if err != nil {
+		t.Fatalf("render tuning manifest: %v", err)
+	}
+	return string(rendered)
+}
+
+// TestNodewrightTuningGateSinglePackageManifests pins the tuningEnabled
+// contract on the single-package tuning manifests (tuning-gke.yaml,
+// tuning-generic.yaml, tuning-rke2.yaml), for every catalog leaf that wires
+// one:
+//
+//   - default (tuningEnabled absent, no leaf sets it on these manifests):
+//     the Skyhook CR renders — behavior identical to before the gate;
+//   - explicit tuningEnabled=false suppresses the whole CR (the tuning
+//     package is the CR's only package, so an empty packages map would be
+//     the alternative) — except on a tuning-rke2.yaml leaf that also sets
+//     rdmaNetnsExclusive, where the CR keeps only the RDMA package;
+//   - explicit tuningEnabled=true renders byte-identically to the default.
+func TestNodewrightTuningGateSinglePackageManifests(t *testing.T) {
+	ctx := context.Background()
+	leaves, err := ResolveLeaves(ctx, ResolveLeavesOptions{})
+	if err != nil {
+		t.Fatalf("ResolveLeaves: %v", err)
+	}
+
+	singlePackageManifests := []string{
+		nodewrightTuningGKEManifest,
+		nodewrightTuningGenericManifest,
+		nodewrightTuningRKE2Manifest,
+		nodewrightTuningGB300Manifest,
+	}
+	seen := map[string]bool{}
+	for _, leaf := range leaves {
+		if leaf.Err != nil || leaf.Result == nil || leaf.Entry.Criteria == nil {
+			continue
+		}
+		// AL2023 leaves intentionally disable nodewright-customizations
+		// (nvidia-setup is Debian/Ubuntu-only); skip them here.
+		if leaf.Entry.Criteria.OS == CriteriaOSAmazonLinux {
+			continue
+		}
+		ref := leaf.Result.GetComponentRef("nodewright-customizations")
+		if ref == nil {
+			continue
+		}
+		for _, manifestPath := range singlePackageManifests {
+			if !slices.Contains(ref.ManifestFiles, manifestPath) {
+				continue
+			}
+			seen[manifestPath] = true
+			t.Run(leaf.Entry.Name+"/"+path.Base(manifestPath), func(t *testing.T) {
+				values, verr := leaf.Result.GetValuesForComponentWithContext(ctx, "nodewright-customizations")
+				if verr != nil {
+					t.Fatalf("GetValuesForComponentWithContext(nodewright-customizations): %v", verr)
+				}
+				content, cerr := GetManifestContentWithContext(ctx, leaf.Result.DataProvider(), manifestPath)
+				if cerr != nil {
+					t.Fatalf("GetManifestContentWithContext(%q): %v", manifestPath, cerr)
+				}
+				if got, ok := values["tuningEnabled"]; ok {
+					t.Fatalf("leaf sets tuningEnabled=%v on a single-package tuning manifest; update this test's default-render assumption", got)
+				}
+
+				defaultRender := renderNodewrightTuningRaw(t, content, values)
+				if !strings.Contains(defaultRender, "kind: NodeWright") {
+					t.Fatalf("default rendering must produce the NodeWright CR:\n%s", defaultRender)
+				}
+
+				disabled := make(map[string]any, len(values)+1)
+				maps.Copy(disabled, values)
+				disabled["tuningEnabled"] = false
+				if fmt.Sprint(values["rdmaNetnsExclusive"]) == "true" {
+					if got := slices.Sorted(maps.Keys(renderedNodewrightPackages(t, content, disabled))); !slices.Equal(got, []string{"rdma-netns-exclusive"}) {
+						t.Errorf("tuningEnabled=false with rdmaNetnsExclusive must keep only the RDMA package, got %v", got)
+					}
+				} else if got := renderNodewrightTuningRaw(t, content, disabled); strings.Contains(got, "kind: NodeWright") {
+					t.Errorf("tuningEnabled=false must suppress the whole NodeWright CR:\n%s", got)
+				}
+
+				enabled := make(map[string]any, len(values)+1)
+				maps.Copy(enabled, values)
+				enabled["tuningEnabled"] = true
+				if got := renderNodewrightTuningRaw(t, content, enabled); got != defaultRender {
+					t.Errorf("tuningEnabled=true must render identically to the default (absent):\ngot:\n%s\nwant:\n%s", got, defaultRender)
+				}
+			})
+		}
+	}
+	for _, manifestPath := range singlePackageManifests {
+		if !seen[manifestPath] {
+			t.Errorf("no catalog leaf wiring %s was resolved", manifestPath)
+		}
+	}
+}
+
+// renderedNodewrightPackages renders a single-CR nodewright manifest and
+// returns the CR's packages, or nil when the gates suppress the CR.
+func renderedNodewrightPackages(t *testing.T, content []byte, values map[string]any) map[string]any {
+	t.Helper()
+
+	var cr map[string]any
+	if err := yaml.Unmarshal([]byte(renderNodewrightTuningRaw(t, content, values)), &cr); err != nil {
+		t.Fatalf("unmarshal rendered manifest: %v", err)
+	}
+	if cr == nil {
+		return nil
+	}
+	return valueAtPath[map[string]any](t, cr, "spec", "packages")
+}
+
+// TestNodewrightTuningRKE2RDMAGate pins the two independent package gates in
+// tuning-rke2.yaml (#2572): tuningEnabled (default on) gates nvidia-tuned,
+// rdmaNetnsExclusive (default off) gates rdma-netns-exclusive, and the CR
+// renders only when a package does. Each gate is also exercised in the string
+// form --deployer flux delivers values in.
+func TestNodewrightTuningRKE2RDMAGate(t *testing.T) {
+	content, err := GetManifestContentWithContext(context.Background(), nil, nodewrightTuningRKE2Manifest)
+	if err != nil {
+		t.Fatalf("GetManifestContentWithContext(%q): %v", nodewrightTuningRKE2Manifest, err)
+	}
+
+	tests := []struct {
+		name      string
+		overrides map[string]any
+		want      []string
+	}{
+		{"default renders tuning only", nil, []string{"nvidia-tuned"}},
+		{"rdma enabled", map[string]any{"rdmaNetnsExclusive": true}, []string{"nvidia-tuned", "rdma-netns-exclusive"}},
+		{"rdma enabled as string", map[string]any{"rdmaNetnsExclusive": "true"}, []string{"nvidia-tuned", "rdma-netns-exclusive"}},
+		{"rdma disabled as string", map[string]any{"rdmaNetnsExclusive": "false"}, []string{"nvidia-tuned"}},
+		{"tuning disabled keeps rdma", map[string]any{"rdmaNetnsExclusive": true, "tuningEnabled": false}, []string{"rdma-netns-exclusive"}},
+		{"tuning disabled as string keeps rdma", map[string]any{"rdmaNetnsExclusive": "true", "tuningEnabled": "false"}, []string{"rdma-netns-exclusive"}},
+		{"both disabled suppresses the CR", map[string]any{"tuningEnabled": false}, nil},
+		{"component disabled suppresses the CR", map[string]any{"rdmaNetnsExclusive": true, "enabled": false}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := map[string]any{"service": "rke2", "accelerator": "vr200", "intent": "inference"}
+			maps.Copy(values, tt.overrides)
+			packages := renderedNodewrightPackages(t, content, values)
+			if got := slices.Sorted(maps.Keys(packages)); !slices.Equal(got, tt.want) {
+				t.Errorf("packages = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// Both packages reboot. nodewright merges their reboots only when they are
+	// runnable in the same pass (neither dependsOn the other), and the first
+	// package in name order issues the merged reboot as soon as no package Job
+	// is running, so it must be the slower nvidia-tuned: were the one-line RDMA
+	// package first, the reboot could fire between nvidia-tuned's stages.
+	t.Run("both packages share one reboot", func(t *testing.T) {
+		packages := renderedNodewrightPackages(t, content, map[string]any{
+			"service": "rke2", "accelerator": "vr200", "intent": "inference", "rdmaNetnsExclusive": true,
+		})
+		for name, raw := range packages {
+			pkg, ok := raw.(map[string]any)
+			if !ok {
+				t.Fatalf("package %q is %T, want map[string]any", name, raw)
+			}
+			if _, ok := pkg["dependsOn"]; ok {
+				t.Errorf("package %q declares dependsOn; it would run in a later pass and reboot separately", name)
+			}
+			if got := valueAtPath[string](t, pkg, "interrupt", "type"); got != "reboot" {
+				t.Errorf("package %q interrupt.type = %q, want reboot", name, got)
+			}
+		}
+		if first := slices.Sorted(maps.Keys(packages))[0]; first != "nvidia-tuned" {
+			t.Errorf("first package in name order = %q, want nvidia-tuned to issue the merged reboot", first)
+		}
+	})
+}
+
+// TestNodewrightTuningOKEGB300Gate pins the gates in tuning-oke-gb300.yaml:
+// tuningEnabled (default on) gates nvidia-tuned only, so the CR keeps the
+// host packages (CRI-O Multus drop-in, RDMA VF settle gate) when tuning is
+// off, and
+// enabled=false suppresses the CR. It also pins the package ordering and the
+// spcx_cc default.
+func TestNodewrightTuningOKEGB300Gate(t *testing.T) {
+	content, err := GetManifestContentWithContext(context.Background(), nil, nodewrightTuningOKEGB300Manifest)
+	if err != nil {
+		t.Fatalf("GetManifestContentWithContext(%q): %v", nodewrightTuningOKEGB300Manifest, err)
+	}
+	base := map[string]any{"service": "oci", "accelerator": "gb300", "intent": "multiNodeTraining"}
+
+	tests := []struct {
+		name      string
+		overrides map[string]any
+		want      []string
+	}{
+		{"default renders every package", nil, []string{"crio-multus-default-network", "nvidia-tuned", "rdma-vfs-settled"}},
+		{"tuning disabled keeps the host packages", map[string]any{"tuningEnabled": false}, []string{"crio-multus-default-network", "rdma-vfs-settled"}},
+		{"tuning disabled as string keeps the host packages", map[string]any{"tuningEnabled": "false"}, []string{"crio-multus-default-network", "rdma-vfs-settled"}},
+		{"component disabled suppresses the CR", map[string]any{"enabled": false}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := maps.Clone(base)
+			maps.Copy(values, tt.overrides)
+			packages := renderedNodewrightPackages(t, content, values)
+			if got := slices.Sorted(maps.Keys(packages)); !slices.Equal(got, tt.want) {
+				t.Errorf("packages = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// The drop-in must be on disk before nvidia-tuned's reboot, so nvidia-tuned
+	// runs in a later pass than the CRI-O package rather than sharing its
+	// interrupt.
+	t.Run("nvidia-tuned runs after the CRI-O package", func(t *testing.T) {
+		packages := renderedNodewrightPackages(t, content, base)
+		tuned := valueAtPath[map[string]any](t, packages, "nvidia-tuned")
+		if _, ok := valueAtPath[map[string]any](t, tuned, "dependsOn")["crio-multus-default-network"]; !ok {
+			t.Errorf("nvidia-tuned dependsOn = %v, want crio-multus-default-network", tuned["dependsOn"])
+		}
+		if got := valueAtPath[string](t, packages, "crio-multus-default-network", "interrupt", "type"); got != "service" {
+			t.Errorf("crio-multus-default-network interrupt.type = %q, want service", got)
+		}
+	})
+
+	t.Run("spcx_cc defaults off and is overridable", func(t *testing.T) {
+		for _, tc := range []struct {
+			spcx any
+			want string
+		}{{nil, "off"}, {"on", "on"}} {
+			values := maps.Clone(base)
+			if tc.spcx != nil {
+				values["spcxCC"] = tc.spcx
+			}
+			packages := renderedNodewrightPackages(t, content, values)
+			if got := valueAtPath[string](t, packages, "nvidia-tuned", "configMap", "spcx_cc"); got != tc.want {
+				t.Errorf("spcxCC=%v: spcx_cc = %q, want %q", tc.spcx, got, tc.want)
+			}
+		}
+	})
+}
+
+// TestAmazonLinuxLeavesDoNotRenderTuning pins that no os=amazonlinux leaf
+// schedules the Ubuntu-only nvidia-setup chain: nodewright-customizations
+// must be absent or disabled (manifestFiles merge additively, so the
+// inherited tuning.yaml cannot be cleared).
+func TestAmazonLinuxLeavesDoNotRenderTuning(t *testing.T) {
+	leaves, err := ResolveLeaves(context.Background(), ResolveLeavesOptions{})
+	if err != nil {
+		t.Fatalf("ResolveLeaves: %v", err)
+	}
+	seen := 0
+	for _, leaf := range leaves {
+		if leaf.Err != nil || leaf.Result == nil || leaf.Entry.Criteria == nil ||
+			leaf.Entry.Criteria.OS != CriteriaOSAmazonLinux {
+
+			continue
+		}
+		seen++
+		t.Run(leaf.Entry.Name, func(t *testing.T) {
+			ref := leaf.Result.GetComponentRef("nodewright-customizations")
+			if ref == nil {
+				return
+			}
+			if ref.IsEnabled() {
+				t.Errorf("nodewright-customizations must be disabled on os=amazonlinux (overrides=%v, manifestFiles=%v)",
+					ref.Overrides, ref.ManifestFiles)
+			}
+		})
+	}
+	if seen == 0 {
+		t.Error("no os=amazonlinux leaf resolved")
+	}
+}

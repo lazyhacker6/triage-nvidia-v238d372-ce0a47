@@ -1,0 +1,1235 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Aggregate merge gate — the ONLY required status check in the main branch
+# ruleset. Every PR-gating CI check is either run or explicitly skipped here,
+# and the final "gate" job aggregates all results into a single pass/fail.
+#
+# To add a new gating check:
+#   1. Add a real job + companion -skip job with inverse if: conditions
+#   2. Add both job names to the gate job's needs: list
+#   3. No ruleset change needed — "gate" is the only required check.
+#
+# GPU tests are intentionally excluded (advisory only) until flake rate is
+# assessed. They can be added later with the same real/skip pattern.
+
+name: Merge Gate
+
+# The push trigger covers what on-push.yaml does not. on-push.yaml already runs
+# the full qualification on every main push, so this workflow skips its `tests`
+# job there (see below) and contributes only its own checks: actionlint,
+# verify-licenses, verify-renovate, docs-mdx, malware-scan, CodeQL, the
+# operator generated-code check and the freshness gates.
+#
+# That matters because main's ruleset is bypassable and bypassing is routine
+# here -- a direct push reports "Bypassed rule violations ... 2 of 2 required
+# status checks are expected", meaning none of these ran before the commit
+# landed. Without this trigger they would not run after it either.
+#
+# Push runs force every check-paths output true, because a merged commit has no
+# base to diff against.
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Push runs key on the SHA, not the ref, and never cancel. Superseding a PR's
+# older run is the point of cancel-in-progress; superseding a merged commit's
+# run is how a broken commit goes unverified. On 2026-09-10 two merges landed 36
+# seconds apart and the first commit's On Push Qualification run was cancelled
+# while queued, so the commit that actually broke main was never tested and the
+# failure surfaced against the next commit instead. Sharing one ref-keyed group
+# across merges reproduces that; a SHA-keyed group gives every merged commit its
+# own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Path classification — determines which checks run vs skip
+  # ---------------------------------------------------------------------------
+
+  check-paths:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    # Every output is forced true on push so a main run skips path filtering
+    # and exercises the whole gate. Path filtering exists to keep PR feedback
+    # cheap by diffing against the base; a push to main has no such base, and a
+    # watchdog that only re-checks the paths the merge happened to touch would
+    # miss exactly the case it is here for — a merge that is individually clean
+    # but breaks a derived artifact somewhere else in the tree.
+    outputs:
+      code: ${{ github.event_name == 'push' && 'true' || steps.code.outputs.code }}
+      actions: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.actions }}
+      deps: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.deps }}
+      renovate: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.renovate }}
+      settings: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.settings }}
+      bom: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.bom }}
+      nvcre: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.nvcre }}
+      crdcmd: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.crdcmd }}
+      crdinv: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.crdinv }}
+      classcol: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.classcol }}
+      tuning: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.tuning }}
+      notices: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.notices }}
+      coverage: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.coverage }}
+      docs: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.docs }}
+      operator: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.operator }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Detect targeted path categories (default: any match = true)
+      #
+      # Skipped on push: the outputs above already force every category true
+      # there, and running the filter anyway is not merely redundant. On a push
+      # event it diffs against github.event.before, which is all-zeros for the
+      # first push on a new branch and after history rewrites; the step then
+      # errors, failing check-paths and taking the whole gate down with it.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        id: changes
+        if: github.event_name != 'push'
+        with:
+          filters: |
+            actions:
+              - '.github/workflows/**'
+              - '.github/actions/**'
+            deps:
+              # Inputs to the verify-licenses gate, which runs `make
+              # license-check` over the resolved dependency graph. Watch the
+              # dependency manifests, plus every input that
+              # defines the check itself, so a change to the gate cannot skip
+              # its own gate: the Makefile recipe is the check's contract, the
+              # install-go-licenses action supplies the binary it runs (that
+              # action pins GOFLAGS to -mod=readonly, without which an inherited
+              # -trimpath strips GOROOT and the check passes while inspecting
+              # zero packages), and this
+              # workflow defines the job. The entry replaced here named
+              # '.github/workflows/verify-licenses.yaml', which was deleted in
+              # 3c9f6ec5 when the job moved into this workflow, so the filter
+              # had stopped watching anything the job actually consumes.
+              #
+              # The toolchain pins are watched too, because the job resolves
+              # them through load-versions before running the check: .go-version
+              # supplies the Go toolchain (which determines the `go list std`
+              # ignore set) and go.mod supplies the go-licenses require line (the
+              # go-licenses build that classifies packages). Both reach the gate
+              # only via that action, so all three paths must be watched or a
+              # version bump silently skips the gate it changes — #814 bumped
+              # go-licenses touching only the pin, and #1204 bumped Go
+              # touching only .go-version.
+              - 'go.mod'
+              - 'go.sum'
+              - 'Makefile'
+              - '.go-version'
+              - '.settings.yaml'
+              - '.github/actions/install-go-licenses/**'
+              - '.github/actions/load-versions/**'
+              - '.github/workflows/merge-gate.yaml'
+            renovate:
+              # Watch every input the verify-renovate job consumes — including
+              # the Makefile target that runs the validator — so changes to the
+              # Make target or its pinned image trigger the gate.
+              - '.github/renovate.json5'
+              - 'Makefile'
+            settings:
+              # Inputs to the checksum-freshness gate. The pins live in
+              # .settings.yaml and the refresh scripts are what re-derive them,
+              # so a change to either can leave a version pinned against a
+              # digest that describes a different artifact. The checker itself
+              # is watched so a change to it re-runs its own gate.
+              - '.settings.yaml'
+              - 'tools/update-*-checksums'
+              - 'tools/check-settings-checksums'
+            bom:
+              # Inputs to the committed-BOM version-freshness check. The full
+              # `tests` job already runs it for code changes, but a docs-only
+              # PR editing the committed BOM (or a registry change that somehow
+              # lands as a docs-only diff) yields code=false and skips `tests`,
+              # so gate the freshness test on the doc + registry directly. The
+              # generator sources are included so a generator change also
+              # re-runs the check independently of the full suite.
+              #
+              # tools/bom/main.go also reads each component's manifests
+              # directory and values.yaml directly (filepath.Join(repoRoot,
+              # "recipes", "components", <name>, ...)), so both must be
+              # watched too.
+              - 'docs/user/container-images.md'
+              - 'recipes/registry.yaml'
+              - 'recipes/components/*/manifests/**'
+              - 'recipes/components/*/values.yaml'
+              - 'tools/bom/**'
+              - 'pkg/bom/**'
+            nvcre:
+              # The NVCRE wiring guard reads the "Enabling NVCRE" fragment out
+              # of the component catalog and resolves it against the real
+              # overlay, mixins and registry. The `tests` job already runs it
+              # on any code change, but the fragment itself lives in docs/, and
+              # a docs-only PR yields code=false and skips `tests` — so an edit
+              # that breaks the documented wiring would merge green. The guard
+              # test is listed too so renaming it re-runs the check rather than
+              # silently disarming this gate.
+              - 'docs/user/component-catalog.md'
+              - 'pkg/recipe/nvcre_wiring_guard_test.go'
+              - 'recipes/components/nvcre/**'
+            crdcmd:
+              # TestCatalogCRDUpgradeCommand runs the manual CRD-upgrade block
+              # in the component catalog against an API server. The `tests`
+              # job runs it on any code change, but a docs-only PR editing
+              # the block skips `tests`, so it is gated here on the doc. The
+              # test is listed so renaming it re-runs the check, and this
+              # workflow so a change to the job cannot skip it.
+              - 'docs/user/component-catalog.md'
+              - 'pkg/bundler/deployer/localformat/catalog_crd_command_test.go'
+              - '.github/workflows/merge-gate.yaml'
+            crdinv:
+              # Inputs to make crd-inventory-check, which renders each pinned
+              # chart a health check asserts a CRD against and compares it with
+              # the committed crds.yaml. The recipes/ entries cover the data
+              # embedded in the recipes package, and the pkg/ entries every
+              # in-repo package the tool imports, directly or not.
+              # TestMergeGateWatchesCRDInventoryInputs fails when either misses
+              # a file the tool builds from. The helm pin, the Go toolchain and
+              # modules, the actions that set up the job, the Makefile target
+              # and this workflow are listed so a change to the check runs it.
+              - 'recipes/*.go'
+              - 'recipes/registry.yaml'
+              - 'recipes/overlays/**'
+              - 'recipes/mixins/**'
+              - 'recipes/checks/**'
+              - 'recipes/validators/catalog.yaml'
+              - 'recipes/components/*/*.yaml'
+              - 'recipes/components/*/manifests/**'
+              - 'tools/crd-inventory/**'
+              - 'pkg/allocpolicy/*.go'
+              - 'pkg/chainsaw/*.go'
+              - 'pkg/chainsaw/validation/*.go'
+              - 'pkg/constraints/expr/*.go'
+              - 'pkg/defaults/*.go'
+              - 'pkg/errors/*.go'
+              - 'pkg/header/*.go'
+              - 'pkg/helm/**'
+              - 'pkg/inventory/*.go'
+              - 'pkg/k8s/client/*.go'
+              - 'pkg/k8s/labels/*.go'
+              - 'pkg/k8s/pod/*.go'
+              - 'pkg/measurement/*.go'
+              - 'pkg/recipe/*.go'
+              - 'pkg/recipe/oskind/*.go'
+              - 'pkg/serializer/*.go'
+              - 'pkg/upgrade/*.go'
+              - 'pkg/version/*.go'
+              - '.settings.yaml'
+              - '.go-version'
+              - 'go.mod'
+              - 'go.sum'
+              - '.github/actions/load-versions/**'
+              - '.github/actions/setup-build-tools/**'
+              - '.github/actions/ghcr-login/**'
+              - 'Makefile'
+              - '.github/workflows/merge-gate.yaml'
+            classcol:
+              # TestComponentCatalogClassColumnMatchesRegistry keeps the Class
+              # column of the component catalog equal to the registry. The
+              # `tests` job runs it on any code change (a registry edit is
+              # code), but a docs-only PR editing a Class cell skips `tests`,
+              # so it is gated here on the doc. The test is listed so renaming
+              # it re-runs the check, and this workflow so a change to the job
+              # cannot skip it.
+              - 'docs/user/component-catalog.md'
+              - 'pkg/recipe/component_class_test.go'
+              - '.github/workflows/merge-gate.yaml'
+            tuning:
+              # Inputs that can change the committed tuning-status table
+              # WITHOUT tripping pkg/tuning's TestCompute_Structure — which runs
+              # in the `tests` job on any non-docs change and already asserts
+              # every row's service, accelerator, profile, setup-name and
+              # tuning-name. That test is version-agnostic, so the only table
+              # changes it misses are a manifest pin version bump, a
+              # renderer/extractor change, or a hand edit of the committed doc.
+              # Structural changes driven by overlays, mixins, registry or
+              # pkg/recipe already fail that test, so they are deliberately NOT
+              # listed here (keeping this gate off unrelated recipe PRs).
+              - 'docs/integrator/components/nodewright.md'
+              - 'recipes/components/nodewright-customizations/**'
+              - 'pkg/tuning/**'
+              - 'tools/tuning/**'
+            notices:
+              # Inputs to the THIRD_PARTY_NOTICES.md generator health check.
+              # The file itself is NOT committed — it is generated by
+              # `make release` and uploaded as a release asset — so there is no
+              # committed copy to watch or to verify a hand edit against. What
+              # this gate protects is the generator's ability to run at all:
+              # `make release` depends on it, so a break discovered at tag time
+              # would block a release.
+              # The file is the union of every redistributed dependency's license
+              # across the released OS/arch matrix, so any dependency-graph
+              # change can alter it. Watch the dependency manifests and the
+              # generator itself. .goreleaser.yaml is included because
+              # the generator asserts its PLATFORMS matrix matches the release
+              # targets defined there — a new goos/goarch must re-run this check.
+              # Makefile is included because the `notices` recipe is the
+              # generation contract — a change to it
+              # must not be able to skip its own gate. go.mod and .settings.yaml
+              # are included because the generator's output depends on their
+              # pins: a go-licenses bump can change license classification/URL
+              # derivation, and a languages.go bump changes the `go list std`
+              # ignore set. This is a standalone job — the full `tests` suite
+              # does NOT regenerate the file.
+              # The Python half of the notices file covers the aiperf-bench
+              # image, whose dependency closure is an installed venv and not
+              # part of the Go module graph. It cannot be regenerated here (needs
+              # docker + PyPI), so the committed fragment is watched directly,
+              # alongside the requirements and overrides files whose sha256 the
+              # generator asserts the fragment still records — editing either
+              # without a refresh must fail this gate rather than ship stale
+              # attributions.
+              - 'Makefile'
+              - '.settings.yaml'
+              - '.goreleaser.yaml'
+              - 'go.mod'
+              - 'go.sum'
+              - 'tools/generate-notices'
+              - 'tools/normalize-go-license-urls'
+              - 'tools/check-fence-balance'
+              - 'tools/generate-python-licenses'
+              - 'validators/performance/requirements.txt'
+              - 'validators/performance/requirements-overrides.txt'
+              - 'validators/performance/licenses/**'
+              # The actions that supply this job's toolchain. install-go-licenses
+              # matters most: it exists to pin GOFLAGS, and a build that
+              # inherits -trimpath yields a go-licenses with no GOROOT. The
+              # `deps` filter watches both too, but that gates verify-licenses,
+              # which under -trimpath PASSES while inspecting zero packages —
+              # `make notices` is the one that fails closed, so it is the better
+              # canary and must not skip when its own toolchain changes.
+              - '.github/actions/install-go-licenses/**'
+              - '.github/actions/load-versions/**'
+            coverage:
+              # Inputs to the committed CUJ/CLI coverage-matrix freshness check.
+              # The matrix is derived, so a change to ANY of its signal sources
+              # can move a row without touching the doc — and until #1977 the
+              # only thing keeping the committed page accurate was that nobody
+              # regenerated it. Watched here:
+              #   - the committed doc itself (catches a hand edit)
+              #   - the generator and pkg/cli (the verb registry it walks)
+              #   - infra/uat/reservations.yaml + pkg/uatbroker: which lanes are
+              #     nightly-enrolled, and for which intents
+              #   - the per-cloud uat-*.yaml pipelines: which CUJ phases are
+              #     actually enabled steps (a commented-out phase is not coverage)
+              #   - uat-nightly-batch.yaml: the previous_n version axis
+              #   - tests/uat, tests/chainsaw, demos: the scanned signal trees
+              #   - Makefile + this workflow: the generate/check contract and the
+              #     coverage-freshness job itself, so a change to either cannot
+              #     skip its own gate
+              - 'docs/user/coverage-matrix.md'
+              - 'tools/coverage/**'
+              - 'pkg/cli/**'
+              - 'pkg/uatbroker/**'
+              - 'infra/uat/reservations.yaml'
+              - '.github/workflows/uat-*.yaml'
+              - 'tests/uat/**'
+              - 'tests/chainsaw/**'
+              - 'demos/**'
+              - 'Makefile'
+              - '.github/workflows/merge-gate.yaml'
+            docs:
+              # Inputs to the documentation parser gates. MDX parsing and the
+              # link check follow the Fern-published page list, while YAML
+              # fence parsing and the shell placeholder check cover Markdown
+              # files under docs/.
+              #
+              # docs/index.yml is Fern's navigation manifest and supplies the
+              # MDX and link checkers' file list, so it is both an input and a
+              # trigger. Adding or removing a page there must run the gate.
+              # docs/README.md is the published landing page — the earlier
+              # per-subdirectory globs missed it entirely.
+              #
+              # Everything the gates are MADE of is listed too, so a change to
+              # either gate cannot skip its own verification: the checkers, the
+              # page enumerator, the locked parser toolchain, this workflow, and
+              # the Makefile targets the job invokes, matching why the `renovate`
+              # and `notices` filters watch it.
+              - 'docs/**'
+              - 'tools/check-docs-mdx'
+              - 'tools/check-docs-mdx-parse'
+              - 'tools/check-docs-yaml*'
+              - 'tools/check-docs-shell*'
+              - 'tools/check-docs-links/**'
+              - 'tools/docs-published-files'
+              - 'tools/mdx/**'
+              - 'Makefile'
+              - '.github/workflows/merge-gate.yaml'
+            operator:
+              # Inputs to make operator-check-generated and make
+              # operator-envtest-floor. The operator-boundary depguard rule
+              # limits what packages in api/operator and tests/operator import
+              # from this module to api/operator, pkg/operator and
+              # tests/operator, so the three trees cover every Go file the
+              # suites build from. The chart is
+              # both the generated CRDs' destination and what the chart suite
+              # installs. Generation reads the controller-gen pin in
+              # .settings.yaml, its wrapper and boilerplate, and the license
+              # header it prepends to each CRD; .settings.yaml also pins the
+              # Kubernetes floor and the tools the job installs.
+              - 'api/operator/**'
+              - 'pkg/operator/**'
+              - 'tests/operator/**'
+              - 'charts/aicr-operator/**'
+              - 'tools/operator-controller-gen'
+              - 'tools/operator-boilerplate.go.txt'
+              - '.github/headers/LICENSE'
+              - '.settings.yaml'
+              - '.go-version'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Makefile'
+              - '.github/actions/load-versions/**'
+              - '.github/actions/setup-build-tools/**'
+              - '.github/workflows/merge-gate.yaml'
+
+      # code = true iff at least one changed file is NOT docs/markdown/LICENSE.
+      #
+      # Exclusion idiom: dorny's `predicate-quantifier: 'every'` requires a file
+      # to match EVERY pattern in the filter, so a file matches `code` only when
+      # it matches '**' AND none of the docs patterns. The filter output is true
+      # when ANY changed file is code — so a docs-only PR yields code=false.
+      #
+      # NOTE: 'every' does NOT mean "every changed file matches"; the prior
+      # `only: [**.md, docs/**, LICENSE]` form required a single file to match
+      # all three at once (impossible), so it was always false and code was
+      # always true — docs-only PRs ran full qualification. '**' matches
+      # dotfiles too (dorny sets picomatch dot:true), so '.golangci.yaml',
+      # '.settings.yaml', etc. still count as code.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        id: code
+        if: github.event_name != 'push'
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '**'
+              - '!**.md'
+              - '!docs/**'
+              - '!LICENSE'
+
+  # ---------------------------------------------------------------------------
+  # Qualification (Test, Lint, CLI E2E, E2E, Security Scan)
+  # ---------------------------------------------------------------------------
+
+  # Not run on push: on-push.yaml already calls this same reusable workflow on
+  # every main push (`cancel-in-progress: false`, so it completes), and running
+  # it here too would qualify each merge twice for nothing. The push trigger on
+  # this workflow exists for the checks on-push does NOT run -- actionlint,
+  # verify-licenses, verify-renovate, docs-mdx, the freshness gates -- which is
+  # what a bypassed direct push to main would otherwise skip entirely.
+  tests:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.code == 'true' && github.event_name != 'push'
+    uses: ./.github/workflows/qualification.yaml
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      security-events: write
+    with:
+      coverage_report: true
+
+  tests-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.code != 'true' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "Qualification not required here (docs-only change, or a push run that on-push.yaml already qualifies)"
+
+  # ---------------------------------------------------------------------------
+  # CodeQL (analyze)
+  # ---------------------------------------------------------------------------
+
+  analyze:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
+        with:
+          languages: go
+      - run: go build ./...
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
+
+  analyze-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.code != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "Docs/non-code change — CodeQL analysis not required"
+
+  # ---------------------------------------------------------------------------
+  # Malware scan (ClamAV)
+  # ---------------------------------------------------------------------------
+
+  malware-scan:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/malware-scan
+        with:
+          scan_path: '.'
+          category: 'clamav'
+
+  malware-scan-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.code != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "Docs/non-code change — malware scan not required"
+
+  # ---------------------------------------------------------------------------
+  # Actionlint (GitHub Actions workflow linting)
+  # ---------------------------------------------------------------------------
+
+  actionlint:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.actions == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint
+        # Pin actionlint to a specific version and verify the downloaded
+        # binary's SHA256 against the upstream-published checksum file.
+        # Replaces `bash <(curl … main …)`, which executed a mutable script
+        # from the default branch and downloaded the binary with no
+        # checksum verification (the upstream installer pipes
+        # `curl … | tar xvz` directly).
+        env:
+          ACTIONLINT_VERSION: '1.7.11'
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          TAR="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          TMP="$(mktemp -d)"
+          curl -fsSL -o "${TMP}/${TAR}" "${BASE}/${TAR}"
+          curl -fsSL -o "${TMP}/checksums.txt" "${BASE}/actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          EXPECTED=$(awk -v t="${TAR}" '$2 == t {print $1}' "${TMP}/checksums.txt")
+          if [[ -z "${EXPECTED}" ]]; then
+            echo "::error::no checksum entry for ${TAR} in upstream checksums.txt"
+            exit 1
+          fi
+          ACTUAL=$(sha256sum "${TMP}/${TAR}" | awk '{print $1}')
+          if [[ "${ACTUAL}" != "${EXPECTED}" ]]; then
+            echo "::error::actionlint checksum mismatch: expected ${EXPECTED}, got ${ACTUAL}"
+            exit 1
+          fi
+          tar -xzf "${TMP}/${TAR}" -C "${TMP}" actionlint
+          mv "${TMP}/actionlint" "${PWD}/actionlint"
+          rm -rf "${TMP}"
+          echo "${PWD}" >> "$GITHUB_PATH"
+      - name: Run actionlint
+        run: actionlint -color -shellcheck=
+      # Also runs from go-lint, but qualification skips Markdown-only changes,
+      # and .github/actions/README.md carries the runs-on examples people copy.
+      - name: Reject floating runner labels
+        run: ./tools/check-runner-labels
+
+  actionlint-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.actions != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No workflow/action changes — actionlint not required"
+
+  # ---------------------------------------------------------------------------
+  # License verification
+  # ---------------------------------------------------------------------------
+
+  verify-licenses:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.deps == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+          cache-dependency-path: |
+            go.sum
+      - uses: ./.github/actions/install-go-licenses
+        with:
+          version: ${{ steps.versions.outputs.go_licenses }}
+      - name: Report licenses
+        run: |
+          echo "=== Dependency Licenses ==="
+          go-licenses report ./... 2>/dev/null | sort -t',' -k3 | column -t -s','
+          echo ""
+          echo "=== License Summary ==="
+          go-licenses report ./... 2>/dev/null | cut -d',' -f3 | sort | uniq -c | sort -rn
+      - name: Check licenses
+        run: make license-check
+
+  verify-licenses-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.deps != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No dependency changes — license check not required"
+
+  # ---------------------------------------------------------------------------
+  # Renovate config validation
+  # ---------------------------------------------------------------------------
+
+  verify-renovate:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.renovate == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate .github/renovate.json5
+        run: make lint-renovate
+
+  verify-renovate-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.renovate != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No Renovate config changes — validation not required"
+
+  # ---------------------------------------------------------------------------
+  # .settings.yaml checksum freshness
+  #
+  # Each checksum pin is kept in step with its version pin by a
+  # tools/update-*-checksums script wired to Renovate postUpgradeTasks. A hook
+  # that runs and *fails* leaves the new version pinned against the old digest,
+  # and Renovate surfaces that only as a warning in the PR body.
+  #
+  # Whether that got caught before merge depended on which consumer read the
+  # pin: helmfile/chainsaw digests feed setup-build-tools on PR-gating jobs and
+  # fail there, but helm_diff_checksums is read solely by
+  # tests/uat/lib/phases.sh, so a stale helm-diff pin passed every PR check and
+  # would first surface in nightly UAT across every cloud. #2801 shipped that
+  # exact pair with a fully green check run.
+  #
+  # This closes it for every pinned tool at once, and for humans as well as
+  # bots — the failure mode is a property of the file, not of who edited it.
+  # ---------------------------------------------------------------------------
+
+  settings-checksums:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.settings == 'true'
+    runs-on: ubuntu-24.04
+    # Sized from the check's own worst case, not from how long it normally
+    # takes (~1 min). It runs 7 refreshers sequentially and each makes 2-3 curl
+    # calls capped at --retry-max-time 180, so a sustained github.com blip can
+    # legitimately burn ~45 minutes before every call has given up. The budget
+    # has to clear that, because a timeout is reported as `cancelled`, the gate
+    # treats `cancelled` exactly like `failure`, and the author then sees a bare
+    # Actions timeout with none of this check's own diagnostics — which is the
+    # one failure mode it cannot explain. Letting it run to completion turns
+    # that into an explicit "could not be verified" message naming the tool.
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          # The check reads the previous version pins from HEAD^ to tell a
+          # bumped-but-unrefreshed pin apart from upstream changing bytes under
+          # a pin nobody touched. On a pull_request the checked-out ref is the
+          # merge commit, whose first parent is the base tip; on a push to main
+          # it is the preceding commit. Depth 2 is the minimum that resolves it.
+          fetch-depth: 2
+      - name: Verify checksum pins match their pinned versions
+        run: make check-settings-checksums
+
+  settings-checksums-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.settings != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No .settings.yaml or refresh-script changes — checksum freshness not required"
+
+  # ---------------------------------------------------------------------------
+  # Docs parser gates. Parse every Fern-published doc as MDX, every YAML fence
+  # under docs/ as YAML, and every shell fence for placeholders that bash would
+  # read as redirection, then check that every link on a published page reaches
+  # a published page or an existing repository path.
+  #
+  # `fern check` (Fern Docs CI) does not parse MDX, and the job that does
+  # (`fern generate --docs --preview`) runs in a workflow_run companion whose
+  # status never lands on the PR head SHA, so it can never be required. That
+  # gap let a bare `<=` merge green and then fail every docs publish, including
+  # a release tag (#2050). This job is the blocking replacement: hermetic, no
+  # DOCS_FERN_TOKEN, no dependency on Fern's SaaS being up at merge time.
+  # ---------------------------------------------------------------------------
+
+  docs-mdx:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.docs == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '20'
+      # The bash approximation runs first: it is instant and its messages name
+      # the specific hazard, so the common cases fail fast with better output.
+      # The parser then decides — it is the authoritative check, and GITHUB_ACTIONS
+      # makes a missing Node or a failed dependency install a hard error rather
+      # than the local warn-and-skip.
+      - name: Check MDX safety (pattern approximation)
+        run: make check-docs-mdx
+      - name: Validate docs with the real MDX parser
+        run: make check-docs-mdx-parse
+      - name: Validate YAML examples in documentation
+        run: make check-docs-yaml
+      - name: Check shell examples for unquoted placeholders
+        run: make check-docs-shell
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      - name: Check links on published pages
+        run: make check-docs-links
+
+  docs-mdx-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.docs != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No documentation changes — docs parser gates not required"
+
+  # ---------------------------------------------------------------------------
+  # BOM version freshness — ensures the committed container-images.md matches
+  # the registry pins even on docs-only PRs (which skip the full `tests` job).
+  # ---------------------------------------------------------------------------
+
+  bom-freshness:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.bom == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      - name: Verify committed BOM versions and variants match the recipes
+        # `go test -run <name>` exits 0 with "no tests to run" if a test is
+        # renamed or removed, which would let this gate silently no-op. Assert
+        # each named test actually executed by requiring its PASS line — a
+        # docs-only PR must not be able to forge either the Components table
+        # or the Version variants table.
+        run: |
+          set -uo pipefail
+          out=$(go test ./tools/bom/... -run '^(TestCommittedBOMVersionsMatchRegistry|TestCommittedBOMVariantsMatchRecipePins)$' -v -count=1 2>&1) && rc=0 || rc=$?
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          for t in TestCommittedBOMVersionsMatchRegistry TestCommittedBOMVariantsMatchRecipePins; do
+            if ! grep -q "^--- PASS: $t" <<<"$out"; then
+              echo "::error::$t did not execute (renamed or removed?); the BOM freshness gate would silently pass. Update this job to run the freshness check."
+              exit 1
+            fi
+          done
+
+  bom-freshness-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.bom != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No BOM/registry changes — BOM freshness check not required"
+
+  # ---------------------------------------------------------------------------
+  # NVCRE documented-wiring guard — ensures the "Enabling NVCRE" fragment in
+  # docs/user/component-catalog.md still resolves to a working wiring, on
+  # docs-only PRs that skip the `tests` job (mirrors bom-freshness).
+  # ---------------------------------------------------------------------------
+
+  nvcre-wiring:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.nvcre == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      - name: Verify the documented NVCRE wiring still resolves
+        # `go test -run <name>` exits 0 with "no tests to run" if a test is
+        # renamed or removed, which would let this gate silently no-op. Assert
+        # the named test actually executed by requiring its PASS line.
+        run: |
+          set -uo pipefail
+          out=$(go test ./pkg/recipe/... -run '^TestNVCREDocumentedWiringResolves$' -v -count=1 2>&1) && rc=0 || rc=$?
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if ! grep -q "^--- PASS: TestNVCREDocumentedWiringResolves" <<<"$out"; then
+            echo "::error::TestNVCREDocumentedWiringResolves did not execute (renamed or removed?); the NVCRE wiring gate would silently pass. Update this job to run the guard."
+            exit 1
+          fi
+
+  nvcre-wiring-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.nvcre != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No NVCRE wiring inputs changed — wiring guard not required"
+
+  # ---------------------------------------------------------------------------
+  # Documented CRD-upgrade command: runs the bash block in
+  # docs/user/component-catalog.md against envtest after a real helm install,
+  # on docs-only PRs that skip the `tests` job (mirrors nvcre-wiring).
+  # ---------------------------------------------------------------------------
+
+  catalog-crd-command:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.crdcmd == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      # The runner image bundles Helm 3; the test needs the pinned Helm 4 and
+      # fails rather than skips in CI without it or without envtest.
+      - uses: ./.github/actions/setup-build-tools
+        with:
+          install_helm: 'true'
+          helm_version: ${{ steps.versions.outputs.helm }}
+          install_setup_envtest: 'true'
+          setup_envtest_version: ${{ steps.versions.outputs.setup_envtest }}
+          setup_envtest_sha256: ${{ steps.versions.outputs.setup_envtest_sha256_linux_amd64 }}
+      - name: Run the documented CRD-upgrade command against an API server
+        # Requires the PASS line for the same reason nvcre-wiring does: a
+        # renamed test makes `go test -run` exit 0 having run nothing.
+        run: |
+          set -uo pipefail
+          assets=$(setup-envtest use --print path) || exit 1
+          out=$(KUBEBUILDER_ASSETS="$assets" go test ./pkg/bundler/deployer/localformat/ -run '^TestCatalogCRDUpgradeCommand$' -v -count=1 2>&1) && rc=0 || rc=$?
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if ! grep -q "^--- PASS: TestCatalogCRDUpgradeCommand" <<<"$out"; then
+            echo "::error::TestCatalogCRDUpgradeCommand did not execute (renamed or removed?); the catalog CRD command gate would silently pass. Update this job to run it."
+            exit 1
+          fi
+
+  catalog-crd-command-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.crdcmd != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No catalog CRD command inputs changed, so the check is not required"
+
+  # ---------------------------------------------------------------------------
+  # CRD inventory freshness: re-renders every chart a health check asserts a
+  # CRD against and compares the result with the committed crds.yaml files.
+  # It needs helm and network access, so make qualify does not run it.
+  # ---------------------------------------------------------------------------
+
+  crd-inventory:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.crdinv == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # Helm reads the Docker credentials this writes, so ghcr.io chart pulls
+      # are authenticated and not rate limited as anonymous.
+      - name: Authenticate to GHCR
+        uses: ./.github/actions/ghcr-login
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      # The runner image bundles Helm 3. The inventories are rendered with the
+      # pinned Helm 4.
+      - uses: ./.github/actions/setup-build-tools
+        with:
+          install_helm: 'true'
+          helm_version: ${{ steps.versions.outputs.helm }}
+      - name: Verify the committed CRD inventories match the pinned charts
+        run: make crd-inventory-check
+
+  crd-inventory-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.crdinv != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No CRD inventory inputs changed, so the check is not required"
+
+  # ---------------------------------------------------------------------------
+  # Catalog Class column: keeps docs/user/component-catalog.md equal to the
+  # registry's class assignments on docs-only PRs that skip the `tests` job
+  # (mirrors nvcre-wiring).
+  # ---------------------------------------------------------------------------
+
+  catalog-class-column:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.classcol == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      - name: Verify the catalog Class column matches the registry
+        # Requires the PASS line for the same reason nvcre-wiring does: a
+        # renamed test makes `go test -run` exit 0 having run nothing.
+        run: |
+          set -uo pipefail
+          out=$(go test ./pkg/recipe/ -run '^TestComponentCatalogClassColumnMatchesRegistry$' -v -count=1 2>&1) && rc=0 || rc=$?
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if ! grep -q "^--- PASS: TestComponentCatalogClassColumnMatchesRegistry" <<<"$out"; then
+            echo "::error::TestComponentCatalogClassColumnMatchesRegistry did not execute (renamed or removed?); the catalog Class column gate would silently pass. Update this job to run it."
+            exit 1
+          fi
+
+  catalog-class-column-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.classcol != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No catalog Class column inputs changed, so the check is not required"
+
+  # ---------------------------------------------------------------------------
+  # Tuning-status doc freshness — ensures the committed tuning table in
+  # docs/integrator/components/nodewright.md matches the recipe catalog and the
+  # nodewright package pins, on PRs touching its inputs (mirrors bom-freshness).
+  # ---------------------------------------------------------------------------
+
+  tuning-freshness:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.tuning == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      - name: Verify committed tuning-status table is up to date
+        # `make tuning-check` regenerates the table into a temp dir and splices
+        # it into the doc, then fails if the working tree differs — so a stale
+        # committed table (or missing splice markers) fails closed here.
+        run: make tuning-check
+
+  tuning-freshness-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.tuning != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No tuning-status inputs changed — freshness check not required"
+
+  # ---------------------------------------------------------------------------
+  # Third-party notices generator health — ensures THIRD_PARTY_NOTICES.md can
+  # still be generated across every released OS/arch target, on PRs touching its
+  # inputs (go.mod/go.sum + the generator). The file is not committed; it is
+  # produced by `make release` and uploaded as a release asset. Because the
+  # release depends on this generator, a break that first surfaced at tag time
+  # would block a release, so it is exercised here on the PR that causes it.
+  # The generator fails closed — an empty `go list -deps ./cmd/...`, an
+  # uncovered linked module, a stale Python fragment, or an unbalanced code
+  # fence all abort it — so "it ran" is a meaningful assertion, not a smoke test.
+  # ---------------------------------------------------------------------------
+
+  notices-generator:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.notices == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+          cache-dependency-path: |
+            go.sum
+      - uses: ./.github/actions/install-go-licenses
+        with:
+          version: ${{ steps.versions.outputs.go_licenses }}
+      - name: Verify THIRD_PARTY_NOTICES.md can be generated
+        # Regenerates the notices file (union across the release OS/arch matrix,
+        # so it is host-independent) and discards it. The output is not compared
+        # against anything: there is no committed copy, and the release builds
+        # its own. What is asserted is that the generator completes — every
+        # failure mode it guards is fatal, so a non-zero exit here is the same
+        # signal `make release` would get at tag time.
+        # The token authenticates the license-URL probes; anonymous github.com
+        # requests from runner IPs are rate-limited (tools/normalize-go-license-urls).
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make notices
+
+  notices-generator-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.notices != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No dependency/generator changes — notices generator check not required"
+
+  # ---------------------------------------------------------------------------
+  # Coverage-matrix freshness — ensures the committed docs/user/coverage-matrix.md
+  # matches the CLI registry, the nightly UAT wiring, and the in-repo test
+  # signals, on PRs touching its inputs (mirrors bom-freshness). Before #1977 the
+  # page was only accurate because contributors avoided regenerating it; this is
+  # the check that makes regeneration mandatory rather than optional.
+  # ---------------------------------------------------------------------------
+
+  coverage-freshness:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.coverage == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      - name: Verify committed coverage matrix is up to date
+        # `make coverage-check` regenerates the matrix in place and fails if the
+        # working tree differs. The generator itself fails closed on an
+        # unresolvable UAT wiring or version axis, so a moved registry or renamed
+        # workflow input errors here instead of quietly reporting the affected
+        # rows as uncovered.
+        run: make coverage-check
+
+  coverage-freshness-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.coverage != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No coverage-matrix inputs changed — freshness check not required"
+
+  # ---------------------------------------------------------------------------
+  # AICR Operator generated code and Kubernetes floor. An api/operator type
+  # change without `make generate` still builds and can pass `make test`, which
+  # runs the CRD validation and chart suites on the newest envtest release only.
+  # ---------------------------------------------------------------------------
+
+  operator-generated:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.operator == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      - uses: ./.github/actions/setup-build-tools
+        with:
+          install_setup_envtest: 'true'
+          setup_envtest_version: ${{ steps.versions.outputs.setup_envtest }}
+          setup_envtest_sha256: ${{ steps.versions.outputs.setup_envtest_sha256_linux_amd64 }}
+          install_helm: 'true'
+          helm_version: ${{ steps.versions.outputs.helm }}
+          install_yq: 'true'
+          yq_version: ${{ steps.versions.outputs.yq }}
+      - name: Generated code is current
+        run: make operator-check-generated
+      - name: CRD validation and chart suites on the Kubernetes floor
+        run: make operator-envtest-floor
+
+  operator-generated-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.operator != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No operator API, chart or generator inputs changed, so the check is not required"
+
+  # ---------------------------------------------------------------------------
+  # Aggregate gate — the single required status check
+  # ---------------------------------------------------------------------------
+
+  gate:
+    if: always()
+    needs:
+      - check-paths
+      - tests
+      - tests-skip
+      - analyze
+      - analyze-skip
+      - malware-scan
+      - malware-scan-skip
+      - actionlint
+      - actionlint-skip
+      - verify-licenses
+      - verify-licenses-skip
+      - verify-renovate
+      - verify-renovate-skip
+      - settings-checksums
+      - settings-checksums-skip
+      - docs-mdx
+      - docs-mdx-skip
+      - bom-freshness
+      - bom-freshness-skip
+      - nvcre-wiring
+      - nvcre-wiring-skip
+      - catalog-crd-command
+      - catalog-crd-command-skip
+      - crd-inventory
+      - crd-inventory-skip
+      - catalog-class-column
+      - catalog-class-column-skip
+      - tuning-freshness
+      - tuning-freshness-skip
+      - notices-generator
+      - notices-generator-skip
+      - coverage-freshness
+      - coverage-freshness-skip
+      - operator-generated
+      - operator-generated-skip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Check gate
+        run: |
+          echo "Gate results:"
+          echo '${{ toJSON(needs) }}' | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+
+          # check-paths must succeed — if it fails, all downstream jobs are
+          # skipped (not failed), which would silently pass the gate.
+          if [ "${{ needs.check-paths.result }}" != "success" ]; then
+            echo "::error::check-paths did not succeed (result: ${{ needs.check-paths.result }})"
+            exit 1
+          fi
+
+          # Fail if ANY other dependency failed or was cancelled.
+          # Skipped is OK — it means the inverse job ran instead.
+          if echo '${{ toJSON(needs.*.result) }}' | jq -e 'map(select(. == "failure" or . == "cancelled")) | length > 0' > /dev/null; then
+            echo "::error::One or more gating checks failed or were cancelled"
+            exit 1
+          fi

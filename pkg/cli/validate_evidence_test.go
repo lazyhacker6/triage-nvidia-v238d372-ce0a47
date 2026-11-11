@@ -1,0 +1,293 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cli
+
+import (
+	"context"
+	"testing"
+
+	"github.com/urfave/cli/v3"
+
+	bundleattest "github.com/NVIDIA/aicr/pkg/bundler/attestation"
+	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+)
+
+// runEvidenceCmd builds a minimal cli.Command that exposes the
+// flag-set buildRecipeEvidenceConfig reads, runs it with the supplied
+// args, and returns the resolved *recipeEvidenceConfig (or nil) plus
+// any action error. att stands in for what Config.EvidenceAttestationOptions
+// would derive from spec.validate.evidence.attestation.
+func runEvidenceCmd(t *testing.T, args []string, att aicr.EvidenceOptions) (*recipeEvidenceConfig, error) {
+	t.Helper()
+	var got *recipeEvidenceConfig
+	cmd := &cli.Command{
+		Name: "test",
+		Flags: append([]cli.Flag{
+			&cli.StringFlag{Name: "emit-attestation"},
+			&cli.StringFlag{Name: "bom"},
+			&cli.StringFlag{Name: "push"},
+			&cli.BoolFlag{Name: "plain-http"},
+			&cli.BoolFlag{Name: "insecure-tls"},
+			&cli.StringFlag{Name: "identity-token"},
+			&cli.BoolFlag{Name: "oidc-device-flow"},
+			&cli.BoolFlag{Name: flagNoSign},
+			&cli.BoolFlag{Name: "full"},
+			&cli.BoolFlag{Name: flagAllowMutableValidatorTags},
+		}, evidenceSigningFlags()...),
+		Action: func(_ context.Context, c *cli.Command) error {
+			var err error
+			got, err = buildRecipeEvidenceConfig(c, att)
+			return err
+		},
+	}
+	if err := cmd.Run(context.Background(), append([]string{"test"}, args...)); err != nil {
+		return nil, err
+	}
+	return got, nil
+}
+
+func TestBuildRecipeEvidenceConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		att     aicr.EvidenceOptions
+		wantNil bool
+		wantErr bool
+		want    *recipeEvidenceConfig
+	}{
+		{
+			name:    "neither flag nor config returns nil",
+			args:    nil,
+			att:     aicr.EvidenceOptions{},
+			wantNil: true,
+		},
+		{
+			name: "flag-only populates from flags",
+			args: []string{
+				"--emit-attestation", "/tmp/out",
+				"--bom", "/tmp/bom.json",
+				"--push", "ttl.sh/x:1h",
+				"--plain-http",
+				"--identity-token", "tok",
+				"--oidc-device-flow",
+			},
+			att: aicr.EvidenceOptions{},
+			want: &recipeEvidenceConfig{
+				OutDir:    "/tmp/out",
+				BOMPath:   "/tmp/bom.json",
+				Push:      "ttl.sh/x:1h",
+				PlainHTTP: true,
+				OIDCResolve: bundleattest.ResolveOptions{
+					IdentityToken: "tok",
+					DeviceFlow:    true,
+				},
+			},
+		},
+		{
+			name: "config-only fallback when flags unset",
+			args: nil,
+			att: aicr.EvidenceOptions{
+				OutDir:      "/cfg/out",
+				BOMPath:     "/cfg/bom.json",
+				Push:        "ttl.sh/cfg:1h",
+				PlainHTTP:   true,
+				InsecureTLS: true,
+			},
+			want: &recipeEvidenceConfig{
+				OutDir:      "/cfg/out",
+				BOMPath:     "/cfg/bom.json",
+				Push:        "ttl.sh/cfg:1h",
+				PlainHTTP:   true,
+				InsecureTLS: true,
+			},
+		},
+		{
+			name: "full flag sets Full",
+			args: []string{"--emit-attestation", "/tmp/out", "--full"},
+			att:  aicr.EvidenceOptions{},
+			want: &recipeEvidenceConfig{
+				OutDir: "/tmp/out",
+				Full:   true,
+			},
+		},
+		{
+			name: "minimal by default (full unset)",
+			args: []string{"--emit-attestation", "/tmp/out"},
+			att:  aicr.EvidenceOptions{},
+			want: &recipeEvidenceConfig{
+				OutDir: "/tmp/out",
+				Full:   false,
+			},
+		},
+		{
+			name: "allow-mutable-validator-tags flag opts out of the provenance gate",
+			args: []string{"--emit-attestation", "/tmp/out", "--" + flagAllowMutableValidatorTags},
+			att:  aicr.EvidenceOptions{},
+			want: &recipeEvidenceConfig{
+				OutDir:                    "/tmp/out",
+				AllowMutableValidatorTags: true,
+			},
+		},
+		{
+			// The gate is CLI-only on purpose: a committed config must not be
+			// able to switch off validator-provenance enforcement for every
+			// later run that loads it.
+			name: "config cannot enable allow-mutable-validator-tags",
+			args: []string{"--emit-attestation", "/tmp/out"},
+			att:  aicr.EvidenceOptions{AllowMutableValidatorTags: true},
+			want: &recipeEvidenceConfig{
+				OutDir:                    "/tmp/out",
+				AllowMutableValidatorTags: false,
+			},
+		},
+		{
+			name: "signing key selects KMS signing",
+			args: []string{"--emit-attestation", "/tmp/out", "--push", "ttl.sh/x:1h",
+				"--" + flagSigningKey, "awskms:///alias/aicr-evidence", "--" + flagTLogUpload + "=false"},
+			att: aicr.EvidenceOptions{},
+			want: &recipeEvidenceConfig{
+				OutDir: "/tmp/out",
+				Push:   "ttl.sh/x:1h",
+				OIDCResolve: bundleattest.ResolveOptions{
+					SigningKey:        "awskms:///alias/aicr-evidence",
+					DisableTLogUpload: true,
+				},
+			},
+		},
+		{
+			name:    "no-sign rejects a signing key",
+			args:    []string{"--emit-attestation", "/tmp/out", "--push", "ttl.sh/x:1h", "--" + flagNoSign, "--" + flagSigningKey, "awskms:///alias/k"},
+			att:     aicr.EvidenceOptions{},
+			wantErr: true,
+		},
+		{
+			name:    "invalid signing flags fail even with config-only emission",
+			args:    []string{"--" + flagTLogUpload + "=false"},
+			att:     aicr.EvidenceOptions{OutDir: "/cfg/out"},
+			wantErr: true,
+		},
+		{
+			name:    "signing flags are inert without emission",
+			args:    []string{"--" + flagTLogUpload + "=false"},
+			att:     aicr.EvidenceOptions{},
+			wantNil: true,
+		},
+		{
+			name: "flag overrides config when both set",
+			args: []string{"--emit-attestation", "/flag/out", "--push", "ttl.sh/flag:1h"},
+			att: aicr.EvidenceOptions{
+				OutDir:  "/cfg/out",
+				Push:    "ttl.sh/cfg:1h",
+				BOMPath: "/cfg/bom.json",
+			},
+			want: &recipeEvidenceConfig{
+				OutDir:  "/flag/out",
+				Push:    "ttl.sh/flag:1h",
+				BOMPath: "/cfg/bom.json",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := runEvidenceCmd(t, tt.args, tt.att)
+			if tt.wantErr {
+				errorstest.WantReportedCode(t, err, errors.ErrCodeInvalidRequest)
+				return
+			}
+			if err != nil {
+				t.Fatalf("cmd.Run: %v", err)
+			}
+			if tt.wantNil {
+				if got != nil {
+					t.Errorf("expected nil, got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected non-nil config")
+			}
+			if got.OutDir != tt.want.OutDir {
+				t.Errorf("OutDir = %q, want %q", got.OutDir, tt.want.OutDir)
+			}
+			if got.BOMPath != tt.want.BOMPath {
+				t.Errorf("BOMPath = %q, want %q", got.BOMPath, tt.want.BOMPath)
+			}
+			if got.Push != tt.want.Push {
+				t.Errorf("Push = %q, want %q", got.Push, tt.want.Push)
+			}
+			if got.PlainHTTP != tt.want.PlainHTTP {
+				t.Errorf("PlainHTTP = %v, want %v", got.PlainHTTP, tt.want.PlainHTTP)
+			}
+			if got.InsecureTLS != tt.want.InsecureTLS {
+				t.Errorf("InsecureTLS = %v, want %v", got.InsecureTLS, tt.want.InsecureTLS)
+			}
+			if got.OIDCResolve.IdentityToken != tt.want.OIDCResolve.IdentityToken {
+				t.Errorf("IdentityToken = %q, want %q",
+					got.OIDCResolve.IdentityToken, tt.want.OIDCResolve.IdentityToken)
+			}
+			if got.OIDCResolve.DeviceFlow != tt.want.OIDCResolve.DeviceFlow {
+				t.Errorf("DeviceFlow = %v, want %v",
+					got.OIDCResolve.DeviceFlow, tt.want.OIDCResolve.DeviceFlow)
+			}
+			if got.OIDCResolve.SigningKey != tt.want.OIDCResolve.SigningKey {
+				t.Errorf("SigningKey = %q, want %q",
+					got.OIDCResolve.SigningKey, tt.want.OIDCResolve.SigningKey)
+			}
+			if got.OIDCResolve.DisableTLogUpload != tt.want.OIDCResolve.DisableTLogUpload {
+				t.Errorf("DisableTLogUpload = %v, want %v",
+					got.OIDCResolve.DisableTLogUpload, tt.want.OIDCResolve.DisableTLogUpload)
+			}
+			if got.Full != tt.want.Full {
+				t.Errorf("Full = %v, want %v", got.Full, tt.want.Full)
+			}
+			if got.AllowMutableValidatorTags != tt.want.AllowMutableValidatorTags {
+				t.Errorf("AllowMutableValidatorTags = %v, want %v",
+					got.AllowMutableValidatorTags, tt.want.AllowMutableValidatorTags)
+			}
+		})
+	}
+}
+
+func TestEvidenceConfigForRunMode(t *testing.T) {
+	cfg := &recipeEvidenceConfig{
+		OutDir: "/tmp/out",
+		Push:   "ghcr.io/nvidia/aicr-evidence/example",
+	}
+	tests := []struct {
+		name      string
+		noCluster bool
+		cfg       *recipeEvidenceConfig
+		wantNil   bool
+	}{
+		{"live cluster keeps emit config", false, cfg, false},
+		{"no-cluster drops emit config", true, cfg, true},
+		{"live cluster nil stays nil", false, nil, true},
+		{"no-cluster nil stays nil", true, nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := evidenceConfigForRunMode(tt.noCluster, tt.cfg)
+			if (got == nil) != tt.wantNil {
+				t.Fatalf("evidenceConfigForRunMode() nil = %v, want nil = %v", got == nil, tt.wantNil)
+			}
+			// A live-cluster run must pass the config through unchanged.
+			if !tt.noCluster && tt.cfg != nil && got != tt.cfg {
+				t.Errorf("live-cluster run mutated the evidence config: got %+v, want %+v", got, tt.cfg)
+			}
+		})
+	}
+}

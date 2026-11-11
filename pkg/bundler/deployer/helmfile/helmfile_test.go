@@ -1,0 +1,1066 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package helmfile
+
+import (
+	"context"
+	"flag"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer/localformat"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+)
+
+const testBundlerVersion = "v1.0.0"
+
+// update regenerates goldens under testdata/ when set via `go test -update`.
+var update = flag.Bool("update", false, "update golden files")
+
+// TestGenerate_Scenarios is the golden-file suite for Generator.Generate:
+// each row supplies a Generator configuration, the testdata/<name>/ dir
+// holding the expected output, and the file basenames to byte-compare.
+// Scenarios that exercise different code paths (error validation,
+// side-effect checks, context cancellation) live in their own focused
+// tests below — they don't fit the runScenario shape and would obscure
+// these positive-case goldens.
+func TestGenerate_Scenarios(t *testing.T) {
+	scenarios := []struct {
+		// name is the t.Run subtest label and the testdata/<name>/ dir.
+		name string
+		// gen is the configured Generator to invoke. Each scenario builds
+		// its own to keep RecipeResult + values + manifests + flags
+		// localized.
+		gen *Generator
+		// goldens lists basenames under testdata/<name>/ to byte-compare
+		// against. helmfile.yaml is always included; README.md is added
+		// only where its content shape is part of the assertion.
+		goldens []string
+	}{
+		{
+			// Two-component stratified-layout case (issue #914):
+			// gpu-operator declares cert-manager as a dependency, so
+			// the DAG produces two levels and the generator emits a
+			// top-level helmfile.yaml carrying a helmfiles: list
+			// referencing level-0.yaml (cert-manager) and level-1.yaml
+			// (gpu-operator). The needs: edge across levels dissolves
+			// because helmfile processes the helmfiles: list
+			// sequentially. README is included to lock its
+			// component-table rendering.
+			name: "upstream_helm_only",
+			gen: func() *Generator {
+				cm := ref("cert-manager", "cert-manager", "cert-manager", "v1.17.2", "https://charts.jetstack.io")
+				gpu := ref("gpu-operator", "gpu-operator", "gpu-operator", "v25.3.3", "https://helm.ngc.nvidia.com/nvidia")
+				gpu.DependencyRefs = []string{"cert-manager"}
+				return &Generator{
+					RecipeResult: recipeWith(cm, gpu),
+					ComponentValues: map[string]map[string]any{
+						"cert-manager": {"crds": map[string]any{"enabled": true}},
+						"gpu-operator": {"driver": map[string]any{"enabled": true}},
+					},
+					Version: testBundlerVersion,
+				}
+			}(),
+			goldens: []string{"helmfile.yaml", "level-0.yaml", "level-1.yaml", "README.md"},
+		},
+		{
+			// k8s-aibom is marked ownsCRDs, and this deployer still emits no
+			// CRD step for it. A presync hook fires only for releases
+			// helmfile decides to sync, and `helmfile apply` selects on
+			// detected change, so the step would hold on a chart bump and
+			// silently not hold on an unchanged rerun. The golden pins the
+			// absence: no hooks key on the release (#2525).
+			name: "owns_crds_no_hook",
+			gen: &Generator{
+				RecipeResult: recipeWith(
+					ref("k8s-aibom", "k8s-aibom-system", "k8s-aibom", "1.3.0",
+						"oci://ghcr.io/googlecloudplatform/charts"),
+				),
+				ComponentValues: map[string]map[string]any{
+					"k8s-aibom": {"replicaCount": 1},
+				},
+				Version: testBundlerVersion,
+			},
+			goldens: []string{"helmfile.yaml"},
+		},
+		{
+			// The same component with its version overridden away from the
+			// registry pin, kept as the sibling case so the two goldens stay
+			// comparable if a CRD step is ever added back here.
+			name: "owns_crds_version_override",
+			gen: &Generator{
+				RecipeResult: recipeWith(
+					ref("k8s-aibom", "k8s-aibom-system", "k8s-aibom", "1.2.0",
+						"oci://ghcr.io/googlecloudplatform/charts"),
+				),
+				ComponentValues: map[string]map[string]any{
+					"k8s-aibom": {"replicaCount": 1},
+				},
+				Version: testBundlerVersion,
+			},
+			goldens: []string{"helmfile.yaml"},
+		},
+		{
+			// cluster-values.yaml must be referenced in the release's
+			// values: list whenever the component has dynamic paths.
+			name: "with_dynamic_values",
+			gen: &Generator{
+				RecipeResult: recipeWith(
+					ref("cert-manager", "cert-manager", "cert-manager", "v1.17.2", "https://charts.jetstack.io"),
+				),
+				ComponentValues: map[string]map[string]any{
+					"cert-manager": {"crds": map[string]any{"enabled": true}, "replicaCount": 3},
+				},
+				DynamicValues: map[string][]string{
+					"cert-manager": {"replicaCount"},
+				},
+				Version: testBundlerVersion,
+			},
+			goldens: []string{"helmfile.yaml"},
+		},
+		{
+			// kai-scheduler is hardcoded in deploy.sh.tmpl as async;
+			// helmfile bundle must mirror that with wait:false + 20m
+			// timeout. Drift between the two is locked by
+			// TestComponentOverrides_ParityWithHelmDeployScript.
+			name: "kai_scheduler_async",
+			gen: &Generator{
+				RecipeResult: recipeWith(
+					ref("kai-scheduler", "kai-scheduler", "kai-scheduler", "v0.14.1",
+						"oci://ghcr.io/kai-scheduler/kai-scheduler"),
+				),
+				ComponentValues: map[string]map[string]any{
+					"kai-scheduler": {"enabled": true},
+				},
+				Version: testBundlerVersion,
+			},
+			goldens: []string{"helmfile.yaml"},
+		},
+		{
+			// Mixed component (Helm chart + post manifests): primary
+			// upstream-helm release plus a local-helm <name>-post
+			// release with needs: pointing at the primary.
+			name: "mixed_gpu_operator",
+			gen: &Generator{
+				RecipeResult: recipeWith(
+					ref("gpu-operator", "gpu-operator", "gpu-operator", "v25.3.3",
+						"https://helm.ngc.nvidia.com/nvidia"),
+				),
+				ComponentValues: map[string]map[string]any{
+					"gpu-operator": {"driver": map[string]any{"enabled": true}},
+				},
+				ComponentPostManifests: map[string]map[string][]byte{
+					"gpu-operator": {
+						"nvidia-runtime-class.yaml": []byte("apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata:\n  name: nvidia\nhandler: nvidia\n"),
+					},
+				},
+				Version: testBundlerVersion,
+			},
+			goldens: []string{"helmfile.yaml"},
+		},
+		{
+			// Manifest-only component (no chart/source, just manifests):
+			// localformat wraps as a local chart, so the release is
+			// `chart: ./001-<name>` with no version.
+			name: "manifest_only",
+			gen: &Generator{
+				RecipeResult: recipeWith(
+					recipe.ComponentRef{
+						Name:      "node-prep",
+						Namespace: "kube-system",
+						Type:      recipe.ComponentTypeHelm,
+					},
+				),
+				ComponentValues: map[string]map[string]any{
+					"node-prep": {},
+				},
+				ComponentPostManifests: map[string]map[string][]byte{
+					"node-prep": {
+						"daemonset.yaml": []byte("apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: node-prep\nspec: {}\n"),
+					},
+				},
+				Version: testBundlerVersion,
+			},
+			// The generated Chart.yaml is pinned too: it is the only
+			// artifact carrying testBundlerVersion, so a regression that
+			// stopped forwarding Generator.Version into
+			// localformat.Options.AICRVersion would silently downgrade
+			// every wrapper to the dev chart version with no other
+			// golden moving. See ADR-021 Decision 7.
+			goldens: []string{"helmfile.yaml", filepath.Join("001-node-prep", "Chart.yaml")},
+		},
+	}
+	for _, tc := range scenarios {
+		t.Run(tc.name, func(t *testing.T) {
+			runScenario(t, tc.gen, tc.name, tc.goldens)
+		})
+	}
+}
+
+// TestGenerate_UpgradeNotice covers a non-empty notice; the empty case is
+// pinned byte-for-byte by the README golden.
+func TestGenerate_UpgradeNotice(t *testing.T) {
+	const notice = "## Before You Upgrade\n\nNOTICE-SENTINEL\n\n"
+	outputDir := t.TempDir()
+	g := &Generator{
+		RecipeResult:    recipeWith(ref("cert-manager", "cert-manager", "cert-manager", "v1.17.2", "https://charts.jetstack.io")),
+		ComponentValues: map[string]map[string]any{"cert-manager": {}},
+		Version:         testBundlerVersion,
+		UpgradeNotice:   notice,
+	}
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(outputDir, fileReadme))
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	assertUpgradeNoticePlacement(t, string(b), notice, "## Components", "## Deployment")
+}
+
+// assertUpgradeNoticePlacement checks that notice sits after afterHeading, has
+// exactly one blank line before it, and is directly followed by beforeHeading.
+func assertUpgradeNoticePlacement(t *testing.T, readme, notice, afterHeading, beforeHeading string) {
+	t.Helper()
+	idx := strings.Index(readme, notice)
+	if idx < 0 {
+		t.Fatalf("README missing upgrade notice:\n%s", readme)
+	}
+	if after := strings.Index(readme, afterHeading); after < 0 || after > idx {
+		t.Errorf("upgrade notice must follow %q:\n%s", afterHeading, readme)
+	}
+	if !strings.HasPrefix(readme[idx+len(notice):], beforeHeading) {
+		t.Errorf("upgrade notice must directly precede %q:\n%s", beforeHeading, readme)
+	}
+	if prefix := readme[:idx]; !strings.HasSuffix(prefix, "\n\n") || strings.HasSuffix(prefix, "\n\n\n") {
+		t.Errorf("want exactly one blank line before the upgrade notice:\n%s", readme)
+	}
+}
+
+// TestGenerate_EmptyRecipe asserts the deployer still emits a parseable
+// helmfile.yaml when a recipe has zero enabled components (helmfile lint
+// would otherwise reject the document; we want a stable artifact).
+func TestGenerate_EmptyRecipe(t *testing.T) {
+	g := &Generator{
+		RecipeResult: &recipe.RecipeResult{},
+		Version:      testBundlerVersion,
+	}
+	ctx := context.Background()
+	out, err := g.Generate(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if out == nil || len(out.Files) == 0 {
+		t.Fatalf("Generate() returned no files: %#v", out)
+	}
+}
+
+// TestGenerate_NilRecipeResult asserts the deployer validates its required
+// input.
+func TestGenerate_NilRecipeResult(t *testing.T) {
+	g := &Generator{Version: testBundlerVersion}
+	_, err := g.Generate(context.Background(), t.TempDir())
+	if err == nil {
+		t.Fatalf("Generate() with nil RecipeResult expected error, got nil")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeInvalidRequest {
+		t.Errorf("Generate() error code = %v, want ErrCodeInvalidRequest", err)
+	}
+	if !strings.Contains(err.Error(), "RecipeResult is required") {
+		t.Errorf("Generate() error message = %q, want substring %q",
+			err.Error(), "RecipeResult is required")
+	}
+}
+
+// TestGenerate_WithChecksums asserts that IncludeChecksums wires
+// checksum.WriteChecksums into the output and produces a checksums.txt
+// adjacent to helmfile.yaml.
+func TestGenerate_WithChecksums(t *testing.T) {
+	g := &Generator{
+		RecipeResult: recipeWith(
+			ref("cert-manager", "cert-manager", "cert-manager", "v1.17.2",
+				"https://charts.jetstack.io"),
+		),
+		ComponentValues:  map[string]map[string]any{"cert-manager": {}},
+		Version:          testBundlerVersion,
+		IncludeChecksums: true,
+	}
+	outputDir := t.TempDir()
+	_, err := g.Generate(context.Background(), outputDir)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	checksumsPath := filepath.Join(outputDir, "checksums.txt")
+	if _, statErr := os.Stat(checksumsPath); statErr != nil {
+		t.Fatalf("checksums.txt missing: %v", statErr)
+	}
+}
+
+// TestGenerateReportsLayout asserts Generate populates output.Entrypoint and
+// output.Releases with the layout it actually wrote to outputDir, mirroring
+// the helm deployer's equivalent coverage (pkg/bundler/deployer/helm).
+func TestGenerateReportsLayout(t *testing.T) {
+	// ComponentRefs declaration order, DeploymentOrder, and alphabetical
+	// component-name order are all deliberately distinct here:
+	//   - declaration (the ref() call order below): gpu-operator,
+	//     cert-manager, nfd
+	//   - DeploymentOrder: cert-manager, nfd, gpu-operator (the real
+	//     dependency order — nfd labels nodes before gpu-operator consumes
+	//     those labels)
+	//   - alphabetical: cert-manager, gpu-operator, nfd
+	// so the primaryOrder assertion below can only pass if Generate genuinely
+	// honors DeploymentOrder rather than sorting by name or falling back to
+	// declaration order (e.g. a dropped SortComponentRefsByDeploymentOrder
+	// call). recipeWith sets DeploymentOrder from declaration order, so it is
+	// overwritten below — this divergence from recipeWith's usual behavior is
+	// intentional, not a bug to "fix" back into agreement.
+	recipeResult := recipeWith(
+		ref("gpu-operator", "gpu-operator", "gpu-operator", "v25.3.3",
+			"https://helm.ngc.nvidia.com/nvidia"),
+		ref("cert-manager", "cert-manager", "cert-manager", "v1.17.2",
+			"https://charts.jetstack.io"),
+		ref("nfd", "node-feature-discovery", "node-feature-discovery", "v0.16.4",
+			"https://kubernetes-sigs.github.io/node-feature-discovery-charts"),
+	)
+	recipeResult.DeploymentOrder = []string{"cert-manager", "nfd", "gpu-operator"}
+	g := &Generator{
+		RecipeResult: recipeResult,
+		ComponentValues: map[string]map[string]any{
+			"cert-manager": {"crds": map[string]any{"enabled": true}},
+			"nfd":          {"enabled": true},
+			"gpu-operator": {"driver": map[string]any{"enabled": true}},
+		},
+		Version: testBundlerVersion,
+	}
+	outputDir := t.TempDir()
+
+	out, err := g.Generate(context.Background(), outputDir)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	if out.Entrypoint != "helmfile.yaml" {
+		t.Errorf("Entrypoint = %q, want helmfile.yaml", out.Entrypoint)
+	}
+	if len(out.Releases) == 0 {
+		t.Fatal("Generate reported no releases; the bundle index would be empty")
+	}
+	for _, r := range out.Releases {
+		if r.Name == "" || r.Component == "" || r.Path == "" {
+			t.Errorf("incomplete release entry: %+v", r)
+		}
+		if _, statErr := os.Stat(filepath.Join(outputDir, r.Path)); statErr != nil {
+			t.Errorf("release %q claims path %q, which does not exist: %v", r.Name, r.Path, statErr)
+		}
+	}
+
+	// Releases order is normative: consumers read deployment sequence from
+	// list position, since the artifact carries no ordinal field. Extract
+	// the primary releases (Name == Component; excludes injected -pre/-post
+	// entries) and confirm their relative order matches the recipe's
+	// DeploymentOrder — a sort or reversal of out.Releases must fail this
+	// check.
+	var primaryOrder []string
+	for _, r := range out.Releases {
+		if r.Name == r.Component {
+			primaryOrder = append(primaryOrder, r.Name)
+		}
+	}
+	if !slices.Equal(primaryOrder, recipeResult.DeploymentOrder) {
+		t.Errorf("primary release order = %v, want %v (recipe DeploymentOrder)",
+			primaryOrder, recipeResult.DeploymentOrder)
+	}
+}
+
+// TestGenerate_WithDataFiles asserts external data files are picked up by
+// output.AddDataFiles and contribute to the file list / total size.
+func TestGenerate_WithDataFiles(t *testing.T) {
+	outputDir := t.TempDir()
+	dataFile := filepath.Join(outputDir, "extra.yaml")
+	if err := os.WriteFile(dataFile, []byte("key: value\n"), 0o600); err != nil {
+		t.Fatalf("seed data file: %v", err)
+	}
+	g := &Generator{
+		RecipeResult: recipeWith(
+			ref("cert-manager", "cert-manager", "cert-manager", "v1.17.2",
+				"https://charts.jetstack.io"),
+		),
+		ComponentValues: map[string]map[string]any{"cert-manager": {}},
+		Version:         testBundlerVersion,
+		DataFiles:       []string{"extra.yaml"},
+	}
+	out, err := g.Generate(context.Background(), outputDir)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	found := false
+	for _, f := range out.Files {
+		if filepath.Base(f) == "extra.yaml" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("extra.yaml not present in output.Files: %v", out.Files)
+	}
+}
+
+// TestGenerate_ContextCanceled asserts the deployer respects a context
+// that's already canceled at entry, before touching the filesystem.
+func TestGenerate_ContextCanceled(t *testing.T) {
+	g := &Generator{
+		RecipeResult: recipeWith(
+			ref("cert-manager", "cert-manager", "cert-manager", "v1.17.2",
+				"https://charts.jetstack.io"),
+		),
+		ComponentValues: map[string]map[string]any{"cert-manager": {}},
+		Version:         testBundlerVersion,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := g.Generate(ctx, t.TempDir())
+	if err == nil {
+		t.Fatalf("Generate() with canceled context expected error, got nil")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeTimeout {
+		t.Errorf("Generate() error code = %v, want ErrCodeTimeout", err)
+	}
+}
+
+// TestGenerate_MissingDataFile asserts the deployer surfaces a structured
+// error when --data references a path that does not exist (defense against
+// silent checksum gaps).
+func TestGenerate_MissingDataFile(t *testing.T) {
+	g := &Generator{
+		RecipeResult: recipeWith(
+			ref("cert-manager", "cert-manager", "cert-manager", "v1.17.2",
+				"https://charts.jetstack.io"),
+		),
+		ComponentValues: map[string]map[string]any{"cert-manager": {}},
+		Version:         testBundlerVersion,
+		DataFiles:       []string{"does-not-exist.yaml"},
+	}
+	_, err := g.Generate(context.Background(), t.TempDir())
+	if err == nil {
+		t.Fatalf("Generate() with missing data file expected error, got nil")
+	}
+	// AddDataFiles wraps the stat failure as ErrCodeInternal — assert the
+	// code rather than just non-nil so a regression that surfaces an
+	// uncoded error here fails this test.
+	if errorstest.ReportedCode(err) != errors.ErrCodeInternal {
+		t.Errorf("Generate() error code = %v, want ErrCodeInternal", err)
+	}
+}
+
+// TestRepositoryFor_OCIStripsScheme asserts that an OCI-prefixed source URL
+// from the recipe is stored in the helmfile repository entry as bare
+// host+path. Helmfile prepends `oci://` itself when `oci: true` is set —
+// an `oci://`-prefixed `url` causes the doubled-scheme bug seen during
+// real `helmfile build` integration testing of issue #632.
+func TestRepositoryFor_OCIStripsScheme(t *testing.T) {
+	tests := []struct {
+		name    string
+		repo    string
+		wantURL string
+		wantOCI bool
+	}{
+		{"oci with scheme", "oci://ghcr.io/example/charts", "ghcr.io/example/charts", true},
+		{"https unchanged", "https://charts.jetstack.io", "https://charts.jetstack.io", false},
+		{"http unchanged", "http://example.com/charts", "http://example.com/charts", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _ := repositoryFor(&localformat.Upstream{Repo: tt.repo})
+			if r.URL != tt.wantURL {
+				t.Errorf("URL = %q, want %q", r.URL, tt.wantURL)
+			}
+			if r.OCI != tt.wantOCI {
+				t.Errorf("OCI = %v, want %v", r.OCI, tt.wantOCI)
+			}
+		})
+	}
+}
+
+// TestBuildHelmfile_NilUpstream asserts buildHelmfile errors out when a
+// KindUpstreamHelm folder arrives without the Upstream pointer set — a
+// programmer-error case from localformat that should fail loud rather
+// than emit `chart: nil/<chart>`.
+func TestBuildHelmfile_NilUpstream(t *testing.T) {
+	folders := []localformat.Folder{
+		{Index: 1, Dir: "001-x", Kind: localformat.KindUpstreamHelm, Name: "x", Parent: "x", Upstream: nil},
+	}
+	_, err := buildHelmfile(folders, map[string]string{"x": "ns"}, nil, nil, false)
+	if err == nil {
+		t.Fatalf("buildHelmfile with nil Upstream expected error, got nil")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeInternal {
+		t.Errorf("error code = %v, want ErrCodeInternal", err)
+	}
+	if !strings.Contains(err.Error(), "KindUpstreamHelm but Upstream is nil") {
+		t.Errorf("error message = %q, want substring 'KindUpstreamHelm but Upstream is nil'", err.Error())
+	}
+}
+
+// TestBuildHelmfile_UnsupportedKind asserts buildHelmfile rejects an
+// unknown FolderKind value rather than silently emitting a release with
+// an empty chart.
+func TestBuildHelmfile_UnsupportedKind(t *testing.T) {
+	folders := []localformat.Folder{
+		{Index: 1, Dir: "001-x", Kind: localformat.FolderKind(99), Name: "x", Parent: "x"},
+	}
+	_, err := buildHelmfile(folders, map[string]string{"x": "ns"}, nil, nil, false)
+	if err == nil {
+		t.Fatalf("buildHelmfile with unsupported kind expected error, got nil")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeInvalidRequest {
+		t.Errorf("error code = %v, want ErrCodeInvalidRequest", err)
+	}
+	if !strings.Contains(err.Error(), "unsupported folder kind") {
+		t.Errorf("error message = %q, want substring 'unsupported folder kind'", err.Error())
+	}
+}
+
+// TestNeedsRef covers the cross-namespace needs: format. Helmfile resolves
+// a bare "<name>" only within the dependent release's own namespace, so a
+// release in cert-manager/ pointing at agentgateway-crds-post (which lives
+// in agentgateway-system/) silently fails to resolve. needsRef must emit
+// "<namespace>/<name>" whenever the dependent and dependency namespaces
+// differ, and bare "<name>" when they match (helmfile community
+// convention for in-namespace chains).
+func TestNeedsRef(t *testing.T) {
+	tests := []struct {
+		name        string
+		dependentNS string
+		depNS       string
+		depName     string
+		want        string
+	}{
+		{"same namespace", "cert-manager", "cert-manager", "cert-manager-crds", "cert-manager-crds"},
+		{"cross namespace", "cert-manager", "agentgateway-system", "agentgateway-crds-post", "agentgateway-system/agentgateway-crds-post"},
+		{"empty dep namespace falls back to bare", "cert-manager", "", "foo", "foo"},
+		{"identical empty namespaces", "", "", "foo", "foo"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := needsRef(tt.dependentNS, tt.depNS, tt.depName); got != tt.want {
+				t.Errorf("needsRef(dep=%q, depNS=%q, name=%q) = %q, want %q",
+					tt.dependentNS, tt.depNS, tt.depName, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildHelmfile_CrossNamespaceNeeds asserts the integrated wiring:
+// when two consecutive releases live in different namespaces, the dependent
+// release's needs: entry is namespace-qualified end-to-end (struct → YAML).
+// Locks the fix for the silent-miss bug caught by the Kind smoke test.
+func TestBuildHelmfile_CrossNamespaceNeeds(t *testing.T) {
+	folders := []localformat.Folder{
+		{Index: 1, Dir: "001-cert-manager", Kind: localformat.KindUpstreamHelm, Name: "cert-manager", Parent: "cert-manager",
+			Upstream: &localformat.Upstream{Chart: "cert-manager", Repo: "https://charts.jetstack.io", Version: "v1.17.2"}},
+		{Index: 2, Dir: "002-kube-prometheus-stack", Kind: localformat.KindUpstreamHelm, Name: "kube-prometheus-stack", Parent: "kube-prometheus-stack",
+			Upstream: &localformat.Upstream{Chart: "kube-prometheus-stack", Repo: "https://prometheus-community.github.io/helm-charts", Version: "84.4.0"}},
+	}
+	ns := map[string]string{
+		"cert-manager":          "cert-manager",
+		"kube-prometheus-stack": "monitoring",
+	}
+	// Cross-namespace needs edges arise only under --serial: the default
+	// chains within a component (same namespace), so two different components
+	// only carry a needs edge when the linear serial chain is requested.
+	doc, err := buildHelmfile(folders, ns, nil, nil, true)
+	if err != nil {
+		t.Fatalf("buildHelmfile() error = %v", err)
+	}
+	if len(doc.Releases) != 2 {
+		t.Fatalf("got %d releases, want 2", len(doc.Releases))
+	}
+	if doc.Releases[0].Needs != nil {
+		t.Errorf("release[0] (cert-manager) should have no needs, got %v", doc.Releases[0].Needs)
+	}
+	want := "cert-manager/cert-manager"
+	if got := doc.Releases[1].Needs; len(got) != 1 || got[0] != want {
+		t.Errorf("release[1] (kube-prometheus-stack) needs = %v, want [%q] — bare name here causes helmfile to look in monitoring/ for a release that lives in cert-manager/", got, want)
+	}
+}
+
+// TestBuildHelmfile_SameNamespaceNeedsBare asserts the complement: when the
+// predecessor shares a namespace with the dependent, needs: is emitted as
+// a bare name (matches helmfile community convention; cleaner diffs).
+func TestBuildHelmfile_SameNamespaceNeedsBare(t *testing.T) {
+	folders := []localformat.Folder{
+		{Index: 1, Dir: "001-gpu-operator", Kind: localformat.KindUpstreamHelm, Name: "gpu-operator", Parent: "gpu-operator",
+			Upstream: &localformat.Upstream{Chart: "gpu-operator", Repo: "https://helm.ngc.nvidia.com/nvidia", Version: "v25.3.3"}},
+		{Index: 2, Dir: "002-gpu-operator-post", Kind: localformat.KindLocalHelm, Name: "gpu-operator-post", Parent: "gpu-operator"},
+	}
+	ns := map[string]string{"gpu-operator": "gpu-operator"}
+	doc, err := buildHelmfile(folders, ns, nil, nil, false)
+	if err != nil {
+		t.Fatalf("buildHelmfile() error = %v", err)
+	}
+	if got := doc.Releases[1].Needs; len(got) != 1 || got[0] != "gpu-operator" {
+		t.Errorf("release[1] needs = %v, want [\"gpu-operator\"] — same-namespace chains should use the bare name form",
+			got)
+	}
+}
+
+// TestBuildHelmfile_CreateNamespaceFromFolder asserts that buildHelmfile
+// emits a per-release `createNamespace: false` override when a folder's
+// CreateNamespace flag is false (the Talos privileged-namespace pattern),
+// and emits no override (relying on helmDefaults.createNamespace: true)
+// otherwise. The localformat writer already encodes the
+// chart-owns-Namespace decision; the helmfile deployer must honor it or
+// helm refuses to import the namespace it created out-of-band.
+func TestBuildHelmfile_CreateNamespaceFromFolder(t *testing.T) {
+	folders := []localformat.Folder{
+		// Pre-injection folder that ships its own Namespace (Talos pattern):
+		// localformat would set CreateNamespace=false; expect the override.
+		{Index: 1, Dir: "001-gpu-operator-pre", Kind: localformat.KindLocalHelm,
+			Name: "gpu-operator-pre", Parent: "gpu-operator", CreateNamespace: false},
+		// Primary upstream-helm folder: no Namespace conflict possible from
+		// AICR's perspective; expect no per-release override.
+		{Index: 2, Dir: "002-gpu-operator", Kind: localformat.KindUpstreamHelm,
+			Name: "gpu-operator", Parent: "gpu-operator", CreateNamespace: true,
+			Upstream: &localformat.Upstream{Chart: "gpu-operator", Repo: "https://helm.ngc.nvidia.com/nvidia", Version: "v25.3.3"}},
+	}
+	ns := map[string]string{"gpu-operator": "privileged-gpu-operator"}
+	doc, err := buildHelmfile(folders, ns, nil, nil, false)
+	if err != nil {
+		t.Fatalf("buildHelmfile() error = %v", err)
+	}
+	if len(doc.Releases) != 2 {
+		t.Fatalf("expected 2 releases, got %d", len(doc.Releases))
+	}
+	if doc.Releases[0].CreateNamespace == nil || *doc.Releases[0].CreateNamespace {
+		t.Errorf("release[0] (gpu-operator-pre) CreateNamespace = %v, want pointer to false — "+
+			"the chart owns the Namespace and helm must not create it out-of-band",
+			doc.Releases[0].CreateNamespace)
+	}
+	if doc.Releases[1].CreateNamespace != nil {
+		t.Errorf("release[1] (gpu-operator) CreateNamespace = %v, want nil — "+
+			"helmDefaults.createNamespace: true covers the common case; no per-release override should be emitted",
+			doc.Releases[1].CreateNamespace)
+	}
+}
+
+// TestBuildHelmfile_DisableValidationPrimaryOnly asserts that the
+// registry flag HasSelfRefCRDs emits `disableValidation: true` only on
+// the primary release of a component, not on the injected -pre / -post
+// local-helm wrappers. The wrappers ship raw manifests (no `crds/`, no
+// self-reference of their own); cascading the flag would silently drop
+// helm-diff's REST-mapper sanity check on those wrappers — a typo in a
+// resource Kind would render at diff time and fail at apply. See issue
+// #929.
+func TestBuildHelmfile_DisableValidationPrimaryOnly(t *testing.T) {
+	folders := []localformat.Folder{
+		{Index: 1, Dir: "001-gpu-operator-pre", Kind: localformat.KindLocalHelm,
+			Name: "gpu-operator-pre", Parent: "gpu-operator"},
+		{Index: 2, Dir: "002-gpu-operator", Kind: localformat.KindUpstreamHelm,
+			Name: "gpu-operator", Parent: "gpu-operator",
+			Upstream: &localformat.Upstream{Chart: "gpu-operator", Repo: "https://helm.ngc.nvidia.com/nvidia", Version: "v25.3.3"}},
+		{Index: 3, Dir: "003-gpu-operator-post", Kind: localformat.KindLocalHelm,
+			Name: "gpu-operator-post", Parent: "gpu-operator"},
+	}
+	ns := map[string]string{"gpu-operator": "gpu-operator"}
+	flags := map[string]componentFlags{"gpu-operator": {HasSelfRefCRDs: true}}
+	doc, err := buildHelmfile(folders, ns, nil, flags, false)
+	if err != nil {
+		t.Fatalf("buildHelmfile() error = %v", err)
+	}
+	if len(doc.Releases) != 3 {
+		t.Fatalf("expected 3 releases (pre + primary + post), got %d", len(doc.Releases))
+	}
+	if doc.Releases[0].DisableValidation {
+		t.Error("release[0] (gpu-operator-pre) DisableValidation = true, want false — " +
+			"the wrapper ships raw manifests, not the self-ref chart's crds/")
+	}
+	if !doc.Releases[1].DisableValidation {
+		t.Error("release[1] (gpu-operator) DisableValidation = false, want true — " +
+			"primary release carries the self-ref CRDs and needs the helm-diff bypass")
+	}
+	if doc.Releases[2].DisableValidation {
+		t.Error("release[2] (gpu-operator-post) DisableValidation = true, want false — " +
+			"the wrapper ships raw manifests, not the self-ref chart's crds/")
+	}
+}
+
+// TestBuildHelmfile_DisableValidationPostManifests asserts that the
+// registry flag ManifestsUseChartCRDs emits `disableValidation: true`
+// on the release whose folder carries the post-phase manifests
+// (Folder.CarriesPostManifests) — not the primary, not the -pre
+// wrapper. The manifests instantiate CRs whose CRDs the parent chart
+// installs at apply time; because the folder shares the parent's DAG
+// level, helm-diff runs its REST-mapper check before the parent has
+// applied, so on a fresh cluster the check can never pass
+// (network-operator's NicClusterPolicy on AKS is the canonical case).
+// The primary keeps validation: its own chart renders no CRs of
+// unregistered CRDs, and #929's typo-check argument still holds for
+// -pre wrappers, whose manifests apply before the chart and therefore
+// cannot depend on its CRDs.
+func TestBuildHelmfile_DisableValidationPostManifests(t *testing.T) {
+	folders := []localformat.Folder{
+		{Index: 1, Dir: "001-network-operator-pre", Kind: localformat.KindLocalHelm,
+			Name: "network-operator-pre", Parent: "network-operator"},
+		{Index: 2, Dir: "002-network-operator", Kind: localformat.KindUpstreamHelm,
+			Name: "network-operator", Parent: "network-operator",
+			Upstream: &localformat.Upstream{Chart: "network-operator", Repo: "https://helm.ngc.nvidia.com/nvidia", Version: "26.1.1"}},
+		{Index: 3, Dir: "003-network-operator-post", Kind: localformat.KindLocalHelm,
+			Name: "network-operator-post", Parent: "network-operator",
+			CarriesPostManifests: true},
+	}
+	ns := map[string]string{"network-operator": "nvidia-network-operator"}
+	flags := map[string]componentFlags{"network-operator": {ManifestsUseChartCRDs: true}}
+	doc, err := buildHelmfile(folders, ns, nil, flags, false)
+	if err != nil {
+		t.Fatalf("buildHelmfile() error = %v", err)
+	}
+	if len(doc.Releases) != 3 {
+		t.Fatalf("expected 3 releases (pre + primary + post), got %d", len(doc.Releases))
+	}
+	if doc.Releases[0].DisableValidation {
+		t.Error("release[0] (network-operator-pre) DisableValidation = true, want false — " +
+			"-pre manifests apply before the chart and cannot depend on its CRDs")
+	}
+	if doc.Releases[1].DisableValidation {
+		t.Error("release[1] (network-operator) DisableValidation = true, want false — " +
+			"the primary chart has no self-referencing CRDs; only the post-manifest folder needs the bypass")
+	}
+	if !doc.Releases[2].DisableValidation {
+		t.Error("release[2] (network-operator-post) DisableValidation = false, want true — " +
+			"the wrapper's CRs reference CRDs the parent installs after the wrapper's diff runs")
+	}
+}
+
+// TestBuildHelmfile_DisableValidationVendoredMixed pins the vendored
+// layout after #1835: a mixed component under --vendor-charts emits a
+// local-helm primary (the wrapper around the vendored tarball) plus an
+// injected "<name>-post" release, so the CarriesPostManifests marker —
+// not a release-name-suffix check — is what routes disableValidation to
+// the manifest-bearing release. The vendored primary and a vendored
+// pure-Helm sibling both keep the mapper check.
+func TestBuildHelmfile_DisableValidationVendoredMixed(t *testing.T) {
+	folders := []localformat.Folder{
+		{Index: 1, Dir: "001-network-operator", Kind: localformat.KindLocalHelm,
+			Name: "network-operator", Parent: "network-operator"},
+		{Index: 2, Dir: "002-network-operator-post", Kind: localformat.KindLocalHelm,
+			Name: "network-operator-post", Parent: "network-operator",
+			CarriesPostManifests: true},
+		{Index: 3, Dir: "003-nfd", Kind: localformat.KindLocalHelm,
+			Name: "nfd", Parent: "nfd"},
+	}
+	ns := map[string]string{"network-operator": "nvidia-network-operator", "nfd": "node-feature-discovery"}
+	flags := map[string]componentFlags{"network-operator": {ManifestsUseChartCRDs: true}}
+	doc, err := buildHelmfile(folders, ns, nil, flags, false)
+	if err != nil {
+		t.Fatalf("buildHelmfile() error = %v", err)
+	}
+	if len(doc.Releases) != 3 {
+		t.Fatalf("expected 3 releases, got %d", len(doc.Releases))
+	}
+	if doc.Releases[0].DisableValidation {
+		t.Error("release[0] (vendored network-operator primary) DisableValidation = true, want false — " +
+			"the primary wraps the upstream chart and carries no recipe-side manifests")
+	}
+	if !doc.Releases[1].DisableValidation {
+		t.Error("release[1] (network-operator-post) DisableValidation = false, want true — " +
+			"the injected -post release carries the CRD-dependent manifests")
+	}
+	if doc.Releases[2].DisableValidation {
+		t.Error("release[2] (vendored pure-Helm nfd) DisableValidation = true, want false — " +
+			"no post manifests, the mapper check must stay on")
+	}
+}
+
+// TestBuildHelmfile_DisableValidationBothFlags pins the kubeflow-trainer
+// shape: hasSelfRefCRDs covers the primary (its templates create CRs of
+// CRDs in its own crds/, #914) while manifestsUseChartCRDs covers the
+// injected -post wrapper (platform-kubeflow attaches a
+// ClusterTrainingRuntime CR as manifestFiles). Both releases need the
+// helm-diff bypass; each flag stays scoped to its own release.
+func TestBuildHelmfile_DisableValidationBothFlags(t *testing.T) {
+	folders := []localformat.Folder{
+		{Index: 1, Dir: "001-kubeflow-trainer", Kind: localformat.KindUpstreamHelm,
+			Name: "kubeflow-trainer", Parent: "kubeflow-trainer",
+			Upstream: &localformat.Upstream{Chart: "trainer", Repo: "oci://ghcr.io/kubeflow/charts", Version: "v2.1.0"}},
+		{Index: 2, Dir: "002-kubeflow-trainer-post", Kind: localformat.KindLocalHelm,
+			Name: "kubeflow-trainer-post", Parent: "kubeflow-trainer",
+			CarriesPostManifests: true},
+	}
+	ns := map[string]string{"kubeflow-trainer": "kubeflow-system"}
+	flags := map[string]componentFlags{"kubeflow-trainer": {HasSelfRefCRDs: true, ManifestsUseChartCRDs: true}}
+	doc, err := buildHelmfile(folders, ns, nil, flags, false)
+	if err != nil {
+		t.Fatalf("buildHelmfile() error = %v", err)
+	}
+	if len(doc.Releases) != 2 {
+		t.Fatalf("expected 2 releases (primary + post), got %d", len(doc.Releases))
+	}
+	if !doc.Releases[0].DisableValidation {
+		t.Error("release[0] (kubeflow-trainer) DisableValidation = false, want true — " +
+			"hasSelfRefCRDs covers the primary's own CR templates (#914)")
+	}
+	if !doc.Releases[1].DisableValidation {
+		t.Error("release[1] (kubeflow-trainer-post) DisableValidation = false, want true — " +
+			"manifestsUseChartCRDs covers the wrapper's ClusterTrainingRuntime manifest")
+	}
+}
+
+// TestGenerate_NamespaceOwningPreManifest is the integration counterpart:
+// a pre-manifest containing a Namespace resource flows end-to-end through
+// localformat.Write → buildHelmfile and surfaces as `createNamespace: false`
+// on the pre-release in the rendered helmfile.yaml. This locks the
+// os-talos failure mode the helmfile deployer originally hit (release
+// creates namespace via --create-namespace, then the chart's Namespace
+// template can't claim it).
+func TestGenerate_NamespaceOwningPreManifest(t *testing.T) {
+	namespaceManifest := []byte("apiVersion: v1\n" +
+		"kind: Namespace\n" +
+		"metadata:\n" +
+		"  name: privileged-gpu-operator\n" +
+		"  labels:\n" +
+		"    pod-security.kubernetes.io/enforce: privileged\n")
+	g := &Generator{
+		RecipeResult: recipeWith(
+			recipe.ComponentRef{
+				Name:      "gpu-operator",
+				Namespace: "privileged-gpu-operator",
+				Chart:     "gpu-operator",
+				Version:   "v25.3.3",
+				Source:    "https://helm.ngc.nvidia.com/nvidia",
+				Type:      recipe.ComponentTypeHelm,
+			},
+		),
+		ComponentValues: map[string]map[string]any{"gpu-operator": {}},
+		ComponentPreManifests: map[string]map[string][]byte{
+			"gpu-operator": {"talos-namespace.yaml": namespaceManifest},
+		},
+		Version: testBundlerVersion,
+	}
+	outputDir := t.TempDir()
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(outputDir, fileHelmfile))
+	if err != nil {
+		t.Fatalf("read helmfile.yaml: %v", err)
+	}
+	var doc Helmfile
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse helmfile.yaml: %v\n--- content ---\n%s", err, data)
+	}
+	if len(doc.Releases) != 2 {
+		t.Fatalf("expected 2 releases (gpu-operator-pre + gpu-operator), got %d", len(doc.Releases))
+	}
+	// release[0] is the injected -pre with the Namespace template.
+	if got := doc.Releases[0].Name; got != "gpu-operator-pre" {
+		t.Fatalf("release[0].name = %q, want %q", got, "gpu-operator-pre")
+	}
+	if doc.Releases[0].CreateNamespace == nil || *doc.Releases[0].CreateNamespace {
+		t.Errorf("release[0] (gpu-operator-pre) CreateNamespace = %v, want pointer to false — "+
+			"pre-manifest ships a kind: Namespace, so helm must not create it out-of-band",
+			doc.Releases[0].CreateNamespace)
+	}
+	// release[1] is the primary upstream-helm; no override expected.
+	if doc.Releases[1].CreateNamespace != nil {
+		t.Errorf("release[1] (gpu-operator) CreateNamespace = %v, want nil",
+			doc.Releases[1].CreateNamespace)
+	}
+	// Global default is unchanged — every other release still benefits.
+	if !doc.HelmDefaults.CreateNamespace {
+		t.Error("helmDefaults.createNamespace should remain true; only the affected release overrides it")
+	}
+}
+
+func TestSanitizeRepoAlias_Edges(t *testing.T) {
+	tests := []struct {
+		name, in, want string
+	}{
+		{"empty input", "", "default-repo"},
+		{"only scheme", "https://", "default-repo"},
+		{"non-alphanum collapsed", "https://EXAMPLE.com/path_with_underscores", "example-com-path-with-underscores"},
+		{"truncated >63", "https://" + strings.Repeat("a", 100), strings.Repeat("a", 63)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeRepoAlias(tt.in); got != tt.want {
+				t.Errorf("sanitizeRepoAlias(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------- helpers ----------
+
+func ref(name, ns, chart, version, source string) recipe.ComponentRef {
+	return recipe.ComponentRef{
+		Name:      name,
+		Namespace: ns,
+		Chart:     chart,
+		Version:   version,
+		Source:    source,
+		Type:      recipe.ComponentTypeHelm,
+	}
+}
+
+func recipeWith(refs ...recipe.ComponentRef) *recipe.RecipeResult {
+	r := &recipe.RecipeResult{}
+	r.Metadata.Version = testBundlerVersion
+	r.ComponentRefs = refs
+	order := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		order = append(order, ref.Name)
+	}
+	r.DeploymentOrder = order
+	return r
+}
+
+func runScenario(t *testing.T, g *Generator, scenario string, goldenFiles []string) {
+	t.Helper()
+	outputDir := t.TempDir()
+	out, err := g.Generate(context.Background(), outputDir)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if out == nil || len(out.Files) == 0 {
+		t.Fatalf("Generate() returned no files")
+	}
+
+	// Validate helmfile.yaml is parseable as a YAML document. Helmfile's
+	// own validator (`helmfile lint`) is not available in unit tests, but
+	// a YAML parse plus a few shape assertions catches the common
+	// regressions (key drift, indentation bugs from template changes).
+	helmfilePath := filepath.Join(outputDir, fileHelmfile)
+	assertHelmfileShape(t, helmfilePath)
+
+	for _, rel := range goldenFiles {
+		assertGolden(t, outputDir, filepath.Join("testdata", scenario), rel)
+	}
+}
+
+func assertGolden(t *testing.T, outDir, goldenDir, relPath string) {
+	t.Helper()
+	got, err := os.ReadFile(filepath.Join(outDir, relPath))
+	if err != nil {
+		t.Fatalf("read actual %s: %v", relPath, err)
+	}
+	goldenPath := filepath.Join(goldenDir, relPath)
+	if *update {
+		if err = os.MkdirAll(filepath.Dir(goldenPath), 0o755); err != nil {
+			t.Fatalf("mkdir golden: %v", err)
+		}
+		if err = os.WriteFile(goldenPath, got, 0o644); err != nil {
+			t.Fatalf("write golden: %v", err)
+		}
+		return
+	}
+	want, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden %s: %v (run with -update to regenerate)", goldenPath, err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("%s differs from golden:\n--- got ---\n%s\n--- want ---\n%s",
+			relPath, got, want)
+	}
+}
+
+// assertHelmfileShape parses helmfile.yaml at path and verifies its
+// structural invariants. Two layouts are supported:
+//
+//   - Single-file: helmfile.yaml IS a leaf with releases/helmDefaults.
+//   - Split (issue #914): helmfile.yaml is a TopHelmfile carrying a
+//     helmfiles: list pointing at level-0 ... level-N.yaml siblings.
+//
+// In the split case the top-level file is validated for the helmfiles:
+// list shape and each leaf sub-helmfile is recursively checked.
+func assertHelmfileShape(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	// Try top-level multi-helmfiles layout first. yaml.v3 is permissive
+	// and would also parse this into Helmfile{} with empty fields, so
+	// gate on a populated Helmfiles list to detect intent.
+	var top TopHelmfile
+	if topErr := yaml.Unmarshal(data, &top); topErr == nil && len(top.Helmfiles) > 0 {
+		dir := filepath.Dir(path)
+		for _, sub := range top.Helmfiles {
+			if sub.Path == "" {
+				t.Errorf("helmfiles entry has empty path")
+				continue
+			}
+			subPath := filepath.Join(dir, sub.Path)
+			if _, statErr := os.Stat(subPath); statErr != nil {
+				t.Errorf("helmfiles entry %q does not resolve to a file: %v",
+					sub.Path, statErr)
+				continue
+			}
+			assertHelmfileLeafShape(t, subPath)
+		}
+		return
+	}
+
+	assertHelmfileLeafShape(t, path)
+}
+
+// assertHelmfileLeafShape verifies the structural invariants of a leaf
+// helmfile.yaml or sub-helmfile (level-0.yaml ... level-N.yaml in the
+// split layout): non-zero helmDefaults.timeout and per-release sanity
+// checks.
+func assertHelmfileLeafShape(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var doc Helmfile
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse %s: %v\n--- content ---\n%s", path, err, data)
+	}
+	if doc.HelmDefaults.Timeout == 0 {
+		t.Errorf("%s: helmDefaults.timeout should be non-zero, got 0", path)
+	}
+	for i, rel := range doc.Releases {
+		if rel.Name == "" {
+			t.Errorf("%s: releases[%d].name is empty", path, i)
+		}
+		if rel.Namespace == "" {
+			t.Errorf("%s: releases[%d] (%s).namespace is empty", path, i, rel.Name)
+		}
+		if rel.Chart == "" {
+			t.Errorf("%s: releases[%d] (%s).chart is empty", path, i, rel.Name)
+		}
+		// KindUpstreamHelm releases must carry a version; KindLocalHelm
+		// (chart: ./<dir>) must not (helmfile would otherwise reject the
+		// version pin against a local chart).
+		isLocal := strings.HasPrefix(rel.Chart, "./")
+		switch {
+		case isLocal && rel.Version != "":
+			t.Errorf("%s: releases[%d] (%s) is a local chart but has version=%q",
+				path, i, rel.Name, rel.Version)
+		case !isLocal && rel.Version == "":
+			t.Errorf("%s: releases[%d] (%s) references an upstream chart %q but has no version",
+				path, i, rel.Name, rel.Chart)
+		}
+	}
+}

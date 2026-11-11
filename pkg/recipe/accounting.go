@@ -1,0 +1,525 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package recipe
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/header"
+	"gopkg.in/yaml.v3"
+)
+
+const (
+	slinkySlurmComponentName            = "slinky-slurm"
+	mariaDBOperatorCRDsComponentName    = "mariadb-operator-crds"
+	mariaDBOperatorComponentName        = "mariadb-operator"
+	slurmAccountingMariaDBComponentName = "slurm-accounting-mariadb"
+	accountingEnabledOverrideKey        = "enabled"
+	componentEnabledOverrideKey         = "enabled"
+	componentInstallOverrideKey         = "install"
+)
+
+// AccountingMode is the ownership model for a Slurm accounting database.
+// It is intentionally not a recipe criterion: changing it changes resolved
+// configuration, not catalog selection.
+type AccountingMode string
+
+const (
+	AccountingModeDisabled        AccountingMode = "disabled"
+	AccountingModeCustomerManaged AccountingMode = "customer-managed"
+	AccountingModeAICRProvided    AccountingMode = "aicr-provided"
+)
+
+// AccountingModes returns the accepted wire values in stable display order.
+func AccountingModes() []string {
+	return []string{
+		string(AccountingModeDisabled),
+		string(AccountingModeCustomerManaged),
+		string(AccountingModeAICRProvided),
+	}
+}
+
+// ParseAccountingMode parses a customer-facing accounting mode.
+func ParseAccountingMode(value string) (AccountingMode, error) {
+	mode := AccountingMode(strings.ToLower(strings.TrimSpace(value)))
+	switch mode {
+	case AccountingModeDisabled, AccountingModeCustomerManaged, AccountingModeAICRProvided:
+		return mode, nil
+	default:
+		return "", errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("invalid Slurm accounting mode %q: must be one of %s",
+				value, strings.Join(AccountingModes(), ", ")))
+	}
+}
+
+// RecipeConfiguration records typed desired-state choices that affect the
+// resolved recipe without participating in catalog matching.
+type RecipeConfiguration struct {
+	Slurm *SlurmConfiguration `json:"slurm,omitempty" yaml:"slurm,omitempty"`
+
+	// Selections remain typed because each needs component-specific validation
+	// and application rules, rather than a generic per-component parameter map.
+	RuntimeInventory *RuntimeInventoryConfiguration `json:"runtimeInventory,omitempty" yaml:"runtimeInventory,omitempty"`
+	GKE              *GKEConfiguration              `json:"gke,omitempty" yaml:"gke,omitempty"`
+}
+
+// SlurmConfiguration records Slurm-specific desired state.
+type SlurmConfiguration struct {
+	Accounting *SlurmAccountingConfiguration `json:"accounting,omitempty" yaml:"accounting,omitempty"`
+}
+
+// SlurmAccountingConfiguration records the selected accounting ownership mode.
+type SlurmAccountingConfiguration struct {
+	Mode AccountingMode `json:"mode" yaml:"mode"`
+}
+
+// BuildOption configures one recipe build without mutating the shared Builder.
+type BuildOption func(*buildConfig)
+
+type buildConfig struct {
+	accountingMode       *AccountingMode
+	runtimeInventoryMode *RuntimeInventoryMode
+	tcpxoInterfaces      *[]NetworkInterfaceMapping
+}
+
+// WithAccountingMode selects the Slurm accounting ownership mode for one
+// build. The mode is validated again at the build boundary.
+func WithAccountingMode(mode AccountingMode) BuildOption {
+	return func(cfg *buildConfig) {
+		cfg.accountingMode = &mode
+	}
+}
+
+func resolveBuildConfig(criteria *Criteria, opts ...BuildOption) (*buildConfig, error) {
+	cfg := &buildConfig{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(cfg)
+		}
+	}
+
+	isSlurm := criteria != nil && criteria.Platform == CriteriaPlatformSlurm
+	if cfg.accountingMode != nil && !isSlurm {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			"Slurm accounting mode can only be set when recipe platform is slurm")
+	}
+
+	// The GKE TCPXO mapping is platform-independent at this layer: reject
+	// only when a concrete criteria dimension already rules the family out,
+	// and defer the component-presence question to applyGKETCPXOInterfaces,
+	// which sees the resolved recipe.
+	if cfg.tcpxoInterfaces != nil {
+		if criteria != nil && criteria.Service != "" && criteria.Service != CriteriaServiceAny &&
+			criteria.Service != CriteriaServiceGKE {
+
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"GKE TCPXO interfaces can only be set when recipe service is gke")
+		}
+		if criteria != nil && criteria.Accelerator != "" && criteria.Accelerator != CriteriaAcceleratorAny &&
+			criteria.Accelerator != CriteriaAcceleratorH100 {
+
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"GKE TCPXO interfaces are supported on h100 (a3-megagpu-8g) recipes only")
+		}
+		if criteria != nil && criteria.Platform != "" && criteria.Platform != CriteriaPlatformAny &&
+			criteria.Platform != CriteriaPlatformKubeflow {
+
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"GKE TCPXO interfaces can only be set when recipe platform is kubeflow")
+		}
+		if err := ValidateGKETCPXOInterfaces(*cfg.tcpxoInterfaces); err != nil {
+			return nil, err
+		}
+	}
+
+	if !isSlurm {
+		return cfg, nil
+	}
+	if cfg.accountingMode == nil {
+		mode := AccountingModeDisabled
+		cfg.accountingMode = &mode
+	}
+	mode, err := ParseAccountingMode(string(*cfg.accountingMode))
+	if err != nil {
+		return nil, err
+	}
+	cfg.accountingMode = &mode
+	return cfg, nil
+}
+
+// AccountingOwnership returns the canonical component paths controlled by the
+// selected Slurm accounting mode. Every configured mode owns the derived gates
+// and component-presence decisions. AICR-provided mode additionally owns the
+// fixed cross-component MariaDB connection contract.
+func AccountingOwnership(mode AccountingMode) OwnershipDomain {
+	paths := map[string][]string{
+		slinkySlurmComponentName: {
+			"accounting.enabled",
+			profileComponentEnabledPath,
+		},
+		mariaDBOperatorCRDsComponentName: {
+			profileComponentEnabledPath,
+			componentInstallOverrideKey,
+		},
+		mariaDBOperatorComponentName: {
+			profileComponentEnabledPath,
+			componentInstallOverrideKey,
+		},
+		slurmAccountingMariaDBComponentName: {
+			profileComponentEnabledPath,
+			componentInstallOverrideKey,
+		},
+	}
+	if mode == AccountingModeAICRProvided {
+		paths[slinkySlurmComponentName] = append(paths[slinkySlurmComponentName],
+			"accounting.storageConfig.database",
+			"accounting.storageConfig.host",
+			"accounting.storageConfig.passwordKeyRef.key",
+			"accounting.storageConfig.passwordKeyRef.name",
+			"accounting.storageConfig.port",
+			"accounting.storageConfig.username",
+		)
+		paths[slurmAccountingMariaDBComponentName] = append(
+			paths[slurmAccountingMariaDBComponentName],
+			"databases",
+			"fullnameOverride",
+			"grants",
+			"mariadb.cleanupPolicy",
+			"mariadb.database",
+			"mariadb.passwordSecretKeyRef.generate",
+			"mariadb.passwordSecretKeyRef.key",
+			"mariadb.passwordSecretKeyRef.name",
+			"mariadb.rootPasswordSecretKeyRef.generate",
+			"mariadb.rootPasswordSecretKeyRef.key",
+			"mariadb.rootPasswordSecretKeyRef.name",
+			"mariadb.username",
+			"namespaceOverride",
+			"users",
+		)
+	}
+	return OwnershipDomain{
+		Name:  fmt.Sprintf("configuration.slurm.accounting.mode=%s", mode),
+		Paths: paths,
+	}
+}
+
+func validateAccountingProfileOwnership(result *RecipeResult, mode AccountingMode) error {
+	if result == nil || result.Metadata.SelectedProfile == nil {
+		return nil
+	}
+	selected := result.Metadata.SelectedProfile
+	return ValidateOwnershipDisjoint(
+		OwnershipDomain{
+			Name:  fmt.Sprintf("profile %s=%s", selected.Name, selected.Value),
+			Paths: selected.OwnedPaths,
+		},
+		AccountingOwnership(mode),
+	)
+}
+
+func applyBuildConfig(result *RecipeResult, cfg *buildConfig) error {
+	if result == nil || cfg == nil {
+		return nil
+	}
+	selected := false
+	if cfg.runtimeInventoryMode != nil {
+		if err := applyRuntimeInventoryMode(result, *cfg.runtimeInventoryMode); err != nil {
+			return err
+		}
+		selected = true
+	}
+	// Runs unconditionally — including builds that supply no mapping —
+	// because fail-closed on a recipe that ships torch-distributed-tcpxo is
+	// the contract. It does not change component enablement, so it does not
+	// participate in the deployment-order recompute `selected` tracks.
+	if err := applyGKETCPXOInterfaces(result, cfg.tcpxoInterfaces); err != nil {
+		return err
+	}
+	if cfg.accountingMode == nil {
+		// Deployment order still has to be refreshed: a selection that ran
+		// above may have disabled a component, and the accounting path's own
+		// recompute is not reached on this branch.
+		if selected {
+			return recomputeDeploymentOrder(result)
+		}
+		return nil
+	}
+
+	mode := *cfg.accountingMode
+	if err := validateAccountingProfileOwnership(result, mode); err != nil {
+		return err
+	}
+	// Update in place rather than assigning a fresh RecipeConfiguration:
+	// another selection may already have recorded its own section, and
+	// replacing the struct would silently discard it while leaving that
+	// selection's component overrides applied. A recipe that acts on a
+	// decision it no longer records is worse than one that never made it.
+	if result.Configuration == nil {
+		result.Configuration = &RecipeConfiguration{}
+	}
+	result.Configuration.Slurm = &SlurmConfiguration{
+		Accounting: &SlurmAccountingConfiguration{Mode: mode},
+	}
+	result.APIVersion = ConfiguredRecipeResultAPIVersion
+
+	accountingEnabled := mode != AccountingModeDisabled
+	mariaDBInstall := mode == AccountingModeAICRProvided
+
+	if err := setComponentOverride(result, slinkySlurmComponentName,
+		map[string]any{"accounting": map[string]any{accountingEnabledOverrideKey: accountingEnabled}}); err != nil {
+		return err
+	}
+	if accountingEnabled {
+		if err := appendSlurmAccountingHealthCheck(result); err != nil {
+			return err
+		}
+	}
+	for _, name := range []string{
+		mariaDBOperatorCRDsComponentName,
+		mariaDBOperatorComponentName,
+		slurmAccountingMariaDBComponentName,
+	} {
+		if err := setComponentOverride(result, name, map[string]any{componentInstallOverrideKey: mariaDBInstall}); err != nil {
+			return err
+		}
+	}
+	return recomputeDeploymentOrder(result)
+}
+
+// recomputeDeploymentOrder refreshes DeploymentOrder after a selection has
+// changed which components are enabled.
+//
+// TopologicalSort emits enabled components only, so a selection that disables
+// one without recomputing leaves the disabled component listed in the emitted
+// recipe's deploymentOrder. The bundler re-filters by IsEnabled, so nothing
+// mis-deploys, but the artifact contradicts itself and `aicr query --selector
+// deploymentOrder` reports a component the same document marks disabled.
+func recomputeDeploymentOrder(result *RecipeResult) error {
+	spec := &RecipeMetadataSpec{ComponentRefs: result.ComponentRefs}
+	deploymentOrder, err := spec.TopologicalSort()
+	if err != nil {
+		return errors.PropagateOrWrap(err, errors.ErrCodeInternal,
+			"failed to recompute deployment order after applying a build selection")
+	}
+	result.DeploymentOrder = deploymentOrder
+	return nil
+}
+
+const slurmAccountingHealthStepTemplate = `
+name: validate-accounting-ready
+try:
+  - assert:
+      resource:
+        apiVersion: apps/v1
+        kind: StatefulSet
+        metadata:
+          name: %q
+          namespace: %q
+        status:
+          (availableReplicas > ` + "`0`" + `): true
+`
+
+func appendSlurmAccountingHealthCheck(result *RecipeResult) error {
+	ref := result.GetComponentRef(slinkySlurmComponentName)
+	if ref == nil {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("Slurm recipe is missing required component %q", slinkySlurmComponentName))
+	}
+	if strings.TrimSpace(ref.HealthCheckAsserts) == "" {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"enabled Slurm accounting requires a slinky-slurm health check")
+	}
+	if strings.TrimSpace(ref.Namespace) == "" {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"enabled Slurm accounting requires a namespace for slinky-slurm")
+	}
+
+	docs, err := decodeHealthCheck(ref.HealthCheckAsserts)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest,
+			"failed to parse slinky-slurm health check for accounting specialization", err)
+	}
+	if len(docs) == 0 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"slinky-slurm health check has no documents")
+	}
+	// The step joins the first document, which is the Test. Later documents
+	// are kept as they are.
+	check, ok := docs[0].(map[string]any)
+	if !ok {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"slinky-slurm health check has no object spec")
+	}
+	spec, ok := check["spec"].(map[string]any)
+	if !ok {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"slinky-slurm health check has no object spec")
+	}
+	steps, ok := spec["steps"].([]any)
+	if !ok {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"slinky-slurm health check has no steps list")
+	}
+	var accountingStep map[string]any
+	stepData := fmt.Sprintf(slurmAccountingHealthStepTemplate,
+		ref.Name+"-accounting", ref.Namespace)
+	if err = yaml.Unmarshal([]byte(stepData), &accountingStep); err != nil {
+		return errors.Wrap(errors.ErrCodeInternal,
+			"failed to parse built-in Slurm accounting health check", err)
+	}
+	spec["steps"] = append(steps, accountingStep)
+	data, err := encodeHealthCheck(docs)
+	if err != nil {
+		return errors.PropagateOrWrap(err, errors.ErrCodeInternal,
+			"failed to serialize Slurm accounting health check")
+	}
+	ref.HealthCheckAsserts = data
+	return nil
+}
+
+func setComponentOverride(result *RecipeResult, name string, override map[string]any) error {
+	ref := result.GetComponentRef(name)
+	if ref == nil {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("Slurm recipe is missing required accounting component %q", name))
+	}
+	if ref.Overrides == nil {
+		ref.Overrides = make(map[string]any)
+	}
+	deepMergeMap(ref.Overrides, override)
+	return nil
+}
+
+// AccountingMode returns the recipe-selected Slurm accounting mode. The bool
+// is false for legacy recipes that do not carry typed accounting evidence.
+func (r *RecipeResult) AccountingMode() (AccountingMode, bool) {
+	if r == nil || r.Configuration == nil || r.Configuration.Slurm == nil ||
+		r.Configuration.Slurm.Accounting == nil {
+
+		return "", false
+	}
+	return r.Configuration.Slurm.Accounting.Mode, true
+}
+
+func (r *RecipeResult) validateAccountingConfiguration() error {
+	mode, present := r.AccountingMode()
+	if !present {
+		return nil
+	}
+	if !header.IsSupportedProfileAPIVersion(r.APIVersion) {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("configuration.slurm.accounting requires apiVersion %q (got %q%s)",
+				header.GroupVersionV1Beta2, r.APIVersion, header.RetirementNote(r.APIVersion)))
+	}
+	if r.Criteria == nil || r.Criteria.Platform != CriteriaPlatformSlurm {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"configuration.slurm.accounting is only valid for a Slurm recipe")
+	}
+	normalizedMode, err := ParseAccountingMode(string(mode))
+	if err != nil {
+		return err
+	}
+	if normalizedMode != mode {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("configuration.slurm.accounting.mode must use canonical value %q (got %q)",
+				normalizedMode, mode))
+	}
+	if err := validateAccountingProfileOwnership(r, mode); err != nil {
+		return err
+	}
+
+	expectedAccounting := mode != AccountingModeDisabled
+	expectedInstall := mode == AccountingModeAICRProvided
+	if err := requireBoolOverride(r, slinkySlurmComponentName,
+		[]string{"accounting", "enabled"}, expectedAccounting); err != nil {
+		return err
+	}
+	if expectedAccounting {
+		if err := requireAccountingComponentEnabled(r, slinkySlurmComponentName, mode); err != nil {
+			return err
+		}
+	}
+	for _, name := range []string{
+		mariaDBOperatorCRDsComponentName,
+		mariaDBOperatorComponentName,
+		slurmAccountingMariaDBComponentName,
+	} {
+		if err := requireBoolOverride(r, name, []string{"install"}, expectedInstall); err != nil {
+			return err
+		}
+		if expectedInstall {
+			if err := requireAccountingComponentEnabled(r, name, mode); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func requireAccountingComponentEnabled(
+	result *RecipeResult,
+	component string,
+	mode AccountingMode,
+) error {
+
+	ref := result.GetComponentRef(component)
+	if ref == nil {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("accounting mode requires component %q", component))
+	}
+	if !ref.IsEnabled() {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q must be enabled for Slurm accounting mode %q", component, mode))
+	}
+	return nil
+}
+
+// requireBoolOverride treats an absent component as satisfying expected=false:
+// a bundle's recipe.yaml omits disabled components, and one that is not in the
+// recipe installs nothing.
+func requireBoolOverride(result *RecipeResult, component string, path []string, expected bool) error {
+	ref := result.GetComponentRef(component)
+	if ref == nil {
+		if !expected {
+			return nil
+		}
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("accounting mode requires component %q", component))
+	}
+	var value any = ref.Overrides
+	for _, key := range path {
+		m, ok := value.(map[string]any)
+		if !ok {
+			return accountingOverrideError(component, path, expected, value)
+		}
+		value, ok = m[key]
+		if !ok {
+			return accountingOverrideError(component, path, expected, nil)
+		}
+	}
+	actual, ok := value.(bool)
+	if !ok || actual != expected {
+		return accountingOverrideError(component, path, expected, value)
+	}
+	return nil
+}
+
+func accountingOverrideError(component string, path []string, expected bool, actual any) error {
+	return errors.New(errors.ErrCodeInvalidRequest,
+		fmt.Sprintf("component %q override %s must be %t for the selected Slurm accounting mode (got %v)",
+			component, strings.Join(path, "."), expected, actual))
+}

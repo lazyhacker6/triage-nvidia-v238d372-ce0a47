@@ -1,0 +1,370 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package attestation
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestBuildPredicate_FillsConstantFields(t *testing.T) {
+	now := time.Date(2026, 5, 8, 10, 23, 11, 0, time.UTC)
+	p := BuildPredicate(PredicateInputs{AttestedAt: now})
+	if p.SchemaVersion != PredicateSchemaVersion {
+		t.Errorf("SchemaVersion = %q, want %q", p.SchemaVersion, PredicateSchemaVersion)
+	}
+	if !p.AttestedAt.Equal(now) {
+		t.Errorf("AttestedAt = %v, want %v", p.AttestedAt, now)
+	}
+}
+
+func TestBuildPredicate_AICRCommit(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	tests := []struct {
+		name   string
+		commit string
+		want   string
+	}{
+		{"full sha", sha, sha},
+		{"short sha", "abc1234", "abc1234"},
+		{"uppercase sha is lowercased", "ABC1234", "abc1234"},
+		{"unstamped build", "unknown", ""},
+		{"empty", "", ""},
+		{"too short", "abc12", ""},
+		{"not hex", "zzzzzzz", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := BuildPredicate(PredicateInputs{AICRCommit: tt.commit})
+			if p.AICRCommit != tt.want {
+				t.Errorf("AICRCommit = %q, want %q", p.AICRCommit, tt.want)
+			}
+			body, err := json.Marshal(p)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if has := strings.Contains(string(body), `"aicrCommit"`); has != (tt.want != "") {
+				t.Errorf("aicrCommit key present = %v, want %v:\n%s", has, tt.want != "", body)
+			}
+		})
+	}
+}
+
+func TestBuildPredicate_SortsValidatorImages(t *testing.T) {
+	p := BuildPredicate(PredicateInputs{
+		ValidatorImages: []ValidatorImage{
+			{Image: "z-image", Digest: "sha256:zz"},
+			{Image: "a-image", Digest: "sha256:aa"},
+		},
+	})
+	if p.ValidatorImages[0].Image != "a-image" {
+		t.Errorf("expected a-image first, got %q", p.ValidatorImages[0].Image)
+	}
+}
+
+func TestBuildPredicate_CarriesRedaction(t *testing.T) {
+	ri := &RedactionInfo{Policy: "minimal", Version: "v1", Applied: []string{"a", "b"}}
+	p := BuildPredicate(PredicateInputs{Redaction: ri})
+	if p.Redaction == nil {
+		t.Fatalf("expected Redaction to be set")
+	}
+	if p.Redaction.Policy != "minimal" || p.Redaction.Version != "v1" {
+		t.Errorf("unexpected redaction policy/version: %+v", p.Redaction)
+	}
+}
+
+func TestBuildPredicate_CarriesProfile(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile *ProfilePredicate
+	}{
+		{
+			name: "profiled input propagates the profile block",
+			profile: &ProfilePredicate{
+				Selection:                "gpuStack=gke-default",
+				Advertiser:               "external",
+				PolicyDescriptorIdentity: "abc123",
+			},
+		},
+		{
+			// Unprofiled input stays unprofiled — the v1/v2
+			// predicate-type split keys off this nil.
+			name:    "unprofiled input stays nil",
+			profile: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := BuildPredicate(PredicateInputs{Profile: tt.profile})
+			if tt.profile == nil {
+				if p.Profile != nil {
+					t.Fatalf("expected nil Profile for unprofiled input, got %+v", p.Profile)
+				}
+				return
+			}
+			if p.Profile == nil {
+				t.Fatalf("expected Profile to be set")
+			}
+			if p.Profile.Selection != tt.profile.Selection ||
+				p.Profile.Advertiser != tt.profile.Advertiser ||
+				p.Profile.PolicyDescriptorIdentity != tt.profile.PolicyDescriptorIdentity {
+
+				t.Errorf("profile block not propagated: %+v", p.Profile)
+			}
+		})
+	}
+}
+
+func TestBuildPredicate_RedactionOmittedWhenNil(t *testing.T) {
+	p := BuildPredicate(PredicateInputs{})
+	if p.Redaction != nil {
+		t.Errorf("expected nil Redaction for full bundle, got %+v", p.Redaction)
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(body), "redaction") {
+		t.Errorf("redaction key must be omitted when nil; body=%s", body)
+	}
+}
+
+func TestBuildPredicate_OnlyKnownPhasesEmitted(t *testing.T) {
+	p := BuildPredicate(PredicateInputs{
+		Phases: map[Phase]PhaseSummary{
+			PhaseDeployment:  {Passed: 1},
+			PhasePerformance: {Passed: 0},
+			Phase("rogue"):   {Passed: 99},
+		},
+	})
+	if _, ok := p.Phases["rogue"]; ok {
+		t.Errorf("predicate must not carry unknown phase keys")
+	}
+	if _, ok := p.Phases[PhaseDeployment]; !ok {
+		t.Errorf("expected deployment phase to be present")
+	}
+}
+
+func TestBuildStatement_RejectsBadInputs(t *testing.T) {
+	pred := BuildPredicate(PredicateInputs{})
+	cases := []struct {
+		name      string
+		recipe    string
+		digest    string
+		predicate *Predicate
+	}{
+		{"empty recipe name", "", strings.Repeat("a", 64), pred},
+		{"empty digest", "h100-eks", "", pred},
+		{"short digest", "h100-eks", "abcd", pred},
+		{"nil predicate", "h100-eks", strings.Repeat("a", 64), nil},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := BuildStatement(tt.recipe, tt.digest, tt.predicate); err == nil {
+				t.Errorf("expected error for %s", tt.name)
+			}
+		})
+	}
+}
+
+func TestBuildStatement_ReturnsValidIntotoJSON(t *testing.T) {
+	pred := BuildPredicate(PredicateInputs{
+		AttestedAt:  time.Date(2026, 5, 8, 10, 23, 11, 0, time.UTC),
+		AICRVersion: "v0.13.0",
+	})
+	stmt, err := BuildStatement("h100-eks-ubuntu-training", strings.Repeat("a", 64), pred)
+	if err != nil {
+		t.Fatalf("BuildStatement: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(stmt, &parsed); err != nil {
+		t.Fatalf("statement is not JSON: %v", err)
+	}
+	if parsed["predicateType"] != PredicateTypeV3 {
+		t.Errorf("predicateType = %v, want %v", parsed["predicateType"], PredicateTypeV3)
+	}
+	subj, ok := parsed["subject"].([]any)
+	if !ok || len(subj) != 1 {
+		t.Fatalf("expected single subject, got %v", parsed["subject"])
+	}
+	first, ok := subj[0].(map[string]any)
+	if !ok {
+		t.Fatalf("subject[0] not an object")
+	}
+	if first["name"] != "recipe:h100-eks-ubuntu-training" {
+		t.Errorf("subject.name = %v, want recipe:<name> form", first["name"])
+	}
+}
+
+func TestSubjectName_PrefixesRecipe(t *testing.T) {
+	if got := SubjectName("foo"); got != "recipe:foo" {
+		t.Errorf("SubjectName = %q, want recipe:foo", got)
+	}
+}
+
+func TestBuildArtifactStatement_SubjectIsArtifactDigest(t *testing.T) {
+	pred := BuildPredicate(PredicateInputs{
+		AttestedAt:  time.Date(2026, 5, 8, 10, 23, 11, 0, time.UTC),
+		AICRVersion: "v0.13.0",
+		Recipe: RecipeRef{
+			Name:   "h100-eks-ubuntu-training",
+			Digest: strings.Repeat("c", 64),
+		},
+	})
+	artifactDigest := strings.Repeat("b", 64)
+	stmt, err := BuildArtifactStatement("ghcr.io/example/aicr-evidence", artifactDigest, "", pred)
+	if err != nil {
+		t.Fatalf("BuildArtifactStatement: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(stmt, &parsed); err != nil {
+		t.Fatalf("statement is not JSON: %v", err)
+	}
+	if parsed["predicateType"] != PredicateTypeV3 {
+		t.Errorf("predicateType = %v, want %v", parsed["predicateType"], PredicateTypeV3)
+	}
+	subj, ok := parsed["subject"].([]any)
+	if !ok || len(subj) != 1 {
+		t.Fatalf("expected single subject, got %v", parsed["subject"])
+	}
+	first, ok := subj[0].(map[string]any)
+	if !ok {
+		t.Fatalf("subject[0] not an object")
+	}
+	if first["name"] != "ghcr.io/example/aicr-evidence" {
+		t.Errorf("subject.name = %v, want OCI ref form (no scheme, no tag)", first["name"])
+	}
+	digestMap, ok := first["digest"].(map[string]any)
+	if !ok {
+		t.Fatalf("subject.digest not an object: %v", first["digest"])
+	}
+	if digestMap["sha256"] != artifactDigest {
+		t.Errorf("subject.digest.sha256 = %v, want %v (artifact digest, NOT recipe digest)", digestMap["sha256"], artifactDigest)
+	}
+	// Recipe identity must remain reachable from the signed payload.
+	predBody, ok := parsed["predicate"].(map[string]any)
+	if !ok {
+		t.Fatalf("predicate not an object: %v", parsed["predicate"])
+	}
+	recipeBlock, ok := predBody["recipe"].(map[string]any)
+	if !ok {
+		t.Fatalf("predicate.recipe missing: %v", predBody)
+	}
+	if recipeBlock["name"] != "h100-eks-ubuntu-training" {
+		t.Errorf("predicate.recipe.name = %v, want h100-eks-ubuntu-training", recipeBlock["name"])
+	}
+	if recipeBlock["digest"] != strings.Repeat("c", 64) {
+		t.Errorf("predicate.recipe.digest = %v, want the canonicalized recipe digest", recipeBlock["digest"])
+	}
+}
+
+func TestBuildArtifactStatement_RejectsBadInputs(t *testing.T) {
+	goodPred := &Predicate{
+		Recipe: RecipeRef{Name: "x", Digest: strings.Repeat("a", 64)},
+	}
+	tests := []struct {
+		name           string
+		ociRef         string
+		artifactDigest string
+		pred           *Predicate
+		wantContains   string
+	}{
+		{"empty ref", "", strings.Repeat("a", 64), goodPred, "OCI reference is required"},
+		{"empty digest", "ghcr.io/x/y", "", goodPred, "artifact digest is required"},
+		{"short digest", "ghcr.io/x/y", "abc", goodPred, "artifact digest must be 64 hex"},
+		{"nil predicate", "ghcr.io/x/y", strings.Repeat("a", 64), nil, "predicate is required"},
+		{"missing recipe name",
+			"ghcr.io/x/y", strings.Repeat("a", 64),
+			&Predicate{Recipe: RecipeRef{Digest: strings.Repeat("a", 64)}},
+			"predicate.recipe.{name,digest} must be populated"},
+		{"missing recipe digest",
+			"ghcr.io/x/y", strings.Repeat("a", 64),
+			&Predicate{Recipe: RecipeRef{Name: "x"}},
+			"predicate.recipe.{name,digest} must be populated"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := BuildArtifactStatement(tt.ociRef, tt.artifactDigest, "", tt.pred)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantContains)
+			}
+			if !strings.Contains(err.Error(), tt.wantContains) {
+				t.Errorf("error = %q, want substring %q", err.Error(), tt.wantContains)
+			}
+		})
+	}
+}
+
+// TestStatementPredicateTypeSelection pins that newly produced evidence is
+// always typed PredicateTypeV3, whether or not the predicate carries a
+// profile block.
+func TestStatementPredicateTypeSelection(t *testing.T) {
+	if got := StatementPredicateType(&Predicate{}); got != PredicateTypeV3 {
+		t.Errorf("unprofiled type = %q, want %q", got, PredicateTypeV3)
+	}
+	profiled := &Predicate{Profile: &ProfilePredicate{
+		Selection: "gpuStack=gke-default", PolicyDescriptorIdentity: "abc",
+	}}
+	if got := StatementPredicateType(profiled); got != PredicateTypeV3 {
+		t.Errorf("profiled type = %q, want %q", got, PredicateTypeV3)
+	}
+}
+
+// TestValidatePredicateTypeCoherence pins the bidirectional type contract
+// every evidence consumer shares.
+func TestValidatePredicateTypeCoherence(t *testing.T) {
+	profile := &ProfilePredicate{
+		Selection: "gpuStack=operator-managed", PolicyDescriptorIdentity: "abc",
+	}
+	tests := []struct {
+		name          string
+		predicateType string
+		pred          *Predicate
+		wantErr       string
+	}{
+		{"v1 unprofiled ok", PredicateTypeV1, &Predicate{}, ""},
+		{"v2 profiled ok", PredicateTypeV2, &Predicate{Profile: profile}, ""},
+		{"v1 with profile block rejected", PredicateTypeV1, &Predicate{Profile: profile}, "cannot carry a profile block"},
+		{"v2 without profile block rejected", PredicateTypeV2, &Predicate{}, "requires the predicate profile block"},
+		{"v2 with empty identity rejected", PredicateTypeV2,
+			&Predicate{Profile: &ProfilePredicate{Selection: "gpuStack=operator-managed"}},
+			"policyDescriptorIdentity"},
+		{"v2 with empty selection rejected", PredicateTypeV2,
+			&Predicate{Profile: &ProfilePredicate{PolicyDescriptorIdentity: "abc"}},
+			"selection"},
+		{"v2 with malformed selection rejected", PredicateTypeV2,
+			&Predicate{Profile: &ProfilePredicate{
+				Selection: "gpuStack", PolicyDescriptorIdentity: "abc",
+			}},
+			"malformed selection"},
+		{"unknown type rejected", "https://aicr.run/recipe-evidence/v9", &Predicate{}, "unexpected predicateType"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidatePredicateTypeCoherence(tt.predicateType, tt.pred)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}

@@ -1,0 +1,145 @@
+#!/bin/bash
+set -euo pipefail
+
+# =============================================================================
+# E2E Integration Tests for aicr CLI
+# =============================================================================
+#
+# PURPOSE:
+# Builds the aicr binary and runs Chainsaw-based CLI integration tests.
+# Tests are defined declaratively in tests/chainsaw/cli/ and tests/chainsaw/bundle-templates/.
+#
+# WHAT THIS SCRIPT DOES:
+# 1. Builds the aicr binary via make build
+# 2. Locates the platform-specific binary
+# 3. Runs chainsaw test --no-cluster on tests/chainsaw/cli/ and tests/chainsaw/bundle-templates/
+#
+# PREREQUISITES:
+# - chainsaw (brew install kyverno/tap/chainsaw)
+# - make, goreleaser (for building)
+#
+# =============================================================================
+
+# Dir setup
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${DIR}/common"
+ROOT=$(dirname "${DIR}")
+
+# Check required tools
+has_tools chainsaw make uname goreleaser
+
+# ============================================================================
+# BUILD
+# ============================================================================
+
+build_binary() {
+  msg "Building aicr binary"
+
+  cd "${ROOT}"
+
+  if ! make build 2>&1; then
+    err "Failed to build aicr binary"
+  fi
+
+  # Find the built binary (platform-specific)
+  local os_name arch_name
+  os_name=$(uname -s | tr '[:upper:]' '[:lower:]')
+  arch_name=$(uname -m)
+
+  # Convert arch name
+  case "$arch_name" in
+    x86_64) arch_name="amd64" ;;
+    aarch64|arm64) arch_name="arm64" ;;
+  esac
+
+  # Try to find the binary with various naming patterns
+  # goreleaser uses different suffixes:
+  # - _v1 for amd64 (x86_64 microarchitecture level 1)
+  # - _v8.0 for arm64 (ARMv8.0 baseline)
+  AICR_BIN=""
+  for pattern in \
+    "${ROOT}/dist/aicr_${os_name}_${arch_name}/aicr" \
+    "${ROOT}/dist/aicr_${os_name}_${arch_name}_v1/aicr" \
+    "${ROOT}/dist/aicr_${os_name}_${arch_name}_v8.0/aicr" \
+    "${ROOT}/dist/aicr_${os_name}_all/aicr"; do
+    if [ -x "$pattern" ]; then
+      AICR_BIN="$pattern"
+      break
+    fi
+  done
+
+  if [ -z "$AICR_BIN" ] || [ ! -x "$AICR_BIN" ]; then
+    err "Built binary not found in dist/"
+  fi
+
+  msg "Using binary: ${AICR_BIN}"
+  export AICR_BIN
+
+  # Detect binary attestation (created by goreleaser cosign hook when SLSA_PREDICATE is set)
+  ATTEST_FILE="$(dirname "$AICR_BIN")/aicr-attestation.sigstore.json"
+  if [[ -f "$ATTEST_FILE" ]]; then
+    export AICR_ATTESTED=true
+    msg "Binary attestation found: ${ATTEST_FILE}"
+  else
+    export AICR_ATTESTED=false
+    msg "No binary attestation found (attestation chainsaw tests will skip)"
+  fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+msg "Starting E2E Integration Tests (Chainsaw)"
+
+build_binary
+
+export REPO_ROOT="${ROOT}"
+
+# ci!=true drops the suites that need a CI-attested binary. Suites labelled
+# requires=docker start the registry image pinned in .settings.yaml
+# (testing_tools.registry_image). They run only when a Docker daemon answers
+# AND that image is present or can be pulled now; otherwise they are dropped
+# rather than failed, so a Docker-less or egress-less workstation still gets a
+# green `make e2e` and the skip is stated in the log. CI runners have both.
+SELECTOR='ci!=true'
+REGISTRY_IMAGE="$(sed -n "s/^  registry_image: '\(.*\)'$/\1/p" "${ROOT}/.settings.yaml")"
+# Every probe is time-bounded: a stalled daemon or a hanging pull must turn
+# into "prerequisite unavailable, skip", never a hung make e2e. `timeout` is
+# coreutils (`timeout` on CI runners, `gtimeout` from brew coreutils on macOS).
+# Without either there is no way to bound the probes, so the Docker suites are
+# skipped outright rather than probed unbounded.
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN=gtimeout
+fi
+bounded() { # <seconds> <command...>
+  "${TIMEOUT_BIN}" "$@"
+}
+if [ -z "${TIMEOUT_BIN}" ]; then
+  msg "No timeout/gtimeout on PATH to bound Docker probes (brew install coreutils); skipping requires=docker suites"
+  SELECTOR="${SELECTOR},requires!=docker"
+elif ! bounded 15 docker info >/dev/null 2>&1; then
+  msg "Docker daemon not reachable within 15s; skipping requires=docker suites"
+  SELECTOR="${SELECTOR},requires!=docker"
+elif [ -z "${REGISTRY_IMAGE}" ]; then
+  msg "testing_tools.registry_image not found in .settings.yaml; skipping requires=docker suites"
+  SELECTOR="${SELECTOR},requires!=docker"
+elif ! bounded 15 docker image inspect "${REGISTRY_IMAGE}" >/dev/null 2>&1 \
+    && ! bounded 120 docker pull -q "${REGISTRY_IMAGE}" >/dev/null 2>&1; then
+  msg "Cannot pull ${REGISTRY_IMAGE} within 120s; skipping requires=docker suites"
+  SELECTOR="${SELECTOR},requires!=docker"
+fi
+
+msg "Running chainsaw tests (CLI + bundle template tests)"
+chainsaw test \
+  --no-cluster \
+  --config "${ROOT}/tests/chainsaw/chainsaw-config.yaml" \
+  --test-dir "${ROOT}/tests/chainsaw/cli/" \
+  --test-dir "${ROOT}/tests/chainsaw/signing/" \
+  --test-dir "${ROOT}/tests/chainsaw/bundle-templates/" \
+  --selector "${SELECTOR}"
+
+msg "All tests passed!"

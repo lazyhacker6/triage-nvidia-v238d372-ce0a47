@@ -1,0 +1,136 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# NVIDIA DRA Driver GPU Helm values
+#
+# GPU Allocation Modes (issue #1327):
+#
+# The cluster supports two mutually exclusive GPU allocation mechanisms:
+#   1. Device-plugin (production default): pods request nvidia.com/gpu in
+#      resources.limits
+#   2. DRA (Dynamic Resource Allocation): pods use ResourceClaim with
+#      gpu.nvidia.com (experimental opt-in)
+#
+# IMPORTANT: exactly ONE whole-GPU advertiser per node. Enabling both
+# concurrently risks GPU over-admission — the two allocators keep INDEPENDENT
+# ledgers (neither sees the other's assignments), so dual advertisement can
+# double-allocate or contend for the same physical GPU. Recipe-backed
+# VALIDATION rejects dual advertisement (and an inert
+# gpuResourcesEnabledOverride=true with gpus.enabled=false) with an
+# invalid-request error at policy-resolution time — running `aicr validate`
+# is what enforces this; recipe/bundle generation alone does not invoke the
+# resolver, so skipping validation bypasses the check.
+#
+# UPGRADING from a dual-advertised (pre-#1327-flip) configuration: an
+# existing full-GPU gpu.nvidia.com claim workload is NOT drained by the Helm
+# change and can retain its prepared GPU while newly admitted scalar
+# workloads contend for the same device. Follow the documented boundary:
+# stop/delete all full-GPU claim workloads → confirm no allocated/reserved
+# gpu.nvidia.com claims remain → apply the flipped bundle → wait until
+# gpu.nvidia.com ResourceSlices disappear (compute-domain slices remain) →
+# confirm nvidia.com/gpu allocatable → only then start scalar workloads.
+# See docs/user/validation.md (Configured GPU allocation policy).
+#
+# The production default (below): full-GPU DRA advertisement is OFF and the
+# gpu-operator device plugin (devicePlugin.enabled=true, pinned in
+# recipes/components/gpu-operator/values.yaml) is the whole-GPU advertiser.
+# The DRA driver remains installed for non-GPU DRA resources — ComputeDomain/
+# IMEX channels and other structured resources — it just does not advertise
+# GPU ResourceSlices.
+#
+# Experimental DRA-only opt-in (full aicr validate NOT guaranteed until the
+# #1327 graduation checklist passes) — a recipe overlay must flip all THREE
+# values together:
+#   nvidia-dra-driver-gpu: resources.gpus.enabled=true
+#   nvidia-dra-driver-gpu: gpuResourcesEnabledOverride=true
+#   gpu-operator:          devicePlugin.enabled=false
+# On GKE-COS the gpuStack profile's dra value (issue #2517) is the stock
+# selection of exactly this tuple; the profile owns all three paths there.
+#
+# Future: KEP-5004 (DRAExtendedResource) lets the same nvidia.com/gpu
+# extended-resource request be served by either backend. When served by DRA,
+# mapped extended-resource requests and explicit claims share DRA
+# accounting, allowing AICR to retire the device plugin on those nodes after
+# validating that path (different nodes may still use different backends;
+# the KEP does not merge device-plugin and DRA accounting). Timeline: alpha
+# in K8s 1.34, beta/enabled-by-default in 1.36, targeted stable in 1.37.
+# AICR does not yet validate the mapped path (the dra-extended-resource
+# policy is reserved; see #1327).
+# See: https://github.com/kubernetes/enhancements/issues/5004
+
+# Pin rendered resource names to nvidia-dra-driver-gpu-*.
+#
+# - fullnameOverride strips the aicr-stack- release prefix from the
+#   resources that use the chart's fullname helper (ServiceAccounts,
+#   RoleBindings).
+# - nameOverride is needed because the chart uses the
+#   `dra-driver-nvidia-gpu.name` helper for the controller Deployment
+#   and the kubelet-plugin DaemonSet. That helper resolves to
+#   `nameOverride || .Chart.Name`, so without it the rendered names
+#   would be `dra-driver-nvidia-gpu-controller` and
+#   `dra-driver-nvidia-gpu-kubelet-plugin`, breaking the
+#   nvidia-dra-driver-gpu-* references in
+#   recipes/checks/nvidia-dra-driver-gpu/health-check.yaml,
+#   validators/conformance/dra_support_check.go, and
+#   tests/chainsaw/ai-conformance/common/assert-dra-driver.yaml.
+nameOverride: nvidia-dra-driver-gpu
+fullnameOverride: nvidia-dra-driver-gpu
+
+# Specify the driver root on the host.
+# If the NVIDIA GPU driver is managed using the NVIDIA GPU Driver Container,
+# this is typically /run/nvidia/driver.
+# For driver installed directly on a host, a value of `/` is used.
+# From https://github.com/NVIDIA/k8s-dra-driver/discussions/249
+
+nvidiaDriverRoot: /run/nvidia/driver
+
+# Production default (#1327): no full-GPU DRA advertisement, no chart-guard
+# waiver. gpuResourcesEnabledOverride=false keeps the upstream chart's
+# install-guard tripwire ARMED — a stray gpus.enabled=true without the
+# explicit waiver fails the install instead of silently dual-advertising.
+gpuResourcesEnabledOverride: false
+resources:
+  gpus:
+    enabled: false
+  computeDomains:
+    # Pinned explicitly: ComputeDomain/IMEX channels are load-bearing for
+    # GB200/MNNVL multi-node NVLink (and future MNNVL platforms) in EVERY
+    # allocation policy — disabling full-GPU DRA above must never disable
+    # them. Do not remove this pin (issue #1327).
+    enabled: true
+
+# The aicr.run/gpu-operator-chart-version annotation that forces
+# a DaemonSet re-roll on every gpu-operator chart bump (stale-NVML
+# mitigation; see PR #965 for the underlying class of bug) is no longer
+# hand-maintained here. As of #973 it is injected by the bundler from
+# the resolved gpu-operator componentRef version after
+# extractComponentValues and before buildDeployer in
+# pkg/bundler/bundler.go (see injectDRAChartVersionAnnotation), so the
+# annotation can never drift from the actual chart pin. Recipes that
+# disable either gpu-operator or nvidia-dra-driver-gpu leave the
+# rendered values untouched.
+#
+# priorityClassName is explicitly neutralized (""), overriding the
+# upstream chart's `system-node-critical` default. This lets the DRA
+# driver install in clusters whose PriorityClass admission restricts
+# `system-node-critical` to kube-system (PSA-restricted, ResourceQuota,
+# or PriorityClassPolicy gates), which AICR cannot assume. The trade-off
+# is that DRA pods can be evicted under node pressure; cluster operators
+# who need them to survive eviction should re-pin via their own overlay.
+# TODO(#1086): revisit whether a higher default (e.g., system-cluster-critical)
+# is safe across all supported services.
+controller:
+  priorityClassName: ""
+kubeletPlugin:
+  priorityClassName: ""

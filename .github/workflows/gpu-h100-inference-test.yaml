@@ -1,0 +1,139 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: GPU Inference Test (nvkind + H100 x1)
+
+on:
+  schedule:
+    - cron: '15 6 * * *'  # Daily, 6h offset from training test
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  workflow_dispatch:
+    inputs:
+      run_full_validation:
+        description: 'Run snapshot and CNCF AI Conformance validation'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+
+  # Gate GPU tests on actual PR diff (against main), not the push diff.
+  # Without this, rebasing a pull-request/* branch includes merged changes
+  # in the push diff, causing GPU tests to trigger for unrelated PRs.
+  check-paths:
+    if: github.repository == 'nvidia/aicr' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      should-run: ${{ steps.filter.outputs.matched }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        id: filter
+        with:
+          base: main
+          predicate-quantifier: 'some-with-excludes'
+          filters: |
+            matched:
+              - '.github/workflows/gpu-h100-inference-test.yaml'
+              - '.settings.yaml'
+              - '.github/actions/gpu-cluster-setup/**'
+              - '.github/actions/runtime-install/**'
+              - '.github/actions/check-control-plane-health/**'
+              - '.github/actions/aicr-build/**'
+              - '.github/actions/setup-build-tools/**'
+              - 'validators/*/Dockerfile'
+              - 'validators/conformance/**'
+              - 'recipes/validators/catalog.yaml'
+              - '.github/workflows/gpu-h100-kind-runtime-test.yaml'
+              - '.github/actions/gpu-workflow-prepare/**'
+              - '.github/actions/gpu-debug-diagnostics/**'
+              - '.github/actions/gpu-chainsaw-health/**'
+              - '.github/actions/gpu-validate-conformance/**'
+              - '.github/actions/gpu-test-cleanup/**'
+              - '.github/actions/load-versions/**'
+              - '.github/scripts/gpu-chainsaw-health.sh'
+              - '.github/scripts/gpu-debug-diagnostics.sh'
+              - 'pkg/bundler/deployer/helm/**'
+              # `aicr validate` (conformance) + recipe bundling are built from
+              # these Go sources; a regression must trigger the GPU conformance run.
+              - 'pkg/validator/**'
+              - 'pkg/recipe/**'
+              - 'pkg/cli/**'
+              - 'cmd/aicr/**'
+              - 'go.mod'
+              - 'go.sum'
+              - 'tests/chainsaw/chainsaw-config.yaml'
+              - 'tests/chainsaw/ai-conformance/common/**'
+              - 'tests/chainsaw/ai-conformance/kind-common/**'
+              - 'tests/chainsaw/ai-conformance/kind-inference-dynamo/**'
+              - 'recipes/data.go'
+              - 'recipes/registry.yaml'
+              - 'recipes/overlays/base.yaml'
+              - 'recipes/mixins/platform-inference.yaml'
+              - 'recipes/components/cert-manager/**'
+              - 'recipes/components/gpu-operator/**'
+              - 'recipes/components/k8s-ephemeral-storage-metrics/**'
+              - 'recipes/components/kai-scheduler/**'
+              - 'recipes/components/kube-prometheus-stack/**'
+              - 'recipes/components/nfd/**'
+              - 'recipes/components/nodewright-operator/**'
+              - 'recipes/components/nvidia-dra-driver-gpu/**'
+              - 'recipes/components/nvsentinel/**'
+              - 'recipes/components/agentgateway/**'
+              - 'recipes/components/agentgateway-crds/**'
+              - 'recipes/components/grove/**'
+              - 'recipes/components/dynamo-platform/**'
+              - 'recipes/components/prometheus-adapter/**'
+              - 'recipes/overlays/kind.yaml'
+              - 'recipes/overlays/kind-inference.yaml'
+              - 'recipes/overlays/h100-kind-inference.yaml'
+              - 'recipes/overlays/h100-kind-inference-dynamo.yaml'
+              - 'pkg/collector/**'
+              - 'pkg/snapshotter/**'
+              - '.github/actions/gpu-snapshot-validate/**'
+              # Markdown/MDX under the runtime globs is documentation — never a
+              # reason to launch a GPU job (#2149). Requires some-with-excludes.
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
+
+  # NVIDIA self-hosted GPU runners reject pull_request event jobs before
+  # checkout. PR GPU coverage runs through the pull-request/<number> push
+  # mirror, which copy-pr-bot syncs for trusted authors and bots
+  # (.github/copy-pr-bot.yaml) and for anyone else after /ok to test.
+  gpu-inference-test:
+    needs: [check-paths]
+    if: >
+      always() && github.repository == 'nvidia/aicr' && (
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && needs.check-paths.outputs.should-run == 'true')
+      )
+    name: GPU Inference Test (nvkind + H100 x1)
+    uses: ./.github/workflows/gpu-h100-kind-runtime-test.yaml
+    with:
+      job_name: GPU Inference Test (nvkind + H100 x1)
+      cluster_name: gpu-inference-test
+      intent: inference
+      platform: dynamo
+      chainsaw_path: tests/chainsaw/ai-conformance/kind-inference-dynamo
+      artifact_name_prefix: gpu-inference-test-debug
+      run_full_validation: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_full_validation) }}

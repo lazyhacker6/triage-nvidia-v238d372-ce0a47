@@ -1,0 +1,1591 @@
+# ADR-007: Verifiable Recipe Test Evidence
+
+> **Amended by [ADR-015](015-recipe-configuration-profiles.md).** For
+> profile-bearing recipes, the selected value joins the evidence path and
+> is a recipe-digest input, so currentness stays digest-authoritative on
+> the existing v1 predicate during the AKS adoption stage. From the GKE
+> rollout stage (#1761), profile-bearing evidence rides a new predicate
+> type whose currentness additionally requires the canonical-descriptor
+> identity to match. Unprofiled
+> evidence keeps this ADR's digest-only currentness rule and the v1
+> predicate; the pointer layout and verification flow below are unchanged.
+
+> **Amended 2026-11-03 for the `cncf-conformance` kind.** The amendment
+> records a decision whose implementation is tracked under
+> [#3601](https://github.com/NVIDIA/aicr/issues/3601): the CNCF
+> submission collector script is retired and `--cncf-submission` is an
+> output option on `aicr validate --phase conformance`; `--feature` and
+> `evidence.cncf.features` are removed, and `--evidence-dir` requires
+> `--cncf-submission` (the `--evidence-dir`-alone rendering is gone).
+> [#3602](https://github.com/NVIDIA/aicr/issues/3602) landed this on
+> 2026-11-05; the submission packaging is
+> [#3605](https://github.com/NVIDIA/aicr/issues/3605). See
+> [Amendment: single-path CNCF conformance evidence (2026-11-03)](#amendment-single-path-cncf-conformance-evidence-2026-11-03).
+> The recipe-test-attestation kind is not affected.
+
+## Status
+
+**Accepted, partially implemented** — proposed 2026-05-08. Amended
+2026-11-03 for the `cncf-conformance` kind (accepted; the single runner
+landed with [#3602](https://github.com/NVIDIA/aicr/issues/3602) on
+2026-11-05, the submission packaging of
+[#3605](https://github.com/NVIDIA/aicr/issues/3605) is pending); see
+[Amendment: single-path CNCF conformance evidence (2026-11-03)](#amendment-single-path-cncf-conformance-evidence-2026-11-03).
+
+This ADR specifies the V1 contract. Implementation lands as five
+follow-on PRs tracked under
+[#750](https://github.com/NVIDIA/aicr/issues/750) and its children
+([#751](https://github.com/NVIDIA/aicr/issues/751)–[#754](https://github.com/NVIDIA/aicr/issues/754)).
+The core bundle format, the committed pointer layout, and the
+`aicr evidence digest`/`publish`/`sign`/`verify` subcommands have
+landed; several schema fields and verifier guarantees described below
+remain future intent, as detailed in the Update note immediately below.
+
+> **Update.** Implementation has since landed in part. The `aicr evidence`
+> family currently ships `digest`, `publish`, `sign`, and `verify` — the
+> `list` and `show` subcommands described below are **not yet implemented**.
+> The shipped verifier verifies the signature when the bundle carries one
+> and performs predicate/schema parse and manifest-inventory hash binding; an
+> *unsigned* bundle that otherwise passes those checks yields a `pending
+> signature` (exit 0) result, whereas an unsigned bundle that fails predicate,
+> inventory, or phase checks is reported as that failure, not pending. The
+> shipped verifier also binds recipe identity: it derives the recipe name,
+> the exact profile selection (including its absence), and the canonical
+> digest from the manifest-bound `recipe.yaml` itself, and requires the
+> pointer's and predicate's identity claims to match those derived values
+> (`pkg/evidence/verifier/identity.go`) — so neither surface can claim a
+> different recipe, profile value, or digest than the bundle carries. When a
+> pointer declares a signer, that claim
+> is **always** cross-checked against the bundle's certificate, so a pointer
+> cannot lie about who signed. What is **opt-in** is external issuer/SAN
+> pinning — enforced only when `expected-issuer` / `expected-identity-regexp`
+> are supplied; without them a plain `verify` run does not pin the signer to
+> an expected identity. The richer
+> guarantees enumerated under "CLI family" remain the proposed contract and
+> are not wired today: inline constraint replay is explicitly reserved for a
+> follow-up slice (`pkg/evidence/verifier/verify.go`), and material-slice/JCS
+> canonicalization, chain manifests, BOM cross-reference, and the CI
+> material-slice gate are likewise future intent. The committed pointer layout
+> (`recipes/evidence/<recipe>/<source>/<digest>.yaml`) is implemented as
+> described.
+
+## Problem
+
+AICR ships recipes for AWS, OCI, GCP, Azure, CoreWeave, Forge, and on-prem
+combinations spanning H100, GB200, B200, MI300, multiple OSes, and several
+intent variants. **No single team has hands-on access to all of them.**
+
+Today, recipe contributions for hardware AICR maintainers can't reach are
+either blocked or accepted on faith. Three classes of friction follow:
+
+- **Reachability gap.** A contributor running on AWS GB200 cannot get a
+  maintainer to re-run their validation; the maintainer has neither the
+  cluster nor the time to set one up. The PR stalls or merges on trust
+  alone.
+- **No artifact for review.** `aicr validate` produces console output and
+  CTRF JSON locally, but nothing the maintainer can cryptographically
+  tie back to the contributor who ran it. "Trust me, it passed" is the
+  current contract.
+- **No signal lineage.** Even when a contribution lands, there is no
+  durable record tying the recipe-as-merged to the validation result the
+  reviewer relied on. A future re-cert or audit has nothing to consult.
+
+The recipe **already self-defines its tests** through `validation`,
+`componentRefs`, `criteria`, and the existing `aicr validate` pipeline.
+What's missing is a way to package the answer to a question the recipe
+already poses, so a maintainer can verify it without re-running.
+
+## Non-Goals
+
+- **Auto-merging recipe PRs based on evidence.** Evidence is a
+  verifiable input to maintainer judgment, not a replacement for it.
+- **Extending the recipe schema with new "acceptance criteria" fields.**
+  The recipe's existing `validation` and `componentRefs` define what
+  passing means; this ADR packages the answer, not the question.
+- **Per-component admission-time digest verification.** That's
+  [ADR-006](006-image-pinning-policy.md) territory and #745. The bundle
+  scopes to AICR's pinning surface (recipe + chart-pin + digest-pin),
+  not chart-default sub-images.
+- **KMS-backed signing.** V1 uses cosign keyless OIDC. KMS is a
+  future extension under the same predicate type and bundle format —
+  no design change required.
+- **Re-running validators in `aicr evidence verify`.** Verification is
+  an offline cryptographic + schema operation; re-running validators
+  defeats the purpose and would require maintainers to have the
+  hardware they don't have.
+- **Pre-building features without demand.** Tier policies, multi-instance
+  pointers, signed layered predicate types, re-cert automation, and an
+  advisory feed are reasonable extensions of the V1 design. None ship
+  now. Each is listed in the deferred-features table under
+  `## Decision` → "What V1 does *not* ship," with the pull-trigger that
+  should bring it in.
+
+## Context
+
+Epic [#750](https://github.com/NVIDIA/aicr/issues/750) and its four
+children ([#751](https://github.com/NVIDIA/aicr/issues/751) contribution
+workflow, [#752](https://github.com/NVIDIA/aicr/issues/752) fingerprint,
+[#753](https://github.com/NVIDIA/aicr/issues/753) verifier,
+[#754](https://github.com/NVIDIA/aicr/issues/754) bundle format) cover
+the broad design. This ADR captures the V1 implementation contract that
+delivers the trust handoff with cryptographic completeness, OCI-native
+transport, and a CycloneDX BOM in every bundle. It defers the rest of
+the broader design until demand pulls it in.
+
+Two design tensions drive what's V1 vs deferred:
+
+| Tension | Full design choice | V1 choice |
+|---|---|---|
+| Identity model | Tier A/B/C/D with signed policy file, freshness-bounded | One bundle class; verifier records the OIDC identity, maintainer review classifies |
+| Re-cert on non-material edits | Material-slice canonicalizer (RFC 8785-derived, append-only versioned) suppresses re-cert on cosmetic changes | Material-slice canonicalizer ships in V1; the CI gate rolls out soft-fail first (warning-only), then hardens to required after a concrete corpus trigger fires |
+| Multi-cluster attestation per recipe | Multi-instance pointer schema with primary / supplementary / negative roles | Pointer carries a list with one entry; second cluster attests via an additive PR. Schema bump (1.0 → 2.0) when roles arrive |
+| Logs handling | Three signed layered predicate types (logs / redaction / augmentation) attached to the same OCI digest | Optional unsigned logs bundle as separate OCI artifact; per-file content hashes pre-committed in summary's manifest binds them to the signature |
+
+Two surfaces from the broader design **do** ship in V1 because their
+cost-to-defer is high:
+
+- **OCI transport + in-tree pointer file.** Bundle bytes live in OCI
+  (`ghcr.io/<owner>/aicr-evidence:<digest>`); the pointer file at
+  `recipes/evidence/<recipe>/<src>/<digest>.yaml` binds the repo to the bundle by
+  content hash. Discoverability and audit trail (`git log` on the
+  pointer) are worth the small added complexity over PR-attached
+  tarballs. **GHCR is shown as the example throughout this ADR; any
+  OCI-1.1-compliant registry is acceptable** (GHCR, GitLab Container
+  Registry, Harbor, JFrog Artifactory, AWS ECR, Google Artifact
+  Registry, Azure Container Registry). Contributors on corporate
+  registries push to whatever their organization permits; the verifier
+  reads the registry from the pointer file and uses standard ORAS
+  client paths.
+- **CycloneDX BOM in the summary bundle.** Per #754 and the hard
+  dependency on [#739](https://github.com/NVIDIA/aicr/issues/739), the
+  BOM ties the recipe to the exact image set deployed at validate
+  time. Excluding it would force re-cert on every Renovate digest
+  rotation and offer no audit baseline.
+
+## Decision
+
+### Trust model
+
+V1's trust handoff is **signer-identity-bound, not cluster-physicality-bound**.
+The bundle proves: an OIDC identity with the recorded cosign cert claims signed
+this `(recipe, snapshot, validator results, BOM)` tuple at the recorded
+`attestedAt` time, and every artifact in the bundle is cryptographically tied
+to that signature. It does not prove the cluster the snapshot describes
+physically existed — a contributor controlling their own cluster can lie to
+the snapshot collectors, and per-signal corroboration that would make those
+lies harder is deferred (see the deferred-features table under
+`## Decision` → "Fingerprint per-signal provenance").
+
+Concretely, this relocates the maintainer's trust judgment from "did this PR
+really run?" to "do I trust this signer's claim that it did?" — a richer
+artifact than today's "trust me, it passed" review surface, but the same
+underlying maintainer-judgment surface. The eventual closer for the
+cluster-physicality gap is the deferred Tier model (signed policy file
+labeling first-party / partner / community identities) plus per-signal
+fingerprint provenance, not a cryptographic primitive V1 can bolt on. V1
+delivers the artifact and the verifier; tier classification arrives when
+contribution volume or partner relationships pull it in.
+
+### Evidence taxonomy
+
+AICR carries multiple kinds of evidence with different purposes and
+shapes; the V1 design treats *recipe-test attestation* as one kind in
+that family, not the only one. Two kinds exist today:
+
+- **`cncf-conformance`** (already shipped, in `pkg/evidence`).
+  Per-requirement Markdown documents rendered from validator results,
+  intended for CNCF conformance submission. Human-readable, not
+  cryptographically signed; trust comes from the submission process,
+  not the artifact itself.
+- **`recipe-test-attestation`** (this ADR, V1). Signed, OCI-distributed
+  in-toto Statement plus supporting bundle (recipe, snapshot, BOM,
+  CTRF, manifest); intended for maintainer review of contributions
+  from unreachable hardware. Cryptographically self-verifying; trust
+  comes from the signer-identity claims and the bundle's content
+  binding.
+
+The two kinds share consumption surface (see V1 surface item 2 below):
+`aicr evidence verify <input>` auto-detects and dispatches per kind.
+They do *not* share production surface — each is emitted by the
+command whose pipeline produced it. CNCF conformance evidence is
+emitted alongside `aicr validate` today; recipe-test attestation is
+emitted by `aicr validate --emit-attestation` (V1 surface item 1).
+Production lives at the origin, where the data is; consumption unifies
+under `aicr evidence` so future kinds (CycloneDX BOM-only attestation,
+SLSA provenance, license attestation) plug in without further
+top-level CLI growth.
+
+**CLI flag layout — kind-scoped flag names disambiguate.** The
+existing CNCF surface on `aicr validate` already uses
+`Category: "Evidence"` for its flags (`--evidence-dir`,
+`--cncf-submission`, `--feature`); adding the recipe-test-attestation
+surface to the same category creates flag-name overlap unless each
+kind is named for itself. V1 keeps the existing CNCF flags unchanged
+and introduces kind-scoped flag names for the new attestation kind:
+
+| Kind | Production flags on `aicr validate` |
+|---|---|
+| `cncf-conformance` | `--evidence-dir <path>` (existing), `--cncf-submission`, `--feature <name>` |
+| `recipe-test-attestation` | `--emit-attestation <path>` (NEW), `--push <oci-ref>`, `--full` (opt out of default minimization); `--include-logs` and `--push-logs` are deferred (log capture not implemented in V1) |
+
+> **Superseded in part (2026-11-03).** The `cncf-conformance` row above
+> and the `evidence.cncf.cncfSubmission` / `evidence.cncf.features`
+> config keys in item 1
+> below describe the surface as it shipped. The
+> [amendment](#amendment-single-path-cncf-conformance-evidence-2026-11-03)
+> keeps `--evidence-dir` and `--cncf-submission` but changed what
+> `--cncf-submission` does (it renders the submission evidence from the
+> conformance run), made `--evidence-dir` require it (the
+> `--evidence-dir`-alone rendering is gone), and removed `--feature` and
+> `evidence.cncf.features`, with
+> [#3602](https://github.com/NVIDIA/aicr/issues/3602) on 2026-11-05. The
+> row records the surface as it shipped at v1. The recipe-test-attestation
+> row is unchanged.
+
+Both kinds may run from a single `aicr validate` invocation (each
+flag set produces its own output tree) — they are independent
+pipelines that happen to consume the same recipe and snapshot inputs.
+`aicr validate --help` groups both flag sets under `Evidence`; the
+flag *names* tell the user which kind each one targets.
+
+The AICRConfig structure mirrors this — `cncf` and `attestation` sit
+as siblings under `spec.validate.evidence`, so a single config file
+can drive either kind or both without flag-name ambiguity (see V1
+surface item 1 below for the full schema).
+
+**Ship V1 as five PRs, deferring the rest until pulled by demand.**
+
+### V1 surface (proposed)
+
+1. **Bundle format + pointer + `aicr validate --emit-attestation`.** Single
+   in-toto Statement per recipe run, predicate type
+   `https://aicr.run/recipe-evidence/v1`, DSSE-wrapped, signed
+   with cosign keyless OIDC. Summary bundle is an OCI artifact;
+   optional logs bundle as a separate OCI artifact,
+   contributor-controlled. The pointer file (schema 1.0, in-tree at
+   `recipes/evidence/<recipe>/<src>/<digest>.yaml`) is a *side effect* of
+   `--emit-attestation`, not a separate command — generation, OCI push,
+   signing, and pointer population happen in one invocation.
+
+   **Decoupled publish (post-V1 addition).** `aicr validate
+   --emit-attestation` *without* `--push` leaves an unsigned bundle on
+   disk; `aicr evidence publish <dir> --push <ref>` then runs the
+   sign+push+pointer leg against that pre-built bundle. This lets the
+   cluster-bound validate step (corporate VPN) and the
+   Fulcio/Rekor-bound signing step (Sigstore egress) run on different
+   hosts. Because the bundle is content-addressable and the predicate
+   (with its baked-in `attestedAt`) is signed verbatim from disk, the
+   unsigned subject/predicate and the OCI digest are identical to the
+   one-shot path; the signature material (certificate, signature, Rekor
+   entry, signing time) differs per run. See the CLI reference for
+   `aicr evidence publish`.
+
+   **Canonical invocation: `--config aicr.yaml`.** PR-A extends
+   `pkg/config.AICRConfig` with a `ValidateSpec` sibling of
+   `RecipeSpec`/`BundleSpec`, reusing `AttestationSpec` and
+   `RegistrySpec` so the cosign and OCI surfaces stay consistent
+   between `bundle` and `validate`:
+
+   ```yaml
+   apiVersion: aicr.run/v1alpha2
+   kind: AICRConfig
+   metadata:
+     name: my-recipe
+   spec:
+     validate:
+       input:
+         recipe: r.yaml
+         snapshot: s.yaml
+       evidence:
+         # Sibling sections per evidence kind; either or both may be
+         # populated. Each block configures one kind end-to-end and is
+         # independent of the others. Signing and OCI-transport
+         # options nest inside the attestation block because only that
+         # kind signs and pushes; the CNCF block has no need for them.
+         cncf:                                 # cncf-conformance kind
+           out: ./cncf-evidence                # equivalent to --evidence-dir
+           cncfSubmission: false               # equivalent to --cncf-submission
+           features: []                        # equivalent to --feature (repeatable)
+         attestation:                          # recipe-test-attestation kind
+           out: ./out                          # equivalent to --emit-attestation
+           push: oci://ghcr.io/myorg/aicr-evidence  # optional; OCI push target
+           # includeLogs and pushLogs are deferred — log capture is not
+           # implemented in V1, so the corresponding flags and config
+           # fields are not active.
+           signing:                            # reuses pkg/config.AttestationSpec
+             enabled: true
+             certificateIdentityRegexp: ^https://github\.com/myorg/.*$
+             oidcDeviceFlow: false
+           registry:                           # reuses pkg/config.RegistrySpec
+             insecureTLS: false
+             plainHTTP: false
+   ```
+
+   `signing` and `registry` reuse the existing Go types
+   `pkg/config.AttestationSpec` and `pkg/config.RegistrySpec` (already
+   exposed under `BundleSpec`), so cosign-identity inputs and OCI
+   transport options stay consistent between `aicr bundle` and
+   `aicr validate`. They nest under `evidence.attestation` rather than
+   sitting at `validate` top-level because they are only meaningful
+   when the attestation kind is being emitted.
+
+   `aicr validate --config aicr.yaml` is the supported invocation;
+   the CLI flag form (`--recipe`, `--snapshot`, `--emit-attestation`,
+   `--push`, plus existing `--evidence-dir` / `--cncf-submission` /
+   `--feature` for the CNCF kind) is the expanded equivalent and
+   overrides config values. (`--include-logs` and `--push-logs` are
+   deferred — log capture is not implemented in V1.)
+   `aicr.yaml` flows the same contributor through `aicr recipe` →
+   `aicr validate --emit-attestation` → `aicr bundle` without re-typing
+   inputs.
+
+   **Flag form (equivalent expansion):**
+
+   ```bash
+   aicr validate --recipe r.yaml --snapshot s.yaml --emit-attestation ./out
+   # writes:
+   #   ./out/summary-bundle/   (recipe, snapshot, BOM, CTRF, manifest, attestation)
+   #   ./out/pointer.yaml      (ready to copy to recipes/evidence/<recipe>/<src>/<digest>.yaml)
+   # logs-bundle/ output is deferred — log capture is not implemented in V1.
+   ```
+
+   With an optional `--push <oci-registry>` that closes the loop:
+
+   ```bash
+   aicr validate --recipe r.yaml --snapshot s.yaml \
+     --emit-attestation ./out \
+     --push ghcr.io/myorg/aicr-evidence
+   # pushes summary OCI artifact, runs cosign attest, populates
+   # pointer.yaml's bundle.oci and bundle.digest fields.
+   # --push-logs is deferred — log capture is not implemented in V1.
+   ```
+
+   The pointer is bundle-derived; mismatches between pointer and
+   bundle are integrity-chain failures. Contributors copy
+   `./out/pointer.yaml` to `recipes/evidence/<recipe>/<src>/<digest>.yaml` and commit.
+
+2. **`aicr evidence` CLI family.** A typed verb group that consumes
+   the evidence kinds enumerated above (see "Evidence taxonomy") with
+   a single shared surface. V1 ships three subcommands:
+
+   - **`aicr evidence verify <input>`** — full verification of a
+     `recipe-test-attestation` bundle: signature, schema, inventory
+     (manifest hashes), recipe ↔ snapshot fingerprint match
+     (per-dimension diff), inline constraint replay, phase results,
+     BOM cross-reference. Markdown + JSON output. Auto-detects kind
+     from input shape and dispatches to the matching verifier (V1:
+     attestation only; CNCF conformance verification slots in here
+     when its trust posture is formalized).
+
+     ```bash
+     aicr evidence verify <input>
+
+     # where <input> is auto-detected as:
+     #   recipes/evidence/<recipe>/<src>/<digest>.yaml      → pointer file
+     #   ghcr.io/.../aicr-evidence:<digest>  → OCI reference
+     #   ./out/summary-bundle/               → unpacked directory
+     ```
+
+     Detection is by URL prefix, file extension, and directory
+     existence. The three forms map to distinct workflows: pointer for
+     CI, OCI for canonical artifact verification, unpacked directory
+     for contributor self-debug without a packaging step. Same
+     verification logic runs against any of the three.
+
+   - **`aicr evidence list`** — enumerate evidence available locally
+     or in a target OCI repository. Useful for "which recipes have
+     attestations?" and "what bundles exist under
+     `ghcr.io/myorg/aicr-evidence`?" without fetching their contents.
+   - **`aicr evidence show <input>`** — read-only inspection of a
+     bundle's predicate body, manifest, and signer claims. No
+     verification; cheap to run during contributor debugging.
+
+   Production stays at the origin (V1 surface item 1 — `aicr validate
+   --emit-attestation` produces attestations; CNCF conformance evidence is
+   produced by the existing `pkg/evidence` pipeline as part of validate
+   today). `aicr evidence` is the *consumption* family; new evidence
+   kinds plug into it without further top-level CLI growth.
+
+3. **CI gate workflow + PR template.** Check on PRs touching
+   `recipes/**` whose material slice (see "Material-slice
+   canonicalization" below) differs from the slice the current pointer
+   was attested against. Reads pointer, runs verify, posts Markdown
+   comment. **Two-phase rollout**:
+
+   - **Phase 1 — soft-fail (informational).** The check runs on every
+     qualifying PR but emits warning-only annotations; merge is not
+     blocked. Phase 1 starts when PR-C lands and stays in effect until
+     the corpus trigger fires (≥ 3 distinct accelerator classes have
+     at least one attested recipe with a valid pointer, OR 12 weeks
+     after PR-A merges, whichever comes first).
+   - **Phase 2 — hard-fail (required).** The check becomes a required
+     status. Maintainers can apply an `evidence/exempt` label to bypass
+     the gate for an individual PR; bypass requires a justification
+     line in the PR description and is recorded for audit. Pure
+     non-material edits (comments, whitespace, `displayName`,
+     `description`, key-order) never reach Phase 2 because the
+     canonicalizer collapses them to the same material-slice digest.
+
+   Promotion from Phase 1 to Phase 2 is a one-line config change in
+   the workflow, paired with a CONTRIBUTING update documenting the
+   `evidence/exempt` policy.
+
+4. **`maintainers:` block on `RecipeMetadataSpec`.** Required field on
+   every recipe in `recipes/overlays/`, listing GitHub handle, org, and
+   a durable escalation contact (DL or shared mailbox). One-time
+   backfill PR populates existing recipes via `git log` heuristics.
+
+   **Why this lives under ADR-007 rather than as a separate schema PR.**
+   The `maintainers:` block is the durable contact surface this
+   evidence design generates work for: re-cert prompts when a
+   material-slice digest expires, advisory-revocation notifications
+   when a deployed image is flagged post-merge (deferred — see the
+   advisory-feed row in the deferred-features table), and
+   signer-identity disputes ("who signed `recipes/evidence/<recipe>/<src>/<digest>.yaml`?
+   are they still the right routing target?"). Without a recipe-level
+   contact, every such event has to be triaged through `git log`
+   heuristics — which is exactly what the backfill PR does *once*, and
+   then ages out of usefulness as authors leave teams. PR-D is
+   schedule-independent of A/B/C (it can land first if convenient,
+   since the field is additive metadata) but its motivation is the
+   evidence lifecycle this ADR establishes.
+
+### Gate report structure (implemented)
+
+The CI gate (`.github/scripts/recipe-evidence-check.sh`) renders its
+warning-only Markdown comment around two ideas that keep it low-noise on
+broad-impact PRs:
+
+- **Protected vs. other affected.** A recipe is *protected* — implicitly —
+  iff it has at least one committed pointer under its per-source tree
+  `recipes/evidence/<recipe>/<src>/<digest>.yaml` (the layout that shipped in
+  #1401; see [Per-source pointer layout](#per-source-pointer-layout-1347-option-a-implemented-in-1401)).
+  The
+  protected set is what the gate actively verifies (pointer present →
+  verify → digest compare) and renders as a status table. Recipes that are
+  affected but carry no pointer are best-effort: evidence is
+  hardware-gated and most recipes have none yet, so they are collapsed
+  into a single `<details>` count rather than shown as alarming "missing"
+  rows. Adding a pointer is the only action that moves a recipe into the
+  protected set — there is no separate list to maintain, and it converges
+  with the recipes validated on real hardware.
+
+- **Component-scoped registry cascade.** A change to
+  `recipes/registry.yaml` does not promote every leaf recipe. The gate
+  diffs the registry at the component-*entry* level and marks a recipe
+  affected only if its resolved component set — walked across the base
+  chain and `spec.mixins` — intersects the changed entries, so an
+  `aws-efa`-only edit flags only recipes that reference `aws-efa`. A change
+  to `recipes/overlays/base.yaml` is still treated as broad (it sits at the
+  root of nearly every base chain). The recomputed digest remains the
+  ground truth: a protected recipe whose digest still matches its pointer
+  is reported as a match, never as drift, regardless of promotion.
+
+- **Classified verify failures.** When `aicr evidence verify` fails, the
+  gate surfaces the structured `failureCause` from its `--format json`
+  output (registry 401/403 → "make the fork's aicr-evidence package
+  public", 404, signature, integrity, schema) in the verify column and
+  echoes the full error into the job log — so a contributor can self-serve
+  the fix instead of seeing a bare "invalid".
+
+### Material-slice canonicalization (proposed)
+
+The material slice is the projection of the recipe-resolution surface
+that affects runtime behavior. Two recipe states with the same material
+slice produce the same deployed cluster; differences outside the slice
+(comments, formatting, descriptive metadata) cannot. The bundle's
+subject digest is computed over the canonical form of this slice, not
+over the raw post-resolution YAML — so non-material edits do not
+invalidate the bundle.
+
+**What the slice includes** (any change re-certs):
+
+- Leaf overlay's `criteria`, `componentRefs`, `constraints`,
+  `validation`, `nodeScheduling` paths.
+- Each `componentRef`'s resolved `{type, source, version, valuesFile,
+  manifestFiles, overrides}`, recursively into included
+  `valuesFile`/`manifestFiles` content.
+- Mixin contents pulled in by `spec.mixins`, scoped to their
+  `constraints` and `componentRefs` (mixins carry no other material
+  fields by construction — see ADR-005).
+- Registry entries (`recipes/registry.yaml`) referenced by the
+  resolution chain: `helm.{defaultRepository, defaultChart}`,
+  `kustomize.{defaultSource, defaultPath, defaultTag}`,
+  `valueOverrideKeys`, `nodeScheduling`.
+- `spec.maintainers` (PR-D) — a maintainer change is durable
+  signal-routing metadata, not cosmetic.
+
+**What the slice excludes** (changes pass without re-cert):
+
+- All YAML comments, leading/trailing whitespace, blank lines,
+  key-order, quoting style.
+- `metadata.{displayName, description, labels, annotations}` and
+  any registry `displayName`.
+- Top-level `# yaml-language-server: $schema=...` directives and
+  similar editor hints.
+
+**Algorithm.** RFC 8785 (JSON Canonicalization Scheme) over the
+filtered subtree, after a type-preserving YAML→JSON load and NFC
+Unicode normalization on string scalars. The slice is built by
+walking the resolution chain (overlay → mixins → registry →
+component values → manifest files transitively) and emitting only
+the included paths above. Output is the SHA-256 of the JCS bytes;
+this is the value bound by the in-toto Statement's
+`subject[0].digest.sha256` and the trigger for re-cert. The same walk
+records each consumed input's file-bytes SHA-256 into the predicate's
+`chainManifest` for forensic provenance (see "Predicate body" below
+for the envelope shape and the rationale for keeping the re-cert
+trigger and the forensic record separate).
+
+**`materialSliceVersion`.** The predicate carries an integer
+`materialSliceVersion` (V1 = `1`). Bundles attest under the algorithm
+in effect at sign-time; the verifier loads the matching algorithm by
+version. New versions append; old versions never get rewritten. This
+isolates canonicalizer bug fixes (and future slice-set changes) from
+historical bundles — a v2 algorithm does not invalidate v1
+attestations, and the verifier carries both parsers.
+
+**Verifier check.** The subject-digest step (verifier step 6) recomputes
+the slice from the repo at HEAD using the bundle's
+`materialSliceVersion` and confirms match against the predicate. A
+mismatch is a hard fail; a match means the recipe is materially
+unchanged since attest-time, regardless of cosmetic edits.
+
+The CI gate (V1 surface item 3) leans on the same canonicalizer:
+"PR touches `recipes/**`" is the broad trigger, but the gate only
+*fails* when the material-slice digest computed from the PR head
+differs from the slice the current pointer was attested against.
+Comment-only PRs, Renovate-driven `displayName` rewrites, and
+formatter changes pass without new evidence.
+
+### Bundle anatomy (proposed)
+
+Summary bundle (always published):
+
+```text
+oci://ghcr.io/<owner>/aicr-evidence:<digest>
+└── (OCI artifact whose layers contain:)
+    ├── attestation.intoto.jsonl    # DSSE-wrapped, cosign keyless signed
+    ├── recipe.yaml                 # post-resolution canonical YAML
+    ├── snapshot.yaml               # cluster snapshot at validate-time (minimized by default)
+    ├── bom.cdx.json                # CycloneDX BOM (per #739)
+    ├── ctrf/                       # per-test stdout/message omitted by default
+    │   ├── deployment.json
+    │   ├── performance.json
+    │   └── conformance.json
+    └── manifest.json               # file inventory + per-file sha256
+```
+
+The bundle is **minimized by default** (see "Minimal-by-default redaction"
+below): `snapshot.yaml` ships an allowlisted subset of fields and the
+`ctrf/*.json` reports omit per-test `stdout`/`message`. `--full` ships the
+raw payloads. Either way the manifest binds whatever bytes shipped, so the
+bundle self-verifies.
+
+Optional logs bundle (contributor-controlled; absent when not published):
+
+```text
+oci://ghcr.io/<owner>/aicr-evidence-logs:<digest>
+└── phases/
+    ├── deployment/logs/*
+    ├── performance/logs/*
+    └── conformance/logs/*
+```
+
+Logs are not signed-as-a-whole. The summary's `manifest.json`
+pre-commits per-file hashes for any log file that *would* be in the
+logs bundle. Anyone fetching the logs bundle later can verify
+file-by-file against the manifest pre-commit; tampering is detectable
+without a separate signature event. This is the V1 mechanism;
+signed-logs predicates (with redaction and augmentation variants)
+arrive when demand justifies — see "Future direction."
+
+### Predicate body
+
+```yaml
+# https://aicr.run/recipe-evidence/v1
+schemaVersion: 1.0.0
+materialSliceVersion: 1
+attestedAt: 2026-05-08T10:23:11Z
+aicrVersion: v0.13.0
+# Build commit of the aicr binary. Omitted when the binary has no commit stamp.
+aicrCommit: 0123456789abcdef0123456789abcdef01234567
+validatorCatalogVersion: v2.4.0
+validatorImages:
+  - image: ghcr.io/nvidia/aicr/validator-deployment
+    digest: sha256:...
+  - image: ghcr.io/nvidia/aicr/validator-performance
+    digest: sha256:...
+fingerprint:
+  service: { value: eks }
+  accelerator: { value: h100 }
+  os: { value: ubuntu }
+  k8sVersion: { value: "1.33.4" }
+  region: { value: us-west-2 }
+  nodeCount: { value: 12 }
+criteriaMatch:
+  matched: true
+  perDimension:   # ordered; match is one of matched | mismatched | unknown | not-inferable
+    - { dimension: service, recipeRequires: eks, fingerprintProvides: eks, match: matched }
+    - { dimension: accelerator, recipeRequires: h100, fingerprintProvides: h100, match: matched }
+    - { dimension: os, recipeRequires: ubuntu, fingerprintProvides: ubuntu, match: matched }
+    - { dimension: intent, recipeRequires: training, match: unknown }
+    - { dimension: platform, recipeRequires: kubeflow, match: unknown }
+    - { dimension: nodes, recipeRequires: "12", fingerprintProvides: "12", match: matched }
+phases:
+  deployment: { passed: 12, failed: 0, skipped: 0, ctrfDigest: sha256:... }
+  performance: { passed: 3, failed: 0, skipped: 0, ctrfDigest: sha256:... }
+  conformance: { passed: 9, failed: 0, skipped: 0, ctrfDigest: sha256:... }
+bom:
+  format: CycloneDX
+  version: "1.5"
+  digest: sha256:...
+  imageCount: 24
+manifest:
+  digest: sha256:...
+  fileCount: 9
+# Present only for minimal (default) bundles; omitted entirely with --full.
+redaction:
+  policy: minimal
+  version: v1
+  applied:
+    - ctrf.tests.omit:message
+    - ctrf.tests.omit:stdout
+    - snapshot.header.allowlist
+    - snapshot.measurements.allowlist
+chainManifest:
+  leaf:
+    path: recipes/overlays/h100-eks-ubuntu-training.yaml
+    sha256: <hex>
+  inputs:
+    - { kind: mixin,    path: recipes/mixins/os-ubuntu.yaml,           sha256: <hex> }
+    - { kind: mixin,    path: recipes/mixins/platform-kubeflow.yaml,   sha256: <hex> }
+    - { kind: registry, path: recipes/registry.yaml,                   sha256: <hex> }
+    - { kind: values,   path: recipes/components/gpu-operator/values.yaml, sha256: <hex> }
+    - { kind: values,   path: recipes/components/network-operator/values.yaml, sha256: <hex> }
+```
+
+The in-toto Statement's `subject[0].digest.sha256` (outside the
+predicate body, in the wrapping Statement) is the **material digest**:
+`sha256(JCS(material-slice(post-resolution recipe)))` under the
+algorithm identified by `materialSliceVersion`. This is the value the
+verifier recomputes in step 6, and it is what determines whether a
+recipe edit needs new evidence:
+
+- Non-material edits (comments, whitespace, `displayName`,
+  `description`, key-order) produce the same material digest and
+  pass without new evidence.
+- Material edits (chart version, criteria, constraints, override
+  values, manifest content) produce a different material digest and
+  require a fresh attestation.
+
+The predicate body's `chainManifest` is the **forensic provenance**:
+it records the unresolved leaf overlay plus every input the resolver
+consumed (mixins, registry entries, component values, manifest files),
+each with its own SHA-256 of the file bytes at attest-time. This is
+*not* what the signature binds to — the material digest is — but it
+lets the verifier (and post-incident investigators) tell *why* the
+material digest changed when one does. A registry edit, a shared
+mixin tweak, or a `recipes/components/<name>/values.yaml` change shows
+up as a specific input hash mismatch; an edit isolated to the leaf
+overlay shows up as a leaf hash mismatch with all inputs intact. This
+ergonomic separation costs nothing at sign-time (the resolver already
+walks every input) and pays off heavily at re-cert review.
+
+`materialSliceVersion` continues to govern algorithm evolution: V1
+ships version `1`; future canonicalizer revisions append
+(`materialSliceVersion: 2`, …) without invalidating bundles signed
+under the previous version. Verifiers carry both algorithm parsers.
+
+The `manifest.digest` field binds the manifest to the signature, which
+in turn binds every supporting file (snapshot, BOM, CTRF) by the
+hashes the manifest enumerates. Without this field, only the material
+digest would be bound — adversaries could swap any other file
+undetected. The verifier's inventory check is what closes the chain.
+
+### Minimal-by-default redaction
+
+An evidence bundle's trust signal is digest-based: the signed predicate
+commits to artifacts by hash and carries the derived fingerprint,
+criteria-match, and per-phase counts. The bundled `snapshot.yaml` and CTRF
+`stdout`/`message` are the *backing content* those digests point at — not the
+signal itself. As collectors grow they accumulate operational detail that is
+sensitive to publish (node names, cloud provider instance IDs, the full node
+label/taint set, kernel/sysctl tuning, loaded modules, systemd service config,
+raw container stdout). The bundle is therefore **minimized by default**, with
+`--full` as the opt-out for operators who want to publish everything.
+
+The minimal policy (`policy: minimal`, `version: v1`) applies two transforms:
+
+- **Snapshot — fail-closed allowlist, enforced at type, subtype, AND key
+  level.** Only enumerated types, subtypes, and data keys survive; a new type,
+  subtype, or key a future collector adds is dropped until explicitly
+  allowlisted (no subtype is keep-all). v1 keeps key-constrained
+  `K8s.server` (version, platform, goVersion) and `K8s.node` (provider,
+  kubelet/runtime/OS versions — *not* `source-node`, `provider-id`,
+  `container-runtime-id`), `GPU.hardware` (present/count/model/driver-loaded/
+  detection-source), `OS.release` (standard distro-identity keys only — the
+  collector ships all of `/etc/os-release`, so non-standard keys are dropped),
+  and `NodeTopology.summary` (counts). It drops `OS.{grub,sysctl,kmod}`, the
+  entire `SystemD` measurement, and `NodeTopology.{label,taint}`. The snapshot
+  header metadata is likewise allowlisted to `{timestamp, version}`, so
+  `source-node` (and any future key) is dropped by default.
+- **CTRF — log omission.** Per-test `stdout` and `message` are removed; the
+  pass/fail signal (name, status, duration, suite, summary counts) is kept.
+
+**The fingerprint is computed from the raw (unredacted) snapshot, not the
+shipped one.** `fingerprint.FromMeasurements` reads several fields the
+allowlist drops (e.g. `NodeTopology.label`), so deriving the predicate's
+`fingerprint`/`criteriaMatch` from the full snapshot keeps the conformance
+signal identical whether or not the shipped bytes were minimized. The verifier
+trusts the fingerprint via the signature; it does not recompute it from
+`snapshot.yaml`. The recorded `redaction` block makes the divergence explicit:
+an auditor can see exactly which rules ran. Because the predicate digests
+(recipe, CTRF, BOM, manifest) all cover the bytes that actually shipped, a
+minimal bundle self-verifies with `aicr evidence verify` — predicate parse,
+manifest inventory, and signature all validate.
+
+The redaction is deterministic (same input → same bytes) and pure
+(`pkg/evidence/redact` never mutates its inputs, so the `--full` path and the
+fingerprint-from-raw computation keep the originals). A `--full` bundle omits
+the `redaction` field entirely and is byte-identical to pre-feature output.
+
+This extends the same reasoning ADR-007 already applied to logs (split into an
+opt-in artifact because they are large and frequently sensitive) to the
+snapshot and CTRF payloads that still ship in the summary bundle.
+
+### Opt-in-only criteria values
+
+Some criteria values are selectable only by an explicit flag because no
+snapshot measurement can produce them. Today that is the `generic` service
+(`aicr recipe --service generic`): a self-managed cluster fingerprints as the
+provisioner it reports through `k8s.node.provider` (`metal3`, `rke2`, `k0s`),
+or as `any` when it reports nothing, never as `generic`. The registry exposes
+this classification as `CriteriaRegistry.IsOptInOnly`.
+
+For such a dimension `Fingerprint.Match` records `match: not-inferable` with
+the observed value kept in `fingerprintProvides`, instead of `mismatched`. A
+`not-inferable` dimension does not flip `matched` to `false`, on the same
+footing as `unknown`: the fingerprint cannot contradict a value it can never
+yield. The verifier surfaces the row and a distinct verdict so a reviewer sees
+which concrete provider validated the provider-independent recipe.
+
+Provider-specific leaves layered over a generic base (`metal3`, `rke2`) carry
+inferable service values and match normally; their evidence qualifies the
+leaf, while evidence collected against the generic leaf itself qualifies the
+base with the provider recorded.
+
+### Pointer schema (1.0) (proposed)
+
+```yaml
+# recipes/evidence/<recipe>/<src>/<bundle-digest>.yaml
+# — schema 1.0, single-attestation list (see "Per-source pointer layout")
+schemaVersion: 1.0.0
+recipe: h100-aks-ubuntu-training-gpustack-operator-managed
+profile: gpuStack=operator-managed   # optional; only for profile-bearing recipes.
+                             # When present, the recipe name MUST carry the
+                             # lowercase "-<name>-<value>" segment (the
+                             # verifier rejects the combination otherwise).
+attestations:
+  - bundle:
+      oci: ghcr.io/<owner>/aicr-evidence:<digest>
+      digest: sha256:abc123...
+      predicateType: https://aicr.run/recipe-evidence/v1
+    signer:                 # optional; absent for unsigned bundles
+      identity: <oidc-subject>
+      issuer: <oidc-issuer-url>
+      rekorLogIndex: 91234567   # optional; absent for --no-rekor signing
+    attestedAt: 2026-05-08T10:23:11Z
+```
+
+The pointer is a **locator**, not a denormalized cache of the signed
+predicate body. A reviewer who wants to know fingerprint dimensions,
+criteria-match status, or per-phase pass/fail counts fetches the
+bundle from `bundle.oci` and reads the predicate body nested inside
+`attestation.intoto.jsonl` (the DSSE envelope wraps an in-toto
+Statement; the predicate is the `predicate` field on the inner
+Statement object). Duplicating those fields in the pointer would
+create two sources of truth, and reviewers would have no good answer
+for which one to trust on mismatch.
+
+The optional top-level `profile: <name>=<value>` field records the profile
+selection the attested recipe was generated with; the repo evidence gate
+replays it (`aicr evidence digest --profile`) when recomputing the recipe's
+canonical digest, and uses it to map a suffixed evidence directory back to
+its overlay slug.
+
+`attestations` is a **list** from day one (length 1 in V1). Each
+committed file stays single-attestation; multi-source is expressed by the
+per-source layout below rather than by growing the list. The schema 2.0
+bump (a `role:` field, multi-attestation files) remains reserved but is not
+needed for multi-source and stays deferred.
+
+#### Per-source pointer layout (#1347 Option A, implemented in #1401)
+
+Pointers are committed **per source** so two parties can attest to the same
+recipe without overwriting each other:
+
+```text
+recipes/evidence/<recipe>/<src>/<bundle-digest>.yaml   # immutable, add-only
+recipes/evidence/allowlist.yaml                            # maintained signer allowlist
+```
+
+`<src>` is `attestation.SourceSlug(issuer, identity)` — the first 32 hex
+characters (128 bits) of `sha256(issuer + "\n" + identity)` of the signer the
+pointer declares. (The on-disk contract gate uses the *claimed* signer fields;
+it does not by itself cryptographically verify the bundle signature — the OCI
+verification is a separate, currently warning-only step. See
+[#1535](https://github.com/NVIDIA/aicr/issues/1535).)
+Deriving the slug from the signer (rather than a free-form label)
+deterministically partitions evidence by signer: the
+`evidence-pointer-contract` CI job (`tools/evidence-pointercheck`, backed by
+`verifier.CheckEvidenceTree`) recomputes the slug from each committed pointer's
+own signer block and rejects any file that does not live under the directory
+its declared signer hashes to, that is unsigned, or whose signer is not
+allowlisted as community/partner. This is *structural* partitioning — it is not
+cryptographic anti-squatting, since the gate uses the claimed signer fields and
+does not itself verify the signature ([#1535](https://github.com/NVIDIA/aicr/issues/1535)). Consumers
+discover a recipe's evidence by glob (`verifier.DiscoverPointers`,
+`<recipe>/*/*.yaml`) and aggregate across sources; nothing is modified in
+place.
+
+Cryptographic trust enters at **ingest** (GP2,
+`.github/workflows/evidence-ingest.yaml`), not at the merge gate. Each
+ingested pointer's signature is verified pinned to the signer it claims
+(`verifier.VerifySignature` + `CrossCheckPointerSigner`), so a pointer that
+named an allowlisted signer it does not control passes the structural gate but
+fails ingest and never reaches the corroboration count. The on-disk contract
+gate and the warning-only `recipe-evidence.yaml` OCI check are defense-in-depth
+around that blocking step — trust derives from the ingest verification, not
+from passing the merge gate ([#1535](https://github.com/NVIDIA/aicr/issues/1535)). (This ingest verification is implemented but **currently fails closed** — the GP2 loader cannot yet parse the canonical `identityPattern`/`source` allowlist; tracked in [#1505](https://github.com/NVIDIA/aicr/issues/1505).)
+
+The **allowlist** is the trust root, validated by `pkg/evidence/allowlist` to
+be disjoint, non-overlapping, and free of over-broad patterns. Community and
+partner entries are keyed by the one-way `source` slug only (no cleartext identity is committed to
+the *allowlist*; the committed pointer and the public Rekor log still carry
+`signer.identity`; an optional non-PII `label` is for display); first-party
+entries pin a tightly-bounded `identityPattern` (a CI workflow URL, not
+personal PII) and ingest directly with no committed per-run pointer. Committed
+pointers are the community/partner channel. A verified signer absent from the
+allowlist is *reported* only — never corroborating.
+
+The pointer is bundle-derived; `aicr validate --emit-attestation`
+regenerates it from the OCI artifact (or the locally-emitted bundle
+directory, before push). Mismatches between pointer and bundle are
+**integrity-chain failures**, not clerical errors — the bundle is
+authoritative; the pointer points at it.
+
+### Verifier steps (proposed)
+
+`aicr evidence verify recipes/evidence/<recipe>/<src>/<digest>.yaml` (or any
+auto-detected input form — OCI ref or unpacked directory):
+
+1. **Schema-validate** the pointer file.
+2. **Cosign signature verify** the in-toto Statement against Rekor
+   (default; `--no-rekor` skips Rekor and uses bundled cert + sig).
+3. **Schema-validate** the predicate body.
+4. **Materialize the bundle.** From an OCI ref: `oras pull` and
+   confirm the artifact's digest matches `pointer.attestations[*].bundle.digest`
+   (or the user-supplied digest when `--bundle` is used without a
+   pointer). From an unpacked directory: read in place; no digest
+   claim to check at this step (the inventory check in step 5 is what
+   binds files to the signature). In all forms, downstream steps are
+   identical because they operate on the materialized file tree.
+5. **Inventory check.** Verify every file in `manifest.json` exists
+   in the bundle; recompute SHA-256 per file; confirm match. Confirm
+   `manifest.digest` matches predicate.
+6. **Material digest + chain manifest check.** Two-part:
+
+   a. **Material digest (re-cert trigger).** Load the algorithm
+      identified by the predicate's `materialSliceVersion`; recompute
+      `sha256(JCS(material-slice(post-resolution recipe in repo at HEAD)))`;
+      confirm match against the in-toto Statement's
+      `subject[0].digest.sha256`. Mismatch is a hard fail (re-cert
+      required). Non-material edits (comments, formatting,
+      `displayName`, `description`, key-order) produce the same digest
+      and pass.
+
+   b. **Chain manifest (forensic check).** Walk the resolution chain
+      from the same HEAD; for each entry recorded in
+      `predicate.chainManifest.{leaf, inputs[]}`, recompute the
+      file's SHA-256 and compare. The check is *informational* in
+      V1: any mismatch is reported in the verifier's Markdown output
+      ("input X changed since attest-time") but does not by itself
+      fail verification — the material-digest check above is the
+      authoritative re-cert signal. The chain manifest's job is to
+      tell the maintainer *why* a re-cert is needed (leaf vs. shared
+      mixin vs. registry vs. component values), not to add a second
+      hard-fail surface. (V2 may promote individual chain mismatches
+      to hard-fail signals once the slice-set has stabilized.)
+7. **Per-dimension fingerprint match.** Run `Fingerprint.Match(recipe.criteria)`
+   from #752; confirm `predicate.criteriaMatch.matched: true` (the
+   predicate is the source of truth; the pointer does not carry this
+   field); render per-dimension diff in Markdown so reviewers see
+   exactly which dimensions matched. `unknown` and `not-inferable`
+   dimensions (see "Opt-in-only criteria values") do not fail this step;
+   a `not-inferable` row must carry `fingerprintProvides` so the report
+   names the provider that validated the recipe.
+8. **Inline constraint replay.** Run the snapshot through the recipe's
+   inline constraints (the `aicr validate --no-cluster` deterministic
+   path) and confirm the recorded pass/fail matches what the bundle
+   claims. This is what makes the verifier independent — it doesn't
+   trust the constraint outcome the contributor recorded; it
+   recomputes it.
+9. **Phase results surface.** Read CTRF results from the bundle; verify
+   per-phase `ctrfDigest` against the predicate.
+10. **BOM cross-reference.** Confirm `bom.digest` matches predicate;
+    count chart-default sub-images for the disclosure
+    ("BOM contains N chart-default sub-images NOT covered by this
+    attestation; admission-time policy required for full coverage").
+11. **(Optional) Logs bundle verification.** When validator log
+    capture is wired in (deferred from V1 — the `--include-logs` /
+    `--push-logs` flags were dropped until the validator side can
+    capture logs), the pointer will gain an optional
+    `logsBundle: {oci, digest}` field; the verifier will pull it,
+    recompute per-file hashes, and confirm match against the summary
+    manifest's pre-commit. Logs bundle absence is **not** a failure.
+    V1 pointers omit the field entirely.
+12. **Render Markdown summary.** Includes signer identity, per-phase
+    results, per-dimension fingerprint match, BOM disclosure, and
+    sub-image count.
+
+Exit codes (proposed):
+
+- `0` — valid + passed (every check passed)
+- `1` — valid + failed checks (informational; signature and integrity
+  intact, but recorded validator results show failures — known-issue
+  documentation, work-in-progress, hardware-specific limitations)
+- `2` — invalid (signature mismatch, schema invalid, inventory
+  mismatch, material-digest mismatch, fingerprint not matched, BOM
+  mismatch, OR no pointer file present for a touched recipe).
+  Chain-manifest mismatches alone do not produce exit `2` in V1 —
+  they surface as informational rows in the Markdown summary so the
+  maintainer can see which input drifted; only material-digest drift
+  is authoritative.
+
+The CI gate explicitly checks for pointer file presence: a PR that
+touches `recipes/overlays/<recipe>.yaml` without producing a fresh
+`recipes/evidence/<recipe>/<src>/<digest>.yaml` (whether new or updated to the
+new recipe state) fails with a clear "no evidence bundle present"
+message, satisfying #751 acceptance criterion 1.
+
+### Forward-compatibility hooks
+
+Three V1 choices preserve future evolution at near-zero cost:
+
+1. **Predicate type is `recipe-evidence/v1`; `materialSliceVersion`
+   handles canonicalizer revs without a predicate bump.** A breaking
+   change to the material-slice algorithm ships as
+   `materialSliceVersion: 2` under the same `/v1` predicate type;
+   verifiers carry both algorithm parsers (append-only). The predicate
+   type bumps to `/v2` only when other parts of the predicate body
+   (signer envelope, phase shape, fingerprint surface) change in a way
+   the algorithm version cannot express.
+2. **`pointer.attestations` is a list from day one.** Multi-instance
+   in schema 2.0 is additive: more entries, plus a `role:` field
+   defaulting to `primary`. No structural break for V1 pointers.
+3. **The verifier takes a single positional input** that auto-detects
+   the form (pointer / OCI / directory), so the CLI surface stays
+   small even as transport options grow. New input forms in V2 (e.g.,
+   tarballs for air-gapped transport, bundles fetched via custom
+   resolver, signed registry refs) slot in as additional auto-detect
+   cases without breaking V1 invocations.
+
+### What V1 does *not* ship
+
+| Deferred | Pulled by |
+|---|---|
+| Tier A/B/C/D identity policy file | First partner relationship requests a non-community trust label, OR community contribution volume creates review fatigue that tier filtering would relieve. |
+| Multi-instance pointer (schema 2.0) with primary / supplementary / negative roles | Two contributors attest the same recipe from different clusters, OR a "this didn't work for me" negative attestation needs to coexist with a passing primary. |
+| Signed layered predicate types (logs / redaction / augmentation) | Contributor asks to publish redacted logs, OR third party wants to add an independent re-run with its own signer. V1's manifest-pre-commit binding handles "publish logs later" already. |
+| Re-cert age cutoffs (24mo hard, 23mo bot) | First bundle ages past 12 months. Document the policy in CONTRIBUTING; defer the bot. |
+| Catalog-MAJOR re-cert trigger | Catalog SemVer contract filed (follow-on to [#660](https://github.com/NVIDIA/aicr/issues/660)). Trigger is dormant until the contract exists. |
+| Advisory feed (`NVIDIA/aicr-advisories` OSV) | First post-merge incident requires revocation of an attestation. |
+| Reusable workflow (`workflow_call`) | Multiple contributors ask for a turn-key path AND have hardware they can register against a public fork (corporate policy commonly disallows). Local `cosign attest` is documented in CONTRIBUTING. |
+| Mirror bot + archive registry | First contributor's OCI registry goes dark on an accepted bundle. |
+| Fingerprint per-signal provenance | First Tier-C-equivalent contribution gets pushback for "is this cluster real?" V1 records resolved `{value}` only; per-signal sources (`signals: [kubelet, dcgm, imds]`, `confidence: high`) are additive predicate fields. |
+| Tarball input form (`./bundle.tar.gz`) for `aicr evidence verify` auto-detect | First contributor with no out-of-band OCI access (air-gapped review, email transport of a one-off bundle). V1 ships pointer / OCI / unpacked directory; tarballs can be unpacked locally first and verified via the directory path. |
+
+Each row's pull-trigger is the demand signal that should bring the
+feature in. Per-row design happens at the demand event, not now —
+see `## Future direction`.
+
+## Consequences
+
+### Positive
+
+- **Trust handoff works for community contributions today.** A
+  contributor on AWS GB200 produces a signed bundle with a few
+  commands; a maintainer reads the verifier's Markdown summary and
+  approves on judgment. The PR stops stalling.
+- **Cryptographically complete.** Every file in the bundle is bound
+  to the signature via the manifest digest. Tampering with snapshot,
+  CTRF, or BOM after sign-time is detectable; the verifier's inventory
+  check enforces it.
+- **OCI-native transport with audit trail.** `git log
+  recipes/evidence/<recipe>/<src>/<digest>.yaml` shows every signing event;
+  content-addressed pulls catch registry compromise.
+- **BOM in every bundle.** Ties the recipe to the exact image set
+  deployed, satisfying #739's audit requirement and giving downstream
+  consumers a stable claim.
+- **Per-dimension fingerprint match.** The verifier's Markdown summary
+  shows exactly which `criteria` dimensions matched (and against what
+  fingerprint values), not just a yes/no.
+- **Inline constraint replay.** The verifier independently confirms
+  constraint pass/fail rather than trusting the recorded outcome.
+- **Standard tooling.** in-toto + cosign keyless + Rekor + CycloneDX
+  + OCI artifacts. Third parties can verify any AICR bundle with
+  vanilla `cosign verify-attestation` against public Rekor; the AICR
+  predicate parser is needed only to render the human-readable
+  summary.
+- **Bounded scope.** Five PRs, ~2300 lines of code, no new external
+  services. Implementation effort fits a sprint plus.
+- **Forward-compat seams visible.** Each deferred feature has a
+  documented pull-trigger in the deferred-features table. No surprise
+  rewrites; expansion is additive.
+
+### Negative
+
+- **Trust is signer-identity-bound, not cluster-physicality-bound.**
+  See `## Decision` → "Trust model." A contributor controlling their
+  own cluster can lie to the snapshot collectors; V1 records the
+  resolved fingerprint values, and per-signal provenance (which
+  collector signal contributed, with what confidence) is deferred.
+  Maintainer review of the cosign cert claims compensates — same
+  judgment surface as today's PR-only review, with a richer artifact
+  attached. The Tier policy file (deferred) is what eventually closes
+  this gap; per-signal provenance alone does not.
+- **Material-slice changes trigger re-cert; the slice definition is
+  itself a maintenance surface.** Edits to the leaf overlay's
+  `criteria`/`componentRefs`/`constraints`/`validation`/`nodeScheduling`,
+  to `componentRefs`-resolved values/manifest files, to mixin
+  `constraints` or `componentRefs`, or to registry entries pulled
+  through the resolution chain re-cert every recipe whose slice
+  touches them. Comment-only and metadata-only edits pass without
+  re-cert. The slice-set (what's in vs. out of the material projection)
+  is part of the algorithm version: tightening or relaxing it requires
+  bumping `materialSliceVersion`. Initial slice-set is conservative
+  (errs toward "include" for safety); empirical pull-trigger to relax
+  is contributors flagging false positives.
+- **Soft-fail window can hide real evidence drift.** During Phase 1,
+  a PR that legitimately needs new evidence merges with a warning the
+  reviewer may overlook. This is the cost of not blocking on hardware
+  availability before the corpus exists; the trigger conditions
+  (≥ 3 accelerator classes attested, OR 12 weeks) are calibrated to
+  end Phase 1 before drift accumulates. If the trigger drags, the
+  corpus is too thin to enforce a gate against in the first place.
+- **No tier label distinguishes first-party from community evidence.**
+  A bundle signed by NVIDIA's CI looks the same to the verifier as
+  one signed by an unfamiliar fork. Maintainers eyeball the cosign
+  cert claims to tell them apart. Acceptable until a real partner
+  relationship requests Tier B.
+- **No long-term archive.** If the contributor deletes the bundle
+  from their OCI registry after merge, the verifiable record is the
+  Rekor entry only — bytes may be unrecoverable. Acceptable until
+  first incident; the mirror bot is the answer.
+- **Single-instance pointer.** Until schema 2.0, only one attestation
+  per recipe lives in the pointer at a time. A second contributor's
+  attestation overwrites the first; multi-cluster diversity isn't
+  captured.
+- **Keyless signing publishes the signer's identity (PII) to a public,
+  immutable log.** The Fulcio certificate embeds the authenticated OIDC
+  identity — typically the signer's **email address** plus the issuer —
+  and with the public-good defaults (`fulcio.sigstore.dev` /
+  `rekor.sigstore.dev`) that identity is written to the **public,
+  append-only Rekor transparency log**, where it is permanent and
+  globally searchable, and is also attached to the pushed OCI artifact.
+  The consequence is irreversible, so consent must be explicit rather
+  than implicit: the CLI emits an endpoint-aware disclosure banner and,
+  on a TTY, pauses for confirmation before any interactive
+  (browser/device-code) login opens (`--yes` / `AICR_ASSUME_YES` skips
+  the prompt; non-interactive stdin proceeds without blocking so CI is
+  not wedged). Pre-fetched `--identity-token`, ambient CI OIDC, and
+  `--signing-key` paths are unaffected. Exposure is controlled by signing
+  from a non-personal CI/service identity, supplying a pre-fetched token,
+  or pointing `--fulcio-url`/`--rekor-url` at private Sigstore
+  infrastructure. See the
+  [CLI reference](../user/cli-reference.md#privacy-identity-in-keyless-signatures).
+
+## Alternatives Considered
+
+The V1 design space is wider than the chosen surface. The alternatives
+below were evaluated and rejected (or deferred) for the reasons given.
+
+### PR-attached tarball vs. OCI artifact (rejected)
+
+A bundle attached to the PR description as a release asset or a
+`*.tar.gz` checked into `recipes/evidence/`. Cheaper to ship — no
+registry dependency, no `oras` in the toolchain.
+
+Rejected because (1) tarballs in git balloon repo size and break
+content-addressed updates, (2) GitHub release assets have no audit
+trail and can be silently replaced, (3) cosign attestations naturally
+live next to OCI artifacts via Rekor — the in-tree-tarball path forces
+a parallel signing surface, and (4) the in-tree pointer file gives the
+same `git log` audit benefit a tarball would, without the size cost.
+
+### Sigstore bundle format vs. in-toto Statement (rejected)
+
+The sigstore "bundle" format (cert + sig + Rekor proof in one envelope)
+is increasingly the default for `cosign sign-blob`. It would let the
+verifier skip a Rekor round-trip.
+
+Rejected because in-toto Statements are the established industry
+standard for build/test attestations, third-party verifiers
+(`cosign verify-attestation`) consume them natively, and the predicate
+type discriminates V1 from future V2 cleanly. Sigstore-bundle remains
+an option for the cosign signing path *underneath* the in-toto
+envelope; this is not an either/or at the bundle layer.
+
+### Single combined bundle vs. split summary/logs (rejected)
+
+Keep summary and logs in one OCI artifact; sign once.
+
+Rejected because logs are large, contributor-controlled (some clusters
+generate GBs per validator phase), and frequently sensitive (cluster
+identifiers, internal endpoints). A single bundle forces every
+publication to ship logs, raises registry costs, and leaks operational
+detail into every public attestation. The split design lets logs stay
+local until the contributor opts in to pushing them (the `--push-logs`
+flag is deferred — log capture is not implemented in V1), while the
+manifest pre-commit binding still gives forensic recoverability.
+
+### KMS-backed signing vs. cosign keyless (deferred, not rejected)
+
+KMS-backed signing (AWS KMS / GCP KMS / Azure Key Vault / HSM-backed
+PKCS#11) gives a stable, organizationally-controlled signing identity
+that does not depend on OIDC token issuers.
+
+Deferred to V2 under the same predicate type — `predicateType` does
+not change, only the `signer.issuer` claim shape. V1 ships keyless
+because contributors targeting unreachable hardware do not have NVIDIA
+KMS access, and corporate OIDC (GitHub Actions OIDC, Azure AD) is
+already the friction-free path. KMS arrives when a partner relationship
+or NVIDIA-internal CI path requires it.
+
+### git-LFS vs. OCI for transport (rejected)
+
+Store bundle bytes in git-LFS at `recipes/evidence-bundles/<recipe>/`.
+Eliminates the OCI-registry dependency.
+
+Rejected because (1) LFS bytes still inflate clone size for every
+contributor who only needs the recipe text, (2) GitHub LFS has bandwidth
+quotas that incidents can blow through, (3) LFS objects are mutable on
+their backing store — content-addressed pulls don't transfer, and
+(4) cosign tooling has no LFS integration, so the signing surface would
+fragment.
+
+### `aicr verify-evidence` top-level verb vs. `aicr evidence verify` family (rejected)
+
+Earlier drafts of this ADR proposed a standalone `aicr verify-evidence`
+top-level command, paired with `aicr validate --emit-attestation` for
+production. Simpler to type; one-to-one mapping between produce and
+verify.
+
+Rejected because (1) AICR already groups verbs under nouns
+(`aicr snapshot`, `aicr recipe`, `aicr validate`, `aicr bundle`,
+`aicr query`); a standalone `verify-evidence` breaks that pattern,
+(2) AICR carries multiple kinds of evidence with different shapes
+(`pkg/evidence` ships CNCF conformance evidence today; this ADR adds
+`recipe-test-attestation`), and a standalone verb fixes the surface
+to one kind, and (3) future evidence kinds (CycloneDX BOM-only
+attestation, SLSA provenance, license attestation) would each need
+their own top-level verb. The `aicr evidence verify` / `list` /
+`show` family handles all kinds under one surface and leaves room
+for future read-only operations (`diff`, `push`, `archive`) without
+top-level pollution.
+
+Production stays at the origin (`aicr validate --emit-attestation`)
+because evidence is a side-effect of the pipeline that produced its
+inputs. Re-emitting via `aicr evidence emit` would either re-run
+validate (defeating the purpose of an offline verifier) or reach into
+validate's stored output (a hidden coupling). Keeping production at
+the origin keeps the data flow obvious; consumption unifying under
+`evidence` keeps the inspection surface coherent.
+
+### Post-resolution-only subject digest vs. material slice + chain manifest (rejected)
+
+Earlier drafts bound the subject digest to the *post-resolution recipe*
+as a single value: `sha256(canonicalize(post-resolution recipe YAML))`.
+Simpler — one hash to compute, one to verify.
+
+Rejected because (1) it couples bundle validity to resolver determinism
+across the entire overlay → mixin → registry → component-values chain
+(a change to ADR-005's resolver semantics would silently invalidate
+every prior bundle even when the leaf overlay is byte-identical), and
+(2) it gives the verifier no way to tell *which* input changed when
+the digest does change — registry-edit, mixin-tweak, and
+component-values-update all surface as a single opaque mismatch. The
+chosen design splits the two concerns: the in-toto subject is the
+material-slice digest (re-cert trigger; what the signature is bound
+to), and the predicate's `chainManifest` records the unresolved leaf
+plus per-input hashes (forensic provenance; tells the maintainer why
+re-cert is needed). This is additive in cost (the resolver already
+walks every input) and materially better in re-cert ergonomics.
+
+### Single attestation per recipe vs. list from day one (rejected)
+
+V1's `pointer.attestations` could be a single object instead of a list
+of one. Slightly simpler schema today.
+
+Rejected because the multi-instance schema 2.0 transition (one
+attestation per cluster) would then require a breaking schema-version
+bump and a migration shim. Shipping a list of one in V1 makes schema
+2.0 purely additive — new entries plus an optional `role:` field —
+and verifier readers do not have to discriminate by schema version.
+
+## Future direction
+
+The deferred-features table in `## Decision` → "What V1 does *not* ship"
+names every V2 candidate with its pull-trigger and compatibility note
+— that is the canonical list. Each row is a *placeholder*, not a
+design: when a row's trigger fires, the V2 work gets its own tracking
+issue under [#750](https://github.com/NVIDIA/aicr/issues/750) and the
+shape is decided then, against the demand event that pulled it in.
+This ADR deliberately does not pre-design that work. Earlier drafts
+sketched detailed V2 surfaces (tier-policy file layout, schema 2.0
+fields, four predicate types, OSV advisory feed shape, mirror bot
+trigger) — those sketches were removed because they implied
+commitments the demand event has not yet justified.
+
+## Adoption plan
+
+1. **This ADR lands.** Sets policy, no code changes.
+2. **PR-A: bundle format + pointer + `aicr validate --emit-attestation`.**
+   Ships the `/v1` predicate; the OCI summary bundle layout (recipe +
+   snapshot + BOM + CTRF + manifest); the optional logs bundle; the
+   manifest pre-commit binding; the cosign keyless signing path; the
+   pointer schema 1.0 (`docs/spec/recipe-evidence-pointer-v1.md` with
+   JSON Schema); and `--emit-attestation` writing the pointer file
+   alongside the bundle directories. Optional `--push <oci-registry>`
+   handles the OCI upload, cosign attest, and pointer population in one
+   command. Updates `pkg/bundler/attestation` with the new predicate
+   type. Pulls the BOM from the existing #739 pipeline. Extends
+   `pkg/config.AICRConfig` (apiVersion `aicr.run/v1alpha2`,
+   additive) with a `ValidateSpec` sibling of `RecipeSpec`/`BundleSpec`,
+   reusing `AttestationSpec` and `RegistrySpec` so cosign and OCI
+   surfaces stay consistent across `bundle` and `validate`.
+3. **PR-B: `aicr evidence` CLI family.** Adds `aicr evidence verify`
+   (single positional input — pointer / OCI / directory, auto-detected
+   — twelve verification steps, three exit codes, Markdown + JSON
+   output), `aicr evidence list`, and `aicr evidence show`. Depends on PR-A (predicate parsing + pointer parsing).
+   Future evidence kinds (CNCF conformance, BOM-only, SLSA provenance)
+   plug in as additional verifier dispatches under the same family
+   without further top-level CLI growth.
+4. **PR-C: CI gate workflow + PR template.** Required check on PRs
+   touching `recipes/**`. Depends on PR-B.
+5. **PR-D: `maintainers:` block schema + CI presence gate + backfill
+   PR.** Schedule-independent of A/B/C — the field is additive
+   metadata and can land first if convenient — but motivated by this
+   ADR's evidence lifecycle (durable contact for re-cert prompts,
+   advisory revocations, and signer-identity disputes).
+
+PR-A is the foundation. PR-B depends on PR-A. PR-C depends on PR-B.
+PR-D is schedule-independent and can land first if convenient; its
+motivation, not its dependencies, is the evidence lifecycle.
+
+When V1 ships and feedback lands, consult the deferred-features table
+under `## Decision`. **Each deferred feature has a documented
+pull-trigger; let demand decide what V2 brings in.** Don't pre-build.
+
+## References
+
+### Standards and specifications
+
+- [in-toto Attestation Framework](https://github.com/in-toto/attestation) —
+  predicate envelope and Statement shape used for the
+  `recipe-evidence/v1` predicate type.
+- [DSSE (Dead Simple Signing Envelope)](https://github.com/secure-systems-lab/dsse) —
+  signature envelope wrapping the in-toto Statement.
+- [Sigstore Cosign](https://docs.sigstore.dev/cosign/signing/overview/) —
+  keyless signing path used in V1; reference for `cosign attest` and
+  `cosign verify-attestation`.
+- [Fulcio](https://github.com/sigstore/fulcio) — short-lived cert
+  authority that issues the OIDC-bound signing cert recorded in the
+  bundle's `signer.identity` and `signer.issuer` claims.
+- [Rekor](https://github.com/sigstore/rekor) — transparency log; the
+  verifier's default cross-check for `signer.rekorLogIndex`.
+- [CycloneDX 1.5](https://cyclonedx.org/specification/overview/) —
+  BOM format used for the `bom.cdx.json` artifact in every summary
+  bundle, per [#739](https://github.com/NVIDIA/aicr/issues/739).
+- [OCI Distribution Spec 1.1](https://github.com/opencontainers/distribution-spec) —
+  registry transport for the summary and (optional) logs bundles.
+- [OCI Image Spec 1.1 — Artifacts](https://github.com/opencontainers/image-spec/blob/main/manifest.md) —
+  artifact-type media field used for AICR evidence bundles.
+- [ORAS](https://oras.land/) — OCI artifact transport library
+  expected to back the `--push` and verifier `oras pull` paths.
+- [RFC 8785 — JSON Canonicalization Scheme (JCS)](https://www.rfc-editor.org/rfc/rfc8785) —
+  canonical form for the material-slice subject digest.
+- [CTRF](https://ctrf.io/) — common test-result format consumed from
+  the validator phases for `phaseSummary`.
+
+### Related ADRs
+
+- [ADR-002: Validator V2](002-validatorv2-adr.md) — the validator
+  pipeline that produces phase results consumed by this bundle.
+- [ADR-005: Overlay Refactoring](005-overlay-refactoring.md) — the
+  resolver chain (overlays → mixins → registry → component values)
+  enumerated in this ADR's `chainManifest` for forensic provenance.
+  The bundle's material digest is computed over the *post-resolution
+  material slice*, so resolver determinism still matters; the chain
+  manifest lets the verifier diagnose which input caused a digest
+  change without re-running the resolver.
+- [ADR-006: Container Image Pinning Policy](006-image-pinning-policy.md) —
+  pinning surface this ADR scopes to (recipe + chart-pin + digest-pin);
+  per-component admission-time digest verification stays out of scope.
+
+### Tracking issues
+
+- [#739](https://github.com/NVIDIA/aicr/issues/739) — CycloneDX BOM
+  pipeline (hard dependency for V1).
+- [#745](https://github.com/NVIDIA/aicr/issues/745) — admission-time
+  image policy (out of scope for this ADR).
+- [#750](https://github.com/NVIDIA/aicr/issues/750) — epic; verifiable
+  recipe test evidence.
+- [#751](https://github.com/NVIDIA/aicr/issues/751) — contribution
+  workflow.
+- [#752](https://github.com/NVIDIA/aicr/issues/752) — fingerprint
+  match.
+- [#753](https://github.com/NVIDIA/aicr/issues/753) — verifier.
+- [#754](https://github.com/NVIDIA/aicr/issues/754) — bundle format.
+
+## Amendment: single-path CNCF conformance evidence (2026-11-03)
+
+Amends the `cncf-conformance` kind in the evidence taxonomy and the
+`cncf-conformance` row of the V1 surface above. Execution is tracked in
+[#3601](https://github.com/NVIDIA/aicr/issues/3601); this section records
+the decisions that change what this ADR committed to. The decisions are
+accepted; each names the sub-issue that lands it. Decisions 1 to 3 landed
+with [#3602](https://github.com/NVIDIA/aicr/issues/3602) on 2026-11-05: the
+collector and `--feature` are gone and `--cncf-submission` renders from the
+conformance run. The packaging of decision 7 is
+[#3605](https://github.com/NVIDIA/aicr/issues/3605); it landed with
+[#3701](https://github.com/NVIDIA/aicr/pull/3701) on 2026-11-07. The
+recipe-test-attestation kind, the bundle format, the pointer layout and
+the verifier are not affected. The depth and submission-output scope
+were revised on 2026-11-04 after an audit against the CNCF requirement
+bar ([#3619](https://github.com/NVIDIA/aicr/issues/3619)); the Options
+and Consequences below record that revision.
+
+### Context
+
+When this ADR was written, `pkg/evidence` already shipped CNCF
+conformance evidence, and the V1 surface took that path as given. It has
+since become two unrelated implementations of every CNCF requirement:
+
+- The Go checks in `validators/conformance/`, run by
+  `aicr validate --phase conformance` and rendered to
+  `evidence/<requirement>.md` by `pkg/evidence/cncf/renderer.go` when
+  `--evidence-dir` is set. Nightly UAT runs these checks without
+  `--evidence-dir` and packages their CTRF results into recipe-evidence
+  attestations; it does not exercise CNCF Markdown rendering.
+- The bash collector `pkg/evidence/cncf/scripts/collect-evidence.sh`,
+  embedded in the binary and run by `--cncf-submission`. That flag
+  short-circuits validation, so the Go checks never run on a submission.
+
+The two differ in depth and keep separate verdict logic. The NVKE v1.36
+submission ([#3389](https://github.com/NVIDIA/aicr/issues/3389),
+[#3455](https://github.com/NVIDIA/aicr/issues/3455)) still needed four
+checks run by hand on top of the collector, a hand-written PRODUCT.yaml,
+README and platform-configuration page, and hand redaction. Review of
+that submission caught a PRODUCT.yaml note whose cited evidence did not
+show the claim.
+
+Upstream has moved since v1.35. The v1.36 checklist removed
+`dra_support`, which the renderer still presents as a requirement. The
+v1.37 checklist added `workload_sandboxing` and introduced hybrid
+verification: `junit.xml` and `e2e.log` in the submission directory,
+parsed by the upstream validator. The graduations announced in the
+upstream Kubernetes AI Requirements (KARs,
+[kubernetes-sigs/ai-conformance/kars/](https://github.com/kubernetes-sigs/ai-conformance/tree/main/kars))
+target `driver_runtime_management` and `workload_sandboxing` as MUST at
+v1.38; no v1.38 schema is published yet.
+
+Nightly UAT runs the conformance phase inside a 40-minute all-phases
+step. The UAT cells have two GPU nodes, so runtime and contention with
+the other phases, not capacity, bound what can be always-on.
+
+### Decision (accepted; 1 to 3 landed with #3602, the rest tracked per issue)
+
+1. **One runner.** Implementing issue:
+   [#3602](https://github.com/NVIDIA/aicr/issues/3602).
+   `aicr validate --phase conformance` is the only behavioral
+   implementation of CNCF conformance. The collector script and
+   `pkg/evidence/cncf/collector.go` are deleted once a section-by-section
+   comparison shows every requirement the script evidenced has a
+   Go-produced counterpart.
+2. **Flags do not change check execution or check verdicts.** Implementing
+   issue: [#3602](https://github.com/NVIDIA/aicr/issues/3602), packaging
+   in [#3605](https://github.com/NVIDIA/aicr/issues/3605). For the same
+   selected checks, verdicts are identical with and without the evidence
+   flags. `--cncf-submission` and `--evidence-dir <path>` require each
+   other: evidence is written only for a submission, so today's
+   `--evidence-dir`-alone rendering goes away. The submission output is
+   PRODUCT.yaml, README.md (carrying the platform facts PRODUCT.yaml notes
+   cite), `junit.xml`, `e2e.log` and the existing
+   `evidence/<requirement>.md` pages, with one redaction pass
+   (`pkg/evidence/redact`) over the complete submission directory, all
+   five kinds of file, before a check of that directory by the pinned
+   upstream validator as the last step. Vendor fields and the conditional
+   `cluster_autoscaling` N/A justification come from the validate config,
+   not a new flag. A submission run refuses `--skip-check` and
+   `--no-cluster` and no longer bypasses validation. A submission run
+   exits non-zero for: (a) flag and input refusals before any check runs,
+   and the readiness pre-flight, with exit 2 as today; (b) an incomplete
+   applicable MUST requirement; (c) a write or redaction error, or the
+   pinned upstream validator failing or being unable to run (refined
+   2026-11-07 in #3701: a validator that cannot run because the CNCF
+   landscape is unreachable exits `SERVICE_UNAVAILABLE`, not an internal
+   error) (for example
+   it cannot fetch the CNCF landscape), reported as an internal error. A
+   submission run derives its exit status from the requirement
+   aggregation, so the per-check rule of `--fail-on-error` is superseded:
+   a non-passing check behind a SHOULD does not fail a submission run,
+   while any non-passing check behind a MUST does, through (b). No check
+   verdict is rewritten. Refined 2026-11-05 in
+   [#3602](https://github.com/NVIDIA/aicr/issues/3602): the submission
+   verdict is additional to the per-check failure rule, not a replacement
+   for it. A check that fails or errors fails a submission run exactly as it
+   fails any other run, because a flag never changes verdict logic
+   (decision 2's own invariant) and because conformance checks with no
+   requirement mapping (platform-health, the Slinky health checks) are
+   invisible to the aggregation; the SHOULD exemption above applies to the
+   aggregation's own verdict and to the export rule of decision 6, not to
+   the per-check rule.
+3. **`--feature` and `evidence.cncf.features` are removed together with
+   the script.** Implementing issue:
+   [#3602](https://github.com/NVIDIA/aicr/issues/3602).
+   `Client.CollectCNCFEvidence` keeps its signature as a wrapper over
+   run-plus-render; a non-empty `Features`, a nil recipe, or `NoCluster`
+   is rejected with `ErrCodeInvalidRequest`. Likewise,
+   `aicr validate --phase conformance --cncf-submission` requires
+   `--recipe` (or a config recipe input) and is refused with
+   `ErrCodeInvalidRequest` otherwise, because the single runner selects
+   checks from the recipe and the collector's capability-detection path
+   goes away with it; the submission examples without `--recipe` in
+   `docs/conformance/cncf/index.md` and `docs/user/validation.md`, and the
+   `--evidence-dir`-alone "Structural Validation (CI)" example in
+   `docs/conformance/cncf/index.md`, are updated in
+   [#3602](https://github.com/NVIDIA/aicr/issues/3602). The argument
+   contract is specified and tested in
+   [#3602](https://github.com/NVIDIA/aicr/issues/3602).
+4. **Depth is set by the CNCF bar; checks are extended in place.**
+   Implementing issues:
+   [#3603](https://github.com/NVIDIA/aicr/issues/3603),
+   [#3604](https://github.com/NVIDIA/aicr/issues/3604),
+   [#3428](https://github.com/NVIDIA/aicr/issues/3428),
+   [#3609](https://github.com/NVIDIA/aicr/issues/3609). Each check's depth
+   is what the corresponding kubernetes-sigs/ai-conformance test requires,
+   per the table in [#3619](https://github.com/NVIDIA/aicr/issues/3619);
+   checks are extended in place and there are no sibling tiers. Every
+   GPU-cell run, nightly UAT and submission alike, executes every check
+   the recipe lists, so the two run the identical set. There is no nightly
+   skip list and no weekly lane. `--skip-check` remains only for lanes
+   that cannot host a check (Kind, KWOK); such a run is narrower than the
+   recipe by construction and stays refused with `--evidence-dir`.
+5. **Requirement map keyed by Kubernetes version.** Implementing issue:
+   [#3606](https://github.com/NVIDIA/aicr/issues/3606). The complete
+   upstream checklist per supported version, with IDs, descriptions and
+   levels preserved exactly and the AICR checks expected to evidence each
+   requirement. `dra_support` is supporting evidence from v1.36;
+   `workload_sandboxing` appears from v1.37; the v1.38 graduations are
+   readiness work until that schema is published. Unsupported versions are
+   refused. Titles name capabilities, not vendors.
+6. **Fail closed on coverage, scoped by level.** Implementing issue:
+   [#3612](https://github.com/NVIDIA/aicr/issues/3612). Any requirement
+   claimed Implemented, MUST or SHOULD, must have every expected check
+   present and passed. Skipped, `other`, missing, or capacity-starved
+   checks leave it incomplete, recorded as an unmet test prerequisite
+   rather than a disproven capability. Implemented and Not Implemented
+   come from the run; N/A comes only from the validate config key
+   `spec.validate.evidence.cncf.notApplicable`, only for conditional
+   MUSTs. A requirement is Implemented only when every expected check is
+   present and passed. An incomplete applicable MUST fails the submission
+   run. A SHOULD with incomplete or absent checks renders Not Implemented
+   and the run does not fail (for example `workload_sandboxing` at v1.37,
+   where a missing sandbox runtime renders Not Implemented). MUST-level
+   N/A exists only for the conditional `cluster_autoscaling`. The
+   `notApplicable` key maps a conditional MUST id (today only
+   `cluster_autoscaling`) to its justification; when set, the requirement
+   renders N/A with that justification, taking precedence over a
+   cluster-autoscaling check that ran, whose result is recorded as an
+   observation and not referenced as proof. Any other id in that map is
+   refused. Checks record observations only and never assert
+   nonapplicability. Export rule for the artifacts: the raw CTRF report
+   keeps the real verdict; the submission `junit.xml` and `e2e.log` export
+   a non-passing testcase that belongs only to a Not Implemented SHOULD as
+   skipped, with the original verdict and reason in the message, and
+   PRODUCT.yaml does not reference it; a non-passing testcase behind a
+   requirement overridden to N/A is exported the same way, as skipped with
+   "not applicable: <justification>" and the original verdict in the
+   message, unreferenced by PRODUCT.yaml and without effect on the exit
+   status; a non-passing testcase behind an applicable MUST, one not
+   overridden to N/A, is exported as a failure and the run exits non-zero,
+   so the directory is not submittable. This is what lets the upstream
+   artifact check, which rejects any failure or error in a referenced
+   artifact, pass for a Not Implemented SHOULD or an N/A conditional MUST.
+7. **AICR-named junit; the upstream suite is optional.** Implementing
+   issue: [#3605](https://github.com/NVIDIA/aicr/issues/3605). `junit.xml`
+   carries AICR check names, referenced per requirement with explicit
+   `file://...#<check>` fragments, which the upstream validator honors
+   before its upstream-name fallback. Running the kubernetes-sigs/ai-
+   conformance suite is optional independent verification with its own
+   provenance; upstream testcase names appear only for tests actually run
+   from it. The submission directory is PRODUCT.yaml, README.md,
+   `junit.xml`, `e2e.log` and the `evidence/<requirement>.md` pages. The
+   upstream validator reads PRODUCT.yaml, resolves every local file it
+   cites (each must exist) and parses `junit.xml` and `e2e.log`; no
+   additional structured artifacts (typed JSON records, `results.json`)
+   are produced.
+
+### Options considered
+
+| Option | Outcome |
+|---|---|
+| A. One depth, always full | Rejected. The nightly step overruns and Kind lanes cannot run the deep tests. |
+| B. Two tiers as separate catalog checks | Chosen on 2026-11-03, superseded 2026-11-04 (see the note below). Reuses `--skip-check`, keeps the recipe the source of truth, and a submission run cannot omit the deep tier. |
+| C. Depth flag on the run | Rejected. A flag that changes verdict logic is the two-behaviors problem being removed, and it creates "passed nightly, failed at submission". |
+| D. Delegate deep MUSTs to the upstream suite | Kept as optional independent verification. External dependency, per-test flags, timeouts of 30 to 75 minutes, no coverage of AICR-specific probes, and not needed for junit credit. |
+
+The table records the options as considered on 2026-11-03. On
+2026-11-04 option B was superseded by the CNCF-bar audit
+([#3619](https://github.com/NVIDIA/aicr/issues/3619)): measured against
+the upstream tests, the expensive tests the tiers were meant to isolate
+exceeded the bar and were dropped, so no tiers are needed and option A's
+cost objection no longer applies. Decision 4 records the result.
+
+### Consequences
+
+- The "Two Modes" description in `docs/conformance/cncf/index.md`
+  collapses to one mode once the script is gone.
+- Evidence rendering becomes a consumer of the validator's CTRF report;
+  `junit.xml` and `e2e.log` are generated from the same report and the
+  run log.
+- Nightly UAT's conformance phase gains the CNCF-bar depth, and recipes
+  gain the checks they were missing;
+  [#3609](https://github.com/NVIDIA/aicr/issues/3609) measures the cost.
+
+### Tracking
+
+- [#3601](https://github.com/NVIDIA/aicr/issues/3601) epic;
+  [#3389](https://github.com/NVIDIA/aicr/issues/3389) NVKE CNCF AI
+  conformance, the submission this work generalizes.
+- [#3611](https://github.com/NVIDIA/aicr/issues/3611) this amendment;
+  [#3619](https://github.com/NVIDIA/aicr/issues/3619) the 2026-11-04
+  CNCF-bar audit that revised its depth and output scope.
+- [#3606](https://github.com/NVIDIA/aicr/issues/3606) versioned
+  requirement map;
+  [#3612](https://github.com/NVIDIA/aicr/issues/3612) fail-closed
+  aggregation.
+- [#3603](https://github.com/NVIDIA/aicr/issues/3603),
+  [#3604](https://github.com/NVIDIA/aicr/issues/3604),
+  [#3428](https://github.com/NVIDIA/aicr/issues/3428) checks extended
+  to the CNCF bar, including the cluster-autoscaling constrained claim;
+  [#3609](https://github.com/NVIDIA/aicr/issues/3609) nightly cost
+  measurement.
+- [#3602](https://github.com/NVIDIA/aicr/issues/3602) runner change and
+  collector removal;
+  [#3605](https://github.com/NVIDIA/aicr/issues/3605) submission
+  packaging and the NVKE proof run.
+- [#3615](https://github.com/NVIDIA/aicr/issues/3615) v1.38 readiness:
+  driver-runtime-management and workload sandboxing.

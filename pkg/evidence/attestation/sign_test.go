@@ -1,0 +1,330 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package attestation
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	bundleattest "github.com/NVIDIA/aicr/pkg/bundler/attestation"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+)
+
+func signableSignPointer() *Pointer {
+	return &Pointer{
+		SchemaVersion: PointerSchemaVersion,
+		Recipe:        "h100-eks-ubuntu-training",
+		Attestations: []PointerAttestation{{
+			Bundle: PointerBundle{OCI: "ghcr.io/owner/aicr-evidence:tag", Digest: "sha256:abc", PredicateType: PredicateTypeV1},
+		}},
+	}
+}
+
+func TestValidateSignablePointer(t *testing.T) {
+	signed := signableSignPointer()
+	signed.Attestations[0].Signer = &PointerSigner{Identity: "u@x", Issuer: "iss"}
+	noBundle := signableSignPointer()
+	noBundle.Attestations[0].Bundle.OCI = ""
+	noDigest := signableSignPointer()
+	noDigest.Attestations[0].Bundle.Digest = ""
+	twoAtts := signableSignPointer()
+	twoAtts.Attestations = append(twoAtts.Attestations, twoAtts.Attestations[0])
+
+	tests := []struct {
+		name     string
+		pointer  *Pointer
+		wantErr  bool
+		wantCode errors.ErrorCode
+	}{
+		{"valid unsigned", signableSignPointer(), false, ""},
+		{"nil pointer", nil, true, errors.ErrCodeInvalidRequest},
+		{"already signed", signed, true, errors.ErrCodeConflict},
+		{"no bundle.oci", noBundle, true, errors.ErrCodeInvalidRequest},
+		{"no bundle.digest", noDigest, true, errors.ErrCodeInvalidRequest},
+		{"multiple attestations", twoAtts, true, errors.ErrCodeInvalidRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSignablePointer(tt.pointer)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr && errorstest.ReportedCode(err) != tt.wantCode {
+				t.Errorf("error code = %v, want %v", err, tt.wantCode)
+			}
+		})
+	}
+}
+
+func TestSignExisting_RejectsBadPointer(t *testing.T) {
+	desc := MainArtifactDescriptor{Digest: "sha256:abc", MediaType: "application/json", Size: 1}
+	noOCI := signableSignPointer()
+	noOCI.Attestations[0].Bundle.OCI = ""
+	noDigest := signableSignPointer()
+	noDigest.Attestations[0].Bundle.Digest = ""
+	alreadySigned := signableSignPointer()
+	alreadySigned.Attestations[0].Signer = &PointerSigner{Identity: "u@x", Issuer: "iss"}
+	multiAtt := signableSignPointer()
+	multiAtt.Attestations = append(multiAtt.Attestations, multiAtt.Attestations[0])
+
+	tests := []struct {
+		name     string
+		pointer  *Pointer
+		path     string
+		wantCode errors.ErrorCode
+	}{
+		{"nil pointer", nil, "p.yaml", errors.ErrCodeInvalidRequest},
+		{"no attestations", &Pointer{}, "p.yaml", errors.ErrCodeInvalidRequest},
+		{"empty path", signableSignPointer(), "", errors.ErrCodeInvalidRequest},
+		{"empty bundle.oci", noOCI, "p.yaml", errors.ErrCodeInvalidRequest},
+		{"empty bundle.digest", noDigest, "p.yaml", errors.ErrCodeInvalidRequest},
+		{"already signed", alreadySigned, "p.yaml", errors.ErrCodeConflict},
+		{"multiple attestations", multiAtt, "p.yaml", errors.ErrCodeInvalidRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := SignExisting(context.Background(), SignExistingOptions{
+				Pointer: tt.pointer, PointerPath: tt.path, Artifact: desc,
+			})
+			if err == nil {
+				t.Fatalf("expected error for %s", tt.name)
+			}
+			if errorstest.ReportedCode(err) != tt.wantCode {
+				t.Errorf("error code = %v, want %v", err, tt.wantCode)
+			}
+		})
+	}
+}
+
+func TestSignExisting_RejectsIncompleteDescriptor(t *testing.T) {
+	tests := []struct {
+		name string
+		desc MainArtifactDescriptor
+	}{
+		{"no digest", MainArtifactDescriptor{MediaType: "application/json", Size: 1}},
+		{"no mediaType", MainArtifactDescriptor{Digest: "sha256:abc", Size: 1}},
+		{"no size", MainArtifactDescriptor{Digest: "sha256:abc", MediaType: "application/json"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := SignExisting(context.Background(), SignExistingOptions{
+				Pointer:     signableSignPointer(),
+				PointerPath: "p.yaml",
+				Artifact:    tt.desc,
+			})
+			if err == nil {
+				t.Fatalf("expected error for incomplete descriptor %+v", tt.desc)
+			}
+			if errorstest.ReportedCode(err) != errors.ErrCodeInvalidRequest {
+				t.Errorf("error code = %v, want ErrCodeInvalidRequest", err)
+			}
+		})
+	}
+}
+
+// TestSignExisting_CanceledContextSurfacesAbort proves SignExisting threads
+// the caller's context into the on-disk bundle read: with a valid signable
+// pointer and a real bundle on disk (so the read would otherwise succeed), an
+// already-canceled context fails closed with ErrCodeCanceled instead of blocking
+// on a potentially hung mount (issue #2054).
+func TestSignExisting_CanceledContextSurfacesAbort(t *testing.T) {
+	dir := emitUnsignedBundle(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := SignExisting(ctx, SignExistingOptions{
+		Pointer:     signableSignPointer(),
+		PointerPath: filepath.Join(t.TempDir(), "pointer.yaml"),
+		BundleDir:   dir,
+		Artifact:    MainArtifactDescriptor{Digest: "sha256:abc", MediaType: "application/json", Size: 1},
+	})
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeCanceled {
+		t.Errorf("expected ErrCodeCanceled, got %v", err)
+	}
+}
+
+// TestSignExisting_RejectsPredicateTypeMismatch proves the pointer-vs-bundle
+// predicateType cross-check. A bundle freshly built by Emit is typed V3
+// (BuildStatement/StatementPredicateType), but the pointer under test claims
+// V1. SignExisting must fail closed on that divergence rather than sign a V3
+// artifact statement around what the pointer recorded as a V1 bundle, the
+// exact split that let a Fulcio cert get spent on evidence the verifier
+// then rejects.
+func TestSignExisting_RejectsPredicateTypeMismatch(t *testing.T) {
+	dir := emitUnsignedBundle(t)
+	pointer := signableSignPointer()
+	pointer.Attestations[0].Bundle.PredicateType = PredicateTypeV1
+
+	err := SignExisting(context.Background(), SignExistingOptions{
+		Pointer:     pointer,
+		PointerPath: filepath.Join(t.TempDir(), "pointer.yaml"),
+		BundleDir:   dir,
+		Artifact:    MainArtifactDescriptor{Digest: "sha256:abc", MediaType: "application/json", Size: 1},
+	})
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeConflict {
+		t.Errorf("expected ErrCodeConflict, got %v", err)
+	}
+}
+
+func TestPointerSignerFromSignature(t *testing.T) {
+	if PointerSignerFromSignature(nil) != nil {
+		t.Errorf("nil signature should yield nil signer")
+	}
+
+	withRekor := PointerSignerFromSignature(&bundleattest.SignedAttestation{
+		Identity: "ci@github", Issuer: "https://token.actions.githubusercontent.com", RekorLogIndex: 42,
+	})
+	if withRekor == nil || withRekor.RekorLogIndex == nil || *withRekor.RekorLogIndex != 42 {
+		t.Fatalf("expected rekor index 42; got %+v", withRekor)
+	}
+	if withRekor.Identity != "ci@github" {
+		t.Errorf("identity mismatch: %+v", withRekor)
+	}
+
+	zeroRekor := PointerSignerFromSignature(&bundleattest.SignedAttestation{Identity: "u@x", RekorLogIndex: 0})
+	if zeroRekor.RekorLogIndex != nil {
+		t.Errorf("zero rekor index should map to nil; got *%d", *zeroRekor.RekorLogIndex)
+	}
+
+	// A key signature records the key fingerprint, never the KMS key URI
+	// SignStatementWith reports as its identity.
+	const fingerprint = "sha256:d93f4a5e57c66728cb33edea59e9fc0fdf246a5361a0b8c50905e497ef0e5c2b"
+	keySigned := PointerSignerFromSignature(&bundleattest.SignedAttestation{
+		Identity: "awskms:///alias/aicr-evidence", KeyFingerprint: fingerprint, RekorLogIndex: 7,
+	})
+	if keySigned.Issuer != KeySignerIssuer || keySigned.Identity != fingerprint {
+		t.Errorf("key signer = %+v, want issuer %q identity %q", keySigned, KeySignerIssuer, fingerprint)
+	}
+	if keySigned.RekorLogIndex == nil || *keySigned.RekorLogIndex != 7 {
+		t.Errorf("key signer rekor index = %v, want 7", keySigned.RekorLogIndex)
+	}
+	if offline := PointerSignerFromSignature(&bundleattest.SignedAttestation{KeyFingerprint: fingerprint}); offline.RekorLogIndex != nil {
+		t.Errorf("tlog-less key signer rekor index = %d, want nil", *offline.RekorLogIndex)
+	}
+}
+
+// TestUnsatisfiableSigningFailsBeforeAnyNetworkLeg pins that a signing request
+// no signature could satisfy (a keyless request to skip the transparency log,
+// a signing key with no KMS scheme) is rejected before anything is pushed,
+// pulled or resolved.
+func TestUnsatisfiableSigningFailsBeforeAnyNetworkLeg(t *testing.T) {
+	keylessNoTLog := bundleattest.ResolveOptions{DisableTLogUpload: true}
+
+	t.Run("emit and publish", func(t *testing.T) {
+		// An unreachable registry: reaching the push would fail Unavailable.
+		_, err := signAndPush(context.Background(), &Bundle{SummaryDir: t.TempDir()}, signPushOptions{
+			Push:        "127.0.0.1:1/aicr-evidence:tag",
+			OIDCResolve: keylessNoTLog,
+		})
+		errorstest.WantReportedCode(t, err, errors.ErrCodeInvalidRequest)
+	})
+
+	t.Run("sign existing", func(t *testing.T) {
+		err := SignExisting(context.Background(), SignExistingOptions{
+			Pointer:     signableSignPointer(),
+			PointerPath: filepath.Join(t.TempDir(), "pointer.yaml"),
+			BundleDir:   filepath.Join(t.TempDir(), "absent"),
+			Artifact:    MainArtifactDescriptor{Digest: "sha256:abc", MediaType: "application/json", Size: 1},
+			OIDCResolve: keylessNoTLog,
+		})
+		errorstest.WantReportedCode(t, err, errors.ErrCodeInvalidRequest)
+		if err == nil || !strings.Contains(err.Error(), "transparency log") {
+			t.Errorf("error %v does not name the transparency-log conflict", err)
+		}
+	})
+
+	t.Run("sign statement", func(t *testing.T) {
+		_, err := signEvidenceStatement(context.Background(), []byte(`{}`), keylessNoTLog)
+		errorstest.WantReportedCode(t, err, errors.ErrCodeInvalidRequest)
+	})
+
+	t.Run("signing key without a KMS scheme", func(t *testing.T) {
+		_, err := signAndPush(context.Background(), &Bundle{SummaryDir: t.TempDir()}, signPushOptions{
+			Push:        "127.0.0.1:1/aicr-evidence:tag",
+			OIDCResolve: bundleattest.ResolveOptions{SigningKey: "cosign.key"},
+		})
+		errorstest.WantReportedCode(t, err, errors.ErrCodeInvalidRequest)
+	})
+
+	t.Run("signing key with keyless-only options", func(t *testing.T) {
+		for _, opts := range []bundleattest.ResolveOptions{
+			{SigningKey: "awskms:///alias/k", IdentityToken: "tok"},
+			{SigningKey: "awskms:///alias/k", DeviceFlow: true},
+			{SigningKey: "awskms:///alias/k", FulcioURL: "https://fulcio.example.com"},
+		} {
+			errorstest.WantReportedCode(t, validateEvidenceSigningMode(opts), errors.ErrCodeInvalidRequest)
+		}
+	})
+
+	t.Run("key signing may skip the transparency log", func(t *testing.T) {
+		if err := validateEvidenceSigningMode(bundleattest.ResolveOptions{SigningKey: "awskms:///alias/k", DisableTLogUpload: true}); err != nil {
+			t.Errorf("key signing without a tlog entry rejected: %v", err)
+		}
+	})
+}
+
+func TestWritePointerFile_WritesExactPath(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "h100-eks-ubuntu-training.yaml")
+	p := &Pointer{
+		SchemaVersion: PointerSchemaVersion,
+		Recipe:        "h100-eks-ubuntu-training",
+		Attestations: []PointerAttestation{{
+			Bundle:     PointerBundle{OCI: "ghcr.io/x/aicr-evidence:tag", Digest: "sha256:abc", PredicateType: PredicateTypeV1},
+			AttestedAt: time.Date(2026, 6, 24, 0, 0, 0, 0, time.UTC),
+		}},
+	}
+	got, err := WritePointerFile(target, p)
+	if err != nil {
+		t.Fatalf("WritePointerFile: %v", err)
+	}
+	if got != target {
+		t.Errorf("returned path = %q, want %q", got, target)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("pointer file not written at exact path: %v", err)
+	}
+}
+
+// TestSignEvidenceStatement_SigningKeySelectsKMS pins the dispatch: a signing
+// key reaches the KMS provider and never the keyless OIDC path. With
+// VAULT_ADDR unset the hashivault provider fails to initialize without any
+// network call; a keyless fallback would instead fail on the unreachable
+// ambient-token endpoint.
+func TestSignEvidenceStatement_SigningKeySelectsKMS(t *testing.T) {
+	t.Setenv("VAULT_ADDR", "")
+	t.Setenv("BAO_ADDR", "")
+
+	_, err := signEvidenceStatement(context.Background(), []byte(`{}`), bundleattest.ResolveOptions{
+		SigningKey:        "hashivault://transit/keys/aicr-evidence",
+		DisableTLogUpload: true,
+		AmbientURL:        "http://127.0.0.1:1/token",
+		AmbientToken:      "unused",
+	})
+	errorstest.WantReportedCode(t, err, errors.ErrCodeUnavailable)
+	if err == nil || !strings.Contains(err.Error(), "KMS") {
+		t.Errorf("error %v does not come from the KMS provider", err)
+	}
+}

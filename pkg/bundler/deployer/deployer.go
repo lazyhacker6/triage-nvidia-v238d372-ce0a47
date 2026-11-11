@@ -1,0 +1,139 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package deployer defines the shared interface and types for bundle deployers.
+//
+// Each deployer (helm, argocd, argocd-helm, flux, helmfile, terraform) produces
+// deployment artifacts from
+// a configured recipe. Deployers are configured as structs with all required
+// data, then Generate is called to produce the output.
+//
+// The Deployer interface enables mockability in bundler tests and provides a
+// consistent contract across deployer implementations. All six deployers
+// implement this interface.
+package deployer
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/NVIDIA/aicr/pkg/errors"
+)
+
+// Release is one Helm release a deployer emits, reported so the bundler can
+// index the bundle without re-deriving paths the deployer already built.
+//
+// Component names the recipe component the release belongs to, which equals
+// Name for a primary release and names the parent for an injected -pre,
+// -post, or -readiness release. Path and Manifest are relative to the bundle
+// root; Manifest is empty for deployers that declare a release through an
+// orchestration script rather than a file.
+type Release struct {
+	Name      string
+	Component string
+	Namespace string
+	Path      string
+	Manifest  string
+}
+
+// Source is the deployment-source coordinates a deployer resolved and baked
+// into the bundle it just wrote.
+//
+// A deployer sets a field only when the resolved value is observable in a
+// file it emitted, and it reports the value it actually wrote — including a
+// default or a placeholder the caller never supplied, because the placeholder
+// is what the bundle ships. A field left empty means this deployer's bundle
+// never mentions that coordinate, which is not the same as the caller
+// omitting it.
+type Source struct {
+	// RepoURL is the repository the emitted manifests point at.
+	RepoURL string
+
+	// TargetRevision is the revision those manifests pin.
+	TargetRevision string
+
+	// AppName is the parent application name the bundle installs under.
+	AppName string
+}
+
+// Output contains the result of deployer generation.
+type Output struct {
+	// Files contains the paths of generated files.
+	Files []string
+
+	// TotalSize is the total size of all generated files.
+	TotalSize int64
+
+	// Duration is the time taken to generate the output.
+	Duration time.Duration
+
+	// DeploymentSteps contains ordered deployment instructions for the user.
+	DeploymentSteps []string
+
+	// DeploymentNotes contains optional deployment notes or warnings.
+	DeploymentNotes []string
+
+	// Entrypoint is the bundle-root file a consumer invokes or applies for
+	// this deployer, relative to the bundle root.
+	Entrypoint string
+
+	// Provenance is the chart-provenance audit file this run wrote, relative
+	// to the bundle root, and empty when the run wrote none. A deployer must
+	// report it rather than let a caller stat the bundle: the file is written
+	// only for a vendored bundle and is never pruned, so a stat would also
+	// find one left behind by an earlier run into the same directory.
+	Provenance string
+
+	// Releases is every Helm release the bundle installs, in deployment
+	// order. The ordering is normative: consumers read sequence from list
+	// position, so a deployer must append in the order it deploys.
+	Releases []Release
+
+	// Source is what the deployer resolved for the bundle's deployment
+	// source, reported rather than re-derived by the caller: re-deriving it
+	// would put each deployer's defaults in a second place to drift from.
+	Source Source
+}
+
+// AddDataFiles resolves each relative data file path against outputDir (via
+// SafeJoin, rejecting traversal), stats the file, and appends the absolute
+// path to Files while adding the file size to TotalSize. Used by generators
+// to include external --data files in their output so they are covered by
+// checksum generation.
+func (o *Output) AddDataFiles(outputDir string, dataFiles []string) error {
+	if o == nil {
+		return errors.New(errors.ErrCodeInvalidRequest, "output is required")
+	}
+	for _, dataFile := range dataFiles {
+		absPath, joinErr := SafeJoin(outputDir, dataFile)
+		if joinErr != nil {
+			return joinErr
+		}
+		info, statErr := os.Stat(absPath)
+		if statErr != nil {
+			return errors.Wrap(errors.ErrCodeInternal, fmt.Sprintf("failed to stat data file %s", dataFile), statErr)
+		}
+		o.Files = append(o.Files, absPath)
+		o.TotalSize += info.Size()
+	}
+	return nil
+}
+
+// Deployer generates deployment bundles from configured inputs.
+// Implementations are configured as structs, then Generate is called.
+type Deployer interface {
+	Generate(ctx context.Context, outputDir string) (*Output, error)
+}

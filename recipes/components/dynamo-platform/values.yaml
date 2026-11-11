@@ -1,0 +1,59 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Dynamo Platform Helm values (v1.4.2)
+# NVIDIA Dynamo inference serving platform operator.
+# Provides OpenAI-compatible endpoints, KV-cache-aware routing,
+# disaggregated prefill/decode, and SLA-driven autoscaling.
+# Grove is installed as a separate AICR component (see recipes/components/grove/).
+
+# --- Global subchart controls ---
+global:
+  # Kubernetes-native discovery replaces etcd for AICR Dynamo workloads.
+  etcd:
+    install: false
+  # Dynamo 1.4+ defaults the request plane to TCP and the KV event plane to
+  # ZMQ, so the bundled NATS chart is no longer needed for AICR's defaults.
+  # global.nats.install is intentionally left unset (chart default: false).
+  #
+  # Upgrading a standing cluster (opting back into NATS, and the separate,
+  # more important runtime-image-vs-operator version-skew hazard): see
+  # "Upgrade Notes" > dynamo-platform in docs/user/component-catalog.md.
+  # Do not hand-edit a generated bundle's values.yaml/cluster-values.yaml --
+  # both are covered by the bundle's checksum manifest and aicr verify
+  # fails closed on any modified file; regenerate with `aicr bundle --set`
+  # instead, per that doc.
+  # Disable kai-scheduler sub-chart install — managed as a separate AICR component.
+  # Keep enabled: true so the Dynamo operator detects and uses the external scheduler.
+  kai-scheduler:
+    install: false
+    enabled: true
+  # Disable grove sub-chart install — installed as a separate AICR component.
+  # Keep enabled: true so the Dynamo operator detects the external grove.
+  grove:
+    install: false
+    enabled: true
+
+dynamo-operator:
+  # Upgrade CRDs via the platform chart (no separate dynamo-crds 1.0 chart)
+  upgradeCRD: true
+
+  # Use Kubernetes-native service discovery.
+  discoveryBackend: "kubernetes"
+
+  # Point Dynamo to the existing kube-prometheus-stack for metrics collection.
+  # PodMonitor CRs are auto-created by the operator for metric discovery.
+  dynamo:
+    metrics:
+      prometheusEndpoint: "http://kube-prometheus-prometheus.monitoring.svc.cluster.local:9090"

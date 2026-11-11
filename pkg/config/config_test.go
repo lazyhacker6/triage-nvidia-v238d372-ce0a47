@@ -1,0 +1,399 @@
+// Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config_test
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/config"
+	"github.com/NVIDIA/aicr/pkg/header"
+)
+
+func newValid() *config.AICRConfig {
+	return &config.AICRConfig{
+		Kind:       config.Kind,
+		APIVersion: config.APIVersion,
+		Metadata:   config.Metadata{Name: "test"},
+		Spec: config.Spec{
+			Recipe: &config.RecipeSpec{
+				Criteria: &config.CriteriaSpec{
+					Service:     "eks",
+					Accelerator: "h100",
+					Intent:      "training",
+					OS:          "ubuntu",
+					Platform:    "kubeflow",
+					Nodes:       8,
+				},
+			},
+		},
+	}
+}
+
+func TestValidate_HappyPath(t *testing.T) {
+	if err := newValid().Validate(); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_AcceptsReleaseNTargetAPIVersion(t *testing.T) {
+	t.Parallel()
+
+	cfg := newValid()
+	cfg.APIVersion = header.GroupVersionV1Beta1
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() rejected Release N target apiVersion: %v", err)
+	}
+}
+
+func TestValidate_BothSpecsPopulated(t *testing.T) {
+	cfg := newValid()
+	cfg.Spec.Bundle = &config.BundleSpec{
+		Deployment: &config.DeploymentSpec{Deployer: "helm"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_BundleOnly(t *testing.T) {
+	cfg := &config.AICRConfig{
+		Kind:       config.Kind,
+		APIVersion: config.APIVersion,
+		Spec: config.Spec{
+			Bundle: &config.BundleSpec{
+				Input:      &config.BundleInputSpec{Recipe: "./recipe.yaml"},
+				Deployment: &config.DeploymentSpec{Deployer: "argocd"},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_ValidateOnly(t *testing.T) {
+	cfg := &config.AICRConfig{
+		Kind:       config.Kind,
+		APIVersion: config.APIVersion,
+		Spec: config.Spec{
+			Validate: &config.ValidateSpec{
+				Input: &config.ValidateInputSpec{
+					Recipe:   "./recipe.yaml",
+					Snapshot: "./snapshot.yaml",
+				},
+				Execution: &config.ValidateExecutionSpec{
+					Timeout: "10m",
+					Phases:  []string{"deployment", "conformance"},
+				},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_InvalidValidateTimeout(t *testing.T) {
+	cfg := &config.AICRConfig{
+		Kind:       config.Kind,
+		APIVersion: config.APIVersion,
+		Spec: config.Spec{
+			Validate: &config.ValidateSpec{
+				Execution: &config.ValidateExecutionSpec{Timeout: "abc"},
+			},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "spec.validate.execution.timeout") {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+}
+
+func TestValidate_Errors(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*config.AICRConfig)
+		wantSub string
+	}{
+		{
+			name: "wrong kind",
+			mutate: func(c *config.AICRConfig) {
+				c.Kind = "Recipe"
+			},
+			wantSub: "invalid kind",
+		},
+		{
+			name: "wrong stable-track apiVersion",
+			mutate: func(c *config.AICRConfig) {
+				c.APIVersion = header.GroupVersionV1
+			},
+			wantSub: "invalid apiVersion",
+		},
+		{
+			name: "wrong profile-track apiVersion",
+			mutate: func(c *config.AICRConfig) {
+				c.APIVersion = header.GroupVersionV1Beta2
+			},
+			wantSub: "invalid apiVersion",
+		},
+		{
+			name: "no snapshot, no recipe, no bundle, and no validate",
+			mutate: func(c *config.AICRConfig) {
+				c.Spec.Snapshot = nil
+				c.Spec.Recipe = nil
+				c.Spec.Bundle = nil
+				c.Spec.Validate = nil
+			},
+			wantSub: "none of spec.snapshot, spec.recipe, spec.bundle, spec.validate",
+		},
+		{
+			name: "criteria and snapshot mutually exclusive",
+			mutate: func(c *config.AICRConfig) {
+				c.Spec.Recipe.Input = &config.RecipeInputSpec{Snapshot: "s.yaml"}
+			},
+			wantSub: "mutually exclusive",
+		},
+		// Criteria membership cases deliberately live in
+		// TestValidate_DefersCriteriaMembership and
+		// TestResolveCriteria_InvalidEnums instead. Validate() no longer
+		// checks them: membership belongs to a per-DataProvider registry
+		// that does not exist at load time.
+		{
+			name: "negative nodes",
+			mutate: func(c *config.AICRConfig) {
+				c.Spec.Recipe.Criteria.Nodes = -1
+			},
+			wantSub: "must be >= 0",
+		},
+		{
+			name: "invalid format",
+			mutate: func(c *config.AICRConfig) {
+				c.Spec.Recipe.Output = &config.RecipeOutputSpec{Format: "xml"}
+			},
+			wantSub: "spec.recipe.output.format",
+		},
+		{
+			name: "invalid profile",
+			mutate: func(c *config.AICRConfig) {
+				c.Spec.Recipe.Profile = "gpuStack"
+			},
+			wantSub: "name=value",
+		},
+		{
+			name: "invalid deployer",
+			mutate: func(c *config.AICRConfig) {
+				c.Spec.Bundle = &config.BundleSpec{
+					Deployment: &config.DeploymentSpec{Deployer: "fluxcd"},
+				}
+			},
+			wantSub: "deployment.deployer",
+		},
+		{
+			name: "negative bundle nodes",
+			mutate: func(c *config.AICRConfig) {
+				c.Spec.Bundle = &config.BundleSpec{
+					Scheduling: &config.SchedulingSpec{Nodes: -1},
+				}
+			},
+			wantSub: "scheduling.nodes",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := newValid()
+			tt.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q does not contain %q", err.Error(), tt.wantSub)
+			}
+		})
+	}
+}
+
+// TestValidate_Snapshot exercises Validate on the spec.snapshot section.
+// Cases share the same shape (build a config with snapshot only → call
+// Validate → assert error substring or nil) so they consolidate cleanly.
+func TestValidate_Snapshot(t *testing.T) {
+	tests := []struct {
+		name    string
+		snap    *config.SnapshotSpec
+		wantSub string // "" = expect no error
+	}{
+		{
+			name: "happy path snapshot only",
+			snap: &config.SnapshotSpec{
+				Output: &config.SnapshotOutputSpec{Path: "./snapshot.yaml"},
+				Agent: &config.SnapshotAgentSpec{
+					Namespace:    "aicr-validation",
+					NodeSelector: map[string]string{"nodeGroup": "gpu-worker"},
+					Tolerations:  []string{"dedicated=gpu-workload:NoSchedule"},
+				},
+				Execution: &config.SnapshotExecutionSpec{Timeout: "5m"},
+			},
+		},
+		{
+			name: "invalid timeout",
+			snap: &config.SnapshotSpec{
+				Execution: &config.SnapshotExecutionSpec{Timeout: "abc"},
+			},
+			wantSub: "spec.snapshot.execution.timeout",
+		},
+		{
+			name: "invalid format",
+			snap: &config.SnapshotSpec{
+				Output: &config.SnapshotOutputSpec{Format: "xml"},
+			},
+			wantSub: "spec.snapshot.output.format",
+		},
+		{
+			name: "invalid tolerations",
+			snap: &config.SnapshotSpec{
+				Agent: &config.SnapshotAgentSpec{Tolerations: []string{"::"}},
+			},
+			wantSub: "spec.snapshot.agent.tolerations",
+		},
+		{
+			name: "negative maxNodesPerEntry",
+			snap: &config.SnapshotSpec{
+				Execution: &config.SnapshotExecutionSpec{MaxNodesPerEntry: -1},
+			},
+			wantSub: "spec.snapshot.execution.maxNodesPerEntry",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.AICRConfig{
+				Kind:       config.Kind,
+				APIVersion: config.APIVersion,
+				Spec:       config.Spec{Snapshot: tt.snap},
+			}
+			err := cfg.Validate()
+			if tt.wantSub == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantSub)
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q does not contain %q", err.Error(), tt.wantSub)
+			}
+		})
+	}
+}
+
+func TestValidate_NilReceiver(t *testing.T) {
+	var c *config.AICRConfig
+	if err := c.Validate(); err == nil {
+		t.Errorf("expected error from nil receiver, got nil")
+	}
+}
+
+func TestValidate_RecipeBundleHandoff(t *testing.T) {
+	tests := []struct {
+		name        string
+		recipePath  string
+		bundleInput string
+		wantErrSub  string
+	}{
+		{"both empty is fine", "", "", ""},
+		{"only recipe.output set is fine", "out.yaml", "", ""},
+		{"only bundle.input set is fine", "", "in.yaml", ""},
+		{"matching paths is fine", "shared.yaml", "shared.yaml", ""},
+		{"mismatched paths rejected", "out.yaml", "different.yaml", "must reference the same file"},
+		{"equivalent relative forms accepted", "./recipe.yaml", "recipe.yaml", ""},
+		{"redundant separators accepted", "dir//file.yaml", "dir/file.yaml", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.AICRConfig{
+				Kind:       config.Kind,
+				APIVersion: config.APIVersion,
+				Spec: config.Spec{
+					Recipe: &config.RecipeSpec{
+						Criteria: &config.CriteriaSpec{Service: "eks"},
+					},
+					Bundle: &config.BundleSpec{
+						Deployment: &config.DeploymentSpec{Deployer: "helm"},
+					},
+				},
+			}
+			if tt.recipePath != "" {
+				cfg.Spec.Recipe.Output = &config.RecipeOutputSpec{Path: tt.recipePath}
+			}
+			if tt.bundleInput != "" {
+				cfg.Spec.Bundle.Input = &config.BundleInputSpec{Recipe: tt.bundleInput}
+			}
+			err := cfg.Validate()
+			if tt.wantErrSub == "" {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErrSub)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrSub) {
+				t.Errorf("error %q should contain %q", err.Error(), tt.wantErrSub)
+			}
+		})
+	}
+}
+
+// TestValidate_DefersCriteriaMembership pins both halves of the two-phase
+// contract introduced when external catalogs were found unusable from a config
+// document.
+//
+// Phase one (Validate) must ACCEPT a value the embedded catalog does not know:
+// a value contributed by spec.recipe.data or --data only exists once that
+// provider is built, so rejecting it here made the external-catalog path
+// unreachable — LoadConfig failed before a provider could be constructed.
+//
+// Phase two (ResolveCriteriaWithRegistry) must still REJECT it, or the
+// deferral would have traded a false rejection for silent acceptance.
+func TestValidate_DefersCriteriaMembership(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.AICRConfig{
+		APIVersion: header.GroupVersionV1Beta1,
+		Kind:       "AICRConfig",
+		Metadata:   config.Metadata{Name: "t"},
+		Spec: config.Spec{
+			Recipe: &config.RecipeSpec{
+				Data:     "/etc/aicr/recipes",
+				Criteria: &config.CriteriaSpec{Service: "ncp-review"},
+			},
+		},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate rejected an external-catalog value; the provider-aware path is unreachable: %v", err)
+	}
+
+	// Against the embedded registry the value is still unknown, so consumption
+	// fails closed. A caller holding the external provider's registry passes
+	// it here instead and the same call succeeds.
+	if _, err := cfg.Spec.Recipe.ResolveCriteriaWithRegistry(nil); err == nil {
+		t.Error("ResolveCriteriaWithRegistry accepted an unknown value; deferral must not mean silent acceptance")
+	}
+}

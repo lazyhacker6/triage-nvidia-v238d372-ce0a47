@@ -1,0 +1,3053 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"context"
+	stderrors "errors"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/NVIDIA/aicr/pkg/bundler"
+	bundlercfg "github.com/NVIDIA/aicr/pkg/bundler/config"
+	"github.com/NVIDIA/aicr/pkg/chainsaw"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+	v1 "github.com/NVIDIA/aicr/pkg/validator/v1"
+	"github.com/NVIDIA/aicr/validators"
+	"github.com/NVIDIA/aicr/validators/helper"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
+	fakediscovery "k8s.io/client-go/discovery/fake"
+	"k8s.io/client-go/dynamic"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
+	clienttesting "k8s.io/client-go/testing"
+)
+
+// testDefaultDRADSName is the kubelet-plugin DaemonSet name the upstream
+// nvidia-dra-driver-gpu chart renders when no fullname override is in play.
+// Tests use it as a sane default fixture name, and a separate test exercises
+// an intentionally-different name to prove the role-suffix discovery works.
+const testDefaultDRADSName = "nvidia-dra-driver-gpu-kubelet-plugin"
+
+// testNodewrightManifest is the path of the Nodewright manifest the AICR embedded
+// data provider ships for the eks/h100/inference recipe used in most tests.
+// Declaring it once here keeps test setup aligned with the recipe defaults.
+const testNodewrightManifest = "components/nodewright-customizations/manifests/tuning.yaml"
+
+// testAICRCreatedBy{Key,Value} mirror the label convention AICR manifests
+// apply to synthesized fixtures that should look like real production objects.
+const (
+	testAICRCreatedByLabelKey   = "app.kubernetes.io/created-by"
+	testAICRCreatedByLabelValue = "aicr"
+)
+
+func TestCheckExpectedResources_IncludesDeploymentCompletenessAndGPUReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("skyhook"),
+			activeNamespace("nvidia-dra-driver"),
+			activeNamespace("app-ns"),
+			readyDeployment("app-ns", "app-deployment"),
+			readyDaemonSet("nvidia-dra-driver", testDefaultDRADSName, 2),
+		},
+		[]runtime.Object{
+			nodewrightWithStatus("tuning", nodewrightCompleteState),
+		},
+		[]recipe.ComponentRef{
+			{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}},
+			{Name: draDriverComponent, Namespace: "nvidia-dra-driver"},
+			{
+				Name:      "app-component",
+				Namespace: "app-ns",
+				ExpectedResources: []recipe.ExpectedResource{
+					{Kind: "Deployment", Namespace: "app-ns", Name: "app-deployment"},
+				},
+			},
+		},
+	)
+
+	if err := checkExpectedResources(ctx); err != nil {
+		t.Fatalf("checkExpectedResources() error = %v, want nil", err)
+		return
+	}
+}
+
+func TestCheckExpectedResources_FailsWhenNodewrightIncomplete(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("skyhook"),
+			activeNamespace("nvidia-dra-driver"),
+			readyDaemonSet("nvidia-dra-driver", testDefaultDRADSName, 1),
+		},
+		[]runtime.Object{
+			nodewrightWithStatus("tuning", "waiting"),
+		},
+		[]recipe.ComponentRef{
+			{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}},
+			{Name: draDriverComponent, Namespace: "nvidia-dra-driver"},
+		},
+	)
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("expected error when Nodewright is not complete")
+		return
+	}
+	if !strings.Contains(err.Error(), "Nodewright tuning: status=waiting") {
+		t.Fatalf("expected Nodewright readiness failure, got: %v", err)
+		return
+	}
+}
+
+func TestCheckExpectedResources_FailsWhenNamespaceNotActive(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			inactiveNamespace("app-ns"),
+		},
+		nil,
+		[]recipe.ComponentRef{
+			{Name: "app-component", Namespace: "app-ns"},
+		},
+	)
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("expected error when namespace is not Active")
+		return
+	}
+	if !strings.Contains(err.Error(), "namespace app-ns: phase=Terminating") {
+		t.Fatalf("expected namespace readiness failure, got: %v", err)
+		return
+	}
+}
+
+func TestCheckExpectedResources_SkipsDisabledComponents(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("app-ns"),
+			readyDeployment("app-ns", "app-deployment"),
+		},
+		nil,
+		[]recipe.ComponentRef{
+			{
+				Name:      nodewrightCustomizationsComponent,
+				Namespace: "skyhook",
+				Overrides: map[string]any{"enabled": false},
+			},
+			{
+				Name:      draDriverComponent,
+				Namespace: "nvidia-dra-driver",
+				Overrides: map[string]any{"enabled": false},
+			},
+			{
+				Name:      "app-component",
+				Namespace: "app-ns",
+				ExpectedResources: []recipe.ExpectedResource{
+					{Kind: "Deployment", Namespace: "app-ns", Name: "app-deployment"},
+				},
+			},
+		},
+	)
+
+	if err := checkExpectedResources(ctx); err != nil {
+		t.Fatalf("checkExpectedResources() error = %v, want nil for disabled optional components", err)
+		return
+	}
+}
+
+// Regression test: Nodewright is a cluster-scoped CR. The validator must list it
+// without a namespace; otherwise the API server returns 404 even when the
+// resource exists on a real cluster.
+func TestVerifyNodewrightReady_ListsClusterScoped(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{activeNamespace("skyhook")},
+		[]runtime.Object{nodewrightWithStatus("tuning", nodewrightCompleteState)},
+		[]recipe.ComponentRef{{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}}},
+	)
+
+	if err := checkExpectedResources(ctx); err != nil {
+		t.Fatalf("checkExpectedResources() error = %v, want nil for cluster-scoped Nodewright", err)
+		return
+	}
+}
+
+func TestCheckExpectedResources_FailsNodewrightWhenCRDNeverRegistered(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContextWithUnregistered(t,
+		[]runtime.Object{activeNamespace("skyhook")},
+		nil,
+		[]schema.GroupVersionResource{nodewrightGVR},
+		[]recipe.ComponentRef{{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}}},
+	)
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("checkExpectedResources() error = nil, want a failure when the recipe declares Nodewright CRs and no CRD is served")
+	}
+	if !strings.Contains(err.Error(), "serves its resource yet") {
+		t.Fatalf("error = %v, want the not-yet-served diagnostic", err)
+	}
+}
+
+// TestResolveNodewrightGVR_RequiresResourceNotJustGroupVersion simulates
+// deploymentpolicies establishing before nodewrights in the same group/version.
+func TestResolveNodewrightGVR_RequiresResourceNotJustGroupVersion(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t, nil, nil, nil)
+	fakeDisc := ctx.Clientset.Discovery().(*fakediscovery.FakeDiscovery)
+	fakeDisc.Resources = append(fakeDisc.Resources, &metav1.APIResourceList{
+		GroupVersion: nodewrightGVR.GroupVersion().String(),
+		APIResources: []metav1.APIResource{{Name: "deploymentpolicies"}},
+	})
+
+	_, registered, err := resolveNodewrightGVR(ctx)
+	if err != nil {
+		t.Fatalf("resolveNodewrightGVR() error = %v", err)
+	}
+	if registered {
+		t.Fatal("registered = true, want false when the group lists only deploymentpolicies")
+	}
+}
+
+func TestVerifyNodewrightReady_PicksUpCRDEstablishedMidPoll(t *testing.T) {
+	t.Parallel()
+
+	ref := recipe.ComponentRef{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}}
+	ctx := newDeploymentTestContext(t, []runtime.Object{activeNamespace("skyhook")},
+		[]runtime.Object{nodeWrightWithStatus("tuning", nodewrightCompleteState)}, []recipe.ComponentRef{ref})
+
+	fakeDisc := ctx.Clientset.Discovery().(*fakediscovery.FakeDiscovery)
+	established := fakeDisc.Resources
+	fakeDisc.Resources = nil
+	calls := 0
+	ctx.Clientset.(*k8sfake.Clientset).PrependReactor("get", "resource", func(clienttesting.Action) (bool, runtime.Object, error) {
+		calls++
+		if calls == 2 {
+			fakeDisc.Resources = established
+		}
+		return false, nil, nil
+	})
+
+	if err := verifyNodewrightReady(ctx, ref, []corev1.Taint{legacyRuntimeRequiredTaint}); err != nil {
+		t.Fatalf("verifyNodewrightReady() error = %v, want nil once the CRD is established mid-poll", err)
+	}
+	if calls < 2 {
+		t.Fatalf("discovery calls = %d, want the GVR re-resolved across polls", calls)
+	}
+}
+
+// When the Nodewright CRD is registered but the specific CR declared by the
+// recipe is absent, verifyNodewrightReady should take the explicit IsNotFound
+// branch and surface the recipe-scoped "declared but missing" diagnostic.
+func TestCheckExpectedResources_FailsWhenNodewrightCRMissing(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContextWithDiscovery(t,
+		[]runtime.Object{activeNamespace("skyhook")},
+		nil,
+		[]schema.GroupVersion{nodewrightGVR.GroupVersion()},
+		nil,
+		[]recipe.ComponentRef{{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}}},
+	)
+
+	start := time.Now()
+	err := checkExpectedResources(ctx)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected error when Nodewright CR is missing but CRD is registered")
+		return
+	}
+	if !strings.Contains(err.Error(), "Nodewright tuning: not found (recipe declared it but the cluster has no such CR)") {
+		t.Fatalf("expected recipe-scoped Nodewright not-found failure, got: %v", err)
+		return
+	}
+	// #3703: a declared CR the cluster does not have is terminal, so the
+	// check fails at once with NotFound instead of polling the readiness
+	// budget to a timeout and leaving the chainsaw asserts unevaluated.
+	if !strings.Contains(err.Error(), "manifests were not applied to this cluster") {
+		t.Errorf("error = %v, want the absent-CR diagnosis", err)
+	}
+	if elapsed >= gpuReadinessTimeout {
+		t.Errorf("checkExpectedResources took %v, want a fast failure well under the %v readiness budget", elapsed, gpuReadinessTimeout)
+	}
+}
+
+// Fail-closed test: when the discovery API itself returns a non-NotFound
+// error (e.g., 403 from RBAC, 5xx from an overloaded API server, network
+// timeout), a Go-resident readiness check must NOT treat that as "CRD not
+// registered" and skip. Anything other than IsNotFound means we cannot
+// prove readiness, so the check must surface a failure. Exercised here via
+// Nodewright discovery, which shares the fail-closed pattern with the other
+// GPU readiness signals.
+func TestCheckExpectedResources_FailsWhenDiscoveryReturnsNonNotFoundError(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContextWithDiscovery(t,
+		[]runtime.Object{activeNamespace("skyhook")},
+		nil,
+		nil,
+		nil,
+		[]recipe.ComponentRef{{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}}},
+	)
+
+	clientset, ok := ctx.Clientset.(*k8sfake.Clientset)
+	if !ok {
+		t.Fatalf("expected *k8sfake.Clientset, got %T", ctx.Clientset)
+		return
+	}
+	// Resource name is the literal string "resource" (not "apiresources") —
+	// that is the string FakeDiscovery hard-codes when synthesizing the
+	// testing.Action for ServerResourcesForGroupVersion. See
+	// vendor/k8s.io/client-go/discovery/fake/discovery.go: the action is built
+	// with schema.GroupVersionResource{Resource: "resource"}. A tighter-looking
+	// "apiresources" would not match anything, the reactor would not fire, and
+	// the test would fall through to the default 404 path (IsNotFound) instead
+	// of exercising the fail-closed branch.
+	clientset.PrependReactor("get", "resource", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(
+			schema.GroupResource{Group: "skyhook.nvidia.com", Resource: "apiresources"},
+			"",
+			stderrors.New("forbidden: user cannot list apiresources"))
+	})
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("expected error when discovery returns a non-NotFound error (fail-closed)")
+		return
+	}
+	if !strings.Contains(err.Error(), "failed to discover") {
+		t.Fatalf("expected discovery failure to surface, got: %v", err)
+		return
+	}
+	if strings.Contains(err.Error(), "not registered, skipping") {
+		t.Fatalf("discovery failure must not be treated as CRD-not-registered skip, got: %v", err)
+		return
+	}
+}
+
+// TestCheckExpectedResources_IgnoresStaleUnrelatedNodewright pins the fix for
+// Codex review comment #2: an unrelated Nodewright CR left on the cluster from
+// a prior deploy (or from a different tenant) must NOT influence this
+// recipe's readiness result. The check is scoped to the Nodewright name(s) the
+// recipe itself declares via ComponentRef.ManifestFiles.
+func TestCheckExpectedResources_IgnoresStaleUnrelatedNodewright(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("skyhook"),
+		},
+		[]runtime.Object{
+			// The recipe's manifestFiles point at tuning.yaml → expected name "tuning".
+			nodewrightWithStatus("tuning", nodewrightCompleteState),
+			// A stale "no-op" Nodewright lingering on the cluster in waiting state
+			// (simulating a partially-cleaned previous deploy). It happens to
+			// carry the AICR label — under the pre-fix implementation this would
+			// have failed the check.
+			nodewrightWithStatus("no-op", "waiting"),
+		},
+		[]recipe.ComponentRef{
+			{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}},
+		},
+	)
+
+	if err := checkExpectedResources(ctx); err != nil {
+		t.Fatalf("checkExpectedResources() error = %v, want nil — stale unrelated Nodewright must not affect the result", err)
+		return
+	}
+}
+
+// TestCheckExpectedResources_FailsWhenRuntimeRequiredTaintPresent proves the
+// readiness gate stays closed while a GPU node still carries the nodewright
+// runtime-required NoSchedule taint, even though every expected Skyhook CR
+// already reports status.status == "complete". This is the issue #1775 race:
+// status.status momentarily reads "complete" in the lull between two package
+// reboots, but the durable taint is still present because tuning is not truly
+// done on the node.
+func TestCheckExpectedResources_FailsWhenRuntimeRequiredTaintPresent(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("skyhook"),
+			nodeWithRuntimeRequiredTaint("gpu-node-0"),
+		},
+		[]runtime.Object{
+			nodewrightWithStatus("tuning", nodewrightCompleteState),
+		},
+		[]recipe.ComponentRef{
+			{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}},
+		},
+	)
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("expected error while a node still carries the runtime-required taint")
+		return
+	}
+	if !strings.Contains(err.Error(), "node gpu-node-0: still carries the runtime-required taint") {
+		t.Fatalf("expected runtime-required taint failure, got: %v", err)
+		return
+	}
+}
+
+// TestCheckExpectedResources_PassesWhenRuntimeRequiredTaintCleared proves the
+// gate opens once the taint is removed from every node — including nodes that
+// carry only unrelated taints, which must not gate.
+func TestCheckExpectedResources_PassesWhenRuntimeRequiredTaintCleared(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("skyhook"),
+			// A GPU node whose tuning finished (taint removed) but still carries
+			// the workload dedication taint it was provisioned with.
+			nodeWithTaints("gpu-node-0", corev1.Taint{
+				Key: "dedicated", Value: "user-workload", Effect: corev1.TaintEffectNoSchedule,
+			}),
+			// A control-plane node with the standard master taint.
+			nodeWithTaints("control-plane-0", corev1.Taint{
+				Key: "node-role.kubernetes.io/control-plane", Effect: corev1.TaintEffectNoSchedule,
+			}),
+		},
+		[]runtime.Object{
+			nodewrightWithStatus("tuning", nodewrightCompleteState),
+		},
+		[]recipe.ComponentRef{
+			{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}},
+		},
+	)
+
+	if err := checkExpectedResources(ctx); err != nil {
+		t.Fatalf("checkExpectedResources() error = %v, want nil once the runtime-required taint is cleared", err)
+		return
+	}
+}
+
+// TestCheckExpectedResources_FailsWhenNoExpectedNodewrightNames pins the
+// fail-closed behavior when an enabled nodewright-customizations ref declares
+// no manifest files. Rather than silently pass, the check must surface this as a
+// recipe misconfiguration. (Contrast with #1844: manifests that ARE declared but
+// render zero Skyhook CRs due to a value gate pass — see
+// TestVerifyNodewrightReady_TolerantWhenAllCRsSuppressed — because the render
+// reflects the effective values, so absence there is deliberate, not missing.)
+func TestCheckExpectedResources_FailsWhenNoExpectedNodewrightNames(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("skyhook"),
+		},
+		nil,
+		[]recipe.ComponentRef{
+			// Intentionally no ManifestFiles — simulates a misconfigured recipe.
+			{Name: nodewrightCustomizationsComponent, Namespace: "skyhook"},
+		},
+	)
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("expected error when enabled nodewright-customizations ref has no expected Nodewright names")
+		return
+	}
+	if !strings.Contains(err.Error(), "no Nodewright CR names could be extracted") {
+		t.Fatalf("expected 'no Nodewright CR names could be extracted' failure, got: %v", err)
+		return
+	}
+}
+
+func TestCheckExpectedResources_FailsWhenDRAKubeletPluginMissing(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("nvidia-dra-driver"),
+		},
+		nil,
+		[]recipe.ComponentRef{
+			{Name: draDriverComponent, Namespace: "nvidia-dra-driver"},
+		},
+	)
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("expected error when DRA kubelet plugin DaemonSet is missing")
+		return
+	}
+	if !strings.Contains(err.Error(), "no kubelet-plugin DaemonSet") {
+		t.Fatalf("expected DRA missing DaemonSet failure, got: %v", err)
+		return
+	}
+}
+
+func TestCheckExpectedResources_FailsWhenDRAKubeletPluginIsUnhealthy(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("nvidia-dra-driver"),
+			unreadyDaemonSet("nvidia-dra-driver", testDefaultDRADSName, 2, 1),
+		},
+		nil,
+		[]recipe.ComponentRef{
+			{Name: draDriverComponent, Namespace: "nvidia-dra-driver"},
+		},
+	)
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("expected error when DRA kubelet plugin DaemonSet is unhealthy")
+		return
+	}
+	if !strings.Contains(err.Error(), "DaemonSet nvidia-dra-driver/"+testDefaultDRADSName) {
+		t.Fatalf("expected DRA DaemonSet context in failure, got: %v", err)
+		return
+	}
+	if !strings.Contains(err.Error(), "not healthy: 1/2 pods ready") {
+		t.Fatalf("expected unhealthy DaemonSet detail, got: %v", err)
+		return
+	}
+}
+
+func TestCheckExpectedResources_FailsWhenDRAKubeletPluginHasNoScheduledPods(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("nvidia-dra-driver"),
+			unreadyDaemonSet("nvidia-dra-driver", testDefaultDRADSName, 0, 0),
+		},
+		nil,
+		[]recipe.ComponentRef{
+			{Name: draDriverComponent, Namespace: "nvidia-dra-driver"},
+		},
+	)
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("expected error when DRA kubelet plugin DaemonSet has no scheduled pods")
+		return
+	}
+	if !strings.Contains(err.Error(), "no ready kubelet-plugin pods scheduled (0/0 pods ready)") {
+		t.Fatalf("expected zero-pod DaemonSet detail, got: %v", err)
+		return
+	}
+}
+
+// TestCheckExpectedResources_DRAKubeletPluginCustomName pins the fix for
+// Codex review comment #1: the check must locate the kubelet-plugin
+// DaemonSet by its chart-template role suffix ("-kubelet-plugin"), not by
+// its hard-coded default name. This lets it find the DaemonSet even when a
+// user overrides fullnameOverride (or the chart renders a different
+// fullname for any reason).
+func TestCheckExpectedResources_DRAKubeletPluginCustomName(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("nvidia-dra-driver"),
+			// DaemonSet named after a custom fullnameOverride; still ends in
+			// the upstream chart's hard-coded role suffix.
+			readyDaemonSet("nvidia-dra-driver", "my-custom-gpu-kubelet-plugin", 2),
+		},
+		nil,
+		[]recipe.ComponentRef{
+			{Name: draDriverComponent, Namespace: "nvidia-dra-driver"},
+		},
+	)
+
+	if err := checkExpectedResources(ctx); err != nil {
+		t.Fatalf("checkExpectedResources() error = %v, want nil for custom-named kubelet-plugin DaemonSet", err)
+		return
+	}
+}
+
+// TestCheckExpectedResources_FailsWhenMultipleKubeletPluginDaemonSets pins
+// the ambiguity guard: two DaemonSets in the same namespace both ending in
+// the role suffix must produce an explicit failure listing their names,
+// rather than silently picking one.
+func TestCheckExpectedResources_FailsWhenMultipleKubeletPluginDaemonSets(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("nvidia-dra-driver"),
+			readyDaemonSet("nvidia-dra-driver", "alpha-kubelet-plugin", 2),
+			readyDaemonSet("nvidia-dra-driver", "beta-kubelet-plugin", 2),
+		},
+		nil,
+		[]recipe.ComponentRef{
+			{Name: draDriverComponent, Namespace: "nvidia-dra-driver"},
+		},
+	)
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("expected error when multiple kubelet-plugin DaemonSets match")
+		return
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("expected ambiguity failure, got: %v", err)
+		return
+	}
+	for _, name := range []string{"alpha-kubelet-plugin", "beta-kubelet-plugin"} {
+		if !strings.Contains(err.Error(), name) {
+			t.Fatalf("expected matched DaemonSet name %q in failure, got: %v", name, err)
+			return
+		}
+	}
+}
+
+// TestCheckExpectedResources_IgnoresUnrelatedDaemonSetInNamespace pins the
+// scoping guarantee: DaemonSets in the same namespace that don't match the
+// kubelet-plugin role suffix must be ignored entirely.
+func TestCheckExpectedResources_IgnoresUnrelatedDaemonSetInNamespace(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{
+			activeNamespace("nvidia-dra-driver"),
+			// An unrelated DaemonSet (e.g. monitoring agent) sharing the
+			// namespace — must not interfere.
+			unreadyDaemonSet("nvidia-dra-driver", "node-exporter", 3, 0),
+			// The real kubelet-plugin, healthy.
+			readyDaemonSet("nvidia-dra-driver", testDefaultDRADSName, 2),
+		},
+		nil,
+		[]recipe.ComponentRef{
+			{Name: draDriverComponent, Namespace: "nvidia-dra-driver"},
+		},
+	)
+
+	if err := checkExpectedResources(ctx); err != nil {
+		t.Fatalf("checkExpectedResources() error = %v, want nil — unrelated DaemonSet must be ignored", err)
+		return
+	}
+}
+
+// TestCheckExpectedResources_NodewrightLiveness pins that readiness keys on the
+// declared CR being live, not merely on some Skyhook reporting complete.
+//
+// The component health check's assert is deliberately name-agnostic, so a stale
+// or unrelated live complete Skyhook satisfies it on its own. Only this
+// per-name check binds liveness to the CR the recipe actually declared, so a
+// Terminating CR must fail even while it still reports complete — Nodewright
+// uses a deletion finalizer, so that state persists. Passing there would be a
+// false PASS on state about to disappear, the same direction the Chainsaw
+// executor guards by skipping ghosts on positive assertions (#2041).
+//
+// The live row is the control: without it a gate that rejected everything would
+// still satisfy the terminating row.
+func TestCheckExpectedResources_NodewrightLiveness(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		nodewrights []runtime.Object
+		wantErr     bool
+		wantNeedles []string
+	}{
+		{
+			name: "terminating declared CR fails despite a stale live complete CR",
+			nodewrights: []runtime.Object{
+				nodewrightTerminatingWithStatus("no-op", "complete"),
+				nodewrightWithStatus("some-other-skyhook", "complete"),
+			},
+			wantErr:     true,
+			wantNeedles: []string{"no-op", "terminating"},
+		},
+		{
+			name:        "live complete declared CR passes",
+			nodewrights: []runtime.Object{nodewrightWithStatus("no-op", "complete")},
+			wantErr:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := newDeploymentTestContext(t,
+				[]runtime.Object{activeNamespace("skyhook")},
+				tt.nodewrights,
+				[]recipe.ComponentRef{
+					{
+						Name:      nodewrightCustomizationsComponent,
+						Namespace: "skyhook",
+						ManifestFiles: []string{
+							"components/nodewright-customizations/manifests/no-op.yaml",
+						},
+					},
+				},
+			)
+
+			err := checkExpectedResources(ctx)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("checkExpectedResources() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			for _, needle := range tt.wantNeedles {
+				if !strings.Contains(err.Error(), needle) {
+					t.Fatalf("expected %q in failure, got: %v", needle, err)
+					return
+				}
+			}
+		})
+	}
+}
+
+// TestCheckExpectedResources_SurfacesMultipleNodewrightFailures pins Codex's
+// non-blocking observation #1: when a recipe declares multiple Nodewright CRs
+// and several are non-complete, all failures must surface in the error so
+// the user can diagnose the whole state, not just the first issue.
+func TestCheckExpectedResources_SurfacesMultipleNodewrightFailures(t *testing.T) {
+	t.Parallel()
+
+	// Use a synthetic recipe ref whose ManifestFiles point at the two real
+	// manifests that declare different names. tuning.yaml yields "tuning";
+	// no-op.yaml yields "no-op". The check must report both failures.
+	ctx := newDeploymentTestContext(t,
+		[]runtime.Object{activeNamespace("skyhook")},
+		[]runtime.Object{
+			nodewrightWithStatus("tuning", "waiting"),
+			nodewrightWithStatus("no-op", "erroring"),
+		},
+		[]recipe.ComponentRef{
+			{
+				Name:      nodewrightCustomizationsComponent,
+				Namespace: "skyhook",
+				ManifestFiles: []string{
+					"components/nodewright-customizations/manifests/tuning.yaml",
+					"components/nodewright-customizations/manifests/no-op.yaml",
+				},
+			},
+		},
+	)
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("expected error when multiple expected Nodewrights are non-complete")
+		return
+	}
+	for _, needle := range []string{
+		"Nodewright tuning: status=waiting",
+		"Nodewright no-op: status=erroring",
+	} {
+		if !strings.Contains(err.Error(), needle) {
+			t.Fatalf("expected %q in failure, got: %v", needle, err)
+			return
+		}
+	}
+}
+
+// TestExtractNodewrightNamesFromManifest exercises the narrow manifest parser
+// directly. The most important case is Codex's: tuning-gke.yaml's filename
+// suggests "tuning-gke" but the actual metadata.name is "tuning".
+func TestExtractNodewrightNamesFromManifest(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		content []byte
+		want    []string
+	}{
+		{
+			name: "simple single-document manifest",
+			content: []byte(`---
+apiVersion: skyhook.nvidia.com/v1alpha1
+kind: Skyhook
+metadata:
+  name: tuning
+spec:
+  runtimeRequired: true
+`),
+			want: []string{"tuning"},
+		},
+		{
+			name: "renamed kind (nodewright-operator v0.18.0) is captured too",
+			content: []byte(`---
+apiVersion: nodewright.nvidia.com/v1alpha1
+kind: NodeWright
+metadata:
+  name: tuning
+spec:
+  runtimeRequired: true
+`),
+			want: []string{"tuning"},
+		},
+		{
+			name: "multi-document manifest — both Skyhook names captured",
+			content: []byte(`---
+apiVersion: skyhook.nvidia.com/v1alpha1
+kind: Skyhook
+metadata:
+  name: first
+---
+apiVersion: skyhook.nvidia.com/v1alpha1
+kind: Skyhook
+metadata:
+  name: second
+`),
+			want: []string{"first", "second"},
+		},
+		{
+			name: "mixed kinds — non-Skyhook documents ignored",
+			content: []byte(`---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-cm
+---
+apiVersion: skyhook.nvidia.com/v1alpha1
+kind: Skyhook
+metadata:
+  name: tuning
+`),
+			want: []string{"tuning"},
+		},
+		{
+			name: "Helm template preamble — not-valid-YAML lines do not break extraction",
+			content: []byte(`{{- $cust := index .Values "nodewright-customizations" }}
+{{- if ne (toString (index $cust "enabled")) "false" }}
+---
+apiVersion: skyhook.nvidia.com/v1alpha1
+kind: Skyhook
+metadata:
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+  labels:
+    app.kubernetes.io/part-of: nodewright-operator
+  name: tuning
+  namespace: {{ .Release.Namespace }}
+spec:
+  runtimeRequired: true
+  additionalTolerations:
+    {{- if $cust.acceleratedTolerations }}
+    {{- toYaml $cust.acceleratedTolerations | nindent 4 }}
+    {{- end }}
+{{- end }}
+`),
+			want: []string{"tuning"},
+		},
+		{
+			name:    "empty content",
+			content: []byte(""),
+			want:    nil,
+		},
+		{
+			name: "templated name — skipped (validator cannot evaluate Helm at validate time)",
+			content: []byte(`---
+apiVersion: skyhook.nvidia.com/v1alpha1
+kind: Skyhook
+metadata:
+  name: {{ .Chart.Name }}
+`),
+			want: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := extractNodewrightNamesFromManifest(tc.content)
+			if !stringSlicesEqual(got, tc.want) {
+				t.Fatalf("extractNodewrightNamesFromManifest(...) = %v, want %v", got, tc.want)
+				return
+			}
+		})
+	}
+}
+
+// TestExtractNodewrightNamesFromManifest_TuningGke is the regression test for
+// Codex's explicit ask: tuning-gke.yaml's metadata.name is "tuning", not
+// "tuning-gke". A basename-derived heuristic would get this wrong.
+func TestExtractNodewrightNamesFromManifest_TuningGke(t *testing.T) {
+	t.Parallel()
+
+	content, err := recipe.GetManifestContent("components/nodewright-customizations/manifests/tuning-gke.yaml")
+	if err != nil {
+		t.Fatalf("failed to load tuning-gke manifest: %v", err)
+		return
+	}
+
+	got := extractNodewrightNamesFromManifest(content)
+	want := []string{"tuning"}
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("extractNodewrightNamesFromManifest(tuning-gke.yaml) = %v, want %v (metadata.name is 'tuning', not the filename basename)", got, want)
+		return
+	}
+}
+
+// TestExpectedNodewrightNames_RenderAware pins the value-aware behavior added
+// for #1844: expectedNodewrightNames renders each manifest with the component's
+// effective values, so a CR gated off by those values drops out of the
+// extracted set. The `enabled: false` override exercises the same value-gate
+// mechanism the tuningEnabled=false gate will use on the single-package tuning
+// manifests — the whole Skyhook CR is suppressed, and the check tolerates its
+// absence rather than asserting a CR that was deliberately not rendered.
+func TestExpectedNodewrightNames_RenderAware(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		manifests []string
+		overrides map[string]any
+		want      []string
+	}{
+		{
+			name:      "tuning.yaml, default values → CR expected",
+			manifests: []string{"components/nodewright-customizations/manifests/tuning.yaml"},
+			overrides: nil,
+			want:      []string{"tuning"},
+		},
+		{
+			name:      "single-package tuning-generic.yaml, default values → CR expected",
+			manifests: []string{"components/nodewright-customizations/manifests/tuning-generic.yaml"},
+			overrides: nil,
+			want:      []string{"tuning"},
+		},
+		{
+			name:      "value gate suppresses the whole CR → nothing expected",
+			manifests: []string{"components/nodewright-customizations/manifests/tuning-generic.yaml"},
+			overrides: map[string]any{"enabled": false},
+			want:      nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ref := recipe.ComponentRef{
+				Name:          nodewrightCustomizationsComponent,
+				Namespace:     "skyhook",
+				ManifestFiles: tc.manifests,
+				Overrides:     tc.overrides,
+			}
+			got, err := expectedNodewrightNames(ref)
+			if err != nil {
+				t.Fatalf("expectedNodewrightNames() error = %v, want nil", err)
+				return
+			}
+			if !stringSlicesEqual(got, tc.want) {
+				t.Fatalf("expectedNodewrightNames() = %v, want %v", got, tc.want)
+				return
+			}
+		})
+	}
+}
+
+// TestNodewrightHealthCheckSuppressed pins the gate that skips the static
+// chainsaw health-check assert when the component's effective values suppress
+// the tuning Skyhook CR (#1844). Only the nodewright-customizations component is
+// subject to it; a component with a renderable CR or no manifests keeps its
+// assert; a render-empty component with manifests declared is suppressed.
+func TestNodewrightHealthCheckSuppressed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		ref  recipe.ComponentRef
+		want bool
+	}{
+		{
+			name: "other component is never suppressed",
+			ref: recipe.ComponentRef{
+				Name:          "gpu-operator",
+				ManifestFiles: []string{"components/nodewright-customizations/manifests/tuning-generic.yaml"},
+				Overrides:     map[string]any{"enabled": false},
+			},
+			want: false,
+		},
+		{
+			name: "nodewright with a renderable CR keeps its assert",
+			ref: recipe.ComponentRef{
+				Name:          nodewrightCustomizationsComponent,
+				ManifestFiles: []string{"components/nodewright-customizations/manifests/tuning-generic.yaml"},
+			},
+			want: false,
+		},
+		{
+			name: "nodewright with all CRs gated off is suppressed",
+			ref: recipe.ComponentRef{
+				Name:          nodewrightCustomizationsComponent,
+				ManifestFiles: []string{"components/nodewright-customizations/manifests/tuning-generic.yaml"},
+				Overrides:     map[string]any{"enabled": false},
+			},
+			want: true,
+		},
+		{
+			name: "nodewright with no manifests keeps its assert (misconfig surfaces elsewhere)",
+			ref: recipe.ComponentRef{
+				Name: nodewrightCustomizationsComponent,
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := nodewrightHealthCheckSuppressed(tc.ref)
+			if err != nil {
+				t.Fatalf("nodewrightHealthCheckSuppressed() error = %v, want nil", err)
+				return
+			}
+			if got != tc.want {
+				t.Fatalf("nodewrightHealthCheckSuppressed() = %v, want %v", got, tc.want)
+				return
+			}
+		})
+	}
+}
+
+// TestVerifyNodewrightReady_TolerantWhenAllCRsSuppressed pins the fail-closed
+// distinction added for #1844: when manifests are declared but the effective
+// values render zero Skyhook CRs, readiness passes (nothing to verify) — the CR
+// was deliberately suppressed. This is checked before the CRD-discovery gate, so
+// no cluster state is required. Contrast with the no-manifests case, which still
+// fails closed as a misconfiguration (TestCheckExpectedResources_FailsWhenNoExpectedNodewrightNames).
+func TestVerifyNodewrightReady_TolerantWhenAllCRsSuppressed(t *testing.T) {
+	t.Parallel()
+
+	// A ref that keeps the component enabled for the readiness check but whose
+	// manifest gate renders the whole Skyhook CR away. `enabled: false` drives
+	// the same value gate the tuningEnabled=false path uses; calling
+	// verifyNodewrightReady directly bypasses the upstream IsEnabled filter so we
+	// exercise the render-empty branch itself.
+	ref := recipe.ComponentRef{
+		Name:          nodewrightCustomizationsComponent,
+		Namespace:     "skyhook",
+		ManifestFiles: []string{"components/nodewright-customizations/manifests/tuning-generic.yaml"},
+		Overrides:     map[string]any{"enabled": false},
+	}
+	ctx := newDeploymentTestContext(t, []runtime.Object{activeNamespace("skyhook")}, nil,
+		[]recipe.ComponentRef{ref})
+
+	if err := verifyNodewrightReady(ctx, ref, []corev1.Taint{legacyRuntimeRequiredTaint}); err != nil {
+		t.Fatalf("verifyNodewrightReady() error = %v, want nil (all CRs suppressed by effective values)", err)
+	}
+}
+
+// TestIsRuntimeRequiredTaint pins the matcher: only an exact key+value+effect
+// match against the gate counts. A taint that shares the key but differs in
+// value or effect must not be mistaken for an in-flight tuning (or the gate
+// would block forever on an unrelated taint).
+func TestIsRuntimeRequiredTaint(t *testing.T) {
+	t.Parallel()
+
+	// A custom configured taint (as --workload-gate would set) plus the legacy
+	// default: the shape runtimeRequiredTaints produces.
+	custom := corev1.Taint{Key: "custom.io/gate", Value: "true", Effect: corev1.TaintEffectNoExecute}
+	gate := []corev1.Taint{custom, legacyRuntimeRequiredTaint}
+
+	tests := []struct {
+		name  string
+		taint corev1.Taint
+		want  bool
+	}{
+		{
+			name:  "exact legacy runtime-required NoSchedule",
+			taint: legacyRuntimeRequiredTaint,
+			want:  true,
+		},
+		{
+			name:  "exact configured taint, including its non-NoSchedule effect",
+			taint: custom,
+			want:  true,
+		},
+		{
+			name:  "legacy key+value but NoExecute effect",
+			taint: corev1.Taint{Key: legacyRuntimeRequiredTaint.Key, Value: legacyRuntimeRequiredTaint.Value, Effect: corev1.TaintEffectNoExecute},
+			want:  false,
+		},
+		{
+			name:  "legacy key but different value",
+			taint: corev1.Taint{Key: legacyRuntimeRequiredTaint.Key, Value: "something-else", Effect: corev1.TaintEffectNoSchedule},
+			want:  false,
+		},
+		{
+			name:  "chart default is not gated once a custom taint is configured",
+			taint: defaultRuntimeRequiredTaint,
+			want:  false,
+		},
+		{
+			name:  "unrelated dedication taint",
+			taint: corev1.Taint{Key: "dedicated", Value: "user-workload", Effect: corev1.TaintEffectNoSchedule},
+			want:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isRuntimeRequiredTaint(&tt.taint, gate); got != tt.want {
+				t.Errorf("isRuntimeRequiredTaint(%+v) = %v, want %v", tt.taint, got, tt.want)
+			}
+		})
+	}
+}
+
+// probeRendezvousTimeout bounds how long one arm of the rendezvous below waits
+// for its sibling. It elapses only when the probes did NOT overlap — i.e. only
+// on the path where the test is already failing — so the passing run never
+// spends it.
+const probeRendezvousTimeout = 10 * time.Second
+
+// rendezvous releases all its arms only once `want` of them have arrived, so a
+// serial implementation cannot satisfy it: arm 1 would have to complete before
+// arm 2 arrives, and completing requires a release that only arm 2's arrival
+// can trigger.
+type rendezvous struct {
+	mu       sync.Mutex
+	arrived  int
+	want     int
+	released chan struct{}
+}
+
+func newRendezvous(want int) *rendezvous {
+	return &rendezvous{want: want, released: make(chan struct{})}
+}
+
+// arrive blocks until every arm has arrived. Late arrivals (a probe that calls
+// the same API more than once) pass straight through on the closed channel.
+// t.Errorf, not t.Fatalf: this runs on a probe goroutine.
+func (r *rendezvous) arrive(t *testing.T, arm string) {
+	t.Helper()
+	r.mu.Lock()
+	r.arrived++
+	if r.arrived == r.want {
+		close(r.released)
+	}
+	r.mu.Unlock()
+
+	select {
+	case <-r.released:
+	case <-time.After(probeRendezvousTimeout):
+		t.Errorf("%s probe waited %s at the rendezvous and its sibling never arrived — the probes ran serially, not concurrently",
+			arm, probeRendezvousTimeout)
+	}
+}
+
+// TestVerifyGPUReadinessSignalsPreservesOrderConcurrently pins the two
+// properties the fan-out must preserve end to end: every enabled signal reports
+// (one failure never truncates its siblings), and failures come back in the
+// fixed nodewright → DRA → RDMA order the firstStructuredErr precedence depends
+// on, whichever probe finishes first.
+//
+// That the probes genuinely overlap is proven by
+// TestRunGPUReadinessProbesOverlap, not here: both real probes reach the
+// cluster through client-go fakes, and testing.Fake.Invokes holds one mutex
+// across the whole reaction chain, so a barrier installed in a reactor blocks
+// every other call on the same fake — including the sibling probe's — and
+// self-deadlocks regardless of whether the implementation is concurrent.
+func TestVerifyGPUReadinessSignalsPreservesOrderConcurrently(t *testing.T) {
+	t.Parallel()
+
+	refs := []recipe.ComponentRef{
+		{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}},
+		{Name: draDriverComponent, Namespace: "nvidia-dra-driver"},
+	}
+	// The canceled budget fails both signals on their first poll. Both must
+	// report.
+	ctx := newDeploymentTestContextWithDiscovery(t, nil, nil, []schema.GroupVersion{nodewrightGVR.GroupVersion()}, nil, refs)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel() // force every probe's poll loop to exit on its first iteration
+	ctx.Ctx = canceled
+
+	failures, firstStructured := verifyGPUReadinessSignals(ctx, refs)
+	if len(failures) != 2 {
+		t.Fatalf("got %d failures, want 2 — every enabled signal must report", len(failures))
+	}
+	if !strings.Contains(failures[0], "Nodewright") {
+		t.Errorf("failures[0] = %q, want the nodewright signal first", failures[0])
+	}
+	// firstStructuredErr precedence is fixed-order, not completion-order: it
+	// must resolve to the nodewright signal (index 0) even though both probes
+	// ran concurrently and either could have finished first.
+	if firstStructured == nil || firstStructured.Error() != failures[0] {
+		t.Errorf("firstStructured = %v, want it to match failures[0] (%q)", firstStructured, failures[0])
+	}
+}
+
+// TestRunGPUReadinessProbesOverlap proves the fan-out is concurrent rather than
+// a loop that happens to produce the same results. Each probe arrives at a
+// rendezvous that releases nobody until every probe has arrived, so a serial
+// implementation cannot get past it: probe 1 would have to return before probe
+// 2 arrives, and returning requires probe 2's arrival.
+//
+// Nothing sleeps on the passing path — probeRendezvousTimeout elapses only when
+// the probes did not overlap, which is already a failure. Results are still
+// asserted in index order to pin that they are read back by index and not in
+// completion order: probe 1 is released first but deliberately returns last.
+func TestRunGPUReadinessProbesOverlap(t *testing.T) {
+	t.Parallel()
+
+	rv := newRendezvous(2)
+	firstDone := make(chan struct{})
+	errFirst := errors.New(errors.ErrCodeInternal, "first probe")
+	errSecond := errors.New(errors.ErrCodeNotFound, "second probe")
+
+	results := runGPUReadinessProbes([]gpuReadinessProbe{
+		{
+			component: "first",
+			signal:    "first signal",
+			run: func() error {
+				rv.arrive(t, "first")
+				// Finish after the sibling so completion order is the reverse
+				// of index order; the assertions below must not notice. Bounded
+				// for the same reason arrive is: on a serial implementation the
+				// sibling never runs, and an unbounded receive would hang the
+				// package instead of reporting a failure.
+				select {
+				case <-firstDone:
+				case <-time.After(probeRendezvousTimeout):
+					t.Errorf("first probe waited %s for the second to finish; the second never ran", probeRendezvousTimeout)
+				}
+				return errFirst
+			},
+		},
+		{
+			component: "second",
+			signal:    "second signal",
+			run: func() error {
+				rv.arrive(t, "second")
+				close(firstDone)
+				return errSecond
+			},
+		},
+	})
+
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want one per probe", len(results))
+	}
+	if !stderrors.Is(results[0], errFirst) {
+		t.Errorf("results[0] = %v, want the first probe's error regardless of completion order", results[0])
+	}
+	if !stderrors.Is(results[1], errSecond) {
+		t.Errorf("results[1] = %v, want the second probe's error", results[1])
+	}
+}
+
+// TestRuntimeRequiredTaints verifies runtimeRequiredTaints returns the
+// configured taint plus the legacy default, falls back to the chart defaults
+// when the Deployment or env is absent, and fails on a list error, several
+// matches, or an invalid taint.
+func TestRuntimeRequiredTaints(t *testing.T) {
+	t.Parallel()
+
+	const ns = "skyhook"
+	custom := corev1.Taint{Key: "custom.io/gate", Value: "true", Effect: corev1.TaintEffectNoExecute}
+	defaultsGate := []corev1.Taint{defaultRuntimeRequiredTaint, legacyRuntimeRequiredTaint}
+
+	tests := []struct {
+		name       string
+		objects    []runtime.Object
+		refs       []recipe.ComponentRef
+		listErr    error
+		want       []corev1.Taint
+		wantErrSub string
+	}{
+		{
+			name:    "custom env value gates that taint plus the legacy default",
+			objects: []runtime.Object{nodewrightOperatorDeploymentWithEnv(ns, custom.ToString())},
+			refs:    []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			want:    []corev1.Taint{custom, legacyRuntimeRequiredTaint},
+		},
+		{
+			name:    "legacy env value is not duplicated",
+			objects: []runtime.Object{nodewrightOperatorDeploymentWithEnv(ns, legacyRuntimeRequiredTaint.ToString())},
+			refs:    []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			want:    []corev1.Taint{legacyRuntimeRequiredTaint},
+		},
+		{
+			name:    "operator ref namespace wins over the fallback namespace",
+			objects: []runtime.Object{nodewrightOperatorDeploymentWithEnv("operator-ns", custom.ToString())},
+			refs:    []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: "operator-ns"}},
+			want:    []corev1.Taint{custom, legacyRuntimeRequiredTaint},
+		},
+		{
+			name:    "no operator ref falls back to the customizations namespace",
+			objects: []runtime.Object{nodewrightOperatorDeploymentWithEnv(ns, custom.ToString())},
+			want:    []corev1.Taint{custom, legacyRuntimeRequiredTaint},
+		},
+		{
+			name:    "env absent uses the chart defaults",
+			objects: []runtime.Object{nodewrightOperatorDeploymentWithEnv(ns, "")},
+			refs:    []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			want:    defaultsGate,
+		},
+		{
+			name: "deployment absent uses the chart defaults",
+			refs: []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			want: defaultsGate,
+		},
+		{
+			name:       "unparseable env value fails closed",
+			objects:    []runtime.Object{nodewrightOperatorDeploymentWithEnv(ns, "not-a-taint")},
+			refs:       []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			wantErrSub: "is not a valid taint",
+		},
+		{
+			// Distinct from an unparseable value: the operator's own options
+			// validation requires a runtime-required taint, so an empty one
+			// means it is not running rather than that the gate cannot read it.
+			name: "empty env value names the operator config, not a parse failure",
+			objects: []runtime.Object{nodewrightOperatorDeploymentWithEnvVar(ns,
+				corev1.EnvVar{Name: runtimeRequiredTaintEnv, Value: ""})},
+			refs:       []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			wantErrSub: "refuses to start without one",
+		},
+		{
+			// The gate reads the Deployment spec, so an indirected value is
+			// unreadable rather than invalid. Fails closed either way.
+			name: "valueFrom env fails closed as unresolvable",
+			objects: []runtime.Object{nodewrightOperatorDeploymentWithEnvVar(ns, corev1.EnvVar{
+				Name: runtimeRequiredTaintEnv,
+				ValueFrom: &corev1.EnvVarSource{
+					ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "cm"},
+						Key:                  "taint",
+					},
+				},
+			})},
+			refs:       []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			wantErrSub: "valueFrom",
+		},
+		{
+			name: "Deployment is found by label whatever its name",
+			objects: []runtime.Object{nodewrightOperatorDeploymentNamed(ns,
+				"nodewright-controller-manager", "custom.io/gate=true:NoExecute")},
+			refs: []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			want: dedupeTaints(custom, legacyRuntimeRequiredTaint),
+		},
+		{
+			// nameOverride changes the name and part-of labels only.
+			name: "Deployment is found with both nameOverride and fullnameOverride set",
+			objects: []runtime.Object{func() *appsv1.Deployment {
+				d := nodewrightOperatorDeploymentWithEnv(ns, custom.ToString())
+				d.Labels["app.kubernetes.io/name"] = "custom"
+				d.Labels["app.kubernetes.io/part-of"] = "custom"
+				return d
+			}()},
+			refs: []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			want: dedupeTaints(custom, legacyRuntimeRequiredTaint),
+		},
+		{
+			name: "Deployment without the controller labels is ignored",
+			objects: []runtime.Object{func() *appsv1.Deployment {
+				d := nodewrightOperatorDeploymentWithEnv(ns, custom.ToString())
+				d.Labels = map[string]string{"control-plane": "controller-manager"}
+				return d
+			}()},
+			refs: []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			want: defaultsGate,
+		},
+		{
+			// Neither can be shown to own the taint the nodes carry, and
+			// picking one would gate on a value the other never applies.
+			name: "more than one matching Deployment fails closed",
+			objects: []runtime.Object{
+				nodewrightOperatorDeploymentWithEnv(ns, "custom.io/gate=true:NoExecute"),
+				nodewrightOperatorDeploymentNamed(ns, "nodewright-controller-manager",
+					"other.io/gate=true:NoSchedule"),
+			},
+			refs:       []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			wantErrSub: "operator is ambiguous",
+		},
+		{
+			name:       "list error fails closed",
+			listErr:    apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, "", stderrors.New("forbidden")),
+			refs:       []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			wantErrSub: "failed to list nodewright controller-manager Deployments",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			clientset := k8sfake.NewClientset(tt.objects...)
+			if tt.listErr != nil {
+				clientset.PrependReactor("list", "deployments", func(clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, tt.listErr
+				})
+			}
+			ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
+
+			got, err := runtimeRequiredTaints(ctx, tt.refs, ns)
+			if tt.wantErrSub != "" {
+				if err == nil {
+					t.Fatalf("runtimeRequiredTaints() error = nil, want error containing %q", tt.wantErrSub)
+				}
+				if !strings.Contains(err.Error(), tt.wantErrSub) {
+					t.Fatalf("runtimeRequiredTaints() error = %v, want substring %q", err, tt.wantErrSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("runtimeRequiredTaints() error = %v, want nil", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("runtimeRequiredTaints() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("runtimeRequiredTaints()[%d] = %+v, want %+v", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestCheckExpectedResources_GatesOnConfiguredTaint proves the end-to-end
+// wiring: with the operator configured for a custom --workload-gate taint, a
+// node carrying that taint keeps the gate closed even though the CR is
+// complete, and a node carrying only the (now unconfigured) chart default does
+// not.
+func TestCheckExpectedResources_GatesOnConfiguredTaint(t *testing.T) {
+	t.Parallel()
+
+	custom := corev1.Taint{Key: "custom.io/gate", Value: "true", Effect: corev1.TaintEffectNoSchedule}
+	refs := []recipe.ComponentRef{
+		{Name: nodewrightOperatorComponent, Namespace: "skyhook"},
+		{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}},
+	}
+
+	tests := []struct {
+		name       string
+		node       *corev1.Node
+		wantErrSub string
+	}{
+		{
+			name:       "node carrying the configured taint blocks",
+			node:       nodeWithTaints("gpu-node-0", custom),
+			wantErrSub: "node gpu-node-0: still carries the runtime-required taint custom.io/gate=true:NoSchedule",
+		},
+		{
+			name:       "node carrying the legacy taint still blocks",
+			node:       nodeWithRuntimeRequiredTaint("gpu-node-0"),
+			wantErrSub: "node gpu-node-0: still carries the runtime-required taint",
+		},
+		{
+			name: "node carrying only the unconfigured chart default passes",
+			node: nodeWithTaints("gpu-node-0", defaultRuntimeRequiredTaint),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := newDeploymentTestContext(t,
+				[]runtime.Object{
+					activeNamespace("skyhook"),
+					nodewrightOperatorDeploymentWithEnv("skyhook", custom.ToString()),
+					tt.node,
+				},
+				[]runtime.Object{nodeWrightWithStatus("tuning", nodewrightCompleteState)},
+				refs,
+			)
+
+			err := checkExpectedResources(ctx)
+			if tt.wantErrSub == "" {
+				if err != nil {
+					t.Fatalf("checkExpectedResources() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("checkExpectedResources() error = nil, want error containing %q", tt.wantErrSub)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrSub) {
+				t.Fatalf("checkExpectedResources() error = %v, want substring %q", err, tt.wantErrSub)
+			}
+		})
+	}
+}
+
+// TestCheckExpectedResources_OperatorHealthCheckRequiresOneController verifies
+// checkExpectedResources fails the operator health check when more than one
+// controller-manager Deployment matches.
+func TestCheckExpectedResources_OperatorHealthCheckRequiresOneController(t *testing.T) {
+	t.Parallel()
+
+	const assertYAML = `apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: nodewright-operator-health-check
+spec:
+  steps:
+    - name: validate-deployment-exists
+      try:
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                namespace: skyhook
+                labels:
+                  control-plane: controller-manager
+`
+	// Serves just enough API discovery for the chainsaw fetcher to resolve
+	// Deployments. The dynamic fake holds one matching Deployment, so the assert
+	// passes whatever the controller count and only the cardinality check varies.
+	discovery := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api":
+			_, _ = w.Write([]byte(`{"kind":"APIVersions","versions":["v1"]}`))
+		case "/apis":
+			_, _ = w.Write([]byte(`{"kind":"APIGroupList","groups":[{"name":"apps","versions":[` +
+				`{"groupVersion":"apps/v1","version":"v1"}],"preferredVersion":{"groupVersion":"apps/v1","version":"v1"}}]}`))
+		case "/apis/apps/v1":
+			_, _ = w.Write([]byte(`{"kind":"APIResourceList","groupVersion":"apps/v1","resources":[` +
+				`{"name":"deployments","namespaced":true,"kind":"Deployment","verbs":["list"]}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","code":404}`))
+		}
+	}))
+	t.Cleanup(discovery.Close)
+
+	tests := []struct {
+		name      string
+		namespace string
+		objects   []runtime.Object
+		wantErr   string
+	}{
+		{
+			name:      "one controller Deployment",
+			namespace: "skyhook",
+			objects:   []runtime.Object{nodewrightOperatorDeploymentWithEnv("skyhook", "")},
+		},
+		{
+			name:      "two controller Deployments",
+			namespace: "skyhook",
+			objects: []runtime.Object{
+				nodewrightOperatorDeploymentWithEnv("skyhook", ""),
+				nodewrightOperatorDeploymentNamed("skyhook", "nodewright-controller-manager", ""),
+			},
+			wantErr: "operator is ambiguous",
+		},
+		{
+			name:    "no namespace on the component",
+			objects: []runtime.Object{nodewrightOperatorDeploymentWithEnv("skyhook", "")},
+			wantErr: "no namespace",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			live := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       "Deployment",
+				"metadata": map[string]any{
+					"name": "d", "namespace": "skyhook",
+					"labels": map[string]any{"control-plane": "controller-manager"},
+				},
+			}}
+			refs := []recipe.ComponentRef{{
+				Name: nodewrightOperatorComponent, Namespace: tt.namespace, HealthCheckAsserts: assertYAML,
+			}}
+			ctx := newDeploymentTestContext(t, append([]runtime.Object{activeNamespace("skyhook")}, tt.objects...),
+				[]runtime.Object{live}, refs)
+			ctx.RESTConfig = &rest.Config{Host: discovery.URL}
+
+			err := checkExpectedResources(ctx)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("checkExpectedResources() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("checkExpectedResources() error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// testNodewrightAssertYAML is the shape of the registry health check for
+// nodewright-customizations: a nameless assert on the NodeWright kind.
+const testNodewrightAssertYAML = `apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: nodewright-customizations-health-check
+spec:
+  steps:
+    - name: validate-nodewright-cr-complete
+      try:
+        - assert:
+            resource:
+              apiVersion: nodewright.nvidia.com/v1alpha1
+              kind: NodeWright
+              status:
+                status: complete
+`
+
+// TestCheckExpectedResources_LegacyOperatorSkipsNodeWrightAssert is the exact
+// pre-v0.18.0 regression: the registry assert is hydrated independently of the
+// resolved chart version and names the NodeWright kind, which a v0.17.x
+// operator does not serve. On such a cluster the static assert must be skipped
+// (the Go check verifies the Skyhook by name) so a healthy legacy cluster
+// passes; on a v0.18.0 cluster the assert stays queued; and a discovery
+// failure fails closed rather than skipping.
+func TestCheckExpectedResources_LegacyOperatorSkipsNodeWrightAssert(t *testing.T) {
+	t.Parallel()
+
+	ref := recipe.ComponentRef{
+		Name:               nodewrightCustomizationsComponent,
+		Namespace:          "skyhook",
+		ManifestFiles:      []string{testNodewrightManifest},
+		HealthCheckAsserts: testNodewrightAssertYAML,
+	}
+	legacyOperator := recipe.ComponentRef{Name: nodewrightOperatorComponent, Namespace: "skyhook", Version: "v0.17.1"}
+
+	t.Run("legacy-only cluster passes with the assert skipped", func(t *testing.T) {
+		t.Parallel()
+		// Only skyhook.nvidia.com is registered (inferred from the Skyhook
+		// object); a queued chainsaw assert would need a fetcher and fail. The
+		// v0.17.1 operator pin is the explicit pre-rename signal.
+		ctx := newDeploymentTestContext(t,
+			[]runtime.Object{activeNamespace("skyhook")},
+			[]runtime.Object{nodewrightWithStatus("tuning", nodewrightCompleteState)},
+			[]recipe.ComponentRef{legacyOperator, ref})
+		if err := checkExpectedResources(ctx); err != nil {
+			t.Fatalf("checkExpectedResources() error = %v, want nil on a healthy v0.17 cluster", err)
+		}
+	})
+
+	t.Run("v0.18 pin on a legacy-only cluster fails closed", func(t *testing.T) {
+		t.Parallel()
+		// A stale complete Skyhook must not certify readiness when the recipe
+		// pins an operator that is required to serve nodewright.nvidia.com.
+		ctx := newDeploymentTestContext(t,
+			[]runtime.Object{activeNamespace("skyhook")},
+			[]runtime.Object{nodewrightWithStatus("tuning", nodewrightCompleteState)},
+			[]recipe.ComponentRef{
+				{Name: nodewrightOperatorComponent, Namespace: "skyhook", Version: "v0.18.0"},
+				ref,
+			})
+		err := checkExpectedResources(ctx)
+		if err == nil {
+			t.Fatal("checkExpectedResources() error = nil, want the fail-closed legacy refusal")
+		}
+		if !strings.Contains(err.Error(), "refusing the legacy") {
+			t.Fatalf("expected the legacy-fallback refusal, got: %v", err)
+		}
+	})
+
+	t.Run("v0.18 cluster keeps the assert queued", func(t *testing.T) {
+		t.Parallel()
+		ctx := newDeploymentTestContext(t,
+			[]runtime.Object{activeNamespace("skyhook")},
+			[]runtime.Object{nodeWrightWithStatus("tuning", nodewrightCompleteState)},
+			[]recipe.ComponentRef{ref})
+		asserts := []chainsaw.ComponentAssert{{Name: ref.Name, AssertYAML: ref.HealthCheckAsserts}}
+		kept, err := dropDiscoverySuppressedAsserts(ctx, asserts)
+		if err != nil {
+			t.Fatalf("dropDiscoverySuppressedAsserts() error = %v", err)
+		}
+		if len(kept) != 1 {
+			t.Fatal("assert must stay queued when the cluster serves nodewright.nvidia.com")
+		}
+	})
+
+	t.Run("legacy-only cluster drops the assert", func(t *testing.T) {
+		t.Parallel()
+		ctx := newDeploymentTestContext(t,
+			[]runtime.Object{activeNamespace("skyhook")},
+			[]runtime.Object{nodewrightWithStatus("tuning", nodewrightCompleteState)},
+			[]recipe.ComponentRef{legacyOperator, ref})
+		asserts := []chainsaw.ComponentAssert{{Name: ref.Name, AssertYAML: ref.HealthCheckAsserts}}
+		kept, err := dropDiscoverySuppressedAsserts(ctx, asserts)
+		if err != nil {
+			t.Fatalf("dropDiscoverySuppressedAsserts() error = %v", err)
+		}
+		if len(kept) != 0 {
+			t.Fatalf("kept = %v, want the assert dropped on a legacy-only cluster", kept)
+		}
+	})
+
+	t.Run("discovery is read after readiness polling", func(t *testing.T) {
+		t.Parallel()
+		// The group is not served when the readiness poll starts and only the
+		// legacy group is established by the time it ends. The assert
+		// selection must reflect the later state.
+		ctx := newDeploymentTestContext(t,
+			[]runtime.Object{activeNamespace("skyhook")},
+			[]runtime.Object{nodewrightWithStatus("tuning", nodewrightCompleteState)},
+			[]recipe.ComponentRef{legacyOperator, ref})
+		fakeDisc := ctx.Clientset.Discovery().(*fakediscovery.FakeDiscovery)
+		established := fakeDisc.Resources
+		fakeDisc.Resources = nil
+		calls := 0
+		ctx.Clientset.(*k8sfake.Clientset).PrependReactor("get", "resource", func(clienttesting.Action) (bool, runtime.Object, error) {
+			calls++
+			if calls == 3 {
+				fakeDisc.Resources = established
+			}
+			return false, nil, nil
+		})
+		if err := checkExpectedResources(ctx); err != nil {
+			t.Fatalf("checkExpectedResources() error = %v, want nil once the legacy group is served", err)
+		}
+	})
+
+	t.Run("discovery failure fails closed", func(t *testing.T) {
+		t.Parallel()
+		ctx := newDeploymentTestContext(t,
+			[]runtime.Object{activeNamespace("skyhook")},
+			[]runtime.Object{nodewrightWithStatus("tuning", nodewrightCompleteState)},
+			[]recipe.ComponentRef{ref})
+		// FakeDiscovery synthesizes the action with Resource "resource"; see
+		// TestCheckExpectedResources_FailsWhenDiscoveryReturnsNonNotFoundError.
+		ctx.Clientset.(*k8sfake.Clientset).PrependReactor("get", "resource", func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: nodewrightGVR.Group}, "", stderrors.New("forbidden"))
+		})
+		asserts := []chainsaw.ComponentAssert{
+			{Name: ref.Name, AssertYAML: ref.HealthCheckAsserts},
+			{Name: "other-component", AssertYAML: "x"},
+		}
+		kept, err := dropDiscoverySuppressedAsserts(ctx, asserts)
+		if err == nil {
+			t.Fatal("dropDiscoverySuppressedAsserts() error = nil, want the discovery failure (must not skip)")
+		}
+		if len(kept) != 1 || kept[0].Name != "other-component" {
+			t.Fatalf("kept = %v, want only the unaffected assert alongside the error", kept)
+		}
+	})
+}
+
+// TestResolveNodewrightGVRHonorsCancellation verifies a canceled context
+// surfaces as ErrCodeTimeout. The fake clientset exposes no RESTClient, so this
+// covers the guard in helper.GroupVersionResources rather than an in-flight
+// cancellation.
+func TestResolveNodewrightGVRHonorsCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContextWithDiscovery(t, nil, nil,
+		[]schema.GroupVersion{nodewrightGVR.GroupVersion()}, nil, nil)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	ctx.Ctx = canceled
+
+	_, registered, err := resolveNodewrightGVR(ctx)
+	if err == nil {
+		t.Fatal("resolveNodewrightGVR() error = nil, want the cancellation to surface")
+	}
+	if registered {
+		t.Error("registered = true, want false — a discovery that never completed cannot report a served group")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeTimeout {
+		t.Errorf("error = %v, want ErrCodeTimeout so the phase fails closed on the budget", err)
+	}
+}
+
+// TestResolveNodewrightGVR_VersionGate verifies which group resolves.
+//   - NodeWright wins whenever it is served.
+//   - Skyhook is read only when nodewright-operator is pinned below the rename
+//     or has no usable pin.
+//   - A rename-or-later pin on a legacy-only cluster is an error.
+//   - Neither group served reports not registered.
+func TestResolveNodewrightGVR_VersionGate(t *testing.T) {
+	t.Parallel()
+
+	operator := func(version string) recipe.ComponentRef {
+		return recipe.ComponentRef{Name: nodewrightOperatorComponent, Namespace: "skyhook", Version: version}
+	}
+	legacyOnly := []runtime.Object{nodewrightWithStatus("tuning", nodewrightCompleteState)}
+	bothGroups := []runtime.Object{
+		nodewrightWithStatus("tuning", nodewrightCompleteState),
+		nodeWrightWithStatus("tuning", nodewrightCompleteState),
+	}
+
+	tests := []struct {
+		name           string
+		objects        []runtime.Object
+		refs           []recipe.ComponentRef
+		wantGVR        schema.GroupVersionResource
+		wantRegistered bool
+		wantErrSub     string
+	}{
+		{name: "both served, v0.18.0 pin → NodeWright", objects: bothGroups, refs: []recipe.ComponentRef{operator("v0.18.0")}, wantGVR: nodewrightGVR, wantRegistered: true},
+		{name: "both served, v0.17.1 pin → NodeWright still preferred", objects: bothGroups, refs: []recipe.ComponentRef{operator("v0.17.1")}, wantGVR: nodewrightGVR, wantRegistered: true},
+		{name: "legacy only, v0.17.1 pin → Skyhook", objects: legacyOnly, refs: []recipe.ComponentRef{operator("v0.17.1")}, wantGVR: legacySkyhookGVR, wantRegistered: true},
+		{name: "legacy only, no operator ref → Skyhook", objects: legacyOnly, wantGVR: legacySkyhookGVR, wantRegistered: true},
+		{name: "legacy only, unparseable pin → Skyhook", objects: legacyOnly, refs: []recipe.ComponentRef{operator("latest")}, wantGVR: legacySkyhookGVR, wantRegistered: true},
+		{name: "legacy only, v0.18.0 pin → fail closed", objects: legacyOnly, refs: []recipe.ComponentRef{operator("v0.18.0")}, wantErrSub: "refusing the legacy"},
+		{name: "legacy only, v0.19.2 pin → fail closed", objects: legacyOnly, refs: []recipe.ComponentRef{operator("v0.19.2")}, wantErrSub: "refusing the legacy"},
+		{name: "neither served, v0.18.0 pin → skip", refs: []recipe.ComponentRef{operator("v0.18.0")}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := newDeploymentTestContext(t, []runtime.Object{activeNamespace("skyhook")}, tt.objects, tt.refs)
+			gvr, registered, err := resolveNodewrightGVR(ctx)
+			if tt.wantErrSub != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrSub) {
+					t.Fatalf("resolveNodewrightGVR() error = %v, want substring %q", err, tt.wantErrSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveNodewrightGVR() error = %v", err)
+			}
+			if registered != tt.wantRegistered || gvr != tt.wantGVR {
+				t.Fatalf("resolveNodewrightGVR() = (%v, %v), want (%v, %v)", gvr, registered, tt.wantGVR, tt.wantRegistered)
+			}
+		})
+	}
+}
+
+// TestVerifyNodewrightReady_PrefersNodeWrightOverLegacySkyhook pins the #2593
+// fix. nodewright-operator v0.18.0 mirrors each legacy Skyhook into a
+// NodeWright and writes status only there; the legacy status stays empty. With
+// both groups registered the gate must read the NodeWright, so a fully tuned
+// cluster passes instead of timing out on the never-populated legacy status.
+// The legacy-only row proves the fallback for older operators.
+func TestVerifyNodewrightReady_PrefersNodeWrightOverLegacySkyhook(t *testing.T) {
+	t.Parallel()
+
+	ref := recipe.ComponentRef{Name: nodewrightCustomizationsComponent, Namespace: "skyhook", ManifestFiles: []string{testNodewrightManifest}}
+
+	tests := []struct {
+		name       string
+		objects    []runtime.Object
+		wantErrSub string
+	}{
+		{
+			name: "v0.18.0 shape: NodeWright complete, legacy Skyhook status empty",
+			objects: []runtime.Object{
+				nodeWrightWithStatus("tuning", nodewrightCompleteState),
+				nodewrightWithStatus("tuning", ""),
+			},
+		},
+		{
+			name: "v0.18.0 shape: NodeWright in_progress is what gates, not the legacy copy",
+			objects: []runtime.Object{
+				nodeWrightWithStatus("tuning", "in_progress"),
+				nodewrightWithStatus("tuning", nodewrightCompleteState),
+			},
+			wantErrSub: "Nodewright tuning: status=in_progress (want complete)",
+		},
+		{
+			name:    "legacy-only operator: falls back to the Skyhook",
+			objects: []runtime.Object{nodewrightWithStatus("tuning", nodewrightCompleteState)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := newDeploymentTestContext(t, []runtime.Object{activeNamespace("skyhook")}, tt.objects, []recipe.ComponentRef{ref})
+			err := verifyNodewrightReady(ctx, ref, []corev1.Taint{legacyRuntimeRequiredTaint})
+			if tt.wantErrSub == "" {
+				if err != nil {
+					t.Fatalf("verifyNodewrightReady() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("verifyNodewrightReady() error = nil, want error containing %q", tt.wantErrSub)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrSub) {
+				t.Fatalf("verifyNodewrightReady() error = %v, want substring %q", err, tt.wantErrSub)
+			}
+		})
+	}
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func newDeploymentTestContext(t *testing.T, kubeObjects, dynamicObjects []runtime.Object, refs []recipe.ComponentRef) *validators.Context {
+	t.Helper()
+	return newDeploymentTestContextWithUnregistered(t, kubeObjects, dynamicObjects, nil, refs)
+}
+
+// newDeploymentTestContextWithUnregistered builds a test context where the
+// given GVRs are treated as unregistered on the cluster. List/Get against
+// them return a meta.NoKindMatchError on the dynamic client, and the fake
+// clientset's discovery service does not advertise their GroupVersion —
+// mirroring what a real client sees when the CRD has not been installed.
+// Used by CRD-missing skip tests.
+//
+// Discovery registration for the *present* GVRs is inferred automatically
+// from dynamicObjects: every GVR that has at least one object in that slice
+// has its GroupVersion advertised (unless it also appears in unregistered).
+// Tests that need to advertise a GV without any objects should use
+// newDeploymentTestContextWithDiscovery below.
+func newDeploymentTestContextWithUnregistered(
+	t *testing.T,
+	kubeObjects, dynamicObjects []runtime.Object,
+	unregistered []schema.GroupVersionResource,
+	refs []recipe.ComponentRef,
+) *validators.Context {
+
+	t.Helper()
+	return newDeploymentTestContextWithDiscovery(t, kubeObjects, dynamicObjects, nil, unregistered, refs)
+}
+
+// newDeploymentTestContextWithDiscovery is the fully-explicit variant: callers
+// pass the exact list of GroupVersions the fake discovery service should
+// advertise. Needed by the "CRD present but CR missing" test, where we need
+// the Nodewright GroupVersion to appear in discovery without any Skyhook object.
+func newDeploymentTestContextWithDiscovery(
+	t *testing.T,
+	kubeObjects, dynamicObjects []runtime.Object,
+	extraRegistered []schema.GroupVersion,
+	unregistered []schema.GroupVersionResource,
+	refs []recipe.ComponentRef,
+) *validators.Context {
+
+	t.Helper()
+
+	clientset := k8sfake.NewClientset(kubeObjects...)
+	configureFakeDiscovery(t, clientset, dynamicObjects, extraRegistered, unregistered)
+	dynClient := newFakeDynamicClient(dynamicObjects, unregistered...)
+
+	rec := &recipe.RecipeResult{
+		ComponentRefs: refs,
+	}
+
+	return &validators.Context{
+		Ctx:             context.Background(),
+		Clientset:       clientset,
+		DynamicClient:   dynClient,
+		ValidationInput: v1.ToValidationInput(rec),
+	}
+}
+
+// configureFakeDiscovery wires the fake clientset's Discovery service so that
+// ServerResourcesForGroupVersion returns a non-error result for the
+// GroupVersions represented by dynamicObjects (minus any unregistered GVRs)
+// plus any extraRegistered GVs that the test declares explicitly.
+func configureFakeDiscovery(
+	t *testing.T,
+	clientset *k8sfake.Clientset,
+	dynamicObjects []runtime.Object,
+	extraRegistered []schema.GroupVersion,
+	unregistered []schema.GroupVersionResource,
+) {
+
+	t.Helper()
+
+	unregSet := make(map[schema.GroupVersion]bool, len(unregistered))
+	for _, gvr := range unregistered {
+		unregSet[gvr.GroupVersion()] = true
+	}
+
+	// gvSet maps each advertised GroupVersion to the resource names it lists.
+	// Nodewright resolution requires the resource name to be listed, so the
+	// Nodewright resources are listed explicitly.
+	gvSet := make(map[schema.GroupVersion][]string)
+	for _, object := range dynamicObjects {
+		u, ok := object.(*unstructured.Unstructured)
+		if !ok {
+			continue
+		}
+		gvk := u.GroupVersionKind()
+		gv := gvk.GroupVersion()
+		if unregSet[gv] {
+			continue
+		}
+		gvSet[gv] = append(gvSet[gv], gvrForTestObject(gvk).Resource)
+	}
+	for _, gv := range extraRegistered {
+		if unregSet[gv] {
+			continue
+		}
+		if _, ok := gvSet[gv]; !ok {
+			gvSet[gv] = nil
+		}
+		for _, gvr := range []schema.GroupVersionResource{nodewrightGVR, legacySkyhookGVR} {
+			if gvr.GroupVersion() == gv {
+				gvSet[gv] = append(gvSet[gv], gvr.Resource)
+			}
+		}
+	}
+
+	fakeDisc, ok := clientset.Discovery().(*fakediscovery.FakeDiscovery)
+	if !ok {
+		t.Fatalf("expected *fakediscovery.FakeDiscovery, got %T", clientset.Discovery())
+		return
+	}
+	for gv, names := range gvSet {
+		list := &metav1.APIResourceList{GroupVersion: gv.String()}
+		seen := make(map[string]bool, len(names))
+		for _, name := range names {
+			if !seen[name] {
+				seen[name] = true
+				list.APIResources = append(list.APIResources, metav1.APIResource{Name: name})
+			}
+		}
+		fakeDisc.Resources = append(fakeDisc.Resources, list)
+	}
+}
+
+type fakeDynamicClient struct {
+	objects      map[schema.GroupVersionResource][]*unstructured.Unstructured
+	unregistered map[schema.GroupVersionResource]bool
+}
+
+func newFakeDynamicClient(objects []runtime.Object, unregistered ...schema.GroupVersionResource) dynamic.Interface {
+	store := make(map[schema.GroupVersionResource][]*unstructured.Unstructured)
+	for _, object := range objects {
+		item := object.(*unstructured.Unstructured)
+		gvk := item.GroupVersionKind()
+		gvr := gvrForTestObject(gvk)
+		store[gvr] = append(store[gvr], item.DeepCopy())
+	}
+	unregSet := make(map[schema.GroupVersionResource]bool, len(unregistered))
+	for _, gvr := range unregistered {
+		unregSet[gvr] = true
+	}
+	return &fakeDynamicClient{objects: store, unregistered: unregSet}
+}
+
+func gvrForTestObject(gvk schema.GroupVersionKind) schema.GroupVersionResource {
+	switch {
+	case gvk.Group == nodewrightGVR.Group && gvk.Version == nodewrightGVR.Version && gvk.Kind == "NodeWright":
+		return nodewrightGVR
+	case gvk.Group == legacySkyhookGVR.Group && gvk.Version == legacySkyhookGVR.Version && gvk.Kind == "Skyhook":
+		return legacySkyhookGVR
+	default:
+		return schema.GroupVersionResource{
+			Group:    gvk.Group,
+			Version:  gvk.Version,
+			Resource: strings.ToLower(gvk.Kind) + "s",
+		}
+	}
+}
+
+func (f *fakeDynamicClient) Resource(resource schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	if f.unregistered[resource] {
+		return &fakeResourceClient{
+			resource:     resource,
+			unregistered: true,
+		}
+	}
+	return &fakeResourceClient{
+		resource: resource,
+		objects:  f.objects[resource],
+	}
+}
+
+// clusterScopedGVRs mirrors the API server's scope model so the fake fails
+// loudly if production code calls .Namespace(x) on a cluster-scoped resource
+// (which real k8s answers with a 404 "server could not find the requested
+// resource", not a silently empty list).
+var clusterScopedGVRs = map[schema.GroupVersionResource]bool{
+	nodewrightGVR:    true,
+	legacySkyhookGVR: true,
+}
+
+type fakeResourceClient struct {
+	resource         schema.GroupVersionResource
+	namespace        string
+	objects          []*unstructured.Unstructured
+	unregistered     bool
+	invalidScopeCall bool
+}
+
+func (f *fakeResourceClient) Namespace(namespace string) dynamic.ResourceInterface {
+	if f.unregistered {
+		return f
+	}
+	if clusterScopedGVRs[f.resource] && namespace != "" {
+		// Any op on this client returns a "not found" error, matching the real
+		// API server's behavior for a namespaced request against a
+		// cluster-scoped resource.
+		return &fakeResourceClient{
+			resource:         f.resource,
+			invalidScopeCall: true,
+		}
+	}
+	return &fakeResourceClient{
+		resource:  f.resource,
+		namespace: namespace,
+		objects:   f.objects,
+	}
+}
+
+func (f *fakeResourceClient) Create(context.Context, *unstructured.Unstructured, metav1.CreateOptions, ...string) (*unstructured.Unstructured, error) {
+	panic("not implemented")
+}
+
+func (f *fakeResourceClient) Update(context.Context, *unstructured.Unstructured, metav1.UpdateOptions, ...string) (*unstructured.Unstructured, error) {
+	panic("not implemented")
+}
+
+func (f *fakeResourceClient) UpdateStatus(context.Context, *unstructured.Unstructured, metav1.UpdateOptions) (*unstructured.Unstructured, error) {
+	panic("not implemented")
+}
+
+func (f *fakeResourceClient) Delete(context.Context, string, metav1.DeleteOptions, ...string) error {
+	panic("not implemented")
+}
+
+func (f *fakeResourceClient) DeleteCollection(context.Context, metav1.DeleteOptions, metav1.ListOptions) error {
+	panic("not implemented")
+}
+
+func (f *fakeResourceClient) noKindMatchError() error {
+	return &meta.NoKindMatchError{
+		GroupKind:        schema.GroupKind{Group: f.resource.Group, Kind: f.resource.Resource},
+		SearchedVersions: []string{f.resource.Version},
+	}
+}
+
+func (f *fakeResourceClient) Get(_ context.Context, name string, _ metav1.GetOptions, _ ...string) (*unstructured.Unstructured, error) {
+	if f.unregistered {
+		return nil, f.noKindMatchError()
+	}
+	if f.invalidScopeCall {
+		return nil, stderrors.New("the server could not find the requested resource")
+	}
+	for _, object := range f.objects {
+		if object.GetName() != name {
+			continue
+		}
+		if f.namespace != "" && object.GetNamespace() != f.namespace {
+			continue
+		}
+		return object.DeepCopy(), nil
+	}
+	return nil, apierrors.NewNotFound(
+		schema.GroupResource{Group: f.resource.Group, Resource: f.resource.Resource},
+		name,
+	)
+}
+
+func (f *fakeResourceClient) List(_ context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	if f.unregistered {
+		return nil, f.noKindMatchError()
+	}
+	if f.invalidScopeCall {
+		return nil, stderrors.New("the server could not find the requested resource")
+	}
+	list := &unstructured.UnstructuredList{
+		Items: make([]unstructured.Unstructured, 0, len(f.objects)),
+	}
+
+	for _, object := range f.objects {
+		if f.namespace != "" && object.GetNamespace() != f.namespace {
+			continue
+		}
+		if opts.LabelSelector != "" && !matchesLabelSelector(object, opts.LabelSelector) {
+			continue
+		}
+		list.Items = append(list.Items, *object.DeepCopy())
+	}
+
+	return list, nil
+}
+
+func (f *fakeResourceClient) Watch(context.Context, metav1.ListOptions) (watch.Interface, error) {
+	panic("not implemented")
+}
+
+func (f *fakeResourceClient) Patch(context.Context, string, types.PatchType, []byte, metav1.PatchOptions, ...string) (*unstructured.Unstructured, error) {
+	panic("not implemented")
+}
+
+func (f *fakeResourceClient) Apply(context.Context, string, *unstructured.Unstructured, metav1.ApplyOptions, ...string) (*unstructured.Unstructured, error) {
+	panic("not implemented")
+}
+
+func (f *fakeResourceClient) ApplyStatus(context.Context, string, *unstructured.Unstructured, metav1.ApplyOptions) (*unstructured.Unstructured, error) {
+	panic("not implemented")
+}
+
+func matchesLabelSelector(object *unstructured.Unstructured, selector string) bool {
+	parts := strings.SplitN(selector, "=", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	return object.GetLabels()[parts[0]] == parts[1]
+}
+
+func activeNamespace(name string) *corev1.Namespace {
+	return &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.NamespaceStatus{
+			Phase: corev1.NamespaceActive,
+		},
+	}
+}
+
+func inactiveNamespace(name string) *corev1.Namespace {
+	return &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.NamespaceStatus{
+			Phase: corev1.NamespaceTerminating,
+		},
+	}
+}
+
+func readyDeployment(namespace, name string) *appsv1.Deployment {
+	replicas := int32(1)
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+		},
+		Status: appsv1.DeploymentStatus{
+			AvailableReplicas: replicas,
+		},
+	}
+}
+
+//nolint:unparam // namespace is a meaningful test input even if current call sites all happen to use the same namespace
+func readyDaemonSet(namespace, name string, ready int32) *appsv1.DaemonSet {
+	return &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Status: appsv1.DaemonSetStatus{
+			DesiredNumberScheduled: ready,
+			NumberReady:            ready,
+		},
+	}
+}
+
+func unreadyDaemonSet(namespace, name string, desired, ready int32) *appsv1.DaemonSet {
+	return &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Status: appsv1.DaemonSetStatus{
+			DesiredNumberScheduled: desired,
+			NumberReady:            ready,
+		},
+	}
+}
+
+// nodeWithTaints builds a Node fixture carrying the given taints.
+func nodeWithTaints(name string, taints ...corev1.Taint) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       corev1.NodeSpec{Taints: taints},
+	}
+}
+
+// nodeWithRuntimeRequiredTaint builds a Node fixture carrying the legacy
+// nodewright runtime-required NoSchedule taint the readiness gate blocks on.
+func nodeWithRuntimeRequiredTaint(name string) *corev1.Node {
+	return nodeWithTaints(name, legacyRuntimeRequiredTaint)
+}
+
+// nodewrightOperatorDeploymentWithEnv builds the operator's controller-manager
+// Deployment fixture with the given RUNTIME_REQUIRED_TAINT env value; an empty
+// value omits the env entirely (an older chart).
+func nodewrightOperatorDeploymentNamed(namespace, name, taintStr string) *appsv1.Deployment {
+	d := nodewrightOperatorDeploymentWithEnv(namespace, taintStr)
+	d.Name = name
+	return d
+}
+
+func nodewrightOperatorDeploymentWithEnv(namespace, taintStr string) *appsv1.Deployment {
+	d := readyDeployment(namespace, "skyhook-operator-controller-manager")
+	d.Labels = maps.Clone(nodewrightControllerLabels)
+	container := corev1.Container{Name: "manager"}
+	if taintStr != "" {
+		container.Env = []corev1.EnvVar{{Name: runtimeRequiredTaintEnv, Value: taintStr}}
+	}
+	d.Spec.Template.Spec.Containers = []corev1.Container{container}
+	return d
+}
+
+// nodewrightOperatorDeploymentWithEnvVar builds the operator Deployment with a
+// RUNTIME_REQUIRED_TAINT entry supplied verbatim, so a test can express the
+// shapes nodewrightOperatorDeploymentWithEnv cannot: present but empty, and
+// sourced from valueFrom. Both are distinct from the env being absent.
+func nodewrightOperatorDeploymentWithEnvVar(namespace string, env corev1.EnvVar) *appsv1.Deployment {
+	d := readyDeployment(namespace, "skyhook-operator-controller-manager")
+	d.Labels = maps.Clone(nodewrightControllerLabels)
+	d.Spec.Template.Spec.Containers = []corev1.Container{{Name: "manager", Env: []corev1.EnvVar{env}}}
+	return d
+}
+
+// nodewrightTerminatingWithStatus builds a legacy Skyhook that is mid-deletion
+// (deletionTimestamp set, as Nodewright's finalizer leaves it) while still
+// reporting the given status. The combination is the trap: status.status alone
+// says "ready" about a CR that is on its way out.
+func nodewrightTerminatingWithStatus(name, status string) *unstructured.Unstructured {
+	sk := nodewrightWithStatus(name, status)
+	meta, _ := sk.Object["metadata"].(map[string]interface{})
+	meta["deletionTimestamp"] = "2026-01-01T00:00:00Z"
+	meta["finalizers"] = []interface{}{"skyhook.nvidia.com/finalizer"}
+	return sk
+}
+
+// nodeWrightWithStatus builds a nodewright.nvidia.com NodeWright fixture (the
+// kind nodewright-operator v0.18.0+ writes status on). Cluster-scoped, so
+// metadata.namespace is intentionally not set.
+//
+//nolint:unparam // name is a meaningful test input even if current call sites all use the manifest's "tuning"
+func nodeWrightWithStatus(name, status string) *unstructured.Unstructured {
+	nw := nodewrightWithStatus(name, status)
+	nw.Object["apiVersion"] = nodewrightGVR.GroupVersion().String()
+	nw.Object["kind"] = "NodeWright"
+	return nw
+}
+
+// nodewrightWithStatus builds a legacy skyhook.nvidia.com Skyhook fixture.
+// Cluster-scoped, so metadata.namespace is intentionally not set.
+func nodewrightWithStatus(name, status string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": legacySkyhookGVR.GroupVersion().String(),
+			"kind":       "Skyhook",
+			"metadata": map[string]any{
+				"name": name,
+				"labels": map[string]any{
+					testAICRCreatedByLabelKey: testAICRCreatedByLabelValue,
+				},
+			},
+			"status": map[string]any{
+				"status": status,
+			},
+		},
+	}
+}
+
+// TestRDMAFabricCoverage_Disclosure exercises the headline behavior of #1952 as a
+// pure function of the partition: a cordoned Mellanox RDMA node must be listed
+// SKIPPED (cordoned), counted in nodesTotal, and never omitted — the same
+// spuriously-narrowed-pass guard check-nvidia-smi got in #1668/#1936, applied to
+// the RDMA fabric gate. The RESULT line uses check-nvidia-smi's breakdown shape.
+func TestRDMAFabricCoverage_Disclosure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		cov              rdmaFabricCoverage
+		passed, failed   int
+		wantTotal        int
+		wantEnumeration  []string
+		wantCoverageLine string
+	}{
+		{
+			name:      "cordoned RDMA node is disclosed and counted",
+			cov:       rdmaFabricCoverage{schedulable: 1, cordoned: []string{"rdma-drain-0"}},
+			passed:    1,
+			wantTotal: 2,
+			wantEnumeration: []string{
+				"Found 2 Mellanox RDMA-capable GPU node(s), 1 schedulable, 1 cordoned:",
+				"  rdma-drain-0: SKIPPED (cordoned)",
+			},
+			wantCoverageLine: "RESULT: nodesValidated: 1/2 (passed 1, failed 0, skipped 1: cordoned 1)",
+		},
+		{
+			name:      "fail-closed exit fails the cohort but still counts cordoned",
+			cov:       rdmaFabricCoverage{schedulable: 2, cordoned: []string{"rdma-drain-0", "rdma-drain-1"}},
+			failed:    2,
+			wantTotal: 4,
+			wantEnumeration: []string{
+				"Found 4 Mellanox RDMA-capable GPU node(s), 2 schedulable, 2 cordoned:",
+				"  rdma-drain-0: SKIPPED (cordoned)",
+				"  rdma-drain-1: SKIPPED (cordoned)",
+			},
+			wantCoverageLine: "RESULT: nodesValidated: 0/4 (passed 0, failed 2, skipped 2: cordoned 2)",
+		},
+		{
+			name:             "no cordoned nodes",
+			cov:              rdmaFabricCoverage{schedulable: 3},
+			passed:           3,
+			wantTotal:        3,
+			wantEnumeration:  []string{"Found 3 Mellanox RDMA-capable GPU node(s), 3 schedulable, 0 cordoned:"},
+			wantCoverageLine: "RESULT: nodesValidated: 3/3 (passed 3, failed 0, skipped 0: cordoned 0)",
+		},
+		{
+			name:             "zero total nodes gets a plain sentence",
+			cov:              rdmaFabricCoverage{},
+			wantTotal:        0,
+			wantEnumeration:  []string{"Found 0 Mellanox RDMA-capable GPU node(s)."},
+			wantCoverageLine: "RESULT: nodesValidated: 0/0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.cov.total(); got != tt.wantTotal {
+				t.Errorf("total() = %d, want %d", got, tt.wantTotal)
+			}
+			gotEnum := tt.cov.enumerationLines()
+			if len(gotEnum) != len(tt.wantEnumeration) {
+				t.Fatalf("enumerationLines() = %v, want %v", gotEnum, tt.wantEnumeration)
+			}
+			for i, want := range tt.wantEnumeration {
+				if gotEnum[i] != want {
+					t.Errorf("enumerationLines()[%d] = %q, want %q", i, gotEnum[i], want)
+				}
+			}
+			if got := tt.cov.coverageLine(tt.passed, tt.failed); got != tt.wantCoverageLine {
+				t.Errorf("coverageLine(%d, %d) = %q, want %q", tt.passed, tt.failed, got, tt.wantCoverageLine)
+			}
+		})
+	}
+}
+
+// TestRDMAFabricCoverageExtra proves the structured coverage disclosure carries
+// exactly the four allowlisted count keys as decimal strings and nothing else —
+// no node names or IPs leak into the Extra channel.
+func TestRDMAFabricCoverageExtra(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		cov            rdmaFabricCoverage
+		passed, failed int
+		want           map[string]string
+	}{
+		{"full cohort, one cordoned excluded", rdmaFabricCoverage{schedulable: 1, cordoned: []string{"c"}}, 1, 0,
+			map[string]string{"nodesValidated": "1", "nodesTotal": "2", "nodesFailed": "0", "nodesSkipped": "1"}},
+		{"uniform cohort no cordoned", rdmaFabricCoverage{schedulable: 2}, 2, 0,
+			map[string]string{"nodesValidated": "2", "nodesTotal": "2", "nodesFailed": "0", "nodesSkipped": "0"}},
+		{"fail-closed cohort", rdmaFabricCoverage{schedulable: 3}, 0, 3,
+			map[string]string{"nodesValidated": "0", "nodesTotal": "3", "nodesFailed": "3", "nodesSkipped": "0"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			extra := tt.cov.coverageExtra(tt.passed, tt.failed)
+			if len(extra) != len(tt.want) {
+				t.Fatalf("coverageExtra() = %v, want %v", extra, tt.want)
+			}
+			for k, v := range tt.want {
+				if extra[k] != v {
+					t.Errorf("coverageExtra()[%q] = %q, want %q", k, extra[k], v)
+				}
+			}
+		})
+	}
+}
+
+// TestRDMAFabricProbeCoverage_DisclosesCordoned is the end-to-end proof of #1952:
+// a cordoned Mellanox RDMA GPU node is enumerated (via helper.FindGpuNodes) and
+// surfaced in the coverage partition — visible and counted — while still being
+// excluded from the validated cohort. Under the pre-fix code path
+// (FindSchedulableGpuNodes) the cordoned node vanished entirely, so this test
+// fails without the production change.
+func TestRDMAFabricProbeCoverage_DisclosesCordoned(t *testing.T) {
+	t.Parallel()
+
+	clientset := k8sfake.NewClientset(
+		rdmaGPUNode("rdma-gpu-0", 8, 1000),         // schedulable, fabric ready → validated cohort
+		cordon(rdmaGPUNode("rdma-drain-0", 8, -1)), // cordoned RDMA node → disclosed, not dropped
+	)
+	ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
+
+	cov, err := rdmaFabricProbeCoverage(ctx, []string{helper.AKSRdmaSharedResource})
+	if err != nil {
+		t.Fatalf("rdmaFabricProbeCoverage() error = %v, want nil (the one schedulable RDMA node carries the fabric)", err)
+	}
+	if cov.schedulable != 1 {
+		t.Errorf("schedulable cohort = %d, want 1 (cordoned node excluded from validation)", cov.schedulable)
+	}
+	if len(cov.cordoned) != 1 || cov.cordoned[0] != "rdma-drain-0" {
+		t.Errorf("cordoned = %v, want [rdma-drain-0] (must be disclosed, not silently dropped)", cov.cordoned)
+	}
+	if got := cov.total(); got != 2 {
+		t.Errorf("total() = %d, want 2 (schedulable + cordoned, never narrowed)", got)
+	}
+}
+
+// TestRDMAFabricProbeCoverage_CountsCordonedOnFailClosed proves the cordoned
+// disclosure survives the fail-closed paths too: when the sole schedulable RDMA
+// node has not finished rolling out the fabric, the probe returns an error AND
+// still reports the cordoned node in the coverage so the terminal disclosure can
+// name it.
+func TestRDMAFabricProbeCoverage_CountsCordonedOnFailClosed(t *testing.T) {
+	t.Parallel()
+
+	clientset := k8sfake.NewClientset(
+		rdmaGPUNode("rdma-gpu-0", 8, -1),           // schedulable but fabric absent → not ready
+		cordon(rdmaGPUNode("rdma-drain-0", 8, -1)), // cordoned RDMA node → still disclosed
+	)
+	ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
+
+	cov, err := rdmaFabricProbeCoverage(ctx, []string{helper.AKSRdmaSharedResource})
+	if err == nil {
+		t.Fatal("expected a fail-closed error while the fabric is absent, got nil")
+	}
+	if !strings.Contains(err.Error(), "not yet allocatable") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cov.cordoned) != 1 || cov.cordoned[0] != "rdma-drain-0" {
+		t.Errorf("cordoned = %v, want [rdma-drain-0] even on the fail-closed path", cov.cordoned)
+	}
+	if got := cov.total(); got != 2 {
+		t.Errorf("total() = %d, want 2 (cordoned counted even on failure)", got)
+	}
+}
+
+// TestGatedHealthCheckSuppressed pins the render-aware static-assert
+// suppression dispatch for values-gated components: the gcp-driver-installer
+// health check is skipped exactly when the effective values gate the render
+// off, other components' asserts queue unconditionally, and render/read
+// failures propagate rather than being read as "nothing to assert".
+func TestGatedHealthCheckSuppressed(t *testing.T) {
+	t.Parallel()
+
+	installerManifest := "components/gcp-driver-installer/manifests/nvidia-driver-installer.yaml"
+	tests := []struct {
+		name           string
+		ref            recipe.ComponentRef
+		wantSuppressed bool
+		wantErr        bool
+	}{
+		{
+			name: "installer gated off (default values) suppresses the assert",
+			ref: recipe.ComponentRef{
+				Name:          "gcp-driver-installer",
+				Type:          recipe.ComponentTypeHelm,
+				ValuesFile:    "components/gcp-driver-installer/values.yaml",
+				ManifestFiles: []string{installerManifest},
+			},
+			wantSuppressed: true,
+		},
+		{
+			// A wholesale override can drop the gate key entirely; the
+			// template must fail closed to not-rendering, never panic.
+			name: "missing gate key renders nothing and suppresses",
+			ref: recipe.ComponentRef{
+				Name:          "gcp-driver-installer",
+				Type:          recipe.ComponentTypeHelm,
+				ManifestFiles: []string{installerManifest},
+			},
+			wantSuppressed: true,
+		},
+		{
+			name: "installer gated on renders objects and keeps the assert",
+			ref: recipe.ComponentRef{
+				Name:          "gcp-driver-installer",
+				Type:          recipe.ComponentTypeHelm,
+				ManifestFiles: []string{installerManifest},
+				Overrides: map[string]any{
+					"installer": map[string]any{"enabled": true},
+				},
+			},
+			wantSuppressed: false,
+		},
+		{
+			name: "no manifests leaves the assert in place",
+			ref: recipe.ComponentRef{
+				Name: "gcp-driver-installer",
+				Type: recipe.ComponentTypeHelm,
+			},
+			wantSuppressed: false,
+		},
+		{
+			name: "unreadable manifest fails closed",
+			ref: recipe.ComponentRef{
+				Name:          "gcp-driver-installer",
+				Type:          recipe.ComponentTypeHelm,
+				ManifestFiles: []string{"components/gcp-driver-installer/manifests/no-such-file.yaml"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "non-gated component queues unconditionally",
+			ref: recipe.ComponentRef{
+				Name:          "gpu-operator",
+				Type:          recipe.ComponentTypeHelm,
+				ManifestFiles: []string{installerManifest},
+			},
+			wantSuppressed: false,
+		},
+		{
+			// Regression for issue #2846: on the default path the eviction
+			// contract is not opted in, the bundler drops dra-node-labeler, and
+			// its default-off manifest renders no objects — so the deployment
+			// validator must suppress the health check instead of failing
+			// NOT_FOUND on a DaemonSet that was never deployed.
+			name: "dra-node-labeler not opted in (default values) suppresses the assert",
+			ref: recipe.ComponentRef{
+				Name:          "dra-node-labeler",
+				Type:          recipe.ComponentTypeHelm,
+				ValuesFile:    "components/dra-node-labeler/values.yaml",
+				ManifestFiles: []string{"components/dra-node-labeler/manifests/dra-node-labeler.yaml"},
+			},
+			wantSuppressed: true,
+		},
+		// The opted-in shape is covered by
+		// TestGatedHealthCheckSuppressed_DRANodeLabelerBundleRecipe, which reads
+		// the ref back from a recipe.yaml the bundler actually wrote rather than
+		// hand-writing the override.
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			suppressed, reason, err := gatedHealthCheckSuppressed(
+				&validators.Context{Ctx: t.Context(), Clientset: k8sfake.NewClientset()}, tt.ref)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("gatedHealthCheckSuppressed() error = nil, want failure")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("gatedHealthCheckSuppressed() error = %v", err)
+			}
+			if suppressed != tt.wantSuppressed {
+				t.Errorf("suppressed = %v, want %v", suppressed, tt.wantSuppressed)
+			}
+			if suppressed && reason == "" {
+				t.Error("suppressed with an empty reason — operators need the why")
+			}
+		})
+	}
+
+	t.Run("canceled context stops manifest evaluation", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, _, err := gatedHealthCheckSuppressed(&validators.Context{Ctx: ctx, Clientset: k8sfake.NewClientset()}, recipe.ComponentRef{
+			Name:          "gcp-driver-installer",
+			Type:          recipe.ComponentTypeHelm,
+			ManifestFiles: []string{installerManifest},
+		})
+		if err == nil {
+			t.Fatal("gatedHealthCheckSuppressed() error = nil, want cancellation")
+		}
+	})
+}
+
+// TestCheckExpectedResourcesFailsClosedOnExhaustedBudget is the regression test
+// for issue #2473's second half: a check whose budget expires must not report a
+// healthy verdict. Before the fix the ctx.Done() branches returned before the
+// reporting block, and with no collected failures the function fell through to
+// "All deployment resources ... are healthy" and returned nil.
+func TestCheckExpectedResourcesFailsClosedOnExhaustedBudget(t *testing.T) {
+	t.Parallel()
+
+	ctx := newDeploymentTestContext(t, nil, nil, []recipe.ComponentRef{
+		{Name: "app-component", Namespace: "app-ns"},
+	})
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel() // budget already spent before the first component is examined
+	ctx.Ctx = canceled
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("checkExpectedResources returned nil on an exhausted budget; it must fail closed")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeTimeout {
+		t.Errorf("error = %v, want ErrCodeTimeout", err)
+	}
+	if !strings.Contains(err.Error(), "budget exhausted") {
+		t.Errorf("error = %q, want it to name budget exhaustion", err.Error())
+	}
+	// verifyNamespacesActive runs before the enabledRefs loop and, against the
+	// nil-kubeObjects fake clientset, produces exactly one NotFound failure for
+	// app-ns before the loop's own ctx.Done() check trips budgetExhausted. This
+	// pins that collected failures survive into the fail-closed report rather
+	// than being discarded — the commit's headline behavior.
+	if !strings.Contains(err.Error(), "1 issue(s) collected") {
+		t.Errorf("error = %q, want it to report 1 issue(s) collected", err.Error())
+	}
+}
+
+// TestCheckExpectedResourcesReportsUnreachedWorkOnExhaustedBudget is the
+// regression for the reporting half of issue #2473: a budget that expires
+// partway through must account for the components the iteration never reached
+// and the GPU probes it skipped, not just the asserts it happened to queue
+// first. Under-reporting is the dangerous direction — an operator reading three
+// namespace failures concludes the other six signals were fine.
+//
+// The context is pre-canceled, so the loop breaks on its very first guard and
+// every enabled ref is unreached. Expected tally, all deterministic:
+//   - 3 namespace failures (verifyNamespacesActive runs before the loop and
+//     every namespace is absent from the empty fake clientset)
+//   - 2 unreached health checks (gpu-operator, network-operator; dra-driver
+//     carries none and must not produce a line)
+//   - 2 skipped GPU probes (network-operator's RDMA fabric, selected by its
+//     NicClusterPolicy manifest, and the DRA kubelet plugin)
+//
+// Before the fix the count was 3.
+func TestCheckExpectedResourcesReportsUnreachedWorkOnExhaustedBudget(t *testing.T) {
+	t.Parallel()
+
+	refs := []recipe.ComponentRef{
+		{Name: "gpu-operator", Namespace: "gpu-ns", HealthCheckAsserts: "apiVersion: v1\nkind: Namespace\n"},
+		{
+			Name:               networkOperatorComponent,
+			Namespace:          "network-operator",
+			HealthCheckAsserts: "apiVersion: v1\nkind: Namespace\n",
+			ManifestFiles:      []string{"components/network-operator/" + nicClusterPolicyManifestMarker + ".yaml"},
+		},
+		{Name: draDriverComponent, Namespace: "nvidia-dra-driver"},
+	}
+
+	ctx := newDeploymentTestContext(t, nil, nil, refs)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel() // budget already spent before the first component is examined
+	ctx.Ctx = canceled
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("checkExpectedResources returned nil on an exhausted budget; it must fail closed")
+	}
+	if !strings.Contains(err.Error(), "7 issue(s) collected") {
+		t.Errorf("error = %q, want 7 issue(s) collected (3 namespaces + 2 unreached health checks + 2 skipped GPU probes)",
+			err.Error())
+	}
+}
+
+// TestCheckExpectedResourcesReportsUnreachedExpectedResources covers the
+// component shape the unreached-work report used to drop entirely: one that
+// declares expectedResources and carries no registry health check. Gating the
+// not-evaluated lines on HealthCheckAsserts let a budget that expired between
+// components omit part of the recipe's deployment contract from a report that
+// otherwise read complete.
+//
+// Unlike the sibling test above, the budget here expires *during* the run
+// rather than before it, which is what puts a later component on the unreached
+// path while an earlier one was fully evaluated. The reactor makes that
+// deterministic: the fake clientset dispatches it synchronously inside
+// first-component's own helper.VerifyResource, so the loop's next guard is
+// guaranteed to see a dead context with later-component still unexamined.
+//
+// Expected tally, all deterministic:
+//   - 2 namespace failures (verifyNamespacesActive runs before the loop and
+//     neither namespace exists in the empty fake clientset)
+//   - 1 expectedResources failure for first-component's Deployment, which the
+//     loop did reach
+//   - 2 not-evaluated lines for later-component's two expected resources
+//
+// Before the fix the count was 3.
+func TestCheckExpectedResourcesReportsUnreachedExpectedResources(t *testing.T) {
+	t.Parallel()
+
+	refs := []recipe.ComponentRef{
+		{
+			Name:      "first-component",
+			Namespace: "first-ns",
+			ExpectedResources: []recipe.ExpectedResource{
+				{Kind: "Deployment", Namespace: "first-ns", Name: "first-dep"},
+			},
+		},
+		{
+			Name:      "later-component",
+			Namespace: "later-ns",
+			ExpectedResources: []recipe.ExpectedResource{
+				{Kind: "Deployment", Namespace: "later-ns", Name: "later-dep"},
+				{Kind: "DaemonSet", Namespace: "later-ns", Name: "later-ds"},
+			},
+		},
+	}
+
+	ctx := newDeploymentTestContext(t, nil, nil, refs)
+	budget, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx.Ctx = budget
+
+	fake, ok := ctx.Clientset.(*k8sfake.Clientset)
+	if !ok {
+		t.Fatalf("Clientset is %T, want *k8sfake.Clientset", ctx.Clientset)
+	}
+	// Spend the budget inside first-component's own verification. Returning
+	// handled=false falls through to the object tracker, so the Deployment
+	// still reports its normal NotFound.
+	fake.PrependReactor("get", "deployments", func(clienttesting.Action) (bool, runtime.Object, error) {
+		cancel()
+		return false, nil, nil
+	})
+
+	err := checkExpectedResources(ctx)
+	if err == nil {
+		t.Fatal("checkExpectedResources returned nil on an exhausted budget; it must fail closed")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeTimeout {
+		t.Errorf("error = %v, want ErrCodeTimeout", err)
+	}
+	if !strings.Contains(err.Error(), "5 issue(s) collected") {
+		t.Errorf("error = %q, want 5 issue(s) collected (2 namespaces + 1 verified resource + 2 unreached resources)",
+			err.Error())
+	}
+}
+
+// TestEnabledGPUReadinessProbesSelection pins which enabled components select
+// which probe, since markUndispatched reports the skipped set from this list
+// without running any of it — a selection drift would silently shrink the
+// budget-exhausted report.
+func TestEnabledGPUReadinessProbesSelection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		refs []recipe.ComponentRef
+		want []string
+	}{
+		{
+			name: "no GPU components enabled",
+			refs: []recipe.ComponentRef{{Name: "gpu-operator", Namespace: "gpu-ns"}},
+			want: nil,
+		},
+		{
+			name: "dra driver alone",
+			refs: []recipe.ComponentRef{{Name: draDriverComponent, Namespace: "dra-ns"}},
+			want: []string{draDriverComponent},
+		},
+		{
+			name: "network operator without a NicClusterPolicy manifest selects nothing",
+			refs: []recipe.ComponentRef{{Name: networkOperatorComponent, Namespace: "net-ns"}},
+			want: nil,
+		},
+		{
+			name: "network operator with a NicClusterPolicy manifest selects the fabric probe",
+			refs: []recipe.ComponentRef{{
+				Name:          networkOperatorComponent,
+				Namespace:     "net-ns",
+				ManifestFiles: []string{nicClusterPolicyManifestMarker + ".yaml"},
+			}},
+			want: []string{networkOperatorComponent},
+		},
+		{
+			name: "order follows the fixed nodewright → dra → rdma sequence, not ref order",
+			refs: []recipe.ComponentRef{
+				{Name: networkOperatorComponent, Namespace: "net-ns", ManifestFiles: []string{nicClusterPolicyManifestMarker + ".yaml"}},
+				{Name: draDriverComponent, Namespace: "dra-ns"},
+			},
+			want: []string{draDriverComponent, networkOperatorComponent},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := newDeploymentTestContext(t, nil, nil, tt.refs)
+			var got []string
+			for _, p := range enabledGPUReadinessProbes(ctx, tt.refs) {
+				if p.signal == "" {
+					t.Errorf("probe %q has an empty signal label; the skipped-probe report needs it", p.component)
+				}
+				got = append(got, p.component)
+			}
+			if !stringSlicesEqual(got, tt.want) {
+				t.Errorf("enabledGPUReadinessProbes() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestMarkUndispatched proves every piece of work an exhausted run left undone
+// is reported as not evaluated rather than silently dropped — otherwise an
+// operator reads a short failure list and concludes the rest of the cluster is
+// fine. All four categories must appear: asserts queued but never dispatched,
+// health checks and expectedResources on components the iteration never
+// reached, and GPU probes that were skipped.
+//
+// The unreached-with-both and unreached-with-resources refs pin that the two
+// kinds of work are reported independently: a component declaring
+// expectedResources and no registry health check still has a deployment
+// contract the run never verified.
+//
+// Unit-tested against the helper rather than through checkExpectedResources:
+// reaching that path in an integration test needs a context that is live while
+// the enabledRefs loop queues asserts and dead by the chainsaw guard a few
+// statements later, which is not deterministically arrangeable.
+func TestMarkUndispatched(t *testing.T) {
+	t.Parallel()
+
+	got := markUndispatched(
+		[]string{"[expectedResources] existing failure"},
+		[]chainsaw.ComponentAssert{{Name: "gpu-operator"}, {Name: "network-operator"}},
+		[]recipe.ComponentRef{
+			{Name: "unreached-with-check", HealthCheckAsserts: "apiVersion: v1"},
+			{
+				Name:               "unreached-with-both",
+				HealthCheckAsserts: "apiVersion: v1",
+				ExpectedResources: []recipe.ExpectedResource{
+					{Kind: "Deployment", Namespace: "both-ns", Name: "both-dep"},
+				},
+			},
+			{
+				Name: "unreached-with-resources",
+				ExpectedResources: []recipe.ExpectedResource{
+					{Kind: "Deployment", Namespace: "res-ns", Name: "res-dep"},
+					{Kind: "DaemonSet", Namespace: "res-ns", Name: "res-ds"},
+				},
+			},
+			// Neither health check nor expectedResources: there was no verdict
+			// to lose, so it must NOT produce a line or the report inflates the
+			// unchecked count.
+			{Name: "unreached-without-work"},
+		},
+		[]gpuReadinessProbe{{component: "dra-driver", signal: "DRA kubelet plugin readiness"}},
+		"chainsaw dispatch",
+	)
+
+	if len(got) != 9 {
+		t.Fatalf("got %d failures (%q), want 9 (1 pre-existing + 2 queued + 2 unreached health checks + 3 unreached resources + 1 GPU probe)",
+			len(got), got)
+	}
+	for _, want := range []string{
+		"[chainsaw] gpu-operator: not evaluated — budget exhausted during chainsaw dispatch",
+		"[chainsaw] network-operator: not evaluated — budget exhausted during chainsaw dispatch",
+		"[chainsaw] unreached-with-check: not evaluated — budget exhausted during chainsaw dispatch",
+		"[chainsaw] unreached-with-both: not evaluated — budget exhausted during chainsaw dispatch",
+		"[expectedResources] Deployment both-ns/both-dep (unreached-with-both): not evaluated — budget exhausted during chainsaw dispatch",
+		"[expectedResources] Deployment res-ns/res-dep (unreached-with-resources): not evaluated — budget exhausted during chainsaw dispatch",
+		"[expectedResources] DaemonSet res-ns/res-ds (unreached-with-resources): not evaluated — budget exhausted during chainsaw dispatch",
+		"[gpuReadiness] dra-driver (DRA kubelet plugin readiness): not evaluated — budget exhausted during chainsaw dispatch",
+	} {
+		if !slices.Contains(got, want) {
+			t.Errorf("failures %q missing %q", got, want)
+		}
+	}
+	for _, f := range got {
+		if strings.Contains(f, "unreached-without-work") {
+			t.Errorf("failures %q names a component that carries no unevaluated work", got)
+		}
+	}
+}
+
+// TestGatedHealthCheckSuppressed_DRANodeLabelerBundleRecipe exercises the real
+// bundle-to-validation path for the labeler (#2848): the recipe.yaml the
+// bundler writes at the bundle root is what post-deployment validation reads.
+// Opted in (--dra-eviction-node-label), the bundler persists enabled: true on
+// the labeler ref, so the manifest renders and the health check stays queued.
+// Not opted in, the bundler drops the ref, so there is nothing to suppress.
+func TestGatedHealthCheckSuppressed_DRANodeLabelerBundleRecipe(t *testing.T) {
+	t.Parallel()
+
+	recipeInput := func() *recipe.RecipeResult {
+		return &recipe.RecipeResult{
+			APIVersion: recipe.RecipeResultAPIVersion,
+			Kind:       recipe.RecipeResultKind,
+			Criteria:   &recipe.Criteria{Service: "eks", Accelerator: "h100", Intent: "training"},
+			ComponentRefs: []recipe.ComponentRef{
+				{Name: "gpu-operator", Version: "v26.4.0", Type: recipe.ComponentTypeHelm, Source: "https://helm.ngc.nvidia.com/nvidia"},
+				{
+					Name:           draNodeLabelerComponent,
+					Type:           recipe.ComponentTypeHelm,
+					ValuesFile:     "components/dra-node-labeler/values.yaml",
+					ManifestFiles:  []string{"components/dra-node-labeler/manifests/dra-node-labeler.yaml"},
+					DependencyRefs: []string{"gpu-operator"},
+				},
+				{
+					Name: draDriverComponent, Version: "25.12.0", Type: recipe.ComponentTypeHelm,
+					Source:         "https://helm.ngc.nvidia.com/nvidia",
+					Overrides:      map[string]any{"nvidiaDriverRoot": "/run/nvidia/driver"},
+					DependencyRefs: []string{"gpu-operator", draNodeLabelerComponent},
+				},
+			},
+			DeploymentOrder: []string{"gpu-operator", draNodeLabelerComponent, draDriverComponent},
+		}
+	}
+	bundleRecipeRefs := func(t *testing.T, opts ...bundlercfg.Option) []recipe.ComponentRef {
+		t.Helper()
+		b, err := bundler.New(bundler.WithConfig(bundlercfg.NewConfig(opts...)))
+		if err != nil {
+			t.Fatalf("bundler.New() error = %v", err)
+		}
+		dir := t.TempDir()
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		if _, makeErr := b.Make(ctx, recipeInput(), dir); makeErr != nil {
+			t.Fatalf("Make() error = %v", makeErr)
+		}
+		loaded, err := recipe.LoadFromFileWithProvider(ctx, filepath.Join(dir, bundler.RecipeFileName), "", "test", nil)
+		if err != nil {
+			t.Fatalf("load bundle %s: %v", bundler.RecipeFileName, err)
+		}
+		return loaded.ComponentRefs
+	}
+	findLabeler := func(refs []recipe.ComponentRef) *recipe.ComponentRef {
+		for i := range refs {
+			if refs[i].Name == draNodeLabelerComponent {
+				return &refs[i]
+			}
+		}
+		return nil
+	}
+
+	t.Run("opted-in bundle recipe keeps the assert", func(t *testing.T) {
+		t.Parallel()
+		refs := bundleRecipeRefs(t, bundlercfg.WithDRAEvictionNodeLabel(bundlercfg.DefaultDRAEvictionNodeLabel()))
+		ref := findLabeler(refs)
+		if ref == nil {
+			t.Fatalf("opted-in bundle recipe lacks %s", draNodeLabelerComponent)
+		}
+		suppressed, reason, err := gatedHealthCheckSuppressed(
+			&validators.Context{Ctx: t.Context(), Clientset: k8sfake.NewClientset()}, *ref)
+		if err != nil {
+			t.Fatalf("gatedHealthCheckSuppressed() error = %v", err)
+		}
+		if suppressed {
+			t.Fatalf("deployed labeler's health check suppressed: %s", reason)
+		}
+	})
+
+	t.Run("default-path bundle recipe carries no labeler", func(t *testing.T) {
+		t.Parallel()
+		if ref := findLabeler(bundleRecipeRefs(t)); ref != nil {
+			t.Fatalf("bundle recipe carries %s without the eviction opt-in: %+v", draNodeLabelerComponent, ref)
+		}
+	})
+}

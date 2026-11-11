@@ -1,0 +1,18 @@
+{
+  "name": "@aicr/docs-mdx-gate",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned parser toolchain for the blocking MDX and fenced-YAML documentation gates. The plugin set mirrors what Fern renders with (GFM and YAML frontmatter), and package-lock.json freezes the full transitive tree so gate results are reproducible.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "dependencies": {
+    "@mdx-js/mdx": "3.1.1",
+    "micromark-core-commonmark": "2.0.4",
+    "micromark-util-character": "2.1.1",
+    "micromark-util-symbol": "2.0.1",
+    "remark-frontmatter": "5.0.0",
+    "remark-gfm": "4.0.1",
+    "unist-util-visit": "5.2.0",
+    "yaml": "2.9.1"
+  }
+}

@@ -1,0 +1,110 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# AWS EBS CSI Driver Helm values
+# Base configuration for EKS deployments
+
+# Override release name prefix to avoid aicr-stack- prefix in resource names
+fullnameOverride: aws-ebs-csi-driver
+
+image:
+  repository: public.ecr.aws/ebs-csi-driver/aws-ebs-csi-driver
+  pullPolicy: IfNotPresent
+
+# forceEnable skips the chart's monitoring.coreos.com capability check, which
+# otherwise drops the ServiceMonitors without error when the API is not
+# visible at render time.
+controller:
+  enableMetrics: true
+  serviceMonitor:
+    forceEnable: true
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 10m
+      memory: 40Mi
+    limits:
+      memory: 256Mi
+  serviceAccount:
+    create: true
+    name: ebs-csi-controller-sa
+    automountServiceAccountToken: true
+
+node:
+  enableMetrics: true
+  serviceMonitor:
+    forceEnable: true
+  tolerateAllTaints: true
+  resources:
+    requests:
+      cpu: 10m
+      memory: 40Mi
+    limits:
+      memory: 256Mi
+  serviceAccount:
+    create: true
+    name: ebs-csi-node-sa
+    automountServiceAccountToken: true
+  enableLinux: true
+  enableWindows: false
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: "10%"
+
+# Sidecar memory limits. The chart defaults (32Mi) are too tight for the node
+# DaemonSet's livenessProbe / node-driver-registrar containers on high-core
+# instances (e.g. p5.48xlarge, 192 vCPU). The Go binary's resident set alone is
+# ~24Mi (file-rss); adding per-P runtime overhead (Go sizes runtime structures
+# by GOMAXPROCS, which defaults to the host core count) pushes the working set
+# to ~31.7Mi during cold start under bringup load, cgroup-OOM-killing
+# livenessProbe (observed: CONSTRAINT_MEMCG, RSS 31.7Mi vs 32Mi). Killing the
+# livenessProbe removes the /healthz endpoint the ebs-plugin livenessProbe
+# depends on, so kubelet restarts ebs-plugin -> CrashLoopBackOff -> the
+# aws-ebs-csi-driver health check trips -> expected-resources (deployment
+# validation) fails. 128Mi gives headroom above the observed peak and is
+# independent of instance core count.
+sidecars:
+  nodeDriverRegistrar:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 40Mi
+      limits:
+        memory: 128Mi
+  livenessProbe:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 40Mi
+      limits:
+        memory: 128Mi
+
+storageClasses: []
+
+# Provision a cluster-default StorageClass (ebs-csi-default-sc: gp3,
+# WaitForFirstConsumer, expandable, annotated is-default-class=true). EKS ships
+# no default StorageClass on its own, so without this any PVC created without an
+# explicit storageClassName — including the inference-perf model-weights cache —
+# stays Pending. Enabling it here makes dynamic provisioning "just work" on
+# AICR-deployed EKS clusters. NOTE: this sets a *cluster-wide* default; if the
+# cluster already has another default StorageClass, unset that one to avoid two
+# defaults (which Kubernetes treats as ambiguous).
+defaultStorageClass:
+  enabled: true
+
+volumeSnapshotClasses: []
+
+helmTester:
+  enabled: false

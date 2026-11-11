@@ -1,0 +1,95 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: 'GPU Test Cleanup'
+description: 'Collect debug artifacts, export kind logs, upload artifacts, and delete the kind cluster'
+
+inputs:
+  cluster_name:
+    description: 'Kind cluster name'
+    required: true
+  artifact_name_prefix:
+    description: 'Prefix for the uploaded artifact name'
+    required: false
+    default: 'gpu-test-debug'
+  collect_artifacts:
+    description: 'Collect and upload debug artifacts before deleting the kind cluster'
+    required: false
+    default: 'false'
+  collect_node_runtime_artifacts:
+    description: 'Collect expensive kind node runtime artifacts such as journalctl, crictl, and kind export logs'
+    required: false
+    default: 'false'
+  diagnostic_mode:
+    description: 'Optional gpu-debug-diagnostics mode to run when collect_artifacts is true'
+    required: false
+    default: ''
+  upload_validation_artifacts:
+    description: 'Upload the validation result artifact before cleanup'
+    required: false
+    default: 'false'
+  validation_artifact_name:
+    description: 'Name for the uploaded validation artifact'
+    required: false
+    default: 'validation-result'
+  validation_artifact_paths:
+    description: 'Newline-separated validation artifact paths'
+    required: false
+    default: |
+      validation-result.yaml
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Debug diagnostics
+      if: inputs.collect_artifacts == 'true' && inputs.diagnostic_mode != ''
+      uses: ./.github/actions/gpu-debug-diagnostics
+      with:
+        cluster_name: ${{ inputs.cluster_name }}
+        mode: ${{ inputs.diagnostic_mode }}
+    - name: Upload validation artifacts
+      if: always() && inputs.upload_validation_artifacts == 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+      with:
+        name: ${{ inputs.validation_artifact_name }}
+        path: ${{ inputs.validation_artifact_paths }}
+        if-no-files-found: warn
+    - name: Collect debug artifacts
+      if: always() && inputs.collect_artifacts == 'true'
+      shell: bash
+      env:
+        KIND_CLUSTER_NAME: ${{ inputs.cluster_name }}
+        COLLECT_NODE_RUNTIME_ARTIFACTS: ${{ inputs.collect_node_runtime_artifacts }}
+      run: bash "${{ github.action_path }}/collect-debug-artifacts.sh"
+    - name: Export kind logs
+      if: always() && inputs.collect_artifacts == 'true' && inputs.collect_node_runtime_artifacts == 'true'
+      shell: bash
+      env:
+        KIND_CLUSTER_NAME: ${{ inputs.cluster_name }}
+      run: bash "${{ github.action_path }}/export-kind-logs.sh"
+    - name: Cleanup
+      if: always()
+      shell: bash
+      env:
+        KIND_CLUSTER_NAME: ${{ inputs.cluster_name }}
+      run: bash "${{ github.action_path }}/cleanup-kind-cluster.sh"
+    - name: Upload debug artifacts
+      if: always() && inputs.collect_artifacts == 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+      with:
+        name: ${{ inputs.artifact_name_prefix }}-${{ github.run_id }}
+        path: |
+          /tmp/debug-artifacts/
+          /tmp/kind-logs/
+        retention-days: 7

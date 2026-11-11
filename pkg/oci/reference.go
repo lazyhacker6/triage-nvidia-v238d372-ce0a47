@@ -1,0 +1,445 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package oci
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"path"
+	"strings"
+
+	"github.com/distribution/reference"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	apperrors "github.com/NVIDIA/aicr/pkg/errors"
+)
+
+// URIScheme is the URI scheme for OCI registry references
+// (e.g., "oci://ghcr.io/org/repo:tag"). Exported so other packages can
+// build references without re-declaring the literal.
+const URIScheme = "oci://"
+
+// uriScheme is the unexported alias retained for legacy in-package use.
+const uriScheme = URIScheme
+
+// LayoutScheme prefixes an output target that writes an OCI image layout
+// directory instead of pushing to a registry ("oci-layout:<dir>[:tag]").
+const LayoutScheme = "oci-layout:"
+
+// EnsureScheme returns ref with the oci:// prefix added when missing.
+// Used by callers that accept user input in either form.
+//
+// Refs that already carry a different URI scheme (e.g., "https://...")
+// are returned unchanged so callers don't accidentally build
+// "oci://https://..." when handed a non-oci URL by mistake.
+func EnsureScheme(ref string) string {
+	if strings.HasPrefix(ref, URIScheme) {
+		return ref
+	}
+	if strings.Contains(ref, "://") {
+		return ref
+	}
+	return URIScheme + ref
+}
+
+// TrimScheme returns ref with any oci:// prefix removed. Useful when
+// emitting a registry/repo:tag form for cosign or for human-readable
+// pointers that don't carry the URI scheme.
+func TrimScheme(ref string) string {
+	return strings.TrimPrefix(ref, URIScheme)
+}
+
+// Reference represents a parsed output target: an OCI registry reference, an
+// OCI image layout directory, or a local directory path.
+type Reference struct {
+	// IsOCI indicates an OCI registry reference; it is false for a local
+	// directory and for an OCI image layout target.
+	IsOCI bool
+	// IsLayout indicates an OCI image layout target. LocalPath is the layout
+	// directory and Tag its tag; IsOCI is false.
+	IsLayout bool
+	// Registry is the OCI registry host (e.g., "ghcr.io", "localhost:5000").
+	// Only populated when IsOCI is true.
+	Registry string
+	// Repository is the image repository path (e.g., "nvidia/bundle").
+	// Only populated when IsOCI is true.
+	Repository string
+	// Tag is the image tag (e.g., "v1.0.0").
+	// Empty string means no tag was specified; caller should apply a default.
+	// Only populated when IsOCI or IsLayout is true.
+	Tag string
+	// LocalPath is the local directory path for non-OCI output.
+	// Only populated when IsOCI is false.
+	LocalPath string
+}
+
+// ParseOutputTarget parses an output target string to detect OCI URI or local directory.
+// For OCI URIs (oci://registry/repository:tag), it extracts the components.
+// For plain paths, it treats them as local directories.
+//
+// For oci-layout:<dir>[:tag], it returns a layout reference.
+//
+// If no tag is specified in an OCI URI, Tag will be empty; the caller is responsible
+// for applying a default (e.g., CLI version).
+func ParseOutputTarget(target string) (*Reference, error) {
+	if strings.HasPrefix(target, LayoutScheme) {
+		return parseLayoutTarget(strings.TrimPrefix(target, LayoutScheme))
+	}
+	if !strings.HasPrefix(target, uriScheme) {
+		return &Reference{
+			IsOCI:     false,
+			LocalPath: target,
+		}, nil
+	}
+
+	// Strip oci:// and parse as standard image reference
+	ref, err := reference.ParseNormalizedNamed(strings.TrimPrefix(target, uriScheme))
+	if err != nil {
+		return nil, apperrors.Wrap(apperrors.ErrCodeInvalidRequest, "invalid OCI reference", err)
+	}
+
+	// Extract components using the reference package
+	registry := reference.Domain(ref)
+	repository := reference.Path(ref)
+
+	var tag string
+	if tagged, ok := ref.(reference.Tagged); ok {
+		tag = tagged.Tag()
+	}
+	// If no tag specified, return empty string; caller will apply default
+
+	// Validate registry and repository format
+	if err := validateRegistryReference(registry, repository); err != nil {
+		return nil, err
+	}
+
+	return &Reference{
+		IsOCI:      true,
+		Registry:   registry,
+		Repository: repository,
+		Tag:        tag,
+	}, nil
+}
+
+// parseLayoutTarget parses "<dir>[:tag]". As with oras --oci-layout, the
+// text after the last colon is the tag only when it is a valid tag with no
+// path separator; otherwise the whole value is the directory.
+func parseLayoutTarget(value string) (*Reference, error) {
+	dir, tag := value, ""
+	if i := strings.LastIndex(value, ":"); i >= 0 {
+		candidate := value[i+1:]
+		if !strings.ContainsAny(candidate, `/\`) && validateDistributionTag(candidate) == nil {
+			dir, tag = value[:i], candidate
+		}
+	}
+	if dir == "" {
+		return nil, apperrors.New(apperrors.ErrCodeInvalidRequest,
+			"OCI layout target requires a directory: "+LayoutScheme+"<dir>[:tag]")
+	}
+	trimmed := strings.TrimRight(dir, `/\`)
+	if err := checkLayoutDirName(trimmed[strings.LastIndexAny(trimmed, `/\`)+1:]); err != nil {
+		return nil, err
+	}
+	return &Reference{IsLayout: true, LocalPath: dir, Tag: tag}, nil
+}
+
+// checkLayoutDirName rejects a layout directory name containing ':' or '@'.
+// Either one means the value most likely held a tag that failed to parse or a
+// digest, which the oras-style split would otherwise keep in the directory
+// name and write with the default tag.
+func checkLayoutDirName(name string) error {
+	if !strings.ContainsAny(name, ":@") {
+		return nil
+	}
+	return apperrors.New(apperrors.ErrCodeInvalidRequest,
+		fmt.Sprintf("OCI layout directory name %q must not contain ':' or '@': in %s<dir>[:tag], "+
+			"the text after the last ':' must be a valid OCI tag "+
+			"(up to 128 of [A-Za-z0-9_.-], not starting with '.' or '-'), "+
+			"and a digest (@sha256:...) is not accepted for a write target", name, LayoutScheme))
+}
+
+// String returns the full reference string.
+// For OCI references: "oci://registry/repository:tag" (or without tag if empty).
+// For layout references: "oci-layout:dir:tag" (or without tag if empty).
+// For local paths: the local path.
+func (r *Reference) String() string {
+	if r.IsLayout {
+		if r.Tag == "" {
+			return LayoutScheme + r.LocalPath
+		}
+		return LayoutScheme + r.LocalPath + ":" + r.Tag
+	}
+	if !r.IsOCI {
+		return r.LocalPath
+	}
+	if r.Tag == "" {
+		return fmt.Sprintf("%s%s/%s", uriScheme, r.Registry, r.Repository)
+	}
+	return fmt.Sprintf("%s%s/%s:%s", uriScheme, r.Registry, r.Repository, r.Tag)
+}
+
+// ChartName returns the last path segment of Repository, which is the
+// chart name a Helm consumer (or ArgoCD's `source.chart`) sees when pulling
+// the artifact at `registry/repository:tag`. For non-OCI references and
+// references whose Repository is empty, the empty string is returned;
+// callers should treat that as "no derived chart name available" and
+// apply their own default.
+//
+// Example: oci://ghcr.io/myorg/my-bundle-name:v1
+//   - Registry = "ghcr.io"
+//   - Repository = "myorg/my-bundle-name"
+//   - ChartName() = "my-bundle-name"
+//
+// This is consumed by the argocd-helm bundler so the generated Chart.yaml
+// and parent Application's `source.chart` match what `helm push` actually
+// publishes — see issue #1019.
+func (r *Reference) ChartName() string {
+	if !r.IsOCI || r.Repository == "" {
+		return ""
+	}
+	// path.Base treats Repository as a slash-separated path; the docker
+	// reference parser already normalized separators so a literal Base is
+	// safe. Reject path.Base's sentinel returns ("." and "/") so callers
+	// see an empty string rather than a nonsense chart name.
+	base := path.Base(r.Repository)
+	if base == "." || base == "/" {
+		return ""
+	}
+	return base
+}
+
+// ParentNamespace returns the OCI registry + repository path with the
+// chart-name segment (last path element) stripped, prefixed with the
+// oci:// scheme. Returns "" for non-OCI references. See #1342.
+func (r *Reference) ParentNamespace() string {
+	if !r.IsOCI || r.Repository == "" {
+		return ""
+	}
+	parentPath := path.Dir(r.Repository)
+	if parentPath == "." || parentPath == "/" {
+		return URIScheme + r.Registry
+	}
+	return URIScheme + r.Registry + "/" + parentPath
+}
+
+// WithTag returns a copy of the reference with the specified tag.
+// For local directory references, returns the same reference unchanged.
+func (r *Reference) WithTag(tag string) *Reference {
+	if r.IsLayout {
+		return &Reference{IsLayout: true, LocalPath: r.LocalPath, Tag: tag}
+	}
+	if !r.IsOCI {
+		return r
+	}
+	return &Reference{
+		IsOCI:      true,
+		Registry:   r.Registry,
+		Repository: r.Repository,
+		Tag:        tag,
+	}
+}
+
+// OutputConfig configures the OCI package and push workflow.
+type OutputConfig struct {
+	// SourceDir is the directory containing artifacts to package.
+	SourceDir string
+	// OutputDir is where temporary OCI artifacts will be created.
+	OutputDir string
+	// SourceFiles is the complete file set to package. Nil requests recursive
+	// discovery; a non-nil empty slice is invalid.
+	SourceFiles []string
+	// SubDir limits recursive discovery while preserving the path prefix.
+	SubDir string
+	// Reference contains the parsed OCI registry reference.
+	Reference *Reference
+	// Version is used for OCI annotations (org.opencontainers.image.version).
+	Version string
+	// PlainHTTP uses HTTP instead of HTTPS for the registry connection.
+	PlainHTTP bool
+	// InsecureTLS skips TLS certificate verification.
+	InsecureTLS bool
+	// Annotations are additional manifest annotations to include.
+	// If nil, default AICR annotations will be used.
+	Annotations map[string]string
+}
+
+// manifestAnnotations returns cfg.Annotations, or the default AICR
+// annotations when it is nil.
+func (cfg OutputConfig) manifestAnnotations() map[string]string {
+	if cfg.Annotations != nil {
+		return cfg.Annotations
+	}
+	return map[string]string{
+		"org.opencontainers.image.version": cfg.Version,
+		"org.opencontainers.image.vendor":  "NVIDIA",
+		"org.opencontainers.image.title":   "AICR Bundle",
+		"org.opencontainers.image.source":  "https://github.com/NVIDIA/aicr",
+	}
+}
+
+// PackageAndPushResult contains the result of a successful package and push operation.
+type PackageAndPushResult struct {
+	// Digest is the SHA256 digest of the pushed artifact.
+	Digest string
+	// MediaType is the manifest media type.
+	MediaType string
+	// Size is the manifest's byte length. Surfaced for OCI Referrers
+	// attachment, which needs a full subject descriptor.
+	Size int64
+	// Reference is the full image reference (registry/repository:tag).
+	Reference string
+	// StorePath is the path to the local OCI Image Layout directory.
+	StorePath string
+	// StoreInfo identifies the directory at StorePath as WriteLayout or
+	// WriteHelmChartLayout published it, so a caller can tell it from one
+	// put there afterward. It is nil for other operations.
+	StoreInfo fs.FileInfo
+}
+
+// PackageAndPush packages a directory as an OCI artifact and pushes it to a registry.
+// This is a convenience function that combines Package and PushFromStore operations.
+func PackageAndPush(ctx context.Context, cfg OutputConfig) (*PackageAndPushResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, defaults.OCIBundlePublishTimeout)
+	defer cancel()
+	return packageAndPushWithDependencies(ctx, cfg, defaultPackageAndPushDependencies())
+}
+
+type packageAndPushDependencies struct {
+	packageOperation func(context.Context, PackageOptions) (*packageOperation, error)
+	pushOperation    func(context.Context, *packageOperation, PushOptions) (*PushResult, error)
+	beforePush       func(*packageOperation) error
+}
+
+func defaultPackageAndPushDependencies() packageAndPushDependencies {
+	return packageAndPushDependencies{
+		packageOperation: packageGenericOperation,
+		pushOperation:    pushPackageOperation,
+	}
+}
+
+func packageAndPushWithDependencies(
+	ctx context.Context,
+	cfg OutputConfig,
+	deps packageAndPushDependencies,
+) (retResult *PackageAndPushResult, retErr error) {
+
+	if cfg.Reference == nil || !cfg.Reference.IsOCI {
+		return nil, apperrors.New(apperrors.ErrCodeInvalidRequest, "OCI reference is required for PackageAndPush")
+	}
+
+	if cfg.Reference.Tag == "" {
+		return nil, apperrors.New(apperrors.ErrCodeInvalidRequest, "tag is required for OCI packaging")
+	}
+	if err := validateDistributionTag(cfg.Reference.Tag); err != nil {
+		return nil, err
+	}
+
+	slog.Info("packaging and pushing bundle as OCI artifact",
+		"registry", cfg.Reference.Registry,
+		"repository", cfg.Reference.Repository,
+		"tag", cfg.Reference.Tag,
+	)
+
+	annotations := cfg.manifestAnnotations()
+
+	// Package locally first. Package returns properly coded errors
+	// (ErrCodeInvalidRequest, ErrCodeInternal, ErrCodeUnavailable); preserve
+	// the inner code rather than re-wrapping with ErrCodeInternal.
+	op, err := deps.packageOperation(ctx, PackageOptions{
+		SourceDir:   cfg.SourceDir,
+		OutputDir:   cfg.OutputDir,
+		SourceFiles: cfg.SourceFiles,
+		SubDir:      cfg.SubDir,
+		Registry:    cfg.Reference.Registry,
+		Repository:  cfg.Reference.Repository,
+		Tag:         cfg.Reference.Tag,
+		Annotations: annotations,
+	})
+	if err != nil {
+		return nil, err
+	}
+	released := false
+	defer func() {
+		if released {
+			return
+		}
+		if closeErr := op.Close(); closeErr != nil {
+			if retErr == nil {
+				retResult = nil
+				retErr = closeErr
+			} else {
+				slog.Warn("failed to clean OCI package operation after primary error", "error", closeErr)
+			}
+		}
+	}()
+
+	slog.Info("OCI artifact packaged locally",
+		"reference", op.result.Reference,
+		"digest", op.result.Digest,
+		"store_path", op.layout.Path(),
+	)
+
+	// Push to remote registry
+	slog.Info("pushing OCI artifact to remote registry",
+		"registry", cfg.Reference.Registry,
+		"repository", cfg.Reference.Repository,
+		"tag", cfg.Reference.Tag,
+	)
+
+	// PushFromStore returns properly coded errors (ErrCodeUnavailable for
+	// transient/canceled, ErrCodeInternal otherwise); preserve the code.
+	if deps.beforePush != nil {
+		if beforePushErr := deps.beforePush(op); beforePushErr != nil {
+			return nil, apperrors.PropagateOrWrap(beforePushErr, apperrors.ErrCodeInternal,
+				"OCI package-to-push check failed")
+		}
+	}
+	if validateErr := op.layout.validate(); validateErr != nil {
+		return nil, validateErr
+	}
+	pushResult, pushErr := deps.pushOperation(ctx, op, PushOptions{
+		Registry:    cfg.Reference.Registry,
+		Repository:  cfg.Reference.Repository,
+		Tag:         cfg.Reference.Tag,
+		PlainHTTP:   cfg.PlainHTTP,
+		InsecureTLS: cfg.InsecureTLS,
+	})
+	if pushErr != nil {
+		return nil, pushErr
+	}
+	if pushResult == nil {
+		return nil, apperrors.New(apperrors.ErrCodeInternal, "OCI push returned no result")
+	}
+	packageResult, err := op.release()
+	if err != nil {
+		return nil, err
+	}
+	released = true
+
+	slog.Info("OCI artifact pushed successfully",
+		"reference", pushResult.Reference,
+		"digest", pushResult.Digest,
+	)
+
+	return &PackageAndPushResult{
+		Digest:    pushResult.Digest,
+		MediaType: pushResult.MediaType,
+		Size:      pushResult.Size,
+		Reference: pushResult.Reference,
+		StorePath: packageResult.StorePath,
+	}, nil
+}

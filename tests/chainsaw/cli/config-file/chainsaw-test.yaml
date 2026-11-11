@@ -1,0 +1,196 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cli-config-file
+spec:
+  description: |
+    Validates the --config flag for recipe and bundle commands.
+    Tests valid YAML/JSON config, CLI flag overrides, invalid files,
+    non-existent files, partial criteria, and bundle from a config-derived recipe.
+    No cluster needed.
+  timeouts:
+    exec: 30s
+  steps:
+    - name: setup-fixtures
+      description: Create AICRConfig fixture files (valid YAML, JSON, invalid variants).
+      try:
+        - script:
+            content: |
+              WORK="/tmp/chainsaw-config-file"
+              rm -rf "${WORK}" && mkdir -p "${WORK}"
+
+              cat > "${WORK}/config.yaml" << 'EOF'
+              kind: AICRConfig
+              apiVersion: aicr.run/v1beta1
+              metadata:
+                name: test-config
+              spec:
+                recipe:
+                  criteria:
+                    service: eks
+                    accelerator: h100
+                    os: ubuntu
+                    intent: training
+              EOF
+
+              cat > "${WORK}/config.json" << 'EOF'
+              {"kind":"AICRConfig","apiVersion":"aicr.run/v1beta1","metadata":{"name":"test"},"spec":{"recipe":{"criteria":{"service":"gke","accelerator":"a100","os":"cos","intent":"inference"}}}}
+              EOF
+
+              echo 'kind: wrongKind' > "${WORK}/invalid-kind.yaml"
+
+              cat > "${WORK}/invalid-version.yaml" << 'EOF'
+              kind: AICRConfig
+              apiVersion: wrong.version/v1
+              spec:
+                recipe:
+                  criteria:
+                    service: eks
+              EOF
+
+              cat > "${WORK}/invalid-enum.yaml" << 'EOF'
+              kind: AICRConfig
+              apiVersion: aicr.run/v1beta1
+              spec:
+                recipe:
+                  criteria:
+                    service: invalid-service
+              EOF
+
+              cat > "${WORK}/partial.yaml" << 'EOF'
+              kind: AICRConfig
+              apiVersion: aicr.run/v1beta1
+              spec:
+                recipe:
+                  criteria:
+                    accelerator: h100
+              EOF
+
+    - name: valid-yaml-config
+      description: Recipe generation with valid YAML config file succeeds.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-config-file"
+              ${AICR_BIN} recipe --config "${WORK}/config.yaml" -o "${WORK}/yaml-recipe.yaml"
+              test -f "${WORK}/yaml-recipe.yaml"
+            check:
+              ($error == null): true
+
+    - name: valid-json-config
+      description: Recipe generation with valid JSON config file succeeds.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-config-file"
+              ${AICR_BIN} recipe --config "${WORK}/config.json" -o "${WORK}/json-recipe.yaml"
+              test -f "${WORK}/json-recipe.yaml"
+            check:
+              ($error == null): true
+
+    - name: cli-flag-override
+      description: CLI --service flag overrides config file value.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-config-file"
+              # aks (like eks) is covered by config.yaml's accelerator=h100/
+              # os=ubuntu/intent=training; gke instead requires os=cos, which
+              # would trip the criteria-coverage post-condition here and
+              # obscure the flag-override behavior under test.
+              ${AICR_BIN} recipe --config "${WORK}/config.yaml" --service aks \
+                -o "${WORK}/override.yaml"
+              grep -q "aks" "${WORK}/override.yaml"
+            check:
+              ($error == null): true
+
+    - name: invalid-kind
+      description: Config file with wrong kind must fail.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-config-file"
+              ${AICR_BIN} recipe --config "${WORK}/invalid-kind.yaml" -o /dev/null 2>&1
+            check:
+              ($error != null): true
+
+    - name: invalid-apiversion
+      description: Config file with wrong apiVersion must fail.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-config-file"
+              ${AICR_BIN} recipe --config "${WORK}/invalid-version.yaml" -o /dev/null 2>&1
+            check:
+              ($error != null): true
+
+    - name: invalid-enum
+      description: Config file with invalid enum value must fail.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-config-file"
+              ${AICR_BIN} recipe --config "${WORK}/invalid-enum.yaml" -o /dev/null 2>&1
+            check:
+              ($error != null): true
+
+    - name: non-existent-file
+      description: Non-existent config file must fail.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              ${AICR_BIN} recipe --config "/non/existent/file.yaml" -o /dev/null 2>&1
+            check:
+              ($error != null): true
+
+    - name: bundle-from-config
+      description: Bundle generation from a config-derived recipe succeeds.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-config-file"
+              ${AICR_BIN} bundle -r "${WORK}/yaml-recipe.yaml" -o "${WORK}/bundle"
+              test -f "${WORK}/bundle/deploy.sh"
+              test -f "${WORK}/bundle/README.md"
+              ls "${WORK}"/bundle/*/values.yaml >/dev/null 2>&1
+            check:
+              ($error == null): true
+
+    - name: partial-criteria
+      description: Partial criteria in config file (only accelerator) succeeds.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-config-file"
+              ${AICR_BIN} recipe --config "${WORK}/partial.yaml" -o "${WORK}/partial-recipe.yaml"
+              test -f "${WORK}/partial-recipe.yaml"
+            check:
+              ($error == null): true
+      cleanup:
+        - script:
+            content: |
+              rm -rf /tmp/chainsaw-config-file

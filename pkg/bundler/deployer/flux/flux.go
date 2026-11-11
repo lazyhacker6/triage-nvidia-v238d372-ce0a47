@@ -1,0 +1,1049 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package flux
+
+import (
+	"context"
+	_ "embed"
+	"fmt"
+	"log/slog"
+	"maps"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/checksum"
+	"github.com/NVIDIA/aicr/pkg/bundler/config"
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer"
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer/localformat"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+)
+
+// Output file names used across generation.
+const (
+	fileArtifactGenerator = "artifactgenerator.yaml"
+	fileChart             = "Chart.yaml"
+	fileConfigMap         = "configmap-values.yaml"
+	fileHelmRelease       = "helmrelease.yaml"
+	fileKustomization     = "kustomization.yaml"
+	fileReadme            = "README.md"
+)
+
+// summaryTypeHelmRelease is the value placed in ComponentSummary.Type for
+// every row of the README's Components table — every emitted release
+// (pre / primary / post) is a Flux HelmRelease CR.
+const summaryTypeHelmRelease = "HelmRelease"
+
+//go:embed templates/configmap-values.yaml.tmpl
+var configMapTemplate string
+
+//go:embed templates/helmrelease.yaml.tmpl
+var helmReleaseTemplate string
+
+//go:embed templates/helmrepo-source.yaml.tmpl
+var helmRepoSourceTemplate string
+
+//go:embed templates/gitrepo-source.yaml.tmpl
+var gitRepoSourceTemplate string
+
+//go:embed templates/chart.yaml.tmpl
+var chartTemplate string
+
+//go:embed templates/kustomization.yaml.tmpl
+var kustomizationTemplate string
+
+//go:embed templates/README.md.tmpl
+var readmeTemplate string
+
+//go:embed templates/artifactgenerator.yaml.tmpl
+var artifactGeneratorTemplate string
+
+//go:embed templates/helmrelease-chartref.yaml.tmpl
+var helmReleaseChartRefTemplate string
+
+// DependsOnRef is a Flux dependsOn reference to another resource.
+// All HelmReleases share a single namespace, so no namespace is needed.
+type DependsOnRef struct {
+	Name string
+}
+
+// RootKustomizationData carries data for the root kustomization.yaml.
+type RootKustomizationData struct {
+	Resources []string
+}
+
+// ReadmeData carries data for the README.md template.
+type ReadmeData struct {
+	Namespace      string // Flux install namespace (e.g. "flux-system")
+	BundlerVersion string
+	Components     []ComponentSummary
+	UpgradeNotice  string
+}
+
+// ComponentSummary is used in README rendering.
+type ComponentSummary struct {
+	Name         string
+	Type         string
+	Version      string
+	Namespace    string
+	DependsOnStr string
+}
+
+// compile-time interface check
+var _ deployer.Deployer = (*Generator)(nil)
+
+// Generator creates Flux manifests from recipe results.
+// Configure it with the required fields, then call Generate.
+type Generator struct {
+	// RecipeResult contains the recipe metadata and component references.
+	RecipeResult *recipe.RecipeResult
+
+	// crdOwners maps component name -> registry ownsCRDs flag, resolved
+	// once per Generate. Components absent from the registry are absent
+	// here and default to false, which keeps helm-controller's Skip
+	// behavior — the conservative direction.
+	crdOwners map[string]bool
+
+	// ComponentValues maps component names to their values.
+	ComponentValues map[string]map[string]any
+
+	// Version is the generator version.
+	Version string
+
+	// RepoURL is the Git repository URL for GitRepository source CRs.
+	// If empty, a placeholder URL will be used.
+	RepoURL string
+
+	// TargetRevision is the target revision for GitRepository refs (default: "main").
+	TargetRevision string
+
+	// IncludeChecksums indicates whether to generate a checksums.txt file.
+	IncludeChecksums bool
+
+	// DataFiles lists additional file paths (relative to output dir) to include
+	// in checksum generation. Used for external data files copied into the bundle.
+	DataFiles []string
+
+	// ComponentManifests maps component name → manifest path → rendered bytes.
+	// Drives generation of local Helm charts for manifest-only and mixed
+	// components. Components without manifests do not appear in the map.
+	ComponentManifests map[string]map[string][]byte
+
+	// ComponentPreManifests maps component name → manifest path → rendered bytes.
+	// Emitted as a <name>-pre HelmRelease that the primary HelmRelease
+	// dependsOn, ensuring pre-phase manifests reconcile before the chart.
+	// Wired by the bundler from ComponentRef.PreManifestFiles and the
+	// synthesized GKE critical-priority ResourceQuota (see issue #915).
+	// Components without pre-manifests do not appear in the map.
+	ComponentPreManifests map[string]map[string][]byte
+
+	// DynamicValues maps component names to their dynamic value paths.
+	// When non-empty, dynamic paths are split from inline values into a
+	// ConfigMap and referenced via spec.valuesFrom in the HelmRelease.
+	DynamicValues map[string][]string
+
+	// Namespace is the Kubernetes namespace where Flux CRs (HelmRelease,
+	// sources, ArtifactGenerator) are deployed. Defaults to
+	// config.DefaultFluxNamespace ("flux-system") via resolveNamespace().
+	Namespace string
+
+	// OCISourceName is the name of the outer OCIRepository that Flux pulls
+	// the bundle from. When non-empty, local-chart components emit an
+	// ArtifactGenerator + ExternalArtifact pair and reference the
+	// ExternalArtifact via spec.chartRef in the HelmRelease (instead of
+	// spec.chart.spec with a GitRepository source). This eliminates the
+	// placeholder GitRepository URL that stalls helm-controller under OCI
+	// consumption.
+	// When empty, the generator falls back to the existing GitRepository path.
+	OCISourceName string
+
+	// VendorCharts pulls upstream Helm chart bytes into the bundle at
+	// bundle time so the resulting artifact is air-gap deployable.
+	// Off by default. With the flag set, vendorable Helm-typed components
+	// emit a local wrapper chart (Chart.yaml + charts/<chart>-<ver>.tgz)
+	// and HelmRelease CRs reference the GitRepository source instead of
+	// HelmRepository.
+	VendorCharts bool
+
+	// Puller fetches upstream chart bytes when VendorCharts is set. nil
+	// resolves to a default *CLIChartPuller; tests inject a stub here
+	// without touching package state. Ignored when VendorCharts is false.
+	Puller localformat.ChartPuller
+
+	// Serial chains each component's dependsOn to the previous component in
+	// deployment order (a linear release chain) instead of projecting the
+	// declared dependencyRefs onto the DAG, so components reconcile strictly
+	// one at a time. Off by default (native DAG). Operator escape hatch wired
+	// from --serial; see config.Serial and serialDependsOn.
+	Serial bool
+
+	// UpgradeNotice is upgrade.WriteNotice output, inserted verbatim before the
+	// first deployment heading of README.md. Empty adds nothing.
+	UpgradeNotice string
+
+	// vendorRecords is populated by Generate when VendorCharts is on.
+	// Captured here so provenance.yaml can be written after component
+	// generation without re-threading the slice through every helper.
+	vendorRecords []localformat.VendorRecord
+}
+
+// resolveNamespace returns the effective Flux install namespace,
+// defaulting to config.DefaultFluxNamespace ("flux-system").
+func (g *Generator) resolveNamespace() string {
+	if g.Namespace != "" {
+		return g.Namespace
+	}
+	return config.DefaultFluxNamespace
+}
+
+// resolveTargetRevision returns the effective target revision, defaulting to "main".
+func (g *Generator) resolveTargetRevision() string {
+	if g.TargetRevision != "" {
+		return g.TargetRevision
+	}
+	return "main"
+}
+
+// resolveRepoURL returns the effective repo URL, using a placeholder if empty.
+func (g *Generator) resolveRepoURL() string {
+	if g.RepoURL != "" {
+		return g.RepoURL
+	}
+	return "https://github.com/YOUR_ORG/YOUR_REPO.git"
+}
+
+// writeTemplate renders a template to disk and tracks the file in output.
+func writeTemplate(output *deployer.Output, tmpl string, data any, dir, filename, errMsg string) error {
+	path, size, err := deployer.GenerateFromTemplate(tmpl, data, dir, filename)
+	if err != nil {
+		return errors.PropagateOrWrap(err, errors.ErrCodeInternal, errMsg)
+	}
+	output.Files = append(output.Files, path)
+	output.TotalSize += size
+	return nil
+}
+
+// appendRelease records one emitted HelmRelease in the bundle's release
+// index. name is the release name (the component, or its -pre / -post
+// injection); component is always the parent component, which is what lets a
+// consumer group an injection with the release it brackets.
+func appendRelease(output *deployer.Output, name, component, namespace, dir string) {
+	output.Releases = append(output.Releases, deployer.Release{
+		Name:      name,
+		Component: component,
+		Namespace: namespace,
+		Path:      dir,
+		Manifest:  path.Join(dir, fileHelmRelease),
+	})
+}
+
+// finalizeOutputMetadata sets output.Duration and the deployment steps/notes
+// once all component resources have been written, so the notes list can
+// react to flags (DynamicValues, vendored charts) resolved during
+// generation.
+func (g *Generator) finalizeOutputMetadata(output *deployer.Output, start time.Time) {
+	output.Duration = time.Since(start)
+	output.DeploymentSteps = []string{
+		"Push this bundle to your Git repository",
+		"Create a Flux Kustomization pointing to the bundle path",
+		"Monitor reconciliation with: flux get helmreleases -A",
+	}
+	notes := []string{
+		"Ensure Flux is installed on your cluster before applying",
+	}
+	if len(g.DynamicValues) > 0 {
+		notes = append(notes,
+			"ConfigMaps with dynamic values have been generated. Edit them before applying to customize per-cluster settings.")
+	}
+	if len(g.vendorRecords) > 0 {
+		notes = append(notes,
+			"This bundle contains vendored Helm charts. No upstream registry access is required at deploy time. See provenance.yaml for chart provenance details.")
+	}
+	output.DeploymentNotes = notes
+}
+
+// Generate produces Flux manifests in the given output directory.
+func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.Output, error) {
+	start := time.Now()
+
+	if g.RecipeResult == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "recipe result is required")
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeTimeout, "context cancelled before generation", err)
+	}
+
+	output := &deployer.Output{}
+
+	// Filter enabled components and sort by deployment order.
+	enabledRefs := filterEnabled(g.RecipeResult.ComponentRefs)
+	sortedRefs := deployer.SortComponentRefsByDeploymentOrder(enabledRefs, g.RecipeResult.DeploymentOrder)
+
+	// Validate component names.
+	for _, ref := range sortedRefs {
+		if !deployer.IsSafePathComponent(ref.Name) {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("unsafe component name: %q", ref.Name))
+		}
+	}
+
+	// Resolve which components solely own their CRDs, so their
+	// HelmRelease can replace CRDs on upgrade instead of skipping them.
+	if ownerErr := g.resolveCRDOwners(ctx, sortedRefs); ownerErr != nil {
+		return nil, ownerErr
+	}
+
+	if err := g.detectInjectedReleaseCollisions(sortedRefs); err != nil {
+		return nil, err
+	}
+
+	// Resolve the sources directory path. Creation is deferred to
+	// writeSources, which creates it only when a source CR is written.
+	sourcesDir, err := deployer.SafeJoin(outputDir, "sources")
+	if err != nil {
+		return nil, err
+	}
+
+	puller, chartDigests, err := g.resolveVendoring(ctx, sortedRefs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Collect and deduplicate sources. When vendoring, skip HelmRepository
+	// sources for components that will reference vendored local charts.
+	// When OCISourceName is set, skip GitRepository sources entirely —
+	// local-chart HelmReleases use ArtifactGenerator + ExternalArtifact
+	// instead of the placeholder GitRepository (issue #964).
+	ns := g.resolveNamespace()
+	helmSources := collectHelmSources(sortedRefs, g.VendorCharts, ns)
+	var gitSources map[string]*GitRepoSourceData
+	if g.OCISourceName == "" {
+		gitSources = collectGitSources(g.resolveRepoURL(), g.resolveTargetRevision(), ns)
+		// Reported only on this branch: OCI mode writes no GitRepository and
+		// no HelmRelease that names one, so neither coordinate reaches any
+		// file in that bundle, whatever the caller passed.
+		output.Source = deployer.Source{
+			RepoURL:        g.resolveRepoURL(),
+			TargetRevision: g.resolveTargetRevision(),
+		}
+	} else {
+		gitSources = make(map[string]*GitRepoSourceData)
+	}
+
+	// Write source CRs.
+	if err := g.writeSources(helmSources, gitSources, sourcesDir, output); err != nil {
+		return nil, err
+	}
+
+	// Track resources for root kustomization.yaml.
+	// Namespace creation is handled by HelmRelease install.createNamespace: true,
+	// so no separate Namespace manifests are needed.
+	var resources []string
+
+	// Add source file paths to resources list.
+	resources = append(resources, sourceResourcePaths(helmSources, gitSources)...)
+
+	// Fail closed on a bad dependency graph before projecting it onto Flux's
+	// dependsOn: Generate is exported, so a direct caller could hand-build a
+	// cyclic or dangling RecipeResult that would otherwise become a cyclic
+	// Flux DAG and stall reconciliation. Validate the UNFILTERED ComponentRefs
+	// (not the enabled-filtered sortedRefs) so the graph builder's own
+	// enabled-filtering can treat an edge to a declared-but-disabled component
+	// as satisfied externally rather than mistaking it for an undeclared
+	// dependency; argocd and helmfile validate the unfiltered refs for the same
+	// reason. The levels themselves are discarded — flux renders the exact DAG.
+	if _, levelErr := recipe.ComponentRefsTopologicalLevels(g.RecipeResult.ComponentRefs); levelErr != nil {
+		return nil, errors.PropagateOrWrap(levelErr, errors.ErrCodeInternal,
+			"failed to validate dependency graph")
+	}
+
+	// Project each component's declared dependencyRefs straight onto Flux's
+	// native dependsOn DAG: a component gates only on its actual dependencies
+	// (their terminal releases), and components with none reconcile in
+	// parallel. See declaredDependsOn for why this differs from the tier-based
+	// argocd/helmfile deployers. Under --serial, fall back to a linear chain
+	// (each component depends on the previous) so releases reconcile strictly
+	// one at a time.
+	depsByComponent := declaredDependsOn(sortedRefs, g.ComponentManifests)
+	if g.Serial {
+		depsByComponent = serialDependsOn(sortedRefs, g.ComponentManifests)
+	}
+
+	// Generate per-component resources.
+	for _, ref := range sortedRefs {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Wrap(errors.ErrCodeTimeout, "context cancelled during component generation", err)
+		}
+		compResources, compErr := g.generateComponentResources(
+			ctx, ref, depsByComponent, outputDir, helmSources, gitSources, puller, chartDigests[ref.Name], output)
+		if compErr != nil {
+			return nil, compErr
+		}
+		resources = append(resources, compResources...)
+	}
+
+	// Write root kustomization.yaml.
+	sort.Strings(resources)
+	if err := writeTemplate(output, kustomizationTemplate, RootKustomizationData{Resources: resources},
+		outputDir, fileKustomization, "failed to write root kustomization.yaml"); err != nil {
+		return nil, err
+	}
+	output.Entrypoint = fileKustomization
+
+	// Write README.md.
+	readmeData := ReadmeData{
+		Namespace:      ns,
+		BundlerVersion: deployer.NormalizeVersionWithDefault(g.Version),
+		Components:     buildComponentSummaries(sortedRefs, g.ComponentPreManifests, g.ComponentManifests, depsByComponent),
+		UpgradeNotice:  g.UpgradeNotice,
+	}
+	if err := writeTemplate(output, readmeTemplate, readmeData,
+		outputDir, fileReadme, "failed to write README.md"); err != nil {
+		return nil, err
+	}
+
+	// Emit provenance.yaml for vendored bundles. Written before
+	// checksums so the audit file is itself checksummed.
+	if len(g.vendorRecords) > 0 {
+		provPath, provSize, provErr := localformat.WriteProvenance(ctx, outputDir, g.vendorRecords)
+		if provErr != nil {
+			return nil, errors.Wrap(errors.ErrCodeInternal,
+				"failed to generate provenance.yaml", provErr)
+		}
+		output.Files = append(output.Files, provPath)
+		output.TotalSize += provSize
+		output.Provenance = localformat.ProvenanceFileName
+	}
+
+	// Add data files to output.
+	if len(g.DataFiles) > 0 {
+		if err := output.AddDataFiles(outputDir, g.DataFiles); err != nil {
+			return nil, err
+		}
+	}
+
+	// Write checksums if requested.
+	if g.IncludeChecksums {
+		if err := checksum.WriteChecksums(ctx, outputDir, output); err != nil {
+			return nil, err
+		}
+	}
+
+	g.finalizeOutputMetadata(output, start)
+
+	slog.Debug("flux bundle generated",
+		"components", len(sortedRefs),
+		"files", len(output.Files),
+		"size_bytes", output.TotalSize,
+		"duration", output.Duration,
+	)
+
+	return output, nil
+}
+
+// resolveVendoring returns the chart puller and the registry-pinned chart
+// digests for a vendored bundle. When VendorCharts is off it returns g.Puller
+// unchanged and no digests.
+func (g *Generator) resolveVendoring(
+	ctx context.Context,
+	refs []recipe.ComponentRef,
+) (localformat.ChartPuller, map[string]string, error) {
+
+	if !g.VendorCharts {
+		return g.Puller, nil, nil
+	}
+	puller := g.Puller
+	if puller == nil {
+		puller = &localformat.CLIChartPuller{}
+	}
+	digests, err := deployer.ResolveChartDigests(ctx, g.RecipeResult.DataProvider(), refs)
+	if err != nil {
+		return nil, nil, err
+	}
+	return puller, digests, nil
+}
+
+// generateComponentResources generates all Flux resources for a single component
+// and returns the resource paths to include in the root kustomization.yaml.
+func (g *Generator) generateComponentResources(ctx context.Context, ref recipe.ComponentRef,
+	deps map[string][]string, outputDir string,
+	helmSources map[string]*HelmRepoSourceData, gitSources map[string]*GitRepoSourceData,
+	puller localformat.ChartPuller, chartDigest string,
+	output *deployer.Output) ([]string, error) {
+
+	compDir, err := deployer.SafeJoin(outputDir, ref.Name)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(compDir, 0750); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("failed to create component directory %s", ref.Name), err)
+	}
+
+	primaryDependsOn := buildPrimaryDependsOn(deps, ref.Name)
+	hasPreManifests := len(g.ComponentPreManifests[ref.Name]) > 0
+	hasManifests := len(g.ComponentManifests[ref.Name]) > 0
+	var resources []string
+
+	// Emit the <name>-pre HelmRelease BEFORE the primary when pre-manifests
+	// exist, and rewire the primary's dependsOn to point at the pre release.
+	// Chain becomes: previous → <name>-pre → <name> → <name>-post → next.
+	if hasPreManifests {
+		preName := ref.Name + "-pre"
+		preDir, preDirErr := deployer.SafeJoin(outputDir, preName)
+		if preDirErr != nil {
+			return nil, preDirErr
+		}
+		if mkErr := os.MkdirAll(preDir, 0750); mkErr != nil {
+			return nil, errors.Wrap(errors.ErrCodeInternal,
+				fmt.Sprintf("failed to create pre directory %s", preName), mkErr)
+		}
+		appendRelease(output, preName, ref.Name, ref.Namespace, preName)
+		preWroteCM, preExtra, preErr := g.generateManifestHelmChart(ref.Name, preName, ref.Namespace, preDir, ref.Version,
+			g.ComponentPreManifests[ref.Name], gitSources, primaryDependsOn, output)
+		if preErr != nil {
+			return nil, preErr
+		}
+		resources = append(resources, filepath.Join(preName, fileHelmRelease))
+		if preWroteCM {
+			resources = append(resources, filepath.Join(preName, fileConfigMap))
+		}
+		resources = append(resources, preExtra...)
+		// Primary chart now waits for the pre release.
+		primaryDependsOn = []DependsOnRef{{Name: preName}}
+	}
+
+	switch ref.Type { //nolint:exhaustive // only Helm is supported; default rejects others
+	case recipe.ComponentTypeHelm:
+		// Manifest-only Helm component: no chart or source, only manifests.
+		// Package as a local Helm chart so Flux renders the templates natively.
+		if ref.Chart == "" && ref.Source == "" && hasManifests {
+			wroteCM, extra, genErr := g.generateManifestHelmChart(ref.Name, ref.Name, ref.Namespace, compDir, ref.Version,
+				g.ComponentManifests[ref.Name], gitSources, primaryDependsOn, output)
+			if genErr != nil {
+				return nil, genErr
+			}
+			resources = append(resources, filepath.Join(ref.Name, fileHelmRelease))
+			if wroteCM {
+				resources = append(resources, filepath.Join(ref.Name, fileConfigMap))
+			}
+			resources = append(resources, extra...)
+			appendRelease(output, ref.Name, ref.Name, ref.Namespace, ref.Name)
+			return resources, nil
+		}
+
+		// Vendored Helm component: pull chart tarball, write wrapper,
+		// reference GitRepository instead of HelmRepository. Mixed
+		// components still produce a separate -post inline chart for
+		// manifests (the existing flow handles them correctly).
+		if g.VendorCharts && isVendorable(ref) {
+			wroteCM, rec, extra, vendErr := g.generateVendoredHelmComponent(
+				ctx, ref, compDir, primaryDependsOn, gitSources, puller, chartDigest, output)
+			if vendErr != nil {
+				return nil, vendErr
+			}
+			g.vendorRecords = append(g.vendorRecords, rec)
+			resources = append(resources, filepath.Join(ref.Name, fileHelmRelease))
+			if wroteCM {
+				resources = append(resources, filepath.Join(ref.Name, fileConfigMap))
+			}
+			resources = append(resources, extra...)
+			appendRelease(output, ref.Name, ref.Name, ref.Namespace, ref.Name)
+			slog.Info("wrote vendored chart for flux",
+				"component", ref.Name,
+				"chart", rec.Chart, "version", rec.Version, "sha256", rec.SHA256)
+		} else {
+			wroteCM, helmErr := g.generateHelmComponent(ref, compDir, primaryDependsOn, helmSources, output)
+			if helmErr != nil {
+				return nil, helmErr
+			}
+			resources = append(resources, filepath.Join(ref.Name, fileHelmRelease))
+			if wroteCM {
+				resources = append(resources, filepath.Join(ref.Name, fileConfigMap))
+			}
+			appendRelease(output, ref.Name, ref.Name, ref.Namespace, ref.Name)
+		}
+
+		// Handle mixed components (Helm + manifests).
+		// Post-manifests are packaged as a local Helm chart with dependsOn
+		// referencing the primary HelmRelease — same for both vendored and
+		// non-vendored paths.
+		if hasManifests {
+			postName := ref.Name + "-post"
+			postDir, postErr := deployer.SafeJoin(outputDir, postName)
+			if postErr != nil {
+				return nil, postErr
+			}
+			if postErr := os.MkdirAll(postDir, 0750); postErr != nil {
+				return nil, errors.Wrap(errors.ErrCodeInternal,
+					fmt.Sprintf("failed to create post directory %s", postName), postErr)
+			}
+			appendRelease(output, postName, ref.Name, ref.Namespace, postName)
+
+			postDependsOn := []DependsOnRef{{Name: ref.Name}}
+			postWroteCM, postExtra, postGenErr := g.generateManifestHelmChart(ref.Name, postName, ref.Namespace, postDir, ref.Version,
+				g.ComponentManifests[ref.Name], gitSources, postDependsOn, output)
+			if postGenErr != nil {
+				return nil, postGenErr
+			}
+			resources = append(resources, filepath.Join(postName, fileHelmRelease))
+			if postWroteCM {
+				resources = append(resources, filepath.Join(postName, fileConfigMap))
+			}
+			resources = append(resources, postExtra...)
+		}
+
+	default:
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("unsupported component type %q for component %q", ref.Type, ref.Name))
+	}
+
+	return resources, nil
+}
+
+// isVendorable maps a ComponentRef to the localformat.ShouldVendor predicate.
+func isVendorable(ref recipe.ComponentRef) bool {
+	return localformat.ShouldVendor(localformat.Component{
+		Name:       ref.Name,
+		Repository: ref.Source,
+		Tag:        ref.Tag,
+		Path:       ref.Path,
+	})
+}
+
+// writeSources writes HelmRepository and GitRepository source CRs to the
+// sources directory, creating that directory only when at least one CR is
+// written and removing a stale empty one from an earlier run otherwise.
+func (g *Generator) writeSources(helmSources map[string]*HelmRepoSourceData,
+	gitSources map[string]*GitRepoSourceData, sourcesDir string, output *deployer.Output) error {
+
+	// sources/ is created lazily, immediately before the first source CR is
+	// written. Both maps can be empty at once: an OCI --output suppresses
+	// GitRepository sources in favor of ArtifactGenerator + ExternalArtifact,
+	// and every remaining HelmRepository source disappears when no component
+	// carries an upstream Source or — the reachable case today — when
+	// --vendor-charts is set, since collectHelmSources skips every vendorable
+	// ref. An unconditional MkdirAll would then leave an empty directory that
+	// the bundle inventory validator rejects as unexpected. See issue #1947.
+	sourcesDirReady := false
+	ensureSourcesDir := func() error {
+		if sourcesDirReady {
+			return nil
+		}
+		if err := checkSourcesPath(sourcesDir); err != nil {
+			return err
+		}
+		if mkdirErr := os.MkdirAll(sourcesDir, 0750); mkdirErr != nil {
+			return errors.Wrap(errors.ErrCodeInternal, "failed to create sources directory", mkdirErr)
+		}
+		sourcesDirReady = true
+		return nil
+	}
+
+	// Write Helm sources in sorted order.
+	for _, key := range slices.Sorted(maps.Keys(helmSources)) {
+		src := helmSources[key]
+		filename := fmt.Sprintf("helmrepo-%s.yaml", src.Name)
+		if err := ensureSourcesDir(); err != nil {
+			return err
+		}
+		if err := writeTemplate(output, helmRepoSourceTemplate, src, sourcesDir, filename,
+			fmt.Sprintf("failed to write HelmRepository source %s", src.Name)); err != nil {
+			return err
+		}
+	}
+
+	// Write Git sources in sorted order.
+	for _, key := range slices.Sorted(maps.Keys(gitSources)) {
+		src := gitSources[key]
+		filename := fmt.Sprintf("gitrepo-%s.yaml", src.Name)
+		if err := ensureSourcesDir(); err != nil {
+			return err
+		}
+		if err := writeTemplate(output, gitRepoSourceTemplate, src, sourcesDir, filename,
+			fmt.Sprintf("failed to write GitRepository source %s", src.Name)); err != nil {
+			return err
+		}
+	}
+
+	// Generation writes directly into --output and the directory is not
+	// cleared between runs, so a failed pre-fix run leaves its empty sources/
+	// behind. Without this, retrying into that same directory reproduces the
+	// original failure even though nothing new is created.
+	if !sourcesDirReady {
+		return removeStaleSourcesDir(sourcesDir)
+	}
+
+	return nil
+}
+
+// checkSourcesPath rejects anything occupying the sources path that is not a
+// plain directory. Both the create and the remove path call it, so a
+// pre-existing file or symlink produces the same ErrCodeInvalidRequest
+// regardless of whether the recipe happens to contribute source CRs —
+// otherwise the identical user error would surface as INVALID_REQUEST for an
+// all-local OCI bundle and INTERNAL (from MkdirAll's ENOTDIR) for any bundle
+// carrying a source.
+//
+// The check matters most before removal, since os.Remove unlinks regular files
+// as readily as it removes empty directories. A pre-existing regular file at
+// this path reaches generation on every route: checksum.ValidateOutputRoot
+// runs first on the DefaultBundler path but permits regular files, rejecting
+// only symlinks and special objects.
+//
+// Lstat rather than Stat additionally rejects a symlink here. On the
+// DefaultBundler path that is redundant, since ValidateOutputRoot already
+// rejects a symlink anywhere under the output root before any deployer runs;
+// it still holds for a caller that constructs this Generator directly and
+// bypasses that check.
+//
+// The guarantee stops there. This is a check-then-act on a path, so a symlink
+// planted between this call and the MkdirAll or Remove that follows is not
+// caught. Closing that would require openat-based operations throughout, and
+// it buys nothing in a supported configuration: it takes a local process with
+// write access to --output, and anything with that access can already rewrite
+// the finished bundle and its checksums.
+func checkSourcesPath(sourcesDir string) error {
+	info, statErr := os.Lstat(sourcesDir)
+	switch {
+	case os.IsNotExist(statErr):
+		return nil
+	case statErr != nil:
+		return errors.Wrap(errors.ErrCodeInternal,
+			"failed to inspect sources directory", statErr)
+	case info.Mode()&os.ModeSymlink != 0:
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("output path %q is a symbolic link", sourcesDir))
+	case !info.IsDir():
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("output path %q exists and is not a directory", sourcesDir))
+	}
+	return nil
+}
+
+// removeStaleSourcesDir clears a sources/ left behind by an earlier run when
+// the current generation contributed no source CRs to it.
+//
+// Emptiness is checked explicitly rather than inferred from an os.Remove
+// errno, which keeps the intent readable and avoids platform-specific error
+// values. A populated sources/ is kept: its contents are reported by
+// validateExactTree as unexpected output, though only when checksums are
+// enabled, since that validator runs inside the IncludeChecksums path. With
+// checksums off a stale sources/ survives into the bundle, which is unchanged
+// from before this fix — a reused --output was never cleared, so stale files
+// of any kind already persisted.
+//
+// Anything that blocks removal of an empty directory fails generation rather
+// than being logged and ignored: leaving it behind either trips that same
+// validator or, when checksums are disabled, ships the bundle this fix exists
+// to prevent.
+func removeStaleSourcesDir(sourcesDir string) error {
+	if err := checkSourcesPath(sourcesDir); err != nil {
+		return err
+	}
+
+	entries, readErr := os.ReadDir(sourcesDir)
+	if readErr != nil {
+		if os.IsNotExist(readErr) {
+			return nil
+		}
+		return errors.Wrap(errors.ErrCodeInternal,
+			"failed to inspect sources directory", readErr)
+	}
+	if len(entries) > 0 {
+		slog.Warn("keeping populated sources directory from an earlier run",
+			"path", sourcesDir, "entries", len(entries))
+		return nil
+	}
+
+	if rmErr := os.Remove(sourcesDir); rmErr != nil && !os.IsNotExist(rmErr) {
+		return errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("failed to remove empty sources directory %q", sourcesDir), rmErr)
+	}
+	return nil
+}
+
+// filterEnabled returns only the components that are enabled for deployment.
+func filterEnabled(refs []recipe.ComponentRef) []recipe.ComponentRef {
+	enabled := make([]recipe.ComponentRef, 0, len(refs))
+	for _, ref := range refs {
+		if ref.IsEnabled() {
+			enabled = append(enabled, ref)
+		}
+	}
+	return enabled
+}
+
+// detectInjectedReleaseCollisions rejects recipes that declare both a
+// component "foo" (with pre- or post-manifests) and a separate component
+// "foo-pre" / "foo-post". The injection rule would synthesize a HelmRelease
+// that collides with the explicitly-declared one. Mirrors the rule in
+// pkg/bundler/deployer/localformat/writer.go.
+func (g *Generator) detectInjectedReleaseCollisions(sortedRefs []recipe.ComponentRef) error {
+	declared := make(map[string]struct{}, len(sortedRefs))
+	for _, ref := range sortedRefs {
+		declared[ref.Name] = struct{}{}
+	}
+	for _, ref := range sortedRefs {
+		if len(g.ComponentPreManifests[ref.Name]) > 0 {
+			if _, clash := declared[ref.Name+"-pre"]; clash {
+				return errors.New(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("component %q has preManifestFiles and would inject %q-pre, but a component named %q-pre is already declared in the recipe — rename one to avoid collision",
+						ref.Name, ref.Name, ref.Name))
+			}
+		}
+		// Post injection only fires for mixed components (chart/source +
+		// post-manifests); manifest-only components fold their manifests
+		// into the primary release and never emit a -post folder.
+		hasChartOrSource := ref.Chart != "" || ref.Source != ""
+		if hasChartOrSource && len(g.ComponentManifests[ref.Name]) > 0 {
+			if _, clash := declared[ref.Name+"-post"]; clash {
+				return errors.New(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("component %q is mixed (helm + manifests) and would inject %q-post, but a component named %q-post is already declared in the recipe — rename one to avoid collision",
+						ref.Name, ref.Name, ref.Name))
+			}
+		}
+	}
+	return nil
+}
+
+// buildPrimaryDependsOn returns the dependsOn references for the head of a
+// component's chain (its <name>-pre release when pre-manifests exist, otherwise
+// the primary HelmRelease), from the precomputed dependency map. A component
+// with no dependencies has no entries and returns nil, so independent
+// components reconcile in parallel. See declaredDependsOn.
+func buildPrimaryDependsOn(deps map[string][]string, name string) []DependsOnRef {
+	targets := deps[name]
+	if len(targets) == 0 {
+		return nil
+	}
+	refs := make([]DependsOnRef, 0, len(targets))
+	for _, t := range targets {
+		refs = append(refs, DependsOnRef{Name: t})
+	}
+	return refs
+}
+
+// declaredDependsOn maps each component to the dependsOn targets its head
+// release should carry: the terminal release of each of its declared
+// dependencyRefs. Unlike the argocd and helmfile deployers — whose total-order
+// mechanisms (integer sync-waves / sequential sub-helmfiles) can only
+// approximate the dependency DAG as depth tiers, and therefore over-constrain
+// a component to wait on every sibling at the prior depth — Flux's dependsOn is
+// a native DAG, so this projects the recipe's declared edges onto it exactly.
+// A flux user reading the generated HelmRelease sees dependsOn mirror
+// dependencyRefs one-for-one.
+//
+// The terminal release honors a dependency's -post tail (terminalReleaseNameFor),
+// so the dependent waits for the full chain. A dependencyRef pointing at a
+// component that is not in the (already enabled-filtered) ref set — disabled via
+// overrides.enabled=false, or provided externally — is dropped rather than
+// generating an edge to a release that will not exist, matching recipe
+// resolution's enabled-filtering. Targets are sorted for deterministic output;
+// components with no surviving edges are absent from the map (nil dependsOn).
+func declaredDependsOn(sortedRefs []recipe.ComponentRef, postManifests map[string]map[string][]byte) map[string][]string {
+	refByName := make(map[string]recipe.ComponentRef, len(sortedRefs))
+	for _, r := range sortedRefs {
+		refByName[r.Name] = r
+	}
+	out := make(map[string][]string, len(sortedRefs))
+	for _, c := range sortedRefs {
+		if len(c.DependencyRefs) == 0 {
+			continue
+		}
+		targets := make([]string, 0, len(c.DependencyRefs))
+		for _, dep := range c.DependencyRefs {
+			depRef, ok := refByName[dep]
+			if !ok {
+				// Disabled, externally provided, or undeclared: no release to
+				// depend on. Recipe resolution already validated real edges.
+				continue
+			}
+			targets = append(targets, terminalReleaseNameFor(depRef, postManifests))
+		}
+		if len(targets) > 0 {
+			sort.Strings(targets)
+			out[c.Name] = targets
+		}
+	}
+	return out
+}
+
+// serialDependsOn maps each component to a single dependsOn target: the
+// terminal release of the previous component in deployment order. This is the
+// pre-parallelism linear chain (previous -> <name>-pre -> <name> -> <name>-post
+// -> next) that --serial restores, so releases reconcile strictly one at a
+// time regardless of the actual dependency graph. The head of the chain (index
+// 0) has no predecessor and is absent from the map (nil dependsOn).
+func serialDependsOn(sortedRefs []recipe.ComponentRef, postManifests map[string]map[string][]byte) map[string][]string {
+	out := make(map[string][]string, len(sortedRefs))
+	prevTerminal := ""
+	for _, c := range sortedRefs {
+		if prevTerminal != "" {
+			out[c.Name] = []string{prevTerminal}
+		}
+		prevTerminal = terminalReleaseNameFor(c, postManifests)
+	}
+	return out
+}
+
+// terminalReleaseNameFor returns the name of the LAST HelmRelease emitted for a
+// component. Mixed components (chart/source + post-manifests) terminate at
+// <name>-post; manifest-only and chart-only components terminate at <name>.
+// Pre-manifests never extend the tail — they live BEFORE the primary.
+//
+// Free function so the README renderer (buildComponentSummaries) can reuse it
+// without a Generator handle.
+func terminalReleaseNameFor(ref recipe.ComponentRef, postManifests map[string]map[string][]byte) string {
+	hasChart := ref.Chart != "" || ref.Source != ""
+	if hasChart && len(postManifests[ref.Name]) > 0 {
+		return ref.Name + "-post"
+	}
+	return ref.Name
+}
+
+// dependsOnStr renders a dependsOn target list for the README "Depends On"
+// column: the sorted names joined by ", ", or "-" when the release has no
+// dependency (a level-0 head).
+func dependsOnStr(names []string) string {
+	if len(names) == 0 {
+		return "-"
+	}
+	return strings.Join(names, ", ")
+}
+
+// nonAlphanumericRe collapses runs of non-DNS characters into a single hyphen.
+var nonAlphanumericRe = regexp.MustCompile(`[^a-z0-9-]+`)
+
+// sanitizeSourceName converts a URL to a Kubernetes-safe DNS-1123 label
+// by stripping the scheme and common suffixes, then replacing everything
+// non-alphanumeric with hyphens, truncated to 63 characters.
+func sanitizeSourceName(rawURL string) string {
+	// Strip scheme prefixes so "https" doesn't appear in the name.
+	s := strings.ToLower(rawURL)
+	for _, prefix := range []string{"oci://", "https://", "http://"} {
+		s = strings.TrimPrefix(s, prefix)
+	}
+	s = strings.TrimSuffix(strings.TrimSuffix(s, "/"), ".git")
+	s = strings.Trim(nonAlphanumericRe.ReplaceAllString(s, "-"), "-")
+	if len(s) > 63 {
+		s = strings.TrimRight(s[:63], "-")
+	}
+	if s == "" {
+		return "default-source"
+	}
+	return s
+}
+
+// sourceName looks up a pre-computed name from the source map, falling back to sanitizeSourceName.
+func sourceName[V any](sourceURL string, sources map[string]V, nameFunc func(V) string) string {
+	if src, ok := sources[sourceURL]; ok {
+		return nameFunc(src)
+	}
+	return sanitizeSourceName(sourceURL)
+}
+
+// sourceResourcePaths returns sorted resource paths for all source CRs.
+func sourceResourcePaths(helmSources map[string]*HelmRepoSourceData, gitSources map[string]*GitRepoSourceData) []string {
+	paths := make([]string, 0, len(helmSources)+len(gitSources))
+	for _, src := range helmSources {
+		paths = append(paths, filepath.Join("sources", fmt.Sprintf("helmrepo-%s.yaml", src.Name)))
+	}
+	for _, src := range gitSources {
+		paths = append(paths, filepath.Join("sources", fmt.Sprintf("gitrepo-%s.yaml", src.Name)))
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// buildComponentSummaries builds the component summary list for the README.
+// The list mirrors the actual HelmRelease graph (pre → primary → post) so the
+// rendered "Depends On" column matches what Flux will reconcile.
+func buildComponentSummaries(sortedRefs []recipe.ComponentRef, preManifests, manifests map[string]map[string][]byte, deps map[string][]string) []ComponentSummary {
+	summaries := make([]ComponentSummary, 0, len(sortedRefs))
+	for _, ref := range sortedRefs {
+		version := ref.Version
+		if version == "" {
+			version = ref.Tag
+		}
+
+		// The head of a component's chain depends on the terminal release of
+		// each of its declared dependencyRefs (see declaredDependsOn). A
+		// component with no dependencies is rendered as "-".
+		headDependsOn := dependsOnStr(deps[ref.Name])
+
+		// When pre-manifests exist, generation inserts a <name>-pre HelmRelease
+		// before the primary and rewires the primary's dependsOn to point at it.
+		// Reflect that in the README so the table matches the generated CRs.
+		primaryDependsOn := headDependsOn
+		if len(preManifests[ref.Name]) > 0 {
+			preName := ref.Name + "-pre"
+			summaries = append(summaries, ComponentSummary{
+				Name:         preName,
+				Type:         summaryTypeHelmRelease,
+				Namespace:    ref.Namespace,
+				DependsOnStr: headDependsOn,
+			})
+			primaryDependsOn = preName
+		}
+
+		summaries = append(summaries, ComponentSummary{
+			Name:         ref.Name,
+			Type:         summaryTypeHelmRelease,
+			Version:      version,
+			Namespace:    ref.Namespace,
+			DependsOnStr: primaryDependsOn,
+		})
+
+		// Mixed components (Helm chart + manifests) produce a post HelmRelease
+		// that depends on the primary. Chart-or-source matches the generation
+		// predicate (and terminalReleaseNameFor): a source-only ref with
+		// manifests emits a post release the README must list.
+		isMixed := (ref.Chart != "" || ref.Source != "") && len(manifests[ref.Name]) > 0
+		if isMixed {
+			summaries = append(summaries, ComponentSummary{
+				Name:         ref.Name + "-post",
+				Type:         summaryTypeHelmRelease,
+				Namespace:    ref.Namespace,
+				DependsOnStr: ref.Name,
+			})
+		}
+	}
+	return summaries
+}
+
+// resolveCRDOwners records which components may replace their CRDs on upgrade,
+// so each HelmRelease can pick between CreateReplace and helm-controller's Skip
+// default. The guard is shared with the helm and helmfile deployers; see
+// deployer.ResolveCRDOwners for why a registry failure is fatal here.
+func (g *Generator) resolveCRDOwners(ctx context.Context, refs []recipe.ComponentRef) error {
+	owners, err := deployer.ResolveCRDOwners(ctx, g.RecipeResult.DataProvider(), refs)
+	if err != nil {
+		return err
+	}
+	g.crdOwners = owners
+	return nil
+}
+
+// ownsCRDs reports whether the named component may replace its CRDs on
+// upgrade. Unknown components are false.
+func (g *Generator) ownsCRDs(name string) bool { return g.crdOwners[name] }

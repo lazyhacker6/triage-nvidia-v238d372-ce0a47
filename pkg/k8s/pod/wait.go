@@ -1,0 +1,379 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package pod
+
+import (
+	"context"
+	stderrors "errors"
+	"log/slog"
+	"time"
+
+	"github.com/NVIDIA/aicr/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
+)
+
+// APIErrorCode classifies an unexpected apiserver error: a dead context is a
+// cancellation or a timeout, rejected credentials are unauthorized, a network
+// failure is retryable, and anything else is internal.
+func APIErrorCode(ctx context.Context, err error) errors.ErrorCode {
+	switch {
+	case stderrors.Is(ctx.Err(), context.Canceled):
+		return errors.ErrCodeCanceled
+	case ctx.Err() != nil:
+		return errors.ErrCodeTimeout
+	case apierrors.IsUnauthorized(err):
+		return errors.ErrCodeUnauthorized
+	case errors.IsNetworkError(err):
+		return errors.ErrCodeUnavailable
+	default:
+		return errors.ErrCodeInternal
+	}
+}
+
+// classifyReGetError preserves the dead-context error code when a re-Get
+// races against context expiry. Without this guard, a context that ended
+// between the watch-close and the re-Get would surface as ErrCodeUnavailable
+// instead of ErrCodeTimeout/ErrCodeCanceled, breaking upstream code that
+// distinguishes transient API unavailability from the caller's own deadline
+// or abort. Within that dead-context case, errors.WrapCtxErr further splits
+// ErrCodeCanceled (operator abort) from ErrCodeTimeout (deadline) — see its
+// doc comment.
+func classifyReGetError(ctx context.Context, message string, getErr error) error {
+	cause := ctx.Err()
+	if cause == nil {
+		cause = getErr
+	}
+	if stderrors.Is(cause, context.Canceled) || stderrors.Is(cause, context.DeadlineExceeded) {
+		return errors.WrapCtxErr(cause, errors.ErrCodeTimeout, message)
+	}
+	return errors.Wrap(errors.ErrCodeUnavailable, message, getErr)
+}
+
+// WaitForPodSucceeded waits for a pod to reach the Succeeded phase.
+// Returns nil on PodSucceeded, error on PodFailed, error on timeout.
+// Performs an initial Get to catch already-terminal pods, then uses the
+// watch API for efficient monitoring.
+func WaitForPodSucceeded(ctx context.Context, client kubernetes.Interface, namespace, name string, timeout time.Duration) error {
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	slog.Info("waiting for pod to reach Succeeded state", "name", name)
+
+	// Fast path: pod may already be in a terminal phase.
+	current, err := client.CoreV1().Pods(namespace).Get(timeoutCtx, name, metav1.GetOptions{})
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to get pod", err)
+	}
+	if done, checkErr := checkPodPhase(current); done {
+		return checkErr
+	}
+
+	watcher, err := client.CoreV1().Pods(namespace).Watch(
+		timeoutCtx,
+		metav1.ListOptions{
+			FieldSelector: "metadata.name=" + name,
+			// Start the watch from the version observed by the fast-path Get so a
+			// terminal transition landing between the Get and the watch is
+			// replayed rather than missed (matching WaitForPodReady).
+			ResourceVersion: current.ResourceVersion,
+		},
+	)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to watch pod", err)
+	}
+	defer watcher.Stop()
+
+	for {
+		select {
+		case <-timeoutCtx.Done():
+			return errors.WrapCtxErr(timeoutCtx.Err(), errors.ErrCodeTimeout, "waiting for pod to succeed")
+		case event, ok := <-watcher.ResultChan():
+			if !ok {
+				// Watch channels close routinely on apiserver rolling
+				// restarts, LB drops, and 1.27+ bookmark hiccups. Re-Get
+				// the pod and reclassify rather than treating a transient
+				// apiserver event as a permanent failure.
+				if rcErr := timeoutCtx.Err(); rcErr != nil {
+					return errors.WrapCtxErr(rcErr, errors.ErrCodeTimeout, "waiting for pod to succeed")
+				}
+				current, getErr := client.CoreV1().Pods(namespace).Get(timeoutCtx, name, metav1.GetOptions{})
+				if getErr != nil {
+					return classifyReGetError(timeoutCtx, "pod watch closed and re-Get failed", getErr)
+				}
+				if done, checkErr := checkPodPhase(current); done {
+					return checkErr
+				}
+				return errors.NewWithContext(errors.ErrCodeUnavailable,
+					"pod watch closed before pod reached terminal state",
+					watchClosedContext(namespace, name, current))
+			}
+
+			watchedPod, ok := event.Object.(*corev1.Pod)
+			if !ok {
+				continue
+			}
+
+			logPodPhase(watchedPod)
+
+			if done, checkErr := checkPodPhase(watchedPod); done {
+				return checkErr
+			}
+		}
+	}
+}
+
+// podWaitingReason returns the reason and message of the first container (init
+// or regular) stuck in a Waiting state, or empty strings when none is waiting.
+// Surfacing this alongside the pod phase turns an opaque run of "status=Pending"
+// log lines into an actionable signal — e.g. an ImagePullBackOff on a mistagged
+// image reads as the cause rather than being masked by a generic wait timeout.
+func podWaitingReason(p *corev1.Pod) (reason, message string) {
+	statuses := make([]corev1.ContainerStatus, 0,
+		len(p.Status.InitContainerStatuses)+len(p.Status.ContainerStatuses))
+	statuses = append(statuses, p.Status.InitContainerStatuses...)
+	statuses = append(statuses, p.Status.ContainerStatuses...)
+	for _, cs := range statuses {
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+			return cs.State.Waiting.Reason, cs.State.Waiting.Message
+		}
+	}
+	return "", ""
+}
+
+// logPodPhase logs the pod's current phase, appending the first waiting
+// container's reason/message when present so a stuck pull/create is visible in
+// the periodic wait log rather than only after a post-mortem.
+func logPodPhase(p *corev1.Pod) {
+	attrs := []any{keyName, p.Name, "status", p.Status.Phase}
+	if reason, message := podWaitingReason(p); reason != "" {
+		attrs = append(attrs, "waitingReason", reason)
+		if message != "" {
+			attrs = append(attrs, "waitingMessage", message)
+		}
+	}
+	slog.Info("pod current phase", attrs...)
+}
+
+// watchClosedContext builds the structured-error context for a watch-closed /
+// still-pending pod, carrying the phase and any container waiting reason so the
+// returned error itself explains why the pod never terminated.
+func watchClosedContext(namespace, name string, p *corev1.Pod) map[string]any {
+	ctxMap := map[string]any{keyNamespace: namespace, keyName: name, "phase": string(p.Status.Phase)}
+	if reason, message := podWaitingReason(p); reason != "" {
+		ctxMap[keyReason] = reason
+		if message != "" {
+			ctxMap[keyMessage] = message
+		}
+	}
+	return ctxMap
+}
+
+// checkPodPhase returns (true, nil) for Succeeded, (true, error) for Failed,
+// and (false, nil) when the pod is still running/pending.
+func checkPodPhase(p *corev1.Pod) (bool, error) {
+	switch p.Status.Phase {
+	case corev1.PodSucceeded:
+		slog.Info("pod successfully completed", "name", p.Name)
+		return true, nil
+	case corev1.PodFailed:
+		return true, errors.NewWithContext(errors.ErrCodeInternal, "pod failed", map[string]any{
+			keyNamespace: p.Namespace,
+			keyName:      p.Name,
+			keyReason:    p.Status.Reason,
+			keyMessage:   p.Status.Message,
+		})
+	case corev1.PodPending, corev1.PodRunning, corev1.PodUnknown:
+		return false, nil
+	default:
+		return false, nil
+	}
+}
+
+// WaitForJobPodsTermination waits until every pod of the named Job is terminal
+// (Succeeded or Failed) or absent. It lists and watches all pods carrying the
+// Job's job-name label, including pods in their deletion grace period and
+// overlapping replacements, because a deleted Job alone does not establish
+// that its pods have stopped using their credentials (e.g., before per-run
+// RBAC is revoked).
+//
+// The supplied context bounds the entire wait: there is no internal retry
+// limit, and a dead context reports ErrCodeCanceled or ErrCodeTimeout. List
+// and Watch failures remain errors, classified by APIErrorCode, so they are
+// never mistaken for an empty pod list.
+func WaitForJobPodsTermination(ctx context.Context, client kubernetes.Interface, namespace, jobName string) error {
+	selector := jobNameLabel + "=" + jobName
+	for {
+		if err := ctx.Err(); err != nil {
+			return errors.WrapCtxErr(err, errors.ErrCodeTimeout, "waiting for Job pod termination")
+		}
+		pods, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+		if err != nil {
+			return errors.Wrap(APIErrorCode(ctx, err), "failed to list Job pods for termination", err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.WrapCtxErr(ctxErr, errors.ErrCodeTimeout, "waiting for Job pod termination")
+		}
+		active := false
+		for i := range pods.Items {
+			if !isPodTerminal(&pods.Items[i]) {
+				active = true
+				break
+			}
+		}
+		if !active {
+			return nil
+		}
+
+		closed, err := waitForJobPodsChange(ctx, client, namespace, selector, pods.ResourceVersion)
+		if err != nil {
+			return err
+		}
+		if closed {
+			// Pace reconnects on a flapping stream. Re-list with a current
+			// collection RV: an old pod's RV can already have been compacted.
+			select {
+			case <-ctx.Done():
+				return errors.WrapCtxErr(ctx.Err(), errors.ErrCodeTimeout, "waiting for Job pod termination")
+			case <-time.After(jobWatchResumeBackoff):
+			}
+		}
+	}
+}
+
+// waitForJobPodsChange watches from the List's collection RV so a transition
+// between List and Watch is replayed. Every terminal/deleted event triggers a
+// re-list to account for other pods, including replacements. closed reports a
+// watch that ended (channel close or 410 Expired/Gone) and must be re-listed.
+func waitForJobPodsChange(ctx context.Context, client kubernetes.Interface, namespace, selector, resourceVersion string) (closed bool, err error) {
+	watcher, err := client.CoreV1().Pods(namespace).Watch(ctx, metav1.ListOptions{
+		LabelSelector: selector, ResourceVersion: resourceVersion,
+	})
+	if err != nil {
+		if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) {
+			return true, nil
+		}
+		return false, errors.Wrap(APIErrorCode(ctx, err), "failed to watch Job pods for termination", err)
+	}
+	defer watcher.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false, errors.WrapCtxErr(ctx.Err(), errors.ErrCodeTimeout, "waiting for Job pod termination")
+		case event, ok := <-watcher.ResultChan():
+			if !ok {
+				return true, nil
+			}
+			if event.Type == watch.Error {
+				cause := apierrors.FromObject(event.Object)
+				if apierrors.IsResourceExpired(cause) || apierrors.IsGone(cause) {
+					return true, nil
+				}
+				return false, errors.Wrap(APIErrorCode(ctx, cause), "Job pod termination watch error", cause)
+			}
+			p, ok := event.Object.(*corev1.Pod)
+			if ok && (event.Type == watch.Deleted || isPodTerminal(p)) {
+				return false, nil
+			}
+		}
+	}
+}
+
+// isPodTerminal reports whether a pod's phase is terminal (Succeeded or Failed).
+func isPodTerminal(p *corev1.Pod) bool {
+	return p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed
+}
+
+// WaitForPodReady waits for a pod to become ready within the specified timeout.
+// Returns nil if pod becomes ready, error if timeout or pod fails.
+// Uses the watch API for efficient monitoring with a fast-path Get for
+// pods that are already ready or failed.
+func WaitForPodReady(ctx context.Context, client kubernetes.Interface, namespace, name string, timeout time.Duration) error {
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Fast path: pod may already be ready or failed.
+	current, err := client.CoreV1().Pods(namespace).Get(timeoutCtx, name, metav1.GetOptions{})
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to get pod", err)
+	}
+	if done, checkErr := checkPodReady(current); done {
+		return checkErr
+	}
+
+	watcher, err := client.CoreV1().Pods(namespace).Watch(timeoutCtx, metav1.ListOptions{
+		FieldSelector:   "metadata.name=" + name,
+		ResourceVersion: current.ResourceVersion,
+	})
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to watch pod", err)
+	}
+	defer watcher.Stop()
+
+	for {
+		select {
+		case <-timeoutCtx.Done():
+			return errors.WrapCtxErr(timeoutCtx.Err(), errors.ErrCodeTimeout, "waiting for pod to become ready")
+		case event, ok := <-watcher.ResultChan():
+			if !ok {
+				// Watch channels close routinely on apiserver hiccups;
+				// re-Get and reclassify instead of declaring failure.
+				if rcErr := timeoutCtx.Err(); rcErr != nil {
+					return errors.WrapCtxErr(rcErr, errors.ErrCodeTimeout, "waiting for pod to become ready")
+				}
+				current, getErr := client.CoreV1().Pods(namespace).Get(timeoutCtx, name, metav1.GetOptions{})
+				if getErr != nil {
+					return classifyReGetError(timeoutCtx, "pod watch closed and re-Get failed", getErr)
+				}
+				if done, checkErr := checkPodReady(current); done {
+					return checkErr
+				}
+				return errors.NewWithContext(errors.ErrCodeUnavailable,
+					"pod watch closed before pod was ready",
+					watchClosedContext(namespace, name, current))
+			}
+			watchedPod, isPod := event.Object.(*corev1.Pod)
+			if !isPod {
+				continue
+			}
+			logPodPhase(watchedPod)
+			if done, checkErr := checkPodReady(watchedPod); done {
+				return checkErr
+			}
+		}
+	}
+}
+
+// checkPodReady returns (true, nil) when the pod is Ready, (true, error) when
+// the pod has Failed, and (false, nil) otherwise.
+func checkPodReady(p *corev1.Pod) (bool, error) {
+	for _, condition := range p.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+			return true, nil
+		}
+	}
+	if p.Status.Phase == corev1.PodFailed {
+		return true, errors.NewWithContext(errors.ErrCodeInternal, "pod failed", map[string]any{
+			keyNamespace: p.Namespace,
+			keyName:      p.Name,
+			keyReason:    p.Status.Reason,
+			keyMessage:   p.Status.Message,
+		})
+	}
+	return false, nil
+}

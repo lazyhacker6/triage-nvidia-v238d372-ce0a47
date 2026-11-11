@@ -1,0 +1,142 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Carried state for the aicr-managing-openvex skill: the working notes one
+# invocation has to hand the next. Read it at the start of an invocation, and
+# update it at the end. It is NOT part of `.openvex.json`, which is signed,
+# published on every release image, and consumed by scanners that need none of
+# this. It is also not a changelog: what a revision changed belongs in that
+# revision's PR description.
+#
+# Three kinds of entry, each with its own lifecycle. The lifecycle is the point
+# of the file: state that is never removed is what turned the document's
+# `tooling` field into 8,010 bytes of accumulated prose (NVIDIA/aicr#2706).
+#
+#   deferred_verifications  A check that cannot be completed in the session
+#                           that wrote it, because it needs a later CI run.
+#                           DELETE the entry once the check has been RUN and
+#                           PASSED, recording the outcome in the PR that
+#                           resolves it. `resolves_when` must name that outcome,
+#                           never the event that merely makes the check
+#                           runnable: "the release published" is not a result.
+#                           Bind it to the specific run the check names, too: a
+#                           later green run does not discharge an unexamined
+#                           earlier failure.
+#                           A failed check is not a resolution either -- it is
+#                           the finding you are now triaging. Any caveat on
+#                           the evidence that made the check necessary lives on
+#                           the entry and goes with it.
+#   known_negatives         Work already done that came back negative, recorded
+#                           so nobody repeats it. Each carries `invalidated_by`:
+#                           the upstream event that makes it worth re-checking.
+#                           DELETE once that event happens, do not rewrite it as
+#                           history.
+#   deliberate_exclusions   A decision not to act, recorded so the next
+#                           maintainer does not silently reverse it. Also
+#                           carries `invalidated_by`. DELETE when the condition
+#                           it rests on changes.
+#
+# Every entry states what would invalidate it. An entry that cannot say what
+# would invalidate it is not state; it is prose, and it belongs in a PR
+# description or nowhere.
+---
+# Entries here are one-off by design: the skill runs each check at the start of
+# an invocation and deletes the entry once it passes. That is what makes this
+# different from `known_negatives` and `deliberate_exclusions`, which persist
+# until their `invalidated_by` condition fires.
+#
+# A post-merge check belongs here rather than only in a PR description, because
+# the skill reads this file and does not read PR descriptions. A check recorded
+# only in a PR is a check nobody runs.
+deferred_verifications: []
+
+known_negatives: []
+
+deliberate_exclusions:
+  - id: arm64-aiperf-bench-is-never-scanned
+    decided: 2026-09-17
+    decision: >-
+      No image scan covers the linux/arm64 aiperf-bench image, and closing that
+      is deliberately out of scope for this skill. The scan job runs on
+      ubuntu-latest and hands grype the multi-arch manifest, so grype resolves
+      the amd64 leg every time; the arm64 leg is built and published but never
+      scanned. Every claim this skill makes about aiperf-bench is therefore an
+      amd64 measurement plus one inference: the final stage only COPYs a venv,
+      so the Debian package set is exactly the base's, and the base can be
+      scanned per architecture directly (`grype <base> --platform linux/arm64`)
+      when a bump needs it. Do not restate an amd64 scan as an arm64 result.
+    invalidated_by: >-
+      the scan job in .github/workflows/vuln-scan-images.yaml gaining a per-arch
+      leg (or grype gaining manifest-wide scanning), at which point the arm64
+      result is measured and the inference above is no longer load-bearing
+    correction_2026_09_21: >-
+      Scope this to the WEEKLY scan only. The release scan in
+      .github/workflows/on-tag.yaml already has a per-arch leg: its matrix
+      crosses each image with linux/amd64 and linux/arm64 and sets
+      `GRYPE_PLATFORM: ${{ matrix.platform.name }}`, and the v0.22.0-rc1 run
+      produced a distinct `anchore-image-aiperf-bench-arm64` SARIF category. So
+      arm64 IS measured at release time, and an arm64-only finding will block a
+      release even though the weekly scan never sees it. The `invalidated_by`
+      above still stands for vuln-scan-images.yaml, which remains amd64-only.
+
+  - id: percona-image-cves-are-a-digest-bump
+    decided: 2026-10-15
+    decision: >-
+      HIGH+ findings on the six Percona images in the scan matrix
+      (percona-server-mongodb-operator, percona-server-mongodb,
+      mongodb_exporter, percona-backup-mongodb, fluentbit, pmm-client) get no
+      VEX statement. AICR pins them by digest for the remediation mixins'
+      datastore (psmdb-operator, nvsentinel-mongodb) but does not build them,
+      so the fix is a digest bump to a cleaner upstream build. Scale at weekly run 38690982469:
+      percona-server-mongodb 26 critical / 235 high, pmm-client 26 / 130,
+      percona-backup-mongodb 6 / 108, percona-server-mongodb-operator 4 / 25,
+      mongodb_exporter 2 / 21, fluentbit 1 / 17.
+    invalidated_by: >-
+      AICR starting to build any of these images, which would make their
+      reachability provable from source
+
+  - id: nvsentinel-image-cves-are-a-version-bump
+    decided: 2026-11-05
+    decision: >-
+      HIGH+ findings on the nineteen ghcr.io/nvidia/nvsentinel/* images and
+      the nvsentinel chart's two file-server pins (docker.io/bitnamilegacy/nginx,
+      quay.io/martinhelmich/prometheus-nginxlog-exporter) get no VEX
+      statement. AICR builds none of them and runs the NVSentinel ones at the
+      nvsentinel defaultVersion in recipes/registry.yaml, so the fix is a
+      defaultVersion bump. A statement would also never publish:
+      tools/openvex-bind drops statements whose product is not a released
+      AICR image, so one here would only hide the weekly scan's signal.
+    invalidated_by: >-
+      AICR starting to build or release any of these images, which would make
+      their reachability provable from source and a statement publishable
+
+  - id: busybox-init-image-unfixed-highs
+    decided: 2026-09-27
+    decision: >-
+      docker.io/library/busybox:1.38.0 carries three High NVD CPE matches --
+      CVE-2026-38753, CVE-2026-38754, CVE-2026-38755 -- that are deliberately
+      NOT suppressed. Grype reports each with `fix-state: unknown`, so
+      `--only-fixed` already withholds them from the reported counts, and
+      pre-suppressing them would hide them the moment a fix ships. They are
+      also `nvd:cpe` matches against the busybox version range rather than
+      distro-tracked advisories, which is the noisiest source grype has.
+      Accepting them is not a new decision: this is the same digest AICR
+      already ships in the network-operator and gpu-operator manifests, and
+      it replaced an image with 13 critical / 109 high *fixable* findings.
+    invalidated_by: >-
+      a busybox release fixing any of the three (then bump the digest in
+      recipes/components/nvsentinel/values.yaml and the two manifests that
+      share it, together -- the repo deliberately carries one busybox
+      identity), or grype reclassifying them with a known fix state, at which
+      point they must surface rather than be pre-suppressed

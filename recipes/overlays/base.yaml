@@ -1,0 +1,135 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+kind: RecipeMetadata
+apiVersion: aicr.run/v1beta1
+metadata:
+  name: base
+
+spec:
+  # Basic assumptions - will create warning in pre-flight but not block deployment
+  # Constraint names use fully qualified measurement paths: {type}.{subtype}.{key}
+  constraints:
+    - name: K8s.server.version
+      value: ">= 1.32"
+
+  componentRefs:
+    - name: nfd
+      type: Helm
+      source: https://kubernetes-sigs.github.io/node-feature-discovery/charts
+      valuesFile: components/nfd/values.yaml
+      dependencyRefs:
+        - prometheus-operator-crds
+
+    - name: cert-manager
+      type: Helm
+      source: https://charts.jetstack.io
+      valuesFile: components/cert-manager/values.yaml
+      dependencyRefs:
+        - prometheus-operator-crds
+
+    - name: gpu-operator
+      type: Helm
+      source: https://helm.ngc.nvidia.com/nvidia
+      valuesFile: components/gpu-operator/values.yaml
+      dependencyRefs:
+        - nfd
+        - cert-manager
+        - prometheus-operator-crds
+      overrides:
+        daemonsets:
+          # Lives here, not in values.yaml: only an overlay-set list puts this
+          # path in the bundler's append mode (schedulingPathPolicy). NVSentinel's
+          # janitor applies the NoSchedule release taint while operands run; one
+          # that does not tolerate it is misscheduled and blocks every driver
+          # upgrade (#3357). The nvidia.com/gpu entry restates the chart default
+          # this list would otherwise displace when no accelerated tolerations
+          # are supplied (Go SDK).
+          tolerations:
+            - key: nvsentinel.dgxc.nvidia.com/external-remediation
+              operator: Exists
+              effect: NoSchedule
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+
+    - name: nvsentinel
+      type: Helm
+      source: oci://ghcr.io/nvidia
+      valuesFile: components/nvsentinel/values.yaml
+      dependencyRefs:
+        - cert-manager
+        - gpu-operator
+        # Direct edge so a refactor of an intermediate node (e.g.,
+        # removing gpu-operator → kube-prometheus-stack) cannot
+        # silently break the helm-diff race on nvsentinel's
+        # PodMonitor CR. Issue #928.
+        - prometheus-operator-crds
+
+    - name: nodewright-operator
+      type: Helm
+      source: oci://ghcr.io/nvidia/nodewright/charts
+      valuesFile: components/nodewright-operator/values.yaml
+
+    - name: prometheus-operator-crds
+      type: Helm
+      source: https://prometheus-community.github.io/helm-charts
+      valuesFile: components/prometheus-operator-crds/values.yaml
+
+    - name: kube-prometheus-stack
+      type: Helm
+      source: https://prometheus-community.github.io/helm-charts
+      valuesFile: components/kube-prometheus-stack/values.yaml
+      dependencyRefs:
+        - prometheus-operator-crds
+
+    - name: k8s-ephemeral-storage-metrics
+      type: Helm
+      source: https://jmcgrath207.github.io/k8s-ephemeral-storage-metrics/chart
+      valuesFile: components/k8s-ephemeral-storage-metrics/values.yaml
+      dependencyRefs:
+        - kube-prometheus-stack
+        # Direct edge so removing the kube-prometheus-stack edge
+        # would not silently break the helm-diff race on this
+        # chart's ServiceMonitor CR. Issue #928.
+        - prometheus-operator-crds
+
+    - name: nvidia-dra-driver-gpu
+      type: Helm
+      source: oci://registry.k8s.io/dra-driver-nvidia/charts
+      valuesFile: components/nvidia-dra-driver-gpu/values.yaml
+      dependencyRefs:
+        - gpu-operator
+        # Hard dependency when DRA eviction is opted in: until the labeler has
+        # run, no node carries the eviction label and the kubelet plugin sits
+        # at DESIRED=0. Pruned automatically when the bundler drops the labeler.
+        - dra-node-labeler
+
+    # Applies the DRA eviction label from GFD's nvidia.com/gpu.present. Present
+    # in the bundle only when --dra-eviction-node-label is set (#2676). Depends
+    # on gpu-operator because GFD ships as its subchart, so gpu.present does
+    # not exist until the operator is up.
+    - name: dra-node-labeler
+      type: Helm
+      source: ""
+      valuesFile: components/dra-node-labeler/values.yaml
+      dependencyRefs:
+        - gpu-operator
+
+    - name: kai-scheduler
+      type: Helm
+      source: oci://ghcr.io/kai-scheduler/kai-scheduler
+      valuesFile: components/kai-scheduler/values.yaml
+      dependencyRefs:
+        - gpu-operator

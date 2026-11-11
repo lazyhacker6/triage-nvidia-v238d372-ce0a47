@@ -1,0 +1,75 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: 'AICR Build'
+description: 'Builds the aicr CLI and optional snapshot/validator images, and loads requested images into kind.'
+
+inputs:
+  build_cli:
+    description: 'Build and stage the standalone aicr CLI binary at the repository root'
+    required: false
+    default: 'true'
+  build_snapshot_agent:
+    description: 'Build the CUDA-based snapshot agent image and load it into kind'
+    required: false
+    default: 'true'
+  build_validators:
+    description: 'Deprecated: use validator_phases instead. Ignored when validator_phases is set.'
+    required: false
+    default: 'true'
+  validator_phases:
+    description: 'Comma-separated validator phases to build (e.g., "conformance,deployment"), or "none" to skip all. Takes precedence over build_validators.'
+    required: false
+    default: ''
+  snapshot_agent_base_image:
+    description: 'Base image for the snapshot agent image; defaults to .settings.yaml via load-versions'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Build standalone aicr CLI binary
+      if: inputs.build_cli == 'true'
+      shell: bash
+      run: bash "${{ github.action_path }}/build-cli.sh"
+
+    - name: Build snapshot agent CLI binary
+      if: inputs.build_cli != 'true' && inputs.build_snapshot_agent == 'true'
+      shell: bash
+      run: bash "${{ github.action_path }}/build-cli.sh"
+
+    - name: Load snapshot agent image version
+      if: inputs.build_snapshot_agent == 'true' && inputs.snapshot_agent_base_image == ''
+      id: snapshot-versions
+      uses: ./.github/actions/load-versions
+
+    - name: Build snapshot agent image and load into kind
+      if: inputs.build_snapshot_agent == 'true'
+      shell: bash
+      env:
+        SNAPSHOT_AGENT_BASE_IMAGE: ${{ inputs.snapshot_agent_base_image || steps.snapshot-versions.outputs.snapshot_agent_base_image }}
+      run: bash "${{ github.action_path }}/build-snapshot-agent.sh"
+
+    - name: Build validator images and load into kind
+      if: "!(inputs.validator_phases == 'none' || (inputs.validator_phases == '' && inputs.build_validators == 'false'))"
+      shell: bash
+      env:
+        VALIDATOR_PHASES: ${{ inputs.validator_phases }}
+      run: bash "${{ github.action_path }}/build-validator-images.sh"
+
+    - name: Stage aicr binary at repo root
+      if: inputs.build_cli == 'true'
+      shell: bash
+      run: bash "${{ github.action_path }}/stage-cli.sh"

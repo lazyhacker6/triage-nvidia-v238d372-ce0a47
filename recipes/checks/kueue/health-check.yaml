@@ -1,0 +1,173 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kueue Health Check
+#
+# Validates that Kueue is running and healthy in the kueue-system
+# namespace. Asserts resourceflavors / clusterqueues /
+# localqueues.kueue.x-k8s.io are Established=True (verified against
+# chart 0.19.6; re-verify on defaultVersion bump), and that the default
+# quota CRs shipped with the component (ResourceFlavor default-flavor,
+# ClusterQueue cluster-queue, LocalQueue default/default) were admitted
+# and reconciled to Active — a functional proof (CRDs installed,
+# controller reconciling, and flavor/queue resolution) within the
+# assert/error-only allowlist.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: kueue-health-check
+spec:
+  timeouts:
+    assert: 5m
+  steps:
+    - name: validate-crds-established
+      try:
+        # kueue.x-k8s.io group verified in-tree: the manifests this
+        # component ships (recipes/components/kueue/manifests/*.yaml)
+        # use apiVersion kueue.x-k8s.io/v1beta2 for ResourceFlavor,
+        # ClusterQueue, and LocalQueue. Chart 0.19.6 (recipes/registry.yaml).
+        - assert:
+            resource:
+              apiVersion: apiextensions.k8s.io/v1
+              kind: CustomResourceDefinition
+              metadata:
+                name: resourceflavors.kueue.x-k8s.io
+              status:
+                (conditions[?type == 'Established']):
+                  - status: "True"
+        - assert:
+            resource:
+              apiVersion: apiextensions.k8s.io/v1
+              kind: CustomResourceDefinition
+              metadata:
+                name: clusterqueues.kueue.x-k8s.io
+              status:
+                (conditions[?type == 'Established']):
+                  - status: "True"
+        - assert:
+            resource:
+              apiVersion: apiextensions.k8s.io/v1
+              kind: CustomResourceDefinition
+              metadata:
+                name: localqueues.kueue.x-k8s.io
+              status:
+                (conditions[?type == 'Established']):
+                  - status: "True"
+    - name: validate-deployment-exists
+      try:
+        # Guard against vacuous pass on empty namespace: verify the
+        # kueue-controller-manager deployment exists and has at least one ready replica.
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: kueue-controller-manager
+                namespace: kueue-system
+              status:
+                (availableReplicas > `0`): true
+    - name: validate-all-pods-healthy
+      try:
+        # Assert no pods are in unhealthy phases (Pending / Failed /
+        # Unknown) or stuck in Running phase with a known-bad
+        # container-waiting reason (CrashLoopBackOff,
+        # ImagePullBackOff, ErrImagePull, CreateContainerConfigError).
+        # Phase-only filtering misses CrashLoopBackOff because such
+        # pods typically remain in Running phase with an unhealthy
+        # container.
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: kueue-system
+              status:
+                phase: Pending
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: kueue-system
+              status:
+                phase: Failed
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: kueue-system
+              status:
+                phase: Unknown
+        # JMESPath projection (not single-element match): kyverno-json's
+        # sliceNode.Assert gates on exact slice length before per-element
+        # comparison, so a `containerStatuses: - state: ...` shape only
+        # matches single-container pods and silently passes sidecars. Use
+        # `containerStatuses[?...] | length(@) > 0` to fire on any
+        # container at any index. Parallel initContainerStatuses block
+        # below catches init-container failures (invisible to
+        # containerStatuses). Per PR #1245 review (@ArangoGutierrez).
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: kueue-system
+              status:
+                ((containerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: kueue-system
+              status:
+                ((initContainerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true
+    - name: validate-quota-crs-active
+      try:
+        # The default quota CRs ship with the component via registry
+        # manifestFiles (wave N+1), so they must exist wherever this
+        # check runs. v1beta2 is the storage version in chart 0.19.6.
+        #
+        # COUPLING: these asserts are pinned to the DEFAULT CR names. An
+        # overlay that overrides the component's manifestFiles (shipping
+        # its own queue CRs under different names) must also override
+        # healthCheck.assertFile, or this check fails on the missing
+        # default names even though Kueue itself is healthy.
+        - assert:
+            resource:
+              apiVersion: kueue.x-k8s.io/v1beta2
+              kind: ResourceFlavor
+              metadata:
+                name: default-flavor
+        # JMESPath projection over conditions for the same sliceNode
+        # exact-length reason documented above: a raw conditions list
+        # only matches when it is the SOLE condition present.
+        - assert:
+            resource:
+              apiVersion: kueue.x-k8s.io/v1beta2
+              kind: ClusterQueue
+              metadata:
+                name: cluster-queue
+              status:
+                ((conditions || `[]`)[?type == 'Active' && status == 'True'] | length(@) > `0`): true
+        - assert:
+            resource:
+              apiVersion: kueue.x-k8s.io/v1beta2
+              kind: LocalQueue
+              metadata:
+                name: default
+                namespace: default
+              status:
+                ((conditions || `[]`)[?type == 'Active' && status == 'True'] | length(@) > `0`): true

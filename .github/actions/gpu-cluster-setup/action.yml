@@ -1,0 +1,183 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: 'GPU Cluster Setup'
+description: 'Creates a GPU-enabled kind cluster using nvkind with CDI-mode GPU passthrough.'
+
+inputs:
+  kind_node_image:
+    description: 'Kind node image for nvkind cluster creation'
+    required: false
+    default: ''
+  min_gpu_count:
+    description: 'Minimum visible GPU count required before cluster setup'
+    required: true
+  gpu_model_pattern:
+    description: 'Optional grep-compatible GPU model pattern required for visible GPUs'
+    required: false
+    default: ''
+  min_free_disk_gb:
+    description: 'Minimum free disk space on / required before cluster setup'
+    required: false
+    default: '20'
+  min_available_memory_gb:
+    description: 'Minimum available system memory required before cluster setup'
+    required: false
+    default: '8'
+  cluster_create_timeout:
+    description: 'Timeout for nvkind cluster create'
+    required: false
+    default: '900s'
+  control_plane_resource_patches:
+    description: 'Apply kubeadm patches that raise control-plane static pod resource requests'
+    required: false
+    default: 'false'
+  control_plane_leader_election_tuning:
+    description: 'Increase kube-controller-manager and kube-scheduler leader election timeouts for slow CI control planes'
+    required: false
+    default: 'false'
+  leader_election_lease_duration:
+    description: 'Leader election lease duration when control_plane_leader_election_tuning is true'
+    required: false
+    default: '300s'
+  leader_election_renew_deadline:
+    description: 'Leader election renew deadline when control_plane_leader_election_tuning is true'
+    required: false
+    default: '240s'
+  leader_election_retry_period:
+    description: 'Leader election retry period when control_plane_leader_election_tuning is true'
+    required: false
+    default: '10s'
+  api_server_cpu_request:
+    description: 'kube-apiserver CPU request when control_plane_resource_patches is true'
+    required: false
+    default: '1000m'
+  api_server_memory_request:
+    description: 'kube-apiserver memory request when control_plane_resource_patches is true'
+    required: false
+    default: '1Gi'
+  controller_manager_cpu_request:
+    description: 'kube-controller-manager CPU request when control_plane_resource_patches is true'
+    required: false
+    default: '1000m'
+  controller_manager_memory_request:
+    description: 'kube-controller-manager memory request when control_plane_resource_patches is true'
+    required: false
+    default: '512Mi'
+  scheduler_cpu_request:
+    description: 'kube-scheduler CPU request when control_plane_resource_patches is true'
+    required: false
+    default: '500m'
+  scheduler_memory_request:
+    description: 'kube-scheduler memory request when control_plane_resource_patches is true'
+    required: false
+    default: '256Mi'
+  etcd_cpu_request:
+    description: 'etcd CPU request when control_plane_resource_patches is true'
+    required: false
+    default: '1000m'
+  etcd_memory_request:
+    description: 'etcd memory request when control_plane_resource_patches is true'
+    required: false
+    default: '1Gi'
+
+runs:
+  using: 'composite'
+  steps:
+
+    - name: Validate environment
+      shell: bash
+      run: bash "${{ github.action_path }}/validate-env.sh"
+    - name: Load versions
+      id: versions
+      uses: ./.github/actions/load-versions
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      with:
+        go-version: '${{ steps.versions.outputs.go }}'
+        cache: true
+        cache-dependency-path: |
+          go.sum
+
+    - name: Setup build tools
+      uses: ./.github/actions/setup-build-tools
+      with:
+        install_kind: 'true'
+        kind_version: '${{ steps.versions.outputs.kind }}'
+        install_kubectl: 'true'
+        kubectl_version: '${{ steps.versions.outputs.kubectl }}'
+        install_helm: 'true'
+        helm_version: '${{ steps.versions.outputs.helm }}'
+
+    - name: Install nvkind
+      shell: bash
+      env:
+        NVKIND_VERSION: ${{ steps.versions.outputs.nvkind }}
+      run: bash "${{ github.action_path }}/install-nvkind.sh"
+    - name: Runner preflight
+      shell: bash
+      env:
+        GPU_MODEL_PATTERN: ${{ inputs.gpu_model_pattern }}
+        MIN_GPU_COUNT: ${{ inputs.min_gpu_count }}
+        MIN_FREE_DISK_GB: ${{ inputs.min_free_disk_gb }}
+        MIN_AVAILABLE_MEMORY_GB: ${{ inputs.min_available_memory_gb }}
+      run: bash "${{ github.action_path }}/runner-preflight.sh"
+    - name: Configure NVIDIA Container Toolkit for kind
+      shell: bash
+      run: bash "${{ github.action_path }}/configure-nvidia-container-toolkit.sh"
+    - name: Validate Docker GPU access
+      shell: bash
+      run: bash "${{ github.action_path }}/validate-docker-gpu-access.sh"
+    - name: Increase inotify limits
+      shell: bash
+      run: bash "${{ github.action_path }}/increase-inotify-limits.sh"
+    - name: Delete stale kind cluster
+      shell: bash
+      run: bash "${{ github.action_path }}/delete-stale-kind-cluster.sh"
+    - name: Check runner capacity
+      shell: bash
+      env:
+        MIN_FREE_DISK_GB: ${{ inputs.min_free_disk_gb }}
+        MIN_AVAILABLE_MEMORY_GB: ${{ inputs.min_available_memory_gb }}
+      run: bash "${{ github.action_path }}/check-runner-capacity.sh"
+    - name: Warm kind node image
+      if: ${{ inputs.kind_node_image != '' }}
+      shell: bash
+      env:
+        KIND_NODE_IMAGE: ${{ inputs.kind_node_image }}
+        MIN_FREE_DISK_GB: ${{ inputs.min_free_disk_gb }}
+      run: bash "${{ github.action_path }}/warm-kind-node-image.sh"
+    - name: Create GPU-enabled kind cluster
+      shell: bash
+      env:
+        KIND_NODE_IMAGE: ${{ inputs.kind_node_image }}
+        CLUSTER_CREATE_TIMEOUT: ${{ inputs.cluster_create_timeout }}
+        CONTROL_PLANE_RESOURCE_PATCHES: ${{ inputs.control_plane_resource_patches }}
+        CONTROL_PLANE_LEADER_ELECTION_TUNING: ${{ inputs.control_plane_leader_election_tuning }}
+        LEADER_ELECTION_LEASE_DURATION: ${{ inputs.leader_election_lease_duration }}
+        LEADER_ELECTION_RENEW_DEADLINE: ${{ inputs.leader_election_renew_deadline }}
+        LEADER_ELECTION_RETRY_PERIOD: ${{ inputs.leader_election_retry_period }}
+        API_SERVER_CPU_REQUEST: ${{ inputs.api_server_cpu_request }}
+        API_SERVER_MEMORY_REQUEST: ${{ inputs.api_server_memory_request }}
+        CONTROLLER_MANAGER_CPU_REQUEST: ${{ inputs.controller_manager_cpu_request }}
+        CONTROLLER_MANAGER_MEMORY_REQUEST: ${{ inputs.controller_manager_memory_request }}
+        SCHEDULER_CPU_REQUEST: ${{ inputs.scheduler_cpu_request }}
+        SCHEDULER_MEMORY_REQUEST: ${{ inputs.scheduler_memory_request }}
+        ETCD_CPU_REQUEST: ${{ inputs.etcd_cpu_request }}
+        ETCD_MEMORY_REQUEST: ${{ inputs.etcd_memory_request }}
+      run: bash "${{ github.action_path }}/create-gpu-kind-cluster.sh"
+    - name: Print GPUs (nvkind)
+      shell: bash
+      run: nvkind cluster print-gpus --name="${KIND_CLUSTER_NAME}"

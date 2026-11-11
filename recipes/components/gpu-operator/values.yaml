@@ -1,0 +1,247 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# GPU Operator Helm values
+# Base configuration for all deployments
+
+# Override release name prefix to avoid aicr-stack- prefix in resource names
+fullnameOverride: gpu-operator
+
+# driverInstallDir is the host path the operator-validator bind-mounts as
+# the driver-validation container's rootfs target; it must never be "/"
+# (runc rejects mounting over the container rootfs, crash-looping
+# nvidia-operator-validator). Set explicitly here so TestDriverRootLockstep
+# (issue #1087) can verify it. When the operator MANAGES the driver
+# (driver.enabled true), this must equal nvidia-dra-driver-gpu's
+# nvidiaDriverRoot or DRA fails CDI spec generation — change one and you
+# MUST change the other in lockstep. When the operator manages no driver
+# (driver.enabled false, host-installed drivers), the two are independent:
+# driverInstallDir stays at this base default while nvidiaDriverRoot tracks
+# the host driver-userspace location (e.g. kind/oke at "/", gke-cos at
+# /home/kubernetes/bin/nvidia).
+hostPaths:
+  driverInstallDir: /run/nvidia/driver
+
+operator:
+  upgradeCRD: true
+  # The working set grows with node count (about 3.4Gi peak at 2500 GB300
+  # nodes, #3148). The limit covers that; the request stays sized for small
+  # clusters, so raise it through valueOverrideKeys on large ones.
+  resources:
+    limits:
+      cpu: 500m
+      memory: 8Gi
+    requests:
+      cpu: 200m
+      memory: 300Mi
+
+dcgm:
+  enabled: true
+
+toolkit:
+  enabled: true
+
+dcgmExporter:
+  serviceMonitor:
+    enabled: true
+    # 30s for faster HPA metric availability; doubles scrape load vs 60s
+    interval: 30s
+    honorLabels: true
+  # The upstream gpu-operator chart renders the dcgm-exporter ConfigMap from
+  # `config.data` directly — when create is true and data is non-empty, the
+  # chart emits a ConfigMap named `config.name` whose `dcgm-metrics.csv` key
+  # holds the indented `data` block. This is the same content previously
+  # shipped as a separate post-manifest; inlining it keeps the ConfigMap in
+  # the same Helm release as the exporter DaemonSet so install/upgrade are
+  # ordered correctly without a second `kubectl apply` pass.
+  config:
+    name: "dcgm-exporter"
+    create: true
+    data: |
+      # Clocks,,
+      DCGM_FI_DEV_SM_CLOCK,     gauge, SM clock frequency (in MHz).
+      DCGM_FI_DEV_MEM_CLOCK, gauge, Memory clock frequency (in MHz).
+
+      # Temperature,,
+      DCGM_FI_DEV_MEMORY_TEMP, gauge, Memory temperature (in C).
+      DCGM_FI_DEV_GPU_TEMP,    gauge, GPU temperature (in C).
+
+      # Power,,
+      DCGM_FI_DEV_POWER_USAGE,  gauge, Power draw (in W).
+      DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION, counter, Total energy consumption since boot (in mJ).
+
+      # PCIe,,
+      DCGM_FI_PROF_PCIE_TX_BYTES,  counter, Total number of bytes transmitted through PCIe TX (in KB) via NVML.
+      DCGM_FI_PROF_PCIE_RX_BYTES,  counter, Total number of bytes received through PCIe RX (in KB) via NVML.
+      DCGM_FI_DEV_PCIE_REPLAY_COUNTER, counter, Total number of PCIe retries.
+
+      # Utilization (the sample period varies depending on the product),,
+      DCGM_FI_DEV_GPU_UTIL,      gauge, GPU utilization (in %).
+      DCGM_FI_DEV_MEM_COPY_UTIL, gauge, Memory utilization (in %).
+      DCGM_FI_DEV_ENC_UTIL,      gauge, Encoder utilization (in %).
+      DCGM_FI_DEV_DEC_UTIL,      gauge, Decoder utilization (in %).
+
+      # Errors and violations,,
+      DCGM_FI_DEV_XID_ERRORS,            gauge, Value of the last XID error encountered.
+      DCGM_FI_DEV_POWER_VIOLATION,       counter, Throttling duration due to power constraints (in us).
+      DCGM_FI_DEV_THERMAL_VIOLATION,     counter, Throttling duration due to thermal constraints (in us).
+      DCGM_FI_DEV_SYNC_BOOST_VIOLATION,  counter, Throttling duration due to sync-boost constraints (in us).
+      DCGM_FI_DEV_BOARD_LIMIT_VIOLATION, counter, Throttling duration due to board limit constraints (in us).
+      DCGM_FI_DEV_LOW_UTIL_VIOLATION,    counter, Throttling duration due to low utilization (in us).
+      DCGM_FI_DEV_RELIABILITY_VIOLATION, counter, Throttling duration due to reliability constraints (in us).
+
+      # Memory usage,,
+      DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free (in MiB).
+      DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used (in MiB).
+
+      # Retired pages,,
+      DCGM_FI_DEV_RETIRED_SBE,     counter, Total number of retired pages due to single-bit errors.
+      DCGM_FI_DEV_RETIRED_DBE,     counter, Total number of retired pages due to double-bit errors.
+      DCGM_FI_DEV_RETIRED_PENDING, counter, Total number of pages pending retirement.
+
+      # NVLink,,
+      DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL, counter, Total number of NVLink bandwidth counters for all lanes
+      DCGM_FI_PROF_NVLINK_TX_BYTES,       counter, The rate of data transmitted over NVLink not including protocol headers in bytes per second.
+      DCGM_FI_PROF_NVLINK_RX_BYTES,       counter, The rate of data received over NVLink not including protocol headers in bytes per second.
+
+      # Add DCP metrics,,
+      DCGM_FI_PROF_GR_ENGINE_ACTIVE,   gauge, Ratio of time the graphics engine is active (in %).
+      DCGM_FI_PROF_SM_ACTIVE,          gauge, The ratio of cycles an SM has at least 1 warp assigned (in %).
+      DCGM_FI_PROF_SM_OCCUPANCY,       gauge, The ratio of number of warps resident on an SM (in %).
+      DCGM_FI_PROF_PIPE_TENSOR_ACTIVE, gauge, Ratio of cycles the tensor (HMMA) pipe is active (in %).
+      DCGM_FI_PROF_DRAM_ACTIVE,        gauge, Ratio of cycles the device memory interface is active sending or receiving data (in %).
+      DCGM_FI_PROF_PCIE_TX_BYTES,      counter, The number of bytes of active pcie tx data including both header and payload.
+      DCGM_FI_PROF_PCIE_RX_BYTES,      counter, The number of bytes of active pcie rx data including both header and payload.
+
+      # BCP Additional metrics
+      DCGM_FI_DEV_GPU_NVLINK_ERRORS,      gauge, Identifies a GPU NVLink error type returned by DCGM_FI_DEV_GPU_NVLINK_ERRORS.
+
+      # Added RunAI Additional metrics https://docs.run.ai/latest/developer/metrics/metrics-api/#advanced-metrics
+      ## NVLink
+      DCGM_FI_DEV_NVLINK_BANDWIDTH_L0, counter, The number of bytes of active NVLink rx or tx data including both header and payload.
+      ## VGPU License status
+      DCGM_FI_DEV_VGPU_LICENSE_STATUS, gauge, vGPU License status
+      ## Remapped rows
+      DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS, counter, Number of remapped rows for uncorrectable errors
+      DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS, counter, Number of remapped rows for correctable errors
+      DCGM_FI_DEV_ROW_REMAP_FAILURE, gauge, Whether remapping of rows has failed
+      ## Static configuration information. These appear as labels on the other metrics
+      DCGM_FI_DRIVER_VERSION, label, Driver Version
+      ## Profiling metrics
+      DCGM_FI_PROF_PIPE_FP64_ACTIVE, gauge, Ratio of cycles the fp64 pipes are active (in %).
+      DCGM_FI_PROF_PIPE_FP32_ACTIVE, gauge, Ratio of cycles the fp32 pipes are active (in %).
+      DCGM_FI_PROF_PIPE_FP16_ACTIVE, gauge, Ratio of cycles the fp16 pipes are active (in %).
+
+gdrcopy:
+  enabled: true
+
+gfd:
+  enabled: true
+
+driver:
+  # HELD at 580.173.02 — deliberately BEHIND the v26.7.0 chart default of
+  # 595.91.07. Do not advance without EFA validation on P6e hardware.
+  #
+  # NVIDIA documents R595 as backward incompatible with P6e-GB200 EFA. R595
+  # drops NVreg_GrdmaPciTopoCheckOverride (the R580-era escape hatch) and
+  # substitutes a topology check: EFA must sit in an IOMMU group, or GPU and
+  # EFA must share a root port. p6e-gb200/gb300 satisfies neither — measured
+  # on a GB300 EKS node, where EFA (0000:97:00.0) has no iommu_group and
+  # sits under pci0000:84 while the GPU (0000:9d:00.0) is in group 0 under
+  # pci0000:98.
+  #
+  # The failure is proven, not inferred. Running the NCCL NET workload under
+  # 595 with the preflight bypassed, both nodes selected aws-ofi-nccl/EFA/RDMA
+  # and then aborted, with the kernel logging:
+  #   NVRM: dma-buf attach failed: topology not supported for mapping type FORCE_PCIE
+  # Under 580.173.02 on the same two nodes, NCCL NET passed at 43.16 GB/s.
+  #
+  # Scope: the AWS P6e Grace-Blackwell + EFA GPUDirect path specifically. NVLS
+  # passed under 595 (840 GB/s), as did deployment and conformance; NVLink
+  # never touches EFA.
+  #
+  # Holding here is a supported combination, not an untested one: GPU Operator
+  # v26.7.0 lists 580.173.02 as supported (595.91.07 is merely its default),
+  # and DRA driver 0.5.0 requires >= 580. Pinned rather than inherited so a
+  # chart bump is an explicit driver decision, and so BOM/attestation inputs
+  # stay deterministic.
+  #
+  # Do not substitute a newer R580 patch without re-validating EFA —
+  # 580.173.02 is the exact measured baseline. Per-family overrides, so
+  # non-P6e families can advance independently, are tracked separately.
+  version: 580.173.02
+  enabled: true
+  # Replaces useOpenKernelModules, which the chart deprecated and made a
+  # no-op (identical NOTE in v26.3.3 and v26.7.0 values.yaml), so the old
+  # key had already stopped having any effect before this pin moved.
+  #
+  # "auto" pins today's effective behaviour, not a change: it is the chart
+  # default both before and after this bump, and it is what the OCP
+  # ClusterPolicy template already falls back to
+  # (components/gpu-operator-ocp/manifests/clusterpolicy.yaml). Per the
+  # ClusterPolicy CRD, auto selects the recommended module type from the
+  # host's GPU devices and driver branch — which yields open modules on
+  # Blackwell/Grace, where they are required.
+  #
+  # Setting "open" instead would pin the intent the dead key expressed, but
+  # that IS a behaviour change on any hardware where auto currently selects
+  # proprietary, so it needs its own validation rather than riding a version
+  # bump.
+  kernelModuleType: auto
+  maxParallelUpgrades: 5
+  rdma:
+    # Default off: nvidia_peermem only loads against Mellanox MOFED
+    # symbols. AWS EFA (EKS p4d/p5/p5e) and Linode have no MOFED, so
+    # peermem fails to load and the chart's stricter driver-validation
+    # init container blocks the rest of the GPU stack. Overlays that
+    # ship MOFED (AKS via network-operator) explicitly re-enable this.
+    enabled: false
+
+devicePlugin:
+  # Pin AICR's supported production co-installation intent explicitly: the
+  # device plugin is the whole-GPU advertiser (nvidia.com/gpu). Matches the
+  # upstream chart default, but declared so the GPU allocation-policy tuple
+  # is observable to recipe-driven resolution (issue #1327).
+  enabled: true
+  env:
+    - name: DP_DISABLE_HEALTHCHECKS
+      value: "109"
+    - name: DEVICE_LIST_STRATEGY
+      value: cdi-cri,cdi-annotations,volume-mounts
+
+migManager:
+  enabled: true
+
+validator:
+  plugin:
+    # Note: env must have at least one entry due to gpu-operator chart template bug.
+    # When env is empty/null, the chart renders spec.validator.plugin as null instead
+    # of an empty object, causing validation error: "must be of type object: null"
+    env:
+      - name: WITH_WORKLOAD
+        value: "false"
+
+# NFD deployed as standalone shared component — disable sub-chart
+nfd:
+  enabled: false
+
+# Confidential Compute Manager defaults to enabled in the upstream chart
+# (verified still true in v26.7.0); keep it off until AICR has explicit
+# CC-capable hardware support.
+ccManager:
+  enabled: false
+
+# Chart default (enabled) renders an undeclared CRD field.
+kataSandboxDevicePlugin:
+  enabled: false

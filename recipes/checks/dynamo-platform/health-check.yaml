@@ -1,0 +1,110 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Dynamo Platform Health Check
+#
+# Validates that the Dynamo Platform is running and healthy in the
+# dynamo-system namespace:
+# 1. dynamocomponentdeployments.nvidia.com CRD Established=True (the
+#    apiserver will accept DCD CRs the operator manages).
+# 2. dynamo-operator Deployment has at least one available replica.
+# 3. No pods stuck in Pending/Failed/Unknown phases or known-bad
+#    container-waiting states.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: dynamo-platform-health-check
+spec:
+  timeouts:
+    assert: 5m
+  steps:
+    - name: validate-dcd-crd-established
+      try:
+        - assert:
+            resource:
+              apiVersion: apiextensions.k8s.io/v1
+              kind: CustomResourceDefinition
+              metadata:
+                name: dynamocomponentdeployments.nvidia.com
+              status:
+                (conditions[?type == 'Established']):
+                  - status: "True"
+    - name: validate-deployment-exists
+      try:
+        # Match by label, not name: the Helm chart prefixes the Deployment
+        # with the release name (e.g. dynamo-platform-dynamo-operator-
+        # controller-manager), so a hardcoded name: dynamo-operator never
+        # matches and the assert retries to the deadline. The chart sets a
+        # stable app.kubernetes.io/name=dynamo-operator label on the manager
+        # Deployment regardless of release name; List-and-match on it.
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                namespace: dynamo-system
+                labels:
+                  app.kubernetes.io/name: dynamo-operator
+              status:
+                (availableReplicas > `0`): true
+    - name: validate-all-pods-healthy
+      try:
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: dynamo-system
+              status:
+                phase: Pending
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: dynamo-system
+              status:
+                phase: Failed
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: dynamo-system
+              status:
+                phase: Unknown
+        # JMESPath projection (not single-element match): kyverno-json's
+        # sliceNode.Assert gates on exact slice length before per-element
+        # comparison, so a `containerStatuses: - state: ...` shape only
+        # matches single-container pods and silently passes sidecars. Use
+        # `containerStatuses[?...] | length(@) > 0` to fire on any
+        # container at any index. Parallel initContainerStatuses block
+        # below catches init-container failures (invisible to
+        # containerStatuses). Per PR #1245 review (@ArangoGutierrez).
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: dynamo-system
+              status:
+                ((containerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: dynamo-system
+              status:
+                ((initContainerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true

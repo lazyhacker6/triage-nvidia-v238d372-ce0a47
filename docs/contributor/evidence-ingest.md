@@ -1,0 +1,250 @@
+# Evidence Ingest (GP2)
+
+The evidence-ingest pipeline turns a **published, signed** recipe-evidence
+bundle into the **source-keyed tree** that the corroboration dashboard
+generator consumes. It is the bridge between the per-run attestation
+bundles produced by `aicr validate --emit-attestation --push` (see
+[ADR-007](https://github.com/NVIDIA/aicr/blob/main/docs/design/007-recipe-evidence.md)) and the aggregated,
+consensus view. The tree it writes is rendered and served by
+[dashboard-publish (GP5)](evidence-dashboard-publish.md).
+
+The `GPn` labels name stages of the evidence-corroboration pipeline (epic #1400):
+**GP1** signer-allowlist management (`recipes/evidence/allowlist.yaml`),
+**GP2** ingest/verify (this doc), **GP3** dedicated dashboard infrastructure
+(closed as not planned in #1403; the dashboard uses the existing bucket and WIF
+identities), **GP4** consensus/corroboration
+(`pkg/corroborate`), and **GP5** dashboard publish.
+
+Its defining property is **verify-before-count**: a bundle's signature,
+issuer, identity, and source registry are all checked in a step that
+holds no bucket-write credentials, *before* any of its results are
+recorded. Unverified evidence never reaches the tree, and contributors
+never hold credentials to the publish bucket.
+
+## Pipeline
+
+```
+pointer / bundle ref
+        │
+        ▼
+  materialize (ORAS pull, digest-pinned)
+        │
+        ▼
+  verify  ── issuer + identity pins, signature, registry allowlist
+        │        (credential-free; fails closed)
+        ▼
+  classify (allowlist → class + allowlisted)
+        │
+        ▼
+  synthesize  results/<group>/<dashboard>/<tab>/<idHash>/<runId>/
+        │         meta.json + ctrf/<phase>.json
+        ▼
+  publish (separate, credentialed step) → GCS
+```
+
+The Go pieces:
+
+- `pkg/evidence/project` — the synthesis library. Pure and offline: given
+  an already-verified bundle plus its verified signer claims, it derives
+  the coordinate and signer id-hash and writes the run directory. It
+  performs no verification and no network I/O of its own.
+- `tools/evidence-project` — the CLI that wires it together: resolve the
+  OCI ref, enforce the trusted-registry allowlist, materialize once,
+  verify on the unpacked directory with non-empty pins
+  (`pkg/evidence/verifier`), classify, then synthesize.
+- `.github/workflows/evidence-ingest.yaml` + `.github/scripts/evidence-ingest.sh`
+  — the CI driver with two triggers (below) and a fork-safe split between
+  the credential-free verify job and the credentialed publish job.
+
+## Triggers
+
+1. **Push to `recipes/evidence/**`** — community and partner pointers
+   added or refreshed in-tree. Each changed pointer is verified with the
+   signature pinned to the signer the pointer *claims*; the verifier also
+   cross-checks the certificate against that claim, so a pointer cannot
+   lie about who signed.
+2. **`workflow_call` / `workflow_dispatch` with `bundle_ref`** — a
+   first-party UAT run ingests its bundle directly, by ref, with no repo
+   commit. The signature is pinned to the NVIDIA/aicr Actions identity.
+   `uat-aws.yaml`, `uat-gcp.yaml`, `uat-azure.yaml`, and — for real-silicon
+   `service: kind` recipes on the self-hosted GPU runners — `uat-kind.yaml`
+   (DC5 #1278) call this workflow as a dependent `ingest-evidence` job on a
+   successful run, passing the digest-pinned ref read from the conformance
+   step's `evidence/pointer.yaml`. The nvkind lane is a sibling of the cloud
+   lanes: dispatched by the shared `uat-run.yaml` from the `kind-h100`
+   reservation row and scoped to H100 x1, single-GPU (whatever the runner
+   physically has).
+
+## Downstream publishes
+
+A successful ingest lands new evidence in the bucket, so the last job,
+`trigger-publishes`, dispatches the two downstream consumers of that
+evidence:
+
+- [`evidence-dashboard-publish.yaml`](evidence-dashboard-publish.md), to
+  re-render the static evidence dashboard.
+- `testgrid-publish.yml` (TG5), passing the same verified, digest-pinned
+  `bundle_ref` this ingest consumed, plus the calling UAT run's URL (with its
+  attempt) as `run_url` so the TestGrid build links back to it. A direct
+  dispatch of this workflow passes no `run_url`; when backfilling by hand,
+  pass the producing run's URL if known, otherwise leave it empty. The link
+  is format-checked only, not verified against the bundle. Dispatch happens
+  only for the first-party UAT path (`bundle_ref` set) on `main` or a
+  `release/*` ref. A feature-branch UAT or a
+  push-triggered community/partner ingest does not dispatch TestGrid
+  automatically; an allowlisted external bundle can be backfilled manually.
+
+TestGrid treats every dispatch as a hint, not as proof of provenance. Before it
+exchanges GCP credentials, it independently pulls the immutable bundle, verifies
+its signature, and derives trust from the checked-in signer allowlist:
+
+- a verified NVIDIA UAT identity on `main` or `release/*` becomes
+  `source_class=uat`;
+- a verified, allowlisted community or partner identity becomes
+  `source_class=community`; and
+- unsigned, unallowlisted, untrusted-registry, feature-branch first-party, or
+  unexpected-class bundles fail closed.
+
+The workflow has no caller-controlled source-class input, so a manual backfill
+cannot promote external evidence to first-party UAT.
+
+Both dispatches run `needs: publish`, so they inherit the
+`produced == 'true'` gate — a no-op ingest (allowlist-only change, deleted
+pointer) never fires either.
+
+The push-to-`main` ingest path already re-triggers the dashboard through
+that workflow's own `push:` trigger; the dispatch exists for the
+**first-party UAT path**, which reaches this workflow as a nested
+`workflow_call` (`uat-run` → `uat-{aws,gcp,azure}` → `evidence-ingest`,
+already at GitHub's four-level reuse limit). A nested call emits no
+top-level run event and cannot nest a fifth reusable workflow, so a
+`workflow_dispatch` is the only way to start a fresh top-level run — for
+the dashboard or for TestGrid — from that depth. It needs `actions:
+write`, threaded down from the `uat-run` `run-*` jobs through each cloud
+pipeline's `ingest-evidence` job.
+
+The dashboard's `concurrency: { group: pages, cancel-in-progress: false }`
+serializes to one running build and one queued build, the newest dispatch
+superseding the queued one — so a multi-cell nightly batch collapses its
+flurry of ingests into a single coalesced rebuild rather than a backlog.
+Both dispatches are best-effort: a transient failure warns instead of
+failing the calling UAT run, and either can be backfilled manually
+afterward.
+
+## meta.json
+
+Each run directory carries one `meta.json` (schema
+`aicr-corroboration-meta/v1`). It is the **authoritative** coordinate
+source — the directory layout is organizational only. There is no clock
+and no randomness, so output is byte-identical across runs from
+identical input. Fields fall into five provenance classes:
+
+- **content-verified** — from the verified predicate or the verified
+  bundle's recipe bytes.
+- **certificate-verified** — from the verified Fulcio certificate.
+- **workflow-derived** — produced by the verification workflow itself
+  (the Rekor lookup).
+- **allowlist-derived** — the `Allowlist.Classify` verdict over the
+  verified signer.
+- **caller-supplied** — operational metadata the ingest caller passes
+  in; recorded as-is, not covered by the signature.
+
+| Field | Class | Source |
+|---|---|---|
+| `schemaVersion` | constant | `aicr-corroboration-meta/v1` |
+| `coordinate.{group,dashboard,tab}` | content-verified | `recipe.CoordinateFor` over the bundle recipe's criteria |
+| `recipe` | content-verified | predicate `recipe.name` |
+| `profile` | content-verified | lowercase profile path segment (`<name>-<value>`) appended to `coordinate.tab` for profile-bearing recipes; omitted for unprofiled runs. Consumers inverting the coordinate back to criteria strip `-<profile>` from the tab first |
+| `profileSelection` | content-verified | exact-case `name=value` wire-form selection for profile-bearing recipes (omitted otherwise) — the lowercase `profile` segment is lossy, so consumers reconstructing the selection (the dashboard's copy-CLI/copy-config generators) read this field |
+| `signer.idHash` | certificate-verified | `SignerIDHash(issuer, identity)` — the source dedup key |
+| `signer.identity` / `signer.issuer` | certificate-verified | the **verified** cert SAN + OIDC issuer |
+| `signer.class` / `signer.allowlisted` | allowlist-derived | classification (below) |
+| `runId` | caller-supplied (default content-verified) | `--run-id` when passed; else derived as `run-<attestedAt:YYYYMMDDThhmm>` |
+| `aicrVersion` | content-verified | predicate `aicrVersion` |
+| `aicrCommit` | content-verified | predicate `aicrCommit`, the commit the `aicr` binary was built from (omitted when the predicate carries none). The dashboard shows it as a short SHA linking to the commit on GitHub, so runs that share an `aicrVersion` such as `main` stay distinguishable. Display only, never a consensus key |
+| `k8sVersion` | content-verified | predicate `fingerprint.k8sVersion.value` |
+| `k8sConstraint` | content-verified | the recipe's `K8s.server.version` constraint |
+| `bundleDigest` | content-verified | predicate `manifest.digest` |
+| `evidenceRef` | caller-supplied | OCI ref of the signed bundle, as passed by the ingest caller |
+| `rekorLogIndex` | workflow-derived | verified Rekor index (omitted when absent) |
+| `attestedAt` | content-verified | predicate `attestedAt` (the only timestamp) |
+
+`ctrf/<phase>.json` reports are copied for each phase the run produced
+(`deployment`, `performance`, `conformance`); a phase the run did not
+produce is simply absent — never stubbed.
+
+## idHash (producer ↔ consumer contract)
+
+`idHash` is the stable per-signer dedup key the consensus model counts
+distinct values of. It is
+
+```
+idHash = first 32 hex chars (128 bits) of sha256(issuer + "\n" + identity)
+```
+
+defined once in `project.SignerIDHash`. The same verified signer hashes
+to the same value across every recipe and run; two different signers do
+not collide. This is the GP2-producer/GP4-consumer contract — do not
+change the algorithm without migrating both the bucket tree and the
+consumer.
+
+## Classification
+
+`project.Allowlist.Classify` derives a signer's trust tier from the
+**verified** `(issuer, identity)`, never a raw pointer string:
+
+1. With an allowlist loaded, the shared loader (`pkg/evidence/allowlist`,
+   the same one the GP4 consumer `pkg/corroborate` uses) decides: a slug or
+   pattern match wins, `allowlisted=true`.
+2. When no allowlist file is loaded (no `--allowlist` flag), a built-in
+   heuristic admits AICR's own UAT identity (GitHub Actions OIDC +
+   `NVIDIA/aicr`) as `first-party` so it is not mislabeled.
+3. Otherwise `community`, `allowlisted=false` — the fail-closed default.
+   Reported, but never counted toward consensus.
+
+The canonical `recipes/evidence/allowlist.yaml` keys first-party CI signers
+by an anchored `identityPattern` and external contributors/partners by a
+one-way `source` slug — it deliberately does **not** store a cleartext
+`identity` field (the loader rejects one, to keep personal emails out of the
+repo):
+
+```yaml
+schemaVersion: 1.0.0
+firstParty:
+  - label: aicr-uat-aws
+    issuer: https://token.actions.githubusercontent.com
+    identityPattern: '^https://github\.com/NVIDIA/aicr/\.github/workflows/uat-aws\.yaml@refs/heads/.+$'
+community:
+  # Keyed by source slug only — first 32 hex of sha256(issuer + "\n" + identity).
+  - issuer: https://github.com/login/oauth
+    source: 7c4c0edc8c765a95a0f3afdb3bbb8e91
+partner: []
+```
+
+`identityPattern` is a `^…$`-anchored regex (full-string match); the loader
+rejects an over-broad pattern (any wildcard left of the OIDC subject's `@` —
+only the ref may vary) and overlapping entries, so the allowlist cannot
+itself be used to manufacture consensus.
+
+Both the GP2 ingest loader (`pkg/evidence/project`) and the GP4 consumer
+(`pkg/corroborate`) delegate to the shared canonical loader in
+`pkg/evidence/allowlist` (#1505), so producer and consumer parse the
+identical `identityPattern`/`source` schema and classify a verified signer
+identically. The shared loader rejects a cleartext `identity:` field, so
+personal emails cannot be reintroduced by accident.
+
+## Forward limitations
+
+- Today's `pkg/evidence/verifier` populates a verified signer only from
+  an in-artifact `attestation.intoto.jsonl` (DSSE + Fulcio cert). The
+  "statement-only bundle whose signer is carried in the pointer and
+  verified against Rekor by digest" shape is not yet implemented, so such
+  community bundles cannot be ingested — the producer fails closed rather
+  than record an unverified signer.
+- Discovery walks the per-source nested layout
+  `recipes/evidence/<recipe>/<src>/<digest>.yaml` (the
+  `<recipe>/<src>/*.yaml` glob in `pkg/evidence/verifier/discover.go`); a
+  flat `recipes/evidence/<recipe>.yaml` is rejected as an unexpected root file.
+- The publish job writes to `gs://aicr-testgrid-staging/results` using the
+  shared eidosx WIF service account from `uat-gcp.yaml`. GP3 will replace
+  it with a dedicated `objectCreator`-only identity scoped to that prefix.

@@ -1,0 +1,363 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# TestGrid Publish (TG5)
+#
+# Publishes verified evidence bundles to the AICR TestGrid dashboard. Evidence
+# ingest dispatches first-party UAT bundles automatically; manual dispatch supports
+# allowlisted community and partner backfills through the same trust policy.
+#
+# Disabled by default — gated on vars.TESTGRID_PUBLISH_ENABLED == 'true' —
+# until the prod WIF pool/SA exist (see aicr-testgrid Terraform apply).
+#
+# Pipeline:
+#   1. Accept and validate the digest-pinned OCI bundle ref
+#   2. Authenticate to GHCR and verify signature + checked-in signer policy
+#   3. Authenticate to GCP via WIF (publish SA, groups/ prefix write-only)
+#   4. Build testgrid-publish from source
+#   5. Pull the same immutable bundle and write started/junit/finished to GCS
+#
+# Auth:
+#   WIF pool:  aicr-testgrid[-<env>]-github   (aicr-testgrid Terraform)
+#   SA:        aicr-testgrid[-<env>]-publish@<project>
+#   Scope:     objectCreator on gs://nv-aicr-testgrid[-<env>]/groups/ prefix only
+#   For prod, <env> is empty (cluster_name = "aicr-testgrid", unsuffixed);
+#   for staging, <env> = "staging". Buckets are named nv-<cluster> (renamed
+#   for the eidosx → nv-testgrid migration; GCS names are globally unique).
+#   This mirrors terraform/variables.tf in the testgrid repo
+#   (dgxcloud/release-automation/testgrid, aicr/terraform) — verify there
+#   before changing the naming logic in "Resolve GCP config" below.
+#
+# Configuration (GitHub repo variables — no secrets in source):
+#   vars.TESTGRID_PUBLISH_ENABLED   'true' to enable (see gate above)
+#   vars.GCP_PROJECT_NUMBER         GCP project number (WIF provider resource name)
+#   vars.GCP_PROJECT_ID             GCP project ID (SA email)
+#
+# The workflow filename must start with "testgrid-publish" — the WIF binding's
+# attribute_condition in wif-publish.tf restricts impersonation to workflows
+# matching this prefix.
+
+name: TestGrid Publish
+
+# Least-privilege default — job elevates only what it needs.
+permissions:
+  contents: read
+
+on:
+  # Evidence ingest explicitly dispatches this workflow with a verified,
+  # digest-pinned UAT bundle ref. workflow_dispatch is an allowed GITHUB_TOKEN
+  # recursion exception, unlike workflow_run chains from bot-dispatched UAT.
+  # Manual dispatch supports backfills, but never supplies trust classification.
+  workflow_dispatch:
+    inputs:
+      bundle_ref:
+        description: "Allowlisted evidence OCI bundle ref (ghcr.io/<org>/...@sha256:...)"
+        type: string
+        required: true
+      environment:
+        description: "Target environment"
+        type: choice
+        default: "prod"
+        options:
+          - prod
+          - staging
+      run_url:
+        description: "GitHub Actions run that produced the bundle, https://github.com/<owner>/<repo>/actions/runs/<id>[/attempts/<n>] (optional; shown as the build's run link)"
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  # Serialize publishes for the same environment and bundle while one is in
+  # flight. Durable overwrite rejection comes from the publish SA's create-only
+  # IAM grant; it does not make a partially completed upload safely retryable.
+  group: testgrid-publish-${{ format('{0}-{1}', inputs.environment, inputs.bundle_ref) }}
+  cancel-in-progress: false  # never cancel an in-flight GCS write
+
+jobs:
+  publish:
+    name: Publish to TestGrid
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15  # Go build ~2 min + gcloud uploads ~3 min; 15 min is generous
+
+    # Stay disabled until the prod WIF pool/SA exists. The workflow is always
+    # loaded from main; WIF's workflow_ref condition is the security boundary.
+    if: >
+      vars.TESTGRID_PUBLISH_ENABLED == 'true' &&
+      github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: read   # required to pull the evidence OCI bundle from ghcr.io
+      id-token: write  # required for WIF token exchange
+
+    env:
+      # First-party TestGrid policy is stricter than staging evidence ingest:
+      # only main/release UAT identities qualify as source_class=uat.
+      FIRST_PARTY_ISSUER: 'https://token.actions.githubusercontent.com'
+      FIRST_PARTY_IDENTITY: '^https://github\.com/NVIDIA/aicr/\.github/workflows/uat-(aws|gcp|azure|kind)\.yaml@refs/heads/(main|release/.+)$'
+      TRUSTED_REGISTRIES: ${{ vars.EVIDENCE_TRUSTED_REGISTRIES || 'ghcr.io/nvidia' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Resolve environment-specific GCP resource names.
+      # prod  → aicr-testgrid          (no env suffix — matches Terraform cluster_name)
+      # other → aicr-testgrid-<env>
+      - name: Resolve GCP config
+        id: gcp
+        env:
+          TG_ENV: ${{ inputs.environment || 'prod' }}
+          GCP_PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          # Fail fast with a clear message rather than deriving a malformed
+          # WIF provider/SA (e.g. "projects//locations/...") that only
+          # surfaces as a cryptic rejection three steps later at auth time.
+          : "${GCP_PROJECT_NUMBER:?repo variable GCP_PROJECT_NUMBER is unset — set it in Settings > Secrets and variables > Actions > Variables}"
+          : "${GCP_PROJECT_ID:?repo variable GCP_PROJECT_ID is unset — set it in Settings > Secrets and variables > Actions > Variables}"
+          if [ "${TG_ENV}" = "prod" ]; then
+            CLUSTER="aicr-testgrid"
+          else
+            CLUSTER="aicr-testgrid-${TG_ENV}"
+          fi
+          # Buckets were renamed for the eidosx → nv-testgrid migration:
+          # nv-aicr-testgrid[-<env>] (nv- prefix, NVIDIA-neutral — the old
+          # aicr-testgrid[-<env>] names stay in eidosx). Clusters keep their
+          # names.
+          BUCKET="nv-${CLUSTER}"
+          {
+            echo "cluster=${CLUSTER}"
+            echo "bucket=${BUCKET}"
+            echo "wif_provider=projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${CLUSTER}-github/providers/github-actions"
+            echo "wif_sa=${CLUSTER}-publish@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+          } >> "${GITHUB_OUTPUT}"
+          # Note: `environment` is fully encoded in `bucket` (bucket ==
+          # nv-aicr-testgrid[-<env>]) and is not passed to
+          # testgrid-publish separately — the tool only needs --bucket.
+
+      - name: Load versions
+        id: versions
+        uses: ./.github/actions/load-versions
+
+      - name: Set up YAML tooling
+        uses: ./.github/actions/setup-build-tools
+        with:
+          install_yq: 'true'
+          yq_version: ${{ steps.versions.outputs.yq }}
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: false
+
+      # Validate the digest-pinned OCI ref supplied by evidence ingest or a
+      # manual backfill. Pass it through env rather than inline shell expansion.
+      - name: Resolve bundle ref
+        id: bundle
+        env:
+          BUNDLE_REF: ${{ inputs.bundle_ref }}
+        run: |
+          set -euo pipefail
+          # Network pulls are separately restricted by TRUSTED_REGISTRIES, and
+          # signer trust is derived from verified certificate claims below.
+          #
+          # Uses bash's [[ =~ ]] (whole-string match, POSIX ERE) rather than
+          # `echo | grep -qE`, which is line-based: a value containing an
+          # embedded newline (e.g. "valid-ref\nfoo=bar") would pass grep
+          # because at least one *line* matches, while the newline still
+          # reaches `echo >> GITHUB_OUTPUT` below and injects a second,
+          # attacker-controlled output key. [[ =~ ]] anchors ^ and $ to the
+          # start/end of the whole variable, so an embedded newline fails.
+          if [[ ! "${BUNDLE_REF}" =~ ^ghcr\.io/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::BUNDLE_REF '${BUNDLE_REF}' does not match expected format ghcr.io/<org>/...@sha256:<64hex>"
+            exit 1
+          fi
+          echo "bundle_ref=${BUNDLE_REF}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved bundle: ${BUNDLE_REF}"
+
+      # Fail a malformed manual run_url before verification and GCP auth;
+      # testgrid-publish applies the same rule before writing anything.
+      - name: Validate run URL
+        env:
+          RUN_URL: ${{ inputs.run_url }}
+        run: |
+          set -euo pipefail
+          # Owner and repo need a non-dot character, so "." and ".." cannot pass.
+          seg='[A-Za-z0-9_.-]*[A-Za-z0-9_-][A-Za-z0-9_.-]*'
+          run_re="^https://github\.com/${seg}/${seg}/actions/runs/[0-9]+(/attempts/[0-9]+)?$"
+          if [[ -n "${RUN_URL}" && ! "${RUN_URL}" =~ ${run_re} ]]; then
+            echo "::error::run_url must be https://github.com/<owner>/<repo>/actions/runs/<id>[/attempts/<n>]"
+            exit 1
+          fi
+
+      # Community/partner evidence must have a reviewed pointer on main. Its
+      # claimed signer is escaped into an exact regexp and then cross-checked
+      # against the verified Fulcio certificate by evidence-project. A bundle
+      # with no pointer gets only the narrow first-party UAT policy.
+      - name: Resolve signer policy
+        id: policy
+        env:
+          BUNDLE_REF: ${{ steps.bundle.outputs.bundle_ref }}
+        run: |
+          set -euo pipefail
+          escape_regexp() {
+            printf '%s' "$1" | sed -e 's/[][\\.^$*+?(){}|]/\\&/g'
+          }
+
+          matches=()
+          while IFS= read -r -d '' pointer; do
+            OCI="$(yq -r '.attestations[0].bundle.oci // ""' "${pointer}")"
+            DIGEST="$(yq -r '.attestations[0].bundle.digest // ""' "${pointer}")"
+            if [[ -n "${OCI}" && -n "${DIGEST}" && "${OCI}@${DIGEST}" == "${BUNDLE_REF}" ]]; then
+              matches+=("${pointer}")
+            fi
+          done < <(find recipes/evidence -type f -name '*.yaml' \
+            ! -name allowlist.yaml -print0)
+
+          if [[ "${#matches[@]}" -gt 1 ]]; then
+            echo "::error::bundle ref matches multiple checked-in evidence pointers"
+            exit 1
+          fi
+          if [[ "${#matches[@]}" -eq 1 ]]; then
+            POINTER="${matches[0]}"
+            EXPECTED_ISSUER="$(yq -r '.attestations[0].signer.issuer // ""' "${POINTER}")"
+            IDENTITY="$(yq -r '.attestations[0].signer.identity // ""' "${POINTER}")"
+            if [[ -z "${EXPECTED_ISSUER}" || -z "${IDENTITY}" ]] ||
+               [[ "${EXPECTED_ISSUER}" == *$'\n'* || "${EXPECTED_ISSUER}" == *$'\r'* ]] ||
+               [[ "${IDENTITY}" == *$'\n'* || "${IDENTITY}" == *$'\r'* ]]; then
+              echo "::error::checked-in pointer has an invalid signer claim"
+              exit 1
+            fi
+            EXPECTED_IDENTITY_REGEXP="^$(escape_regexp "${IDENTITY}")$"
+            echo "Using checked-in signer policy from ${POINTER}"
+          else
+            EXPECTED_ISSUER="${FIRST_PARTY_ISSUER}"
+            EXPECTED_IDENTITY_REGEXP="${FIRST_PARTY_IDENTITY}"
+            echo "No checked-in pointer; requiring first-party UAT signer policy"
+          fi
+          {
+            echo "expected_issuer=${EXPECTED_ISSUER}"
+            echo "expected_identity_regexp=${EXPECTED_IDENTITY_REGEXP}"
+          } >> "${GITHUB_OUTPUT}"
+
+      # Authenticate to GHCR and verify provenance before exchanging GCP
+      # credentials. evidence-project rejects unsigned/invalid bundles, then the
+      # policy step admits only a signer matched by the checked-in allowlist.
+      - name: Login to GHCR
+        uses: ./.github/actions/ghcr-login
+
+      - name: Build evidence verifier
+        run: |
+          set -euo pipefail
+          go build \
+            -o /tmp/evidence-project ./tools/evidence-project
+
+      - name: Verify evidence provenance
+        env:
+          BUNDLE_REF: ${{ steps.bundle.outputs.bundle_ref }}
+          EXPECTED_ISSUER: ${{ steps.policy.outputs.expected_issuer }}
+          EXPECTED_IDENTITY_REGEXP: ${{ steps.policy.outputs.expected_identity_regexp }}
+        run: |
+          set -euo pipefail
+          /tmp/evidence-project \
+            -in "${BUNDLE_REF}" \
+            -out /tmp/testgrid-verified-evidence \
+            --expected-issuer "${EXPECTED_ISSUER}" \
+            --expected-identity-regexp "${EXPECTED_IDENTITY_REGEXP}" \
+            --allowlist recipes/evidence/allowlist.yaml \
+            --trusted-registry "${TRUSTED_REGISTRIES}"
+
+      - name: Derive source class from verified signer
+        id: source
+        run: |
+          set -euo pipefail
+          mapfile -d '' META_FILES < <(
+            find /tmp/testgrid-verified-evidence -type f -name meta.json -print0
+          )
+          if [[ "${#META_FILES[@]}" -ne 1 ]]; then
+            echo "::error::expected exactly one verified meta.json, found ${#META_FILES[@]}"
+            exit 1
+          fi
+
+          META="${META_FILES[0]}"
+          ALLOWLISTED="$(jq -r '.signer.allowlisted' "${META}")"
+          CLASS="$(jq -r '.signer.class' "${META}")"
+          ISSUER="$(jq -r '.signer.issuer' "${META}")"
+          IDENTITY="$(jq -r '.signer.identity' "${META}")"
+          if [[ "${ALLOWLISTED}" != "true" ]]; then
+            echo "::error::verified signer is not allowlisted"
+            exit 1
+          fi
+
+          case "${CLASS}" in
+            first-party)
+              if [[ "${ISSUER}" != "${FIRST_PARTY_ISSUER}" ]] ||
+                 [[ ! "${IDENTITY}" =~ ${FIRST_PARTY_IDENTITY} ]]; then
+                echo "::error::first-party signer is not an allowed main/release UAT identity"
+                exit 1
+              fi
+              SOURCE_CLASS=uat
+              ;;
+            community|partner)
+              SOURCE_CLASS=community
+              ;;
+            *)
+              echo "::error::unsupported verified signer class '${CLASS}'"
+              exit 1
+              ;;
+          esac
+          echo "source_class=${SOURCE_CLASS}" >> "${GITHUB_OUTPUT}"
+
+      # Exchange GCP credentials only after provenance verification succeeds.
+      - name: Authenticate to GCP
+        id: gcp-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
+        with:
+          workload_identity_provider: ${{ steps.gcp.outputs.wif_provider }}
+          service_account: ${{ steps.gcp.outputs.wif_sa }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db  # v3.0.1
+
+      # Always build from source — ensures the binary matches the current
+      # commit and avoids integrity risks from downloading a release artifact
+      # into a privileged WIF context. goreleaser packages testgrid-publish
+      # for local / manual use; the workflow always builds from vendor.
+      - name: Build testgrid-publish
+        run: |
+          set -euo pipefail
+          go build \
+            -o /tmp/testgrid-publish ./tools/testgrid-publish
+
+      # Pass all user-controlled values through env — never inline ${{ }}
+      # expressions in run: scripts to prevent script injection.
+      - name: Publish to TestGrid
+        env:
+          BUNDLE_REF: ${{ steps.bundle.outputs.bundle_ref }}
+          TG_BUCKET: ${{ steps.gcp.outputs.bucket }}
+          TG_SOURCE_CLASS: ${{ steps.source.outputs.source_class }}
+          TG_RUN_URL: ${{ inputs.run_url }}
+        run: |
+          set -euo pipefail
+          /tmp/testgrid-publish \
+            --bundle "${BUNDLE_REF}" \
+            --bucket "${TG_BUCKET}" \
+            --source-class "${TG_SOURCE_CLASS}" \
+            --run-url "${TG_RUN_URL}"

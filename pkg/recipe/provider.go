@@ -1,0 +1,818 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package recipe
+
+import (
+	"context"
+	"embed"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"gopkg.in/yaml.v3"
+)
+
+// readExternalFile streams a file under baseDir through io.LimitReader
+// against maxBytes. Callers pass the configured per-provider limit
+// (LayeredProviderConfig.MaxFileSize) so a smaller-than-default cap
+// still applies under TOCTOU swaps.
+//
+// Path handling is defense-in-depth:
+//
+//   - filepath.IsLocal(relPath) rejects absolute paths, parent-directory
+//     refs (..), and (on Windows) reserved device names. It also acts
+//     as a path-injection sanitizer for static analysis, so callers can
+//     pass relPath values derived from external data without tripping
+//     go/path-injection.
+//   - When allowSymlinks is false (the default), os.OpenRoot confines
+//     all opens to baseDir at the syscall level. If a regular file gets
+//     swapped to a symlink between walk-time validation and the read,
+//     Root.Open will refuse to follow it — preventing a post-validation
+//     symlink escape that plain os.Open would silently honor.
+//   - When allowSymlinks is true the caller has explicitly opted into
+//     symlink resolution at walk time, so the read falls back to plain
+//     os.Open with a containment check on the resolved target so a
+//     symlink whose target points outside baseDir is still rejected.
+//
+// The walk-time MaxFileSize check on LayeredDataProvider is best-effort;
+// a TOCTOU window or network-mount swap can substitute a much larger
+// file between walk and read, so the read-time bound is the
+// authoritative guard.
+func readExternalFile(baseDir, relPath string, maxBytes int64, allowSymlinks bool) ([]byte, error) {
+	if !filepath.IsLocal(relPath) {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("external data path %q is not local to base directory", relPath))
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaults.MaxExternalDataFileBytes
+	}
+	f, err := openExternalFile(baseDir, relPath, allowSymlinks)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("external data file %q exceeds %d-byte limit", relPath, maxBytes))
+	}
+	return data, nil
+}
+
+// openExternalFile opens relPath under baseDir using the path-confinement
+// strategy appropriate to the provider's symlink policy. See readExternalFile
+// for the rationale.
+func openExternalFile(baseDir, relPath string, allowSymlinks bool) (*os.File, error) {
+	if !allowSymlinks {
+		root, err := os.OpenRoot(baseDir)
+		if err != nil {
+			return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal,
+				fmt.Sprintf("failed to open base directory %q", baseDir), err)
+		}
+		defer func() { _ = root.Close() }()
+		return root.Open(relPath)
+	}
+	// AllowSymlinks=true: caller opted into symlinks at walk time, but the
+	// resolved target must still be contained in baseDir. Resolve both
+	// sides through EvalSymlinks so the comparison is robust on platforms
+	// where the temp/data root itself is a symlink (e.g., macOS's
+	// /var/folders -> /private/var/folders).
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal,
+			fmt.Sprintf("failed to resolve base directory %q", baseDir), err)
+	}
+	canonicalBase, err := filepath.EvalSymlinks(absBase)
+	if err != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal,
+			fmt.Sprintf("failed to canonicalize base directory %q", baseDir), err)
+	}
+	fullPath := filepath.Join(canonicalBase, relPath)
+	resolved, err := filepath.EvalSymlinks(fullPath)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(resolved, canonicalBase+string(filepath.Separator)) && resolved != canonicalBase {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("external data path %q resolves outside base directory", relPath))
+	}
+	return os.Open(resolved) //nolint:gosec // resolved is verified to be within canonicalBase above
+}
+
+// DataProvider abstracts access to recipe data files.
+// This allows layering external directories over embedded data.
+//
+// Implementations must be comparable per the Go language spec: per-provider
+// caches (the metadata store, component registry, and criteria registry) key
+// by interface value via sync.Map, which panics at runtime if the dynamic
+// type is non-comparable (e.g., a struct containing a slice, map, or func
+// field). The safe and idiomatic shape is methods on a pointer receiver, as
+// the in-tree EmbeddedDataProvider / LayeredDataProvider do.
+//
+// ReadFile and WalkDir accept a context.Context. Cancellation is honored
+// at I/O boundaries — before each file open, and between WalkDir entries —
+// not mid-syscall on an in-flight read. The in-tree LayeredDataProvider
+// reads external files through os.Open + io.ReadAll, which are not
+// cancelable once started; a caller that cancels mid-syscall (e.g. on a
+// stalled NFS / sshfs mount mid-readv) will see the cancellation honored
+// on the *next* file the walk touches, not on the one currently blocked.
+// Embedded reads are in-memory and cannot hang; they honor cancellation
+// before each I/O for symmetry. Source is pure metadata and is not
+// context-aware.
+type DataProvider interface {
+	// ReadFile reads a file by path (relative to data directory). Returns
+	// the context's error if it is canceled before the read completes.
+	ReadFile(ctx context.Context, path string) ([]byte, error)
+
+	// WalkDir walks the directory tree rooted at root. Returns the
+	// context's error if it is canceled mid-walk.
+	WalkDir(ctx context.Context, root string, fn fs.WalkDirFunc) error
+
+	// Source returns a description of where data came from (for debugging).
+	Source(path string) string
+}
+
+// EmbeddedDataProvider wraps an embed.FS to implement DataProvider.
+type EmbeddedDataProvider struct {
+	fs     embed.FS
+	prefix string // e.g., "data" to strip from paths
+}
+
+// NewEmbeddedDataProvider creates a provider from an embedded filesystem.
+func NewEmbeddedDataProvider(efs embed.FS, prefix string) *EmbeddedDataProvider {
+	return &EmbeddedDataProvider{
+		fs:     efs,
+		prefix: prefix,
+	}
+}
+
+// ReadFile reads a file from the embedded filesystem.
+func (p *EmbeddedDataProvider) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeTimeout, fmt.Sprintf("context canceled before reading %q", path), err)
+	}
+	fullPath := filepath.ToSlash(filepath.Clean(filepath.Join(p.prefix, path)))
+	slog.Debug("reading file from embedded provider", "path", path, "fullPath", fullPath)
+	return p.fs.ReadFile(fullPath)
+}
+
+// WalkDir walks the embedded filesystem.
+func (p *EmbeddedDataProvider) WalkDir(ctx context.Context, root string, fn fs.WalkDirFunc) error {
+	fullRoot := filepath.ToSlash(filepath.Clean(filepath.Join(p.prefix, root)))
+	if fullRoot == "" || fullRoot == "." {
+		fullRoot = "." // embed.FS expects "." for root
+	}
+	slog.Debug("walking embedded filesystem", "root", root, "fullRoot", fullRoot)
+	return fs.WalkDir(p.fs, fullRoot, func(path string, d fs.DirEntry, err error) error {
+		// Honor caller cancellation between entries — embed.FS reads
+		// can't hang but a slow callback (e.g. one that does its own
+		// I/O) still benefits from short-circuiting on cancel.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return aicrerrors.Wrap(aicrerrors.ErrCodeTimeout, "context canceled during embedded walk", ctxErr)
+		}
+		// Strip the prefix before passing to callback
+		var relPath string
+		normalizedPrefix := filepath.ToSlash(p.prefix)
+		if normalizedPrefix == "" || normalizedPrefix == "." {
+			relPath = path
+		} else {
+			relPath = strings.TrimPrefix(path, normalizedPrefix+"/")
+			if relPath == normalizedPrefix {
+				relPath = ""
+			}
+		}
+		return fn(relPath, d, err)
+	})
+}
+
+// Source returns "embedded" for all paths.
+func (p *EmbeddedDataProvider) Source(path string) string {
+	return sourceEmbedded
+}
+
+// LayeredDataProvider overlays an external directory on top of embedded data.
+// For registryFileName: merges external components with embedded (external takes precedence).
+// An external overlay replaces the embedded one at the same path, unless it carries
+// only a profile declaration. That patch adds values to the embedded overlay's profile.
+// For all other files: external completely replaces embedded if present.
+// ExternalOnly disables all embedded reads and merges.
+type LayeredDataProvider struct {
+	externalOnly bool
+	embedded     *EmbeddedDataProvider
+	externalDir  string
+
+	// maxFileSize bounds read-time loads against the same limit the walk-time
+	// check uses, so a TOCTOU swap on a network mount cannot bypass a
+	// configured smaller-than-default cap.
+	maxFileSize int64
+
+	// allowSymlinks mirrors LayeredProviderConfig.AllowSymlinks so the
+	// read-time helper can pick between os.OpenRoot (strict, no symlinks)
+	// and a containment-checked EvalSymlinks path (caller opted in).
+	allowSymlinks bool
+
+	// Cached merged registry (computed once on first access)
+	mergedRegistryOnce sync.Once
+	mergedRegistry     []byte
+	mergedRegistryErr  error
+
+	// Cached merged catalog (computed once on first access)
+	mergedCatalogOnce sync.Once
+	mergedCatalog     []byte
+	mergedCatalogErr  error
+
+	// Track which files came from external (for debugging)
+	externalFiles map[string]bool
+
+	// patchedOverlays holds the overlay paths whose external file was a profile
+	// patch, recorded by ReadFile so Source can report their embedded origin.
+	patchedOverlays sync.Map
+}
+
+// LayeredProviderConfig configures the layered data provider.
+type LayeredProviderConfig struct {
+	// ExternalOnly disables embedded fallback and merging for complete catalogs.
+	ExternalOnly bool
+
+	// ExternalDir is the path to the external data directory.
+	ExternalDir string
+
+	// MaxFileSize is the maximum allowed file size in bytes (default: 10MB).
+	MaxFileSize int64
+
+	// AllowSymlinks allows symlinks in the external directory (default: false).
+	AllowSymlinks bool
+}
+
+const (
+	// CatalogSourceEmbedded is the Source value for overlays shipped with the
+	// binary (built-in OSS recipes).
+	CatalogSourceEmbedded = "embedded"
+
+	// CatalogSourceExternal is the Source value for overlays loaded from an
+	// external --data directory.
+	CatalogSourceExternal = "external"
+
+	// sourceEmbedded is the internal alias kept for backward compatibility
+	// within this package.
+	sourceEmbedded = CatalogSourceEmbedded
+
+	// sourceExternal is the internal alias kept for backward compatibility
+	// within this package.
+	sourceExternal = CatalogSourceExternal
+
+	// sourceMerged is the source name for files merged from both embedded and external.
+	sourceMerged = "merged (" + sourceEmbedded + " + " + sourceExternal + ")"
+
+	// RegistryFileName is the name of the component registry file.
+	RegistryFileName = "registry.yaml"
+
+	// CatalogFileName is the name of the validator catalog file.
+	CatalogFileName = "validators/catalog.yaml"
+
+	registryFileName = RegistryFileName
+	catalogFileName  = CatalogFileName
+)
+
+// NewLayeredDataProvider creates a provider that layers external data over embedded.
+// Returns an error if:
+// - External directory doesn't exist
+// - External directory doesn't contain registryFileName
+// - Path traversal is detected
+// - File size exceeds limits
+func NewLayeredDataProvider(embedded *EmbeddedDataProvider, config LayeredProviderConfig) (*LayeredDataProvider, error) {
+	slog.Debug("creating layered data provider",
+		"external_dir", config.ExternalDir,
+		"max_file_size", config.MaxFileSize,
+		"allow_symlinks", config.AllowSymlinks)
+
+	if config.MaxFileSize == 0 {
+		// Single source of truth: same constant readExternalFile uses
+		// when its caller passes a non-positive maxBytes, so direct
+		// helper callers and provider-backed reads cannot drift.
+		config.MaxFileSize = defaults.MaxExternalDataFileBytes
+	}
+
+	// Validate external directory exists
+	slog.Debug("validating external directory")
+	info, err := os.Stat(config.ExternalDir)
+	if err != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeNotFound,
+			fmt.Sprintf("external data directory not found: %s", config.ExternalDir), err)
+	}
+	if !info.IsDir() {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("external data path is not a directory: %s", config.ExternalDir))
+	}
+
+	// Validate registryFileName exists in external directory
+	registryPath := filepath.Join(config.ExternalDir, registryFileName)
+	slog.Debug("checking for required registry file", "path", registryPath)
+	if _, statErr := os.Stat(registryPath); statErr != nil {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("%s is required in external data directory: %s", registryFileName, config.ExternalDir))
+	}
+	slog.Debug("registry file found", "path", registryPath)
+
+	// Validate external directory for security issues
+	slog.Debug("scanning external directory for security issues")
+	externalFiles := make(map[string]bool)
+	err = filepath.WalkDir(config.ExternalDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "failed to walk external directory", err)
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		// Get relative path
+		relPath, relErr := filepath.Rel(config.ExternalDir, path)
+		if relErr != nil {
+			return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "failed to get relative path", relErr)
+		}
+
+		// Reject any path that escapes the external root or contains
+		// reserved segments. filepath.IsLocal is the canonical check (rejects
+		// absolute paths, drive letters, ".." segments, and reserved names)
+		// and avoids the false positives a substring scan for ".." produces
+		// on benign names like "foo..bak".
+		if !filepath.IsLocal(relPath) {
+			return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+				fmt.Sprintf("path traversal or non-local path detected: %s", relPath))
+		}
+
+		// Check for symlinks
+		if !config.AllowSymlinks {
+			info, lstatErr := os.Lstat(path)
+			if lstatErr != nil {
+				return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "failed to stat file", lstatErr)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+					fmt.Sprintf("symlinks not allowed: %s", relPath))
+			}
+		}
+
+		// Check file size
+		info, statErr := d.Info()
+		if statErr != nil {
+			return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "failed to get file info", statErr)
+		}
+		if info.Size() > config.MaxFileSize {
+			return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+				fmt.Sprintf("file too large (%d bytes, max %d): %s", info.Size(), config.MaxFileSize, relPath))
+		}
+
+		externalFiles[filepath.ToSlash(relPath)] = true
+		slog.Debug("discovered external file",
+			"path", relPath,
+			"size", info.Size())
+		return nil
+	})
+	if err != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "external directory validation failed", err)
+	}
+
+	slog.Info("layered data provider initialized",
+		"external_dir", config.ExternalDir,
+		"external_files", len(externalFiles))
+
+	// Log all external files at debug level for troubleshooting
+	for path := range externalFiles {
+		slog.Debug("external file registered", "path", path)
+	}
+
+	return &LayeredDataProvider{
+		externalOnly:  config.ExternalOnly,
+		embedded:      embedded,
+		externalDir:   config.ExternalDir,
+		maxFileSize:   config.MaxFileSize,
+		allowSymlinks: config.AllowSymlinks,
+		externalFiles: externalFiles,
+	}, nil
+}
+
+// ExternalFiles returns a sorted list of file paths that came from the external
+// data directory. Paths are relative to the external directory root.
+func (p *LayeredDataProvider) ExternalFiles() []string {
+	files := make([]string, 0, len(p.externalFiles))
+	for path := range p.externalFiles {
+		files = append(files, path)
+	}
+	sort.Strings(files)
+	return files
+}
+
+// ExternalDir returns the path to the external data directory.
+func (p *LayeredDataProvider) ExternalDir() string {
+	return p.externalDir
+}
+
+// ReadFile reads a file, checking external directory first.
+// For registryFileName, returns merged content.
+// For an overlay that carries only a profile declaration, returns the embedded overlay
+// with those values added to its profile. For other files, external completely
+// replaces embedded.
+func (p *LayeredDataProvider) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeTimeout, fmt.Sprintf("context canceled before reading %q", path), err)
+	}
+	slog.Debug("reading file from layered provider", "path", path)
+
+	lookupPath := filepath.ToSlash(path)
+	if p.externalOnly {
+		data, err := readExternalFile(p.externalDir, lookupPath, p.maxFileSize, p.allowSymlinks)
+		if err != nil {
+			return nil, aicrerrors.PropagateOrWrap(err, aicrerrors.ErrCodeInvalidRequest, "failed to read external catalog file")
+		}
+		return data, nil
+	}
+
+	// Special handling for registry file - merge instead of replace
+	if lookupPath == registryFileName {
+		slog.Debug("reading merged registry file")
+		return p.getMergedRegistry(ctx)
+	}
+
+	// Special handling for catalog file - merge instead of replace (when external exists)
+	if lookupPath == catalogFileName && p.externalFiles[catalogFileName] {
+		slog.Debug("reading merged catalog file")
+		return p.getMergedCatalog(ctx)
+	}
+
+	// Check external directory first
+	if p.externalFiles[lookupPath] {
+		data, err := readExternalFile(p.externalDir, lookupPath, p.maxFileSize, p.allowSymlinks)
+		if err != nil {
+			return nil, aicrerrors.PropagateOrWrap(err, aicrerrors.ErrCodeInternal, fmt.Sprintf("failed to read external file %s", path))
+		}
+		patched := false
+		if isOverlay, _ := filepath.Match("overlays/*.yaml", lookupPath); isOverlay {
+			if embeddedData, embErr := p.embedded.ReadFile(ctx, lookupPath); embErr == nil {
+				merged, isPatch, patchErr := patchOverlayProfile(lookupPath, embeddedData, data)
+				if patchErr != nil {
+					return nil, patchErr
+				}
+				if isPatch {
+					patched = true
+					slog.Info("external overlay extends the embedded profile", "path", lookupPath)
+					data = merged
+				}
+			}
+		}
+		if patched {
+			p.patchedOverlays.Store(lookupPath, struct{}{})
+			if path != lookupPath {
+				p.patchedOverlays.Store(path, struct{}{})
+			}
+		} else {
+			p.patchedOverlays.Delete(lookupPath)
+			if path != lookupPath {
+				p.patchedOverlays.Delete(path)
+			}
+		}
+		slog.Debug("read from external data directory", "path", path)
+		return data, nil
+	}
+
+	// Fall back to embedded
+	slog.Debug("falling back to embedded data", "path", path)
+	return p.embedded.ReadFile(ctx, lookupPath)
+}
+
+// WalkDir walks both embedded and external directories.
+// External files take precedence over embedded files.
+func (p *LayeredDataProvider) WalkDir(ctx context.Context, root string, fn fs.WalkDirFunc) error {
+	if err := ctx.Err(); err != nil {
+		return aicrerrors.Wrap(aicrerrors.ErrCodeTimeout, fmt.Sprintf("context canceled before walking %q", root), err)
+	}
+	slog.Debug("walking layered data directory", "root", root)
+
+	// Track files we've visited (to avoid duplicates)
+	visited := make(map[string]bool)
+
+	// Walk external directory first
+	externalRoot := filepath.Join(p.externalDir, root)
+	if _, err := os.Stat(externalRoot); err == nil {
+		slog.Debug("walking external directory", "path", externalRoot)
+		err := filepath.WalkDir(externalRoot, func(path string, d fs.DirEntry, err error) error {
+			// Honor caller cancellation between entries — a slow
+			// network-mounted --data directory can otherwise hold the
+			// walk goroutine indefinitely on stat / readdirent.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return aicrerrors.Wrap(aicrerrors.ErrCodeTimeout, "context canceled during external walk", ctxErr)
+			}
+			if err != nil {
+				return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "failed to walk external directory", err)
+			}
+
+			relPath, relErr := filepath.Rel(p.externalDir, path)
+			if relErr != nil {
+				return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "failed to compute relative path", relErr)
+			}
+			slashRelPath := filepath.ToSlash(relPath)
+
+			visited[slashRelPath] = true
+			slog.Debug("visiting external file", "path", slashRelPath, "isDir", d.IsDir())
+			return fn(slashRelPath, d, nil)
+		})
+		if err != nil {
+			return aicrerrors.PropagateOrWrap(err, aicrerrors.ErrCodeInternal,
+				"failed to walk external directory tree")
+		}
+	}
+
+	if p.externalOnly {
+		return nil
+	}
+
+	slog.Debug("walking embedded directory", "root", root)
+
+	// Walk embedded, skipping already-visited paths
+	return p.embedded.WalkDir(ctx, root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "failed to walk embedded directory", err)
+		}
+		if visited[path] {
+			slog.Debug("skipping embedded file (external takes precedence)", "path", path)
+			return nil // Skip, external takes precedence
+		}
+		slog.Debug("visiting embedded file", "path", path, "isDir", d.IsDir())
+		return fn(path, d, err)
+	})
+}
+
+// Source returns "external" or "embedded" depending on where the file comes from.
+func (p *LayeredDataProvider) Source(path string) string {
+	if p.externalOnly {
+		return sourceExternal
+	}
+	normalizedPath := filepath.ToSlash(path)
+	var source string
+	// The catalog loader reads a file before asking for its source, so ReadFile
+	// has already recorded whether the file was a profile patch.
+	_, patched := p.patchedOverlays.Load(normalizedPath)
+	if !patched {
+		_, patched = p.patchedOverlays.Load(path)
+	}
+	switch {
+	case normalizedPath == registryFileName:
+		// Always merged: registry.yaml is required in external dir (enforced by constructor).
+		source = sourceMerged
+	case normalizedPath == catalogFileName && p.externalFiles[catalogFileName]:
+		// Merged only when external catalog exists (catalog is optional).
+		source = sourceMerged
+	case p.externalFiles[normalizedPath] && patched:
+		// A profile patch adds values to an embedded overlay whose criteria
+		// and identity stay embedded.
+		source = sourceEmbedded
+	case p.externalFiles[normalizedPath] && !patched:
+		source = sourceExternal
+	default:
+		source = sourceEmbedded
+	}
+	slog.Debug("resolved file source", "path", path, "source", source)
+	return source
+}
+
+// fileReader is a minimal interface for reading a file by path.
+type fileReader interface {
+	ReadFile(ctx context.Context, path string) ([]byte, error)
+}
+
+// mergeEmbeddedAndExternal loads a YAML file from both embedded and external
+// sources, unmarshals each into type T, validates the raw external value when
+// a validator is supplied, merges them, and serializes the result back to YAML
+// bytes. Validation deliberately precedes merge so an embedded header cannot
+// erase an unsupported external one.
+func mergeEmbeddedAndExternal[T any](
+	ctx context.Context,
+	embedded fileReader, externalDir string, maxFileSize int64, allowSymlinks bool,
+	fileName string, validateExternal func(embedded, external *T) error,
+	merge func(embedded, external *T) *T,
+) ([]byte, error) {
+
+	kind := filepath.Base(fileName)
+	slog.Debug("merging files", "file", kind)
+
+	// Load embedded
+	embeddedData, err := embedded.ReadFile(ctx, fileName)
+	if err != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "failed to read embedded "+kind, err)
+	}
+
+	var embeddedVal T
+	if unmarshalErr := yaml.Unmarshal(embeddedData, &embeddedVal); unmarshalErr != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "failed to parse embedded "+kind, unmarshalErr)
+	}
+
+	// Load external
+	externalData, err := readExternalFile(externalDir, fileName, maxFileSize, allowSymlinks)
+	if err != nil {
+		return nil, aicrerrors.PropagateOrWrap(err, aicrerrors.ErrCodeInternal, "failed to read external "+kind)
+	}
+
+	var externalVal T
+	if unmarshalErr := yaml.Unmarshal(externalData, &externalVal); unmarshalErr != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "failed to parse external "+kind, unmarshalErr)
+	}
+	if validateExternal != nil {
+		if validateErr := validateExternal(&embeddedVal, &externalVal); validateErr != nil {
+			return nil, validateErr
+		}
+	}
+
+	// Merge: external overrides embedded
+	merged := merge(&embeddedVal, &externalVal)
+
+	// Serialize merged result
+	data, marshalErr := yaml.Marshal(merged)
+	if marshalErr != nil {
+		return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInternal, "failed to serialize merged "+kind, marshalErr)
+	}
+
+	return data, nil
+}
+
+// getMergedRegistry returns the merged registryFileName content.
+// External registry components are merged with embedded, with external
+// taking precedence.
+//
+// Caching invariant: sync.Once captures the *first* caller's context, so
+// whatever ctx error the merge surfaces on first call is cached for the
+// provider's lifetime. In production this is safe because the only
+// reachable entry point (loadComponentRegistryFor) supplies a fresh
+// bounded background ctx, and per-command Clients discard their
+// LayeredDataProvider at command end. Callers that hold a LayeredDataProvider
+// across requests with cancelable contexts MUST NOT cancel a request's
+// ctx before the first merge completes or every later caller will see
+// the cached cancellation error.
+func (p *LayeredDataProvider) getMergedRegistry(ctx context.Context) ([]byte, error) {
+	p.mergedRegistryOnce.Do(func() {
+		p.mergedRegistry, p.mergedRegistryErr = mergeEmbeddedAndExternal(
+			ctx, p.embedded, p.externalDir, p.maxFileSize, p.allowSymlinks, registryFileName,
+			func(_ *ComponentRegistry, registry *ComponentRegistry) error {
+				return validateComponentRegistryHeader(registry, "external "+registryFileName)
+			},
+			mergeRegistries,
+		)
+	})
+
+	return p.mergedRegistry, p.mergedRegistryErr
+}
+
+// mergeByName merges two slices by a name key. Items from external override
+// embedded items with the same name. New items from external are appended.
+// Embedded order is preserved.
+func mergeByName[T any](embedded, external []T, getName func(T) string) []T {
+	result := make([]T, 0, len(embedded)+len(external))
+
+	extByName := make(map[string]T, len(external))
+	for _, item := range external {
+		if name := getName(item); name != "" {
+			extByName[name] = item
+		}
+	}
+
+	addedNames := make(map[string]bool, len(embedded))
+	for _, item := range embedded {
+		name := getName(item)
+		if ext, found := extByName[name]; found {
+			result = append(result, ext)
+			slog.Debug("item overridden from external", "name", name)
+		} else {
+			result = append(result, item)
+			slog.Debug("item retained from embedded", "name", name)
+		}
+		addedNames[name] = true
+	}
+
+	for _, item := range external {
+		if name := getName(item); !addedNames[name] {
+			result = append(result, item)
+			slog.Debug("item added from external", "name", name)
+		}
+	}
+
+	return result
+}
+
+// mergeRegistries merges external registry into embedded.
+// Components with the same name are replaced by external version.
+// New components from external are added.
+func mergeRegistries(embedded, external *ComponentRegistry) *ComponentRegistry {
+	slog.Debug("starting registry merge",
+		"embedded_count", len(embedded.Components),
+		"external_count", len(external.Components))
+
+	// An external entry replaces the embedded one wholesale, so a replacement
+	// that omits class lands in core even when the embedded component is
+	// not. Under --split that moves the component between bundles (ADR-018),
+	// so say so where the replacement happens.
+	embeddedClass := make(map[string]ComponentClass, len(embedded.Components))
+	for _, c := range embedded.Components {
+		embeddedClass[c.Name] = c.GetClass()
+	}
+	for _, c := range external.Components {
+		if was, found := embeddedClass[c.Name]; found && c.Class == "" && was != ComponentClassCore {
+			slog.Warn("external registry entry replaces an embedded component without declaring class; it defaults to core",
+				"component", c.Name, "embeddedClass", was, "effectiveClass", ComponentClassCore)
+		}
+	}
+
+	return &ComponentRegistry{
+		APIVersion: embedded.APIVersion,
+		Kind:       embedded.Kind,
+		Components: mergeByName(embedded.Components, external.Components,
+			func(c ComponentConfig) string { return c.Name }),
+	}
+}
+
+// catalogForMerge is a minimal representation for catalog merge operations.
+// Uses generic map types to avoid importing pkg/validator/catalog (which would
+// create a circular dependency). All validator entry fields are preserved through
+// the map[string]any round-trip.
+type catalogForMerge struct {
+	APIVersion string           `yaml:"apiVersion"`
+	Kind       string           `yaml:"kind"`
+	Metadata   map[string]any   `yaml:"metadata"`
+	Validators []map[string]any `yaml:"validators"`
+}
+
+// getMergedCatalog returns the merged catalogFileName content.
+// External catalog validators are merged with embedded, with external
+// taking precedence by name.
+//
+// Caching invariant: see getMergedRegistry. sync.Once captures the first
+// caller's context; today this is safe because LayeredDataProvider is
+// per-command and discarded at command end, but a long-lived
+// LayeredDataProvider reused across requests with cancelable contexts
+// could see a single canceled first read poison the cache for the
+// provider's lifetime.
+func (p *LayeredDataProvider) getMergedCatalog(ctx context.Context) ([]byte, error) {
+	p.mergedCatalogOnce.Do(func() {
+		p.mergedCatalog, p.mergedCatalogErr = mergeEmbeddedAndExternal(
+			ctx, p.embedded, p.externalDir, p.maxFileSize, p.allowSymlinks, catalogFileName,
+			nil, mergeCatalogs,
+		)
+	})
+
+	return p.mergedCatalog, p.mergedCatalogErr
+}
+
+// mergeCatalogs merges external catalog into embedded.
+// Validators with the same name are replaced by external version.
+// New validators from external are added.
+func mergeCatalogs(embedded, external *catalogForMerge) *catalogForMerge {
+	slog.Debug("starting catalog merge",
+		"embedded_count", len(embedded.Validators),
+		"external_count", len(external.Validators))
+
+	// ValidatorCatalog uses a separate API domain and is explicitly outside
+	// ADR-022. Preserve its existing advisory mismatch behavior until that
+	// schema defines its own compatibility policy.
+	if external.APIVersion != "" && external.APIVersion != embedded.APIVersion {
+		slog.Warn("external catalog has different API version",
+			"embedded", embedded.APIVersion,
+			"external", external.APIVersion)
+	}
+
+	return &catalogForMerge{
+		APIVersion: embedded.APIVersion,
+		Kind:       embedded.Kind,
+		Metadata:   embedded.Metadata,
+		Validators: mergeByName(embedded.Validators, external.Validators,
+			func(v map[string]any) string { s, _ := v["name"].(string); return s }),
+	}
+}
+
+// defaultEmbeddedProvider is the singleton embedded-data provider used as the
+// nil-fallback by per-provider cache entry points (LoadMetadataStoreFor,
+// GetComponentRegistryFor, GetCriteriaRegistryFor, GetManifestContentWithProvider).
+// A fresh *EmbeddedDataProvider per nil-call would change the cache key on every
+// access, defeating storeCache / registryCache and causing unbounded growth on
+// the default path. Holding a single instance gives the cache a stable key.
+var defaultEmbeddedProvider DataProvider = NewEmbeddedDataProvider(GetEmbeddedFS(), "")

@@ -1,0 +1,60 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Cross-cutting overlay applied via criteria-wildcard matching.
+#
+# Carries the deployment-phase floor (the 4 standard checks plus the
+# gpu-operator version pin) and applies to every GB200 query regardless
+# of intent, so both training and inference recipes (e.g.,
+# gb200-eks-ubuntu-inference-dynamo, gb200-oke-ubuntu-inference) inherit
+# the version pin.
+#
+# The intent-scoped sibling `gb200-any-training.yaml` (NCCL performance
+# floor for training only) was retired in #1052 — performance thresholds
+# now live per-leaf so the value can be tuned to each service's network
+# fabric instead of carrying one cross-service number that is rarely
+# correct for two fabrics.
+#
+# Per-field union merge (see pkg/recipe/metadata.go) means concrete leaves
+# that declare their own `deployment:` block (e.g., gb200-eks-training,
+# gb200-eks-inference) add to or override this floor without dropping its
+# inherited checks — same-name constraints from the leaf win, additional
+# checks are appended.
+#
+# See docs/contributor/recipe.md#criteria-wildcard-overlays for details.
+
+kind: RecipeMetadata
+apiVersion: aicr.run/v1beta1
+metadata:
+  name: gb200-any
+
+spec:
+  base: base
+
+  criteria:
+    service: any
+    accelerator: gb200
+
+  validation:
+    deployment:
+      checks:
+        - operator-health
+        - expected-resources
+        - gpu-operator-version
+        - check-nvidia-smi
+      constraints:
+        # GB200 support stabilized in gpu-operator v25.10. Concrete leaves
+        # can tighten if they pin to a later working version.
+        - name: Deployment.gpu-operator.version
+          value: ">= v25.10.0"

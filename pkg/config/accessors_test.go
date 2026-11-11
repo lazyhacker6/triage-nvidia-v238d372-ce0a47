@@ -1,0 +1,174 @@
+// Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config_test
+
+import (
+	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/config"
+)
+
+func TestAccessors_NilTolerant(t *testing.T) {
+	var nilCfg *config.AICRConfig
+	if got := nilCfg.Recipe(); got != nil {
+		t.Errorf("nil cfg Recipe() = %v, want nil", got)
+	}
+	if got := nilCfg.Bundle(); got != nil {
+		t.Errorf("nil cfg Bundle() = %v, want nil", got)
+	}
+	if got := nilCfg.Validation(); got != nil {
+		t.Errorf("nil cfg Validation() = %v, want nil", got)
+	}
+
+	var nilRecipe *config.RecipeSpec
+	if got := nilRecipe.SnapshotPath(); got != "" {
+		t.Errorf("nil RecipeSpec SnapshotPath = %q, want empty", got)
+	}
+	if got := nilRecipe.OutputPath(); got != "" {
+		t.Errorf("nil RecipeSpec OutputPath = %q, want empty", got)
+	}
+	if got := nilRecipe.OutputFormat(); got != "" {
+		t.Errorf("nil RecipeSpec OutputFormat = %q, want empty", got)
+	}
+	if got := nilRecipe.DataDir(); got != "" {
+		t.Errorf("nil RecipeSpec DataDir = %q, want empty", got)
+	}
+	if got := nilRecipe.ProfileSelection(); got != "" {
+		t.Errorf("nil RecipeSpec ProfileSelection = %q, want empty", got)
+	}
+	if got := nilRecipe.IsCriteriaStrict(); got {
+		t.Errorf("nil RecipeSpec IsCriteriaStrict = %v, want false", got)
+	}
+}
+
+func TestAccessors_EmptyReturnsEmpty(t *testing.T) {
+	r := &config.RecipeSpec{}
+	if got := r.SnapshotPath(); got != "" {
+		t.Errorf("empty RecipeSpec SnapshotPath = %q", got)
+	}
+	if got := r.OutputPath(); got != "" {
+		t.Errorf("empty RecipeSpec OutputPath = %q", got)
+	}
+	if got := r.OutputFormat(); got != "" {
+		t.Errorf("empty RecipeSpec OutputFormat = %q", got)
+	}
+	if got := r.DataDir(); got != "" {
+		t.Errorf("empty RecipeSpec DataDir = %q", got)
+	}
+	if got := r.IsCriteriaStrict(); got {
+		t.Errorf("empty RecipeSpec IsCriteriaStrict = %v, want false", got)
+	}
+}
+
+func TestRecipeSpec_IsCriteriaStrict(t *testing.T) {
+	tru, fls := true, false
+	tests := []struct {
+		name string
+		ptr  *bool
+		want bool
+	}{
+		{"nil pointer absent in YAML", nil, false},
+		{"explicit false opt-out", &fls, false},
+		{"explicit true opt-in", &tru, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &config.RecipeSpec{CriteriaStrict: tt.ptr}
+			if got := r.IsCriteriaStrict(); got != tt.want {
+				t.Errorf("IsCriteriaStrict() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRecipeSpec_IsRequireEvidence(t *testing.T) {
+	tru, fls := true, false
+	tests := []struct {
+		name string
+		ptr  *bool
+		want bool
+	}{
+		{"nil pointer absent in YAML", nil, false},
+		{"explicit false", &fls, false},
+		{"explicit true", &tru, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &config.RecipeSpec{RequireEvidence: tt.ptr}
+			if got := r.IsRequireEvidence(); got != tt.want {
+				t.Errorf("IsRequireEvidence() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+	if got := (*config.RecipeSpec)(nil).IsRequireEvidence(); got {
+		t.Errorf("nil RecipeSpec IsRequireEvidence = %v, want false", got)
+	}
+}
+
+func TestAccessors_PopulatedReturnsValues(t *testing.T) {
+	cfg := &config.AICRConfig{
+		Spec: config.Spec{
+			Recipe: &config.RecipeSpec{
+				Input:   &config.RecipeInputSpec{Snapshot: "snap.yaml"},
+				Output:  &config.RecipeOutputSpec{Path: "out.yaml", Format: "json"},
+				Data:    "/data",
+				Profile: "gpuStack=operator-managed",
+			},
+			Bundle: &config.BundleSpec{},
+		},
+	}
+	r := cfg.Recipe()
+	if r == nil {
+		t.Fatal("Recipe() = nil")
+	}
+	if got := r.SnapshotPath(); got != "snap.yaml" {
+		t.Errorf("SnapshotPath = %q", got)
+	}
+	if got := r.OutputPath(); got != "out.yaml" {
+		t.Errorf("OutputPath = %q", got)
+	}
+	if got := r.OutputFormat(); got != "json" {
+		t.Errorf("OutputFormat = %q", got)
+	}
+	if got := r.DataDir(); got != "/data" {
+		t.Errorf("DataDir = %q", got)
+	}
+	if got := r.ProfileSelection(); got != "gpuStack=operator-managed" {
+		t.Errorf("ProfileSelection = %q", got)
+	}
+	if cfg.Bundle() == nil {
+		t.Fatal("Bundle() = nil")
+	}
+}
+
+func TestAccessors_Validation(t *testing.T) {
+	// Nil cfg → nil.
+	var nilCfg *config.AICRConfig
+	if got := nilCfg.Validation(); got != nil {
+		t.Errorf("nil cfg Validation() = %v, want nil", got)
+	}
+	// Spec.Validate unset → nil.
+	cfg := &config.AICRConfig{}
+	if got := cfg.Validation(); got != nil {
+		t.Errorf("unset Validation() = %v, want nil", got)
+	}
+	// Spec.Validate populated → returns the spec.
+	v := &config.ValidateSpec{Input: &config.ValidateInputSpec{Recipe: "r.yaml"}}
+	cfg2 := &config.AICRConfig{Spec: config.Spec{Validate: v}}
+	got := cfg2.Validation()
+	if got != v {
+		t.Errorf("Validation() did not return spec.validate; got %p, want %p", got, v)
+	}
+}

@@ -1,0 +1,1415 @@
+// Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config_test
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+
+	bundlercfg "github.com/NVIDIA/aicr/pkg/bundler/config"
+	"github.com/NVIDIA/aicr/pkg/config"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+)
+
+// === RecipeSpec.ResolveCriteria ===
+
+func TestResolveCriteria_NilReceiver(t *testing.T) {
+	var r *config.RecipeSpec
+	got, err := r.ResolveCriteriaWithRegistry(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result for nil receiver")
+	}
+	want := &recipe.Criteria{}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("expected zero-valued Criteria, got %+v", got)
+	}
+}
+
+func TestResolveCriteria_NilCriteria(t *testing.T) {
+	r := &config.RecipeSpec{}
+	got, err := r.ResolveCriteriaWithRegistry(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if got.Service != "" || got.Nodes != 0 {
+		t.Errorf("expected zero-valued, got %+v", got)
+	}
+}
+
+func TestResolveCriteria_AllFieldsPopulated(t *testing.T) {
+	r := &config.RecipeSpec{
+		Criteria: &config.CriteriaSpec{
+			Service:     "eks",
+			Accelerator: "h100",
+			Intent:      "training",
+			OS:          "ubuntu",
+			Platform:    "kubeflow",
+			Nodes:       4,
+		},
+	}
+	got, err := r.ResolveCriteriaWithRegistry(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Service != recipe.CriteriaServiceEKS {
+		t.Errorf("Service: got %q, want eks", got.Service)
+	}
+	if got.Accelerator != recipe.CriteriaAcceleratorH100 {
+		t.Errorf("Accelerator: got %q", got.Accelerator)
+	}
+	if got.Intent != recipe.CriteriaIntentTraining {
+		t.Errorf("Intent: got %q", got.Intent)
+	}
+	if got.OS != recipe.CriteriaOSUbuntu {
+		t.Errorf("OS: got %q", got.OS)
+	}
+	if got.Platform != recipe.CriteriaPlatformKubeflow {
+		t.Errorf("Platform: got %q", got.Platform)
+	}
+	if got.Nodes != 4 {
+		t.Errorf("Nodes: got %d, want 4", got.Nodes)
+	}
+}
+
+func TestResolveCriteria_PartialFields_UnsetStayZero(t *testing.T) {
+	r := &config.RecipeSpec{
+		Criteria: &config.CriteriaSpec{Service: "gke"},
+	}
+	got, err := r.ResolveCriteriaWithRegistry(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Service != recipe.CriteriaServiceGKE {
+		t.Errorf("Service: got %q, want gke", got.Service)
+	}
+	if got.Accelerator != "" {
+		t.Errorf("Accelerator: expected empty (unset), got %q", got.Accelerator)
+	}
+	if got.Intent != "" || got.OS != "" || got.Platform != "" {
+		t.Errorf("expected unset enum fields to remain zero, got %+v", got)
+	}
+}
+
+func TestResolveCriteria_InvalidEnums(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*config.CriteriaSpec)
+		wantSub string
+	}{
+		{
+			name:    "service",
+			mutate:  func(c *config.CriteriaSpec) { c.Service = "bogus" },
+			wantSub: "spec.recipe.criteria.service",
+		},
+		{
+			name:    "accelerator",
+			mutate:  func(c *config.CriteriaSpec) { c.Accelerator = "h99999" },
+			wantSub: "spec.recipe.criteria.accelerator",
+		},
+		{
+			name:    "intent",
+			mutate:  func(c *config.CriteriaSpec) { c.Intent = "mining" },
+			wantSub: "spec.recipe.criteria.intent",
+		},
+		{
+			name:    "os",
+			mutate:  func(c *config.CriteriaSpec) { c.OS = "windows" },
+			wantSub: "spec.recipe.criteria.os",
+		},
+		{
+			name:    "platform",
+			mutate:  func(c *config.CriteriaSpec) { c.Platform = "spark" },
+			wantSub: "spec.recipe.criteria.platform",
+		},
+		{
+			name:    "negative nodes",
+			mutate:  func(c *config.CriteriaSpec) { c.Nodes = -1 },
+			wantSub: "spec.recipe.criteria.nodes",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &config.RecipeSpec{Criteria: &config.CriteriaSpec{}}
+			tt.mutate(r.Criteria)
+			_, err := r.ResolveCriteriaWithRegistry(nil)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q must contain %q", err.Error(), tt.wantSub)
+			}
+		})
+	}
+}
+
+// === BundleSpec.Resolve ===
+
+func TestBundleResolve_NilReceiver(t *testing.T) {
+	var b *config.BundleSpec
+	got, err := b.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result for nil receiver")
+	}
+	want := &config.BundleResolved{}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("expected zero BundleResolved, got %+v", got)
+	}
+}
+
+func TestBundleResolve_EmptySpec(t *testing.T) {
+	b := &config.BundleSpec{}
+	got, err := b.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil")
+	}
+	if got.Deployer != "" || got.RecipeInput != "" {
+		t.Errorf("expected zero, got %+v", got)
+	}
+}
+
+func TestBundleResolve_RejectsMalformedSigstoreURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		attest  *config.AttestationSpec
+		wantSub string
+	}{
+		{
+			name:    "non-https fulcioURL fails with spec-path attribution",
+			attest:  &config.AttestationSpec{FulcioURL: "http://fulcio.internal.example.com"},
+			wantSub: "spec.bundle.attestation.fulcioURL",
+		},
+		{
+			name:    "malformed rekorURL fails with spec-path attribution",
+			attest:  &config.AttestationSpec{RekorURL: "https://user:pass@rekor.internal.example.com"},
+			wantSub: "spec.bundle.attestation.rekorURL",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &config.BundleSpec{Attestation: tt.attest}
+			_, err := b.Resolve()
+			if err == nil {
+				t.Fatal("expected error for malformed Sigstore URL, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q must contain %q", err.Error(), tt.wantSub)
+			}
+		})
+	}
+}
+
+// TestBundleResolve_SigningKey covers signing-mode exclusivity and the key's
+// normal form at the Resolve boundary, so every caller inherits both.
+// attestation.ResolveAttesterLazy takes the KMS branch whenever SigningKey is
+// non-empty, so accepting a document that also names a Fulcio would sign with
+// the key while the caller believed they signed against that CA.
+func TestBundleResolve_SigningKey(t *testing.T) {
+	const key = "gcpkms://projects/p/locations/l/keyRings/r/cryptoKeys/k"
+	tests := []struct {
+		name    string
+		attest  *config.AttestationSpec
+		want    string
+		wantSub string
+	}{
+		{
+			name:   "kms alone projects the key",
+			attest: &config.AttestationSpec{Enabled: true, SigningKey: key},
+			want:   key,
+		},
+		{
+			name:   "surrounding whitespace is trimmed",
+			attest: &config.AttestationSpec{Enabled: true, SigningKey: "  " + key + "\n"},
+			want:   key,
+		},
+		{
+			name:   "absent key leaves keyless in place",
+			attest: &config.AttestationSpec{Enabled: true, FulcioURL: "https://fulcio.example.com"},
+			want:   "",
+		},
+		{
+			// The whole point of rejecting it here: a blank-but-present key is
+			// non-empty enough to select the KMS path, then fails late in the
+			// cosign URI parser with no spec path attached.
+			name:    "present but blank is rejected",
+			attest:  &config.AttestationSpec{Enabled: true, SigningKey: "   \t "},
+			wantSub: "spec.bundle.attestation.signingKey must not be blank",
+		},
+		{
+			name:    "kms plus fulcio is rejected",
+			attest:  &config.AttestationSpec{Enabled: true, SigningKey: key, FulcioURL: "https://fulcio.example.com"},
+			wantSub: "mutually exclusive",
+		},
+		{
+			// Not a conflict at this layer, deliberately: the CLI's
+			// --oidc-device-flow=false must still be able to correct a document
+			// that sets both, and that flag is read after Resolve.
+			// validateSigningKeyExclusivity rejects the config-only pair on the
+			// merged opts (pkg/cli TestBundleCmd_SigningKeyFromConfig).
+			name:   "kms plus device flow is allowed here",
+			attest: &config.AttestationSpec{Enabled: true, SigningKey: key, OIDCDeviceFlow: true},
+			want:   key,
+		},
+		{
+			// The transparency log is orthogonal to how the artifact is signed;
+			// "KMS key + private Rekor" is the enterprise air-gapped case.
+			name:   "kms plus rekor is allowed",
+			attest: &config.AttestationSpec{Enabled: true, SigningKey: key, RekorURL: "https://rekor.example.com"},
+			want:   key,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &config.BundleSpec{Attestation: tt.attest}
+			got, err := b.Resolve()
+			if tt.wantSub != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantSub)
+				}
+				if !strings.Contains(err.Error(), tt.wantSub) {
+					t.Errorf("error %q must contain %q", err.Error(), tt.wantSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.SigningKey != tt.want {
+				t.Errorf("SigningKey = %q, want %q", got.SigningKey, tt.want)
+			}
+		})
+	}
+}
+
+func TestBundleResolve_AllFieldsPopulated(t *testing.T) {
+	b := &config.BundleSpec{
+		Input:  &config.BundleInputSpec{Recipe: "recipe.yaml"},
+		Output: &config.BundleOutputSpec{Target: "./out", ImageRefs: "refs.txt"},
+		Deployment: &config.DeploymentSpec{
+			Deployer: "argocd",
+			Repo:     "https://repo.example",
+			Set:      []string{"gpuoperator:driver.version=570.0.0"},
+			Dynamic:  []string{"gpuoperator:storage.class"},
+		},
+		Scheduling: &config.SchedulingSpec{
+			SystemNodeSelector:         map[string]string{"sys": "true"},
+			SystemNodeTolerations:      []string{"sys-only=yes:NoSchedule"},
+			AcceleratedNodeSelector:    map[string]string{"gpu": "true"},
+			AcceleratedNodeTolerations: []string{"gpu-only=yes:NoSchedule"},
+			DRAEvictionNodeLabel:       "example.com/dra-ready=enabled",
+			WorkloadGate:               "k=v:NoSchedule",
+			WorkloadSelector:           map[string]string{"workload": "true"},
+			Nodes:                      8,
+			StorageClass:               "fast-ssd",
+			SharedStorageClass:         "shared-rwx",
+		},
+		// Keyless: signingKey is mutually exclusive with fulcioURL, so the two
+		// cannot appear in one populated-everything spec. SigningKey has its own
+		// projection case in TestBundleResolve_SigningKey.
+		Attestation: &config.AttestationSpec{
+			Enabled:                   true,
+			CertificateIdentityRegexp: ".+",
+			OIDCDeviceFlow:            true,
+			FulcioURL:                 "https://fulcio.internal.example.com",
+			RekorURL:                  "https://rekor.internal.example.com",
+		},
+		Registry: &config.RegistrySpec{InsecureTLS: true, PlainHTTP: true},
+	}
+	got, err := b.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.RecipeInput != "recipe.yaml" {
+		t.Errorf("RecipeInput: got %q", got.RecipeInput)
+	}
+	if got.OutputTargetRaw != "./out" {
+		t.Errorf("OutputTargetRaw: got %q", got.OutputTargetRaw)
+	}
+	if got.OutputTarget == nil {
+		t.Errorf("OutputTarget should be non-nil for non-empty target")
+	}
+	if got.ImageRefs != "refs.txt" {
+		t.Errorf("ImageRefs: got %q", got.ImageRefs)
+	}
+	if got.Deployer != bundlercfg.DeployerArgoCD {
+		t.Errorf("Deployer: got %q", got.Deployer)
+	}
+	if got.Repo != "https://repo.example" {
+		t.Errorf("Repo: got %q", got.Repo)
+	}
+	if len(got.ValueOverrides) != 1 {
+		t.Errorf("ValueOverrides count: got %d, want 1", len(got.ValueOverrides))
+	}
+	if len(got.DynamicValues) != 1 {
+		t.Errorf("DynamicValues count: got %d, want 1", len(got.DynamicValues))
+	}
+	if got.SystemNodeSelector["sys"] != "true" {
+		t.Errorf("SystemNodeSelector: got %v", got.SystemNodeSelector)
+	}
+	if len(got.SystemNodeTolerations) != 1 {
+		t.Errorf("SystemNodeTolerations count: got %d, want 1", len(got.SystemNodeTolerations))
+	}
+	if len(got.AcceleratedNodeTolerations) != 1 {
+		t.Errorf("AcceleratedNodeTolerations count: got %d", len(got.AcceleratedNodeTolerations))
+	}
+	if got.DRAEvictionNodeLabel == nil || got.DRAEvictionNodeLabel.String() != "example.com/dra-ready=enabled" {
+		t.Errorf("DRAEvictionNodeLabel: got %+v", got.DRAEvictionNodeLabel)
+	}
+	if got.WorkloadGate == nil || got.WorkloadGate.Key != "k" {
+		t.Errorf("WorkloadGate: got %+v", got.WorkloadGate)
+	}
+	if got.WorkloadSelector["workload"] != "true" {
+		t.Errorf("WorkloadSelector: got %v", got.WorkloadSelector)
+	}
+	if got.Nodes != 8 {
+		t.Errorf("Nodes: got %d", got.Nodes)
+	}
+	if got.StorageClass != "fast-ssd" {
+		t.Errorf("StorageClass: got %q", got.StorageClass)
+	}
+	if got.SharedStorageClass != "shared-rwx" {
+		t.Errorf("SharedStorageClass: got %q", got.SharedStorageClass)
+	}
+	if !got.Attest || got.CertIDRegexp != ".+" || !got.OIDCDeviceFlow {
+		t.Errorf("Attestation fields: got attest=%v cert=%q oidc=%v",
+			got.Attest, got.CertIDRegexp, got.OIDCDeviceFlow)
+	}
+	if got.FulcioURL != "https://fulcio.internal.example.com" || got.RekorURL != "https://rekor.internal.example.com" {
+		t.Errorf("Sigstore URLs: got fulcio=%q rekor=%q", got.FulcioURL, got.RekorURL)
+	}
+	if got.SigningKey != "" {
+		t.Errorf("SigningKey: got %q, want empty for a keyless spec", got.SigningKey)
+	}
+	if !got.InsecureTLS || !got.PlainHTTP {
+		t.Errorf("Registry: got insecure=%v plain=%v", got.InsecureTLS, got.PlainHTTP)
+	}
+}
+
+func TestBundleResolve_NilVsExplicitlyEmptyMaps(t *testing.T) {
+	tests := []struct {
+		name           string
+		scheduling     *config.SchedulingSpec
+		wantSysSel     map[string]string
+		wantSysSelNil  bool
+		wantSysSelLen0 bool
+	}{
+		{
+			name:          "nil scheduling: selector nil",
+			scheduling:    nil,
+			wantSysSelNil: true,
+		},
+		{
+			name:          "scheduling present, selector nil: stays nil",
+			scheduling:    &config.SchedulingSpec{},
+			wantSysSelNil: true,
+		},
+		{
+			name:           "scheduling present, selector explicitly empty: non-nil empty",
+			scheduling:     &config.SchedulingSpec{SystemNodeSelector: map[string]string{}},
+			wantSysSelLen0: true,
+		},
+		{
+			name:       "scheduling present, selector populated",
+			scheduling: &config.SchedulingSpec{SystemNodeSelector: map[string]string{"k": "v"}},
+			wantSysSel: map[string]string{"k": "v"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &config.BundleSpec{Scheduling: tt.scheduling}
+			got, err := b.Resolve()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.wantSysSelNil {
+				if got.SystemNodeSelector != nil {
+					t.Errorf("expected nil, got %v", got.SystemNodeSelector)
+				}
+				return
+			}
+			if tt.wantSysSelLen0 {
+				if got.SystemNodeSelector == nil {
+					t.Errorf("expected non-nil empty map")
+				}
+				if len(got.SystemNodeSelector) != 0 {
+					t.Errorf("expected empty, got %v", got.SystemNodeSelector)
+				}
+				return
+			}
+			if got.SystemNodeSelector["k"] != "v" {
+				t.Errorf("got %v, want %v", got.SystemNodeSelector, tt.wantSysSel)
+			}
+		})
+	}
+}
+
+func TestBundleResolve_NilVsExplicitlyEmptySlices(t *testing.T) {
+	tests := []struct {
+		name           string
+		deployment     *config.DeploymentSpec
+		wantOverNil    bool
+		wantOverLen0   bool
+		wantDynamicNil bool
+	}{
+		{
+			name:           "nil deployment: both nil",
+			deployment:     nil,
+			wantOverNil:    true,
+			wantDynamicNil: true,
+		},
+		{
+			name:           "deployment present, set nil: nil",
+			deployment:     &config.DeploymentSpec{},
+			wantOverNil:    true,
+			wantDynamicNil: true,
+		},
+		{
+			name:         "deployment present, set explicitly empty: non-nil empty",
+			deployment:   &config.DeploymentSpec{Set: []string{}, Dynamic: []string{}},
+			wantOverLen0: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &config.BundleSpec{Deployment: tt.deployment}
+			got, err := b.Resolve()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.wantOverNil {
+				if got.ValueOverrides != nil {
+					t.Errorf("ValueOverrides: expected nil, got %v", got.ValueOverrides)
+				}
+			} else if tt.wantOverLen0 {
+				if got.ValueOverrides == nil {
+					t.Errorf("ValueOverrides: expected non-nil empty, got nil")
+				}
+				if len(got.ValueOverrides) != 0 {
+					t.Errorf("ValueOverrides: expected len 0, got %d", len(got.ValueOverrides))
+				}
+				if got.DynamicValues == nil {
+					t.Errorf("DynamicValues: expected non-nil empty, got nil")
+				}
+			}
+			if tt.wantDynamicNil && got.DynamicValues != nil {
+				t.Errorf("DynamicValues: expected nil, got %v", got.DynamicValues)
+			}
+		})
+	}
+}
+
+func TestBundleResolve_NilVsExplicitlyEmptyTolerations(t *testing.T) {
+	// nil tolerations: resolved field stays nil so CLI can apply DefaultTolerations.
+	b1 := &config.BundleSpec{Scheduling: &config.SchedulingSpec{}}
+	r1, err := b1.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r1.SystemNodeTolerations != nil {
+		t.Errorf("nil input → expected nil output, got %v", r1.SystemNodeTolerations)
+	}
+
+	// Explicitly empty tolerations: parser conflates nil/empty and returns
+	// DefaultTolerations — Resolve preserves that parser semantics.
+	b2 := &config.BundleSpec{Scheduling: &config.SchedulingSpec{SystemNodeTolerations: []string{}}}
+	r2, err := b2.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(r2.SystemNodeTolerations) == 0 {
+		t.Errorf("explicit empty input → expected DefaultTolerations, got empty")
+	}
+}
+
+func TestBundleResolve_InvalidValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		spec    *config.BundleSpec
+		wantSub string
+	}{
+		{
+			name: "invalid deployer",
+			spec: &config.BundleSpec{
+				Deployment: &config.DeploymentSpec{Deployer: "fluxcd"},
+			},
+			wantSub: "spec.bundle.deployment.deployer",
+		},
+		{
+			name: "invalid set value override",
+			spec: &config.BundleSpec{
+				Deployment: &config.DeploymentSpec{Set: []string{"no-equals-sign"}},
+			},
+			wantSub: "spec.bundle.deployment.set",
+		},
+		{
+			name: "invalid dynamic declaration",
+			spec: &config.BundleSpec{
+				Deployment: &config.DeploymentSpec{Dynamic: []string{"with=equals"}},
+			},
+			wantSub: "spec.bundle.deployment.dynamic",
+		},
+		{
+			name: "invalid system tolerations",
+			spec: &config.BundleSpec{
+				Scheduling: &config.SchedulingSpec{
+					SystemNodeTolerations: []string{"malformed"},
+				},
+			},
+			wantSub: "spec.bundle.scheduling.systemNodeTolerations",
+		},
+		{
+			name: "invalid accelerated tolerations",
+			spec: &config.BundleSpec{
+				Scheduling: &config.SchedulingSpec{
+					AcceleratedNodeTolerations: []string{"bad:taint:format"},
+				},
+			},
+			wantSub: "spec.bundle.scheduling.acceleratedNodeTolerations",
+		},
+		{
+			name: "system toleration the API server rejects",
+			spec: &config.BundleSpec{
+				Scheduling: &config.SchedulingSpec{
+					SystemNodeTolerations: []string{"bad key=v:NoSchedule"},
+				},
+			},
+			wantSub: "spec.bundle.scheduling.systemNodeTolerations",
+		},
+		{
+			name: "invalid system node selector",
+			spec: &config.BundleSpec{
+				Scheduling: &config.SchedulingSpec{
+					SystemNodeSelector: map[string]string{"bad key": "v"},
+				},
+			},
+			wantSub: "spec.bundle.scheduling.systemNodeSelector",
+		},
+		{
+			name: "invalid accelerated node selector",
+			spec: &config.BundleSpec{
+				Scheduling: &config.SchedulingSpec{
+					AcceleratedNodeSelector: map[string]string{"nvidia.com/gpu.present": "not valid"},
+				},
+			},
+			wantSub: "spec.bundle.scheduling.acceleratedNodeSelector",
+		},
+		{
+			name: "invalid workload selector",
+			spec: &config.BundleSpec{
+				Scheduling: &config.SchedulingSpec{
+					WorkloadSelector: map[string]string{"k": "{{ .Values.x }}"},
+				},
+			},
+			wantSub: "spec.bundle.scheduling.workloadSelector",
+		},
+		{
+			name: "invalid workload gate",
+			spec: &config.BundleSpec{
+				Scheduling: &config.SchedulingSpec{WorkloadGate: "no-effect"},
+			},
+			wantSub: "spec.bundle.scheduling.workloadGate",
+		},
+		{
+			name: "invalid DRA eviction node label",
+			spec: &config.BundleSpec{
+				Scheduling: &config.SchedulingSpec{DRAEvictionNodeLabel: "not-a-key-value-label"},
+			},
+			wantSub: "invalid node label",
+		},
+		{
+			name: "invalid output target",
+			spec: &config.BundleSpec{
+				Output: &config.BundleOutputSpec{Target: "oci://"},
+			},
+			wantSub: "spec.bundle.output.target",
+		},
+		{
+			name: "invalid oci-layout tag",
+			spec: &config.BundleSpec{
+				Output: &config.BundleOutputSpec{Target: "oci-layout:./out:bad tag!"},
+			},
+			wantSub: "spec.bundle.output.target",
+		},
+		{
+			name: "oci-layout digest",
+			spec: &config.BundleSpec{
+				Output: &config.BundleOutputSpec{Target: "oci-layout:./out@sha256:abc"},
+			},
+			wantSub: "digest (@sha256:...) is not accepted",
+		},
+		{
+			name: "negative nodes",
+			spec: &config.BundleSpec{
+				Scheduling: &config.SchedulingSpec{Nodes: -3},
+			},
+			wantSub: "spec.bundle.scheduling.nodes",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := tt.spec.Resolve()
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q must contain %q", err.Error(), tt.wantSub)
+			}
+		})
+	}
+}
+
+func TestBundleResolve_OutputTargetEmptyStringStaysNil(t *testing.T) {
+	b := &config.BundleSpec{Output: &config.BundleOutputSpec{}}
+	got, err := b.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.OutputTarget != nil {
+		t.Errorf("expected nil OutputTarget for empty raw, got %+v", got.OutputTarget)
+	}
+	if got.OutputTargetRaw != "" {
+		t.Errorf("expected empty OutputTargetRaw, got %q", got.OutputTargetRaw)
+	}
+}
+
+func TestBundleResolve_DeployerEmptyStaysZero(t *testing.T) {
+	// Empty config-deployer means "config did not set" — Resolve does NOT
+	// fabricate a default. The CLI is responsible for defaulting to Helm.
+	b := &config.BundleSpec{Deployment: &config.DeploymentSpec{}}
+	got, err := b.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Deployer != "" {
+		t.Errorf("expected zero deployer, got %q", got.Deployer)
+	}
+}
+
+func TestBundleResolve_WorkloadGateEmptyStaysNil(t *testing.T) {
+	b := &config.BundleSpec{Scheduling: &config.SchedulingSpec{WorkloadGate: ""}}
+	got, err := b.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.WorkloadGate != nil {
+		t.Errorf("expected nil WorkloadGate, got %+v", got.WorkloadGate)
+	}
+}
+
+func TestBundleResolve_DefensiveCloneOfMaps(t *testing.T) {
+	// Ensures Resolve clones map fields so callers cannot mutate the
+	// loaded config's backing map by mutating the resolved value.
+	src := map[string]string{"k": "v"}
+	b := &config.BundleSpec{Scheduling: &config.SchedulingSpec{SystemNodeSelector: src}}
+	got, err := b.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got.SystemNodeSelector["k"] = "mutated"
+	if src["k"] != "v" {
+		t.Errorf("Resolve must defensively clone maps; source was mutated to %q", src["k"])
+	}
+}
+
+// === ValidateSpec.Resolve ===
+
+func TestValidateResolve_NilReceiver(t *testing.T) {
+	var v *config.ValidateSpec
+	got, err := v.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("nil ValidateResolved")
+	}
+}
+
+func TestValidateResolve_EmptySpec(t *testing.T) {
+	got, err := (&config.ValidateSpec{}).Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.RecipePath != "" || got.SnapshotPath != "" || got.Namespace != "" ||
+		got.Timeout != nil || got.NoCluster || got.NoCleanup || got.RequireGPU ||
+		got.FailOnError != nil || got.FailFast != nil || got.Phases != nil ||
+		got.NodeSelector != nil || got.Tolerations != nil || got.ImagePullSecrets != nil {
+
+		t.Errorf("expected all zero, got %+v", got)
+	}
+}
+
+func TestValidateResolve_AllFieldsPopulated(t *testing.T) {
+	tr := true
+	v := &config.ValidateSpec{
+		Input: &config.ValidateInputSpec{
+			Recipe:   "r.yaml",
+			Snapshot: "s.yaml",
+		},
+		Agent: &config.ValidateAgentSpec{
+			Namespace:          "ns",
+			Image:              "img:1",
+			ImagePullSecrets:   []string{"secret-a", "secret-b"},
+			JobName:            "j",
+			ServiceAccountName: "sa",
+			NodeSelector:       map[string]string{"k": "v"},
+			Tolerations:        []string{"foo=bar:NoSchedule"},
+			RequireGPU:         true,
+
+			ValidatorServiceAccountName: "validator-sa",
+		},
+		Execution: &config.ValidateExecutionSpec{
+			Phases:      []string{"deployment", "conformance"},
+			FailOnError: &tr,
+			FailFast:    &tr,
+			NoCluster:   true,
+			NoCleanup:   true,
+			Timeout:     "5m",
+		},
+	}
+	got, err := v.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.RecipePath != "r.yaml" || got.SnapshotPath != "s.yaml" {
+		t.Errorf("input mismatch: %+v", got)
+	}
+	if got.Namespace != "ns" || got.Image != "img:1" || got.JobName != "j" ||
+		got.ServiceAccountName != "sa" || got.ValidatorServiceAccountName != "validator-sa" || !got.RequireGPU {
+
+		t.Errorf("agent mismatch: %+v", got)
+	}
+	if !reflect.DeepEqual(got.ImagePullSecrets, []string{"secret-a", "secret-b"}) {
+		t.Errorf("ImagePullSecrets = %v", got.ImagePullSecrets)
+	}
+	if !reflect.DeepEqual(got.NodeSelector, map[string]string{"k": "v"}) {
+		t.Errorf("NodeSelector = %v", got.NodeSelector)
+	}
+	if len(got.Tolerations) != 1 || got.Tolerations[0].Key != "foo" {
+		t.Errorf("Tolerations = %+v", got.Tolerations)
+	}
+	if !reflect.DeepEqual(got.Phases, []string{"deployment", "conformance"}) {
+		t.Errorf("Phases = %v", got.Phases)
+	}
+	if got.FailOnError == nil || !*got.FailOnError {
+		t.Errorf("FailOnError = %v", got.FailOnError)
+	}
+	if got.FailFast == nil || !*got.FailFast {
+		t.Errorf("FailFast = %v, want true", got.FailFast)
+	}
+	if !got.NoCluster || !got.NoCleanup {
+		t.Errorf("flags = %+v", got)
+	}
+	if got.Timeout == nil || got.Timeout.String() != "5m0s" {
+		t.Errorf("Timeout = %v", got.Timeout)
+	}
+}
+
+func TestValidateResolve_InvalidPhase(t *testing.T) {
+	v := &config.ValidateSpec{Execution: &config.ValidateExecutionSpec{
+		Phases: []string{"deployment", "warp-drive"},
+	}}
+	_, err := v.Resolve()
+	if err == nil || !strings.Contains(err.Error(), "spec.validate.execution.phases") {
+		t.Fatalf("expected phase-validation error, got %v", err)
+	}
+}
+
+func TestValidateResolve_AllPhaseSpecialValue(t *testing.T) {
+	// "all" is accepted at the config layer; the CLI parser collapses it
+	// into nil (= run every phase). Resolve must not reject it.
+	v := &config.ValidateSpec{Execution: &config.ValidateExecutionSpec{
+		Phases: []string{"all"},
+	}}
+	if _, err := v.Resolve(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateResolve_ZeroTimeoutPreserved(t *testing.T) {
+	// A config-supplied "0s" must surface as a non-nil zero, distinct from
+	// "field unset" (nil), so callers like durationFlagOrConfig can honor
+	// an intentional disable-timeout setting.
+	v := &config.ValidateSpec{Execution: &config.ValidateExecutionSpec{Timeout: "0s"}}
+	got, err := v.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Timeout == nil {
+		t.Fatal("expected non-nil Timeout for explicit 0s; got nil")
+	}
+	if *got.Timeout != 0 {
+		t.Errorf("expected *Timeout = 0, got %v", *got.Timeout)
+	}
+}
+
+func TestValidateResolve_InvalidTimeout(t *testing.T) {
+	v := &config.ValidateSpec{Execution: &config.ValidateExecutionSpec{Timeout: "abc"}}
+	_, err := v.Resolve()
+	if err == nil || !strings.Contains(err.Error(), "spec.validate.execution.timeout") {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+}
+
+func TestValidateResolve_NegativeTimeout(t *testing.T) {
+	v := &config.ValidateSpec{Execution: &config.ValidateExecutionSpec{Timeout: "-5s"}}
+	_, err := v.Resolve()
+	if err == nil || !strings.Contains(err.Error(), ">= 0") {
+		t.Fatalf("expected negative-timeout error, got %v", err)
+	}
+}
+
+func TestValidateResolve_InvalidToleration(t *testing.T) {
+	v := &config.ValidateSpec{Agent: &config.ValidateAgentSpec{Tolerations: []string{"garbage"}}}
+	_, err := v.Resolve()
+	if err == nil || !strings.Contains(err.Error(), "spec.validate.agent.tolerations") {
+		t.Fatalf("expected tolerations error, got %v", err)
+	}
+}
+
+func TestValidateResolve_InvalidNodeSelector(t *testing.T) {
+	v := &config.ValidateSpec{Agent: &config.ValidateAgentSpec{NodeSelector: map[string]string{"bad key": "v"}}}
+	_, err := v.Resolve()
+	if err == nil || !strings.Contains(err.Error(), "spec.validate.agent.nodeSelector") {
+		t.Fatalf("expected nodeSelector error, got %v", err)
+	}
+}
+
+func TestValidateResolve_DefensiveCloneOfNodeSelector(t *testing.T) {
+	src := map[string]string{"k": "v"}
+	v := &config.ValidateSpec{Agent: &config.ValidateAgentSpec{NodeSelector: src}}
+	got, err := v.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got.NodeSelector["k"] = "mutated"
+	if src["k"] != "v" {
+		t.Errorf("Resolve must defensively clone NodeSelector; source mutated to %q", src["k"])
+	}
+}
+
+func TestValidateResolve_NilVsExplicitlyEmpty(t *testing.T) {
+	// Tolerations nil → resolved nil. Downstream uses nil as the "no
+	// override" sentinel so the inner validator's default policy applies.
+	v1 := &config.ValidateSpec{Agent: &config.ValidateAgentSpec{}}
+	got1, err := v1.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got1.Tolerations != nil {
+		t.Errorf("nil source → expected nil Tolerations, got %v", got1.Tolerations)
+	}
+	// Tolerations [] → resolved non-nil empty slice. This is the
+	// explicit-clear case: the operator wrote `tolerations: []` to drop
+	// the tolerate-all default, and Resolve must NOT collapse that into
+	// DefaultTolerations() the way snapshotter.ParseTolerations would on
+	// an empty input. Distinguishable from the nil case above.
+	v2 := &config.ValidateSpec{Agent: &config.ValidateAgentSpec{Tolerations: []string{}}}
+	got2, err := v2.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got2.Tolerations == nil {
+		t.Error("explicit [] source → expected non-nil empty Tolerations, got nil")
+	}
+	if len(got2.Tolerations) != 0 {
+		t.Errorf("explicit [] source → expected len 0, got %v", got2.Tolerations)
+	}
+}
+
+// === SnapshotSpec.Resolve ===
+
+// TestSnapshotResolve_ShapeEdges covers the nil-receiver and empty-spec
+// cases together: both must return a non-nil, all-zero SnapshotResolved
+// so callers can read fields without nil-checking the result.
+func TestSnapshotResolve_ShapeEdges(t *testing.T) {
+	tests := []struct {
+		name string
+		in   *config.SnapshotSpec
+	}{
+		{"nil receiver", nil},
+		{"empty spec", &config.SnapshotSpec{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.in.Resolve()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got == nil {
+				t.Fatal("nil SnapshotResolved")
+			}
+			if got.OutputPath != "" || got.OutputFormat != "" || got.OutputTemplate != "" ||
+				got.Namespace != "" || got.Image != "" || got.JobName != "" ||
+				got.ServiceAccountName != "" || got.RequireGPU || got.RuntimeClassName != "" ||
+				got.OS != "" || got.Requests != "" || got.Limits != "" || got.NoCleanup ||
+				got.MaxNodesPerEntry != 0 || got.Timeout != nil || got.Privileged != nil ||
+				got.NodeSelector != nil || got.Tolerations != nil || got.ImagePullSecrets != nil {
+
+				t.Errorf("expected all zero, got %+v", got)
+			}
+		})
+	}
+}
+
+func TestSnapshotResolve_AllFieldsPopulated(t *testing.T) {
+	fals := false
+	s := &config.SnapshotSpec{
+		Output: &config.SnapshotOutputSpec{
+			Path:     "snapshot.yaml",
+			Format:   "yaml",
+			Template: "tpl.tmpl",
+		},
+		Agent: &config.SnapshotAgentSpec{
+			Namespace:          "aicr-validation",
+			Image:              "img:1",
+			ImagePullSecrets:   []string{"secret-a", "secret-b"},
+			JobName:            "snap-job",
+			ServiceAccountName: "snap-sa",
+			NodeSelector:       map[string]string{"nodeGroup": "gpu-worker"},
+			Tolerations: []string{
+				"dedicated=gpu-workload:NoSchedule",
+				"nvidia.com/gpu=present:NoSchedule",
+			},
+			RequireGPU:       true,
+			RuntimeClassName: "nvidia",
+			OS:               "ubuntu",
+			Requests:         "cpu=500m,memory=1Gi",
+			Limits:           "cpu=1,memory=2Gi",
+		},
+		Execution: &config.SnapshotExecutionSpec{
+			Timeout:          "7m",
+			NoCleanup:        true,
+			Privileged:       &fals,
+			MaxNodesPerEntry: 4,
+		},
+	}
+	got, err := s.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got.OutputPath != "snapshot.yaml" || got.OutputFormat != "yaml" || got.OutputTemplate != "tpl.tmpl" {
+		t.Errorf("output mismatch: %+v", got)
+	}
+	if got.Namespace != "aicr-validation" || got.Image != "img:1" || got.JobName != "snap-job" ||
+		got.ServiceAccountName != "snap-sa" || !got.RequireGPU ||
+		got.RuntimeClassName != "nvidia" || got.OS != "ubuntu" ||
+		got.Requests != "cpu=500m,memory=1Gi" || got.Limits != "cpu=1,memory=2Gi" {
+
+		t.Errorf("agent mismatch: %+v", got)
+	}
+	if !reflect.DeepEqual(got.ImagePullSecrets, []string{"secret-a", "secret-b"}) {
+		t.Errorf("ImagePullSecrets = %v", got.ImagePullSecrets)
+	}
+	if !reflect.DeepEqual(got.NodeSelector, map[string]string{"nodeGroup": "gpu-worker"}) {
+		t.Errorf("NodeSelector = %v", got.NodeSelector)
+	}
+	if len(got.Tolerations) != 2 || got.Tolerations[0].Key != "dedicated" || got.Tolerations[1].Key != "nvidia.com/gpu" {
+		t.Errorf("Tolerations = %+v", got.Tolerations)
+	}
+	if !got.NoCleanup || got.MaxNodesPerEntry != 4 {
+		t.Errorf("execution flags = %+v", got)
+	}
+	if got.Privileged == nil || *got.Privileged {
+		t.Errorf("Privileged = %v (want &false)", got.Privileged)
+	}
+	if got.Timeout == nil || got.Timeout.String() != "7m0s" {
+		t.Errorf("Timeout = %v", got.Timeout)
+	}
+}
+
+// TestSnapshotResolve_InvalidInput consolidates the wire-form parser
+// failure modes: every case is "bad input → expected error substring."
+func TestSnapshotResolve_InvalidInput(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      *config.SnapshotSpec
+		wantSub string
+	}{
+		{
+			name:    "invalid timeout",
+			in:      &config.SnapshotSpec{Execution: &config.SnapshotExecutionSpec{Timeout: "not-a-duration"}},
+			wantSub: "spec.snapshot.execution.timeout",
+		},
+		{
+			name:    "negative timeout",
+			in:      &config.SnapshotSpec{Execution: &config.SnapshotExecutionSpec{Timeout: "-5s"}},
+			wantSub: ">= 0",
+		},
+		{
+			name:    "negative maxNodesPerEntry",
+			in:      &config.SnapshotSpec{Execution: &config.SnapshotExecutionSpec{MaxNodesPerEntry: -1}},
+			wantSub: "spec.snapshot.execution.maxNodesPerEntry",
+		},
+		{
+			name:    "invalid toleration",
+			in:      &config.SnapshotSpec{Agent: &config.SnapshotAgentSpec{Tolerations: []string{"::"}}},
+			wantSub: "spec.snapshot.agent.tolerations",
+		},
+		{
+			name:    "invalid node selector",
+			in:      &config.SnapshotSpec{Agent: &config.SnapshotAgentSpec{NodeSelector: map[string]string{"bad key": "v"}}},
+			wantSub: "spec.snapshot.agent.nodeSelector",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := tt.in.Resolve()
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantSub)
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q does not contain %q", err.Error(), tt.wantSub)
+			}
+		})
+	}
+}
+
+// TestSnapshotResolve_ZeroTimeoutPreserved verifies that a config-supplied
+// "0s" surfaces as a non-nil zero, distinct from "field unset" (nil), so
+// callers like durationFlagOrConfig can honor an intentional
+// disable-timeout setting. Kept separate from the error-table because
+// the assertion shape (non-nil + dereferenced value) differs.
+func TestSnapshotResolve_ZeroTimeoutPreserved(t *testing.T) {
+	s := &config.SnapshotSpec{Execution: &config.SnapshotExecutionSpec{Timeout: "0s"}}
+	got, err := s.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Timeout == nil {
+		t.Fatal("expected non-nil Timeout for explicit 0s; got nil")
+	}
+	if *got.Timeout != 0 {
+		t.Errorf("expected *Timeout = 0, got %v", *got.Timeout)
+	}
+}
+
+// TestSnapshotResolve_DefensiveCloneOfCollections verifies Resolve does
+// not alias map/slice memory with the source spec, so callers mutating
+// the resolved value cannot leak into a shared config.
+func TestSnapshotResolve_DefensiveCloneOfCollections(t *testing.T) {
+	tests := []struct {
+		name   string
+		assert func(t *testing.T, srcSpec *config.SnapshotSpec, got *config.SnapshotResolved)
+	}{
+		{
+			name: "node selector",
+			assert: func(t *testing.T, srcSpec *config.SnapshotSpec, got *config.SnapshotResolved) {
+				got.NodeSelector["nodeGroup"] = "mutated"
+				if srcSpec.Agent.NodeSelector["nodeGroup"] != "gpu-worker" {
+					t.Errorf("Resolve must defensively clone NodeSelector; source mutated to %q",
+						srcSpec.Agent.NodeSelector["nodeGroup"])
+				}
+			},
+		},
+		{
+			name: "image pull secrets",
+			assert: func(t *testing.T, srcSpec *config.SnapshotSpec, got *config.SnapshotResolved) {
+				got.ImagePullSecrets[0] = "mutated"
+				if srcSpec.Agent.ImagePullSecrets[0] != "secret-a" {
+					t.Errorf("Resolve must defensively clone ImagePullSecrets; source mutated to %q",
+						srcSpec.Agent.ImagePullSecrets[0])
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := &config.SnapshotSpec{Agent: &config.SnapshotAgentSpec{
+				NodeSelector:     map[string]string{"nodeGroup": "gpu-worker"},
+				ImagePullSecrets: []string{"secret-a"},
+			}}
+			got, err := src.Resolve()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			tt.assert(t, src, got)
+		})
+	}
+}
+
+// TestSnapshotResolve_TolerationsNilVsExplicitlyEmpty pins the
+// distinguish-the-two-sentinels contract. Both cases share shape: build
+// a spec, call Resolve, assert on the resolved Tolerations slice.
+func TestSnapshotResolve_TolerationsNilVsExplicitlyEmpty(t *testing.T) {
+	tests := []struct {
+		name string
+		// nil = no Tolerations field on the input spec.
+		// non-nil with len 0 = explicit `tolerations: []`.
+		in       []string
+		wantNil  bool
+		wantLen0 bool
+	}{
+		{
+			// Downstream uses nil as the "no override" sentinel so
+			// the snapshotter's default (tolerate-all) applies.
+			name: "nil source → resolved nil",
+			in:   nil, wantNil: true,
+		},
+		{
+			// Explicit empty list opts out of tolerate-all; resolved
+			// must preserve the non-nil-but-empty shape.
+			name: "explicit [] source → resolved non-nil empty",
+			in:   []string{}, wantLen0: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &config.SnapshotSpec{Agent: &config.SnapshotAgentSpec{Tolerations: tt.in}}
+			got, err := s.Resolve()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.wantNil && got.Tolerations != nil {
+				t.Errorf("expected nil Tolerations, got %v", got.Tolerations)
+			}
+			if tt.wantLen0 {
+				if got.Tolerations == nil {
+					t.Error("expected non-nil empty Tolerations, got nil")
+				}
+				if len(got.Tolerations) != 0 {
+					t.Errorf("expected len 0, got %v", got.Tolerations)
+				}
+			}
+		})
+	}
+}
+
+func TestSnapshotResolve_PrivilegedPointer(t *testing.T) {
+	tr := true
+	fals := false
+	tests := []struct {
+		name string
+		in   *bool
+		want *bool
+	}{
+		{"unset stays nil", nil, nil},
+		{"explicit true", &tr, &tr},
+		{"explicit false", &fals, &fals},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &config.SnapshotSpec{Execution: &config.SnapshotExecutionSpec{Privileged: tt.in}}
+			got, err := s.Resolve()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if (got.Privileged == nil) != (tt.want == nil) {
+				t.Fatalf("Privileged nil-mismatch: got=%v want=%v", got.Privileged, tt.want)
+			}
+			if got.Privileged != nil && *got.Privileged != *tt.want {
+				t.Errorf("Privileged = %v, want %v", *got.Privileged, *tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateResolve_SkipChecks(t *testing.T) {
+	v := &config.ValidateSpec{Execution: &config.ValidateExecutionSpec{
+		SkipChecks: []string{"gpu-operator-health", "dra-support"},
+	}}
+	got, err := v.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(got.SkipChecks, []string{"gpu-operator-health", "dra-support"}) {
+		t.Errorf("SkipChecks = %v", got.SkipChecks)
+	}
+}
+
+func TestValidateResolve_SkipChecksRejectsEmptyEntry(t *testing.T) {
+	// An empty entry matches no check name, so it would be inert -- and the
+	// validator's own preflight would reject it as unmatched with an error
+	// naming "". Catching it here attributes the defect to the field that
+	// carries it.
+	v := &config.ValidateSpec{Execution: &config.ValidateExecutionSpec{
+		SkipChecks: []string{"gpu-operator-health", "  "},
+	}}
+	_, err := v.Resolve()
+	if err == nil || !strings.Contains(err.Error(), "spec.validate.execution.skipChecks") {
+		t.Fatalf("expected skipChecks-validation error, got %v", err)
+	}
+}
+
+func TestValidateResolve_SkipChecksUnsetIsNil(t *testing.T) {
+	// Nil, not empty: WithSkipChecks on an empty slice is a no-op either way,
+	// but nil keeps "config said nothing" distinct for a caller that cares.
+	v := &config.ValidateSpec{Execution: &config.ValidateExecutionSpec{}}
+	got, err := v.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.SkipChecks != nil {
+		t.Errorf("SkipChecks = %v, want nil", got.SkipChecks)
+	}
+}
+
+func TestBundleResolve_ArgoCD(t *testing.T) {
+	limit := int64(20)
+	factor := int64(2)
+	duration, maxDuration := "30s", "5m"
+	project := "gpu-infra"
+	cascade := false
+
+	negative := int64(-1)
+	tests := []struct {
+		name      string
+		dep       *config.DeploymentSpec
+		want      bundlercfg.ArgoCDSettings
+		errSubstr []string
+	}{
+		{
+			name: "unset stays zero",
+			dep:  &config.DeploymentSpec{Deployer: "argocd"},
+		},
+		{
+			name: "settings and nested retry flatten",
+			dep: &config.DeploymentSpec{ArgoCD: &config.ArgoCDSpec{
+				Project:       &project,
+				CascadeDelete: &cascade,
+				SyncRetry: &config.SyncRetrySpec{
+					Limit: &limit,
+					Backoff: &config.SyncRetryBackoffSpec{
+						Duration: &duration, Factor: &factor, MaxDuration: &maxDuration,
+					},
+				},
+			}},
+			want: bundlercfg.ArgoCDSettings{
+				Project:                     &project,
+				CascadeDelete:               &cascade,
+				SyncRetryLimit:              &limit,
+				SyncRetryBackoffDuration:    &duration,
+				SyncRetryBackoffFactor:      &factor,
+				SyncRetryBackoffMaxDuration: &maxDuration,
+			},
+		},
+		{
+			// A CLI --argocd-sync-retry-limit may still complete it; the
+			// bundler rejects the layered result if nothing does.
+			name: "backoff without limit is left to the bundler",
+			dep: &config.DeploymentSpec{ArgoCD: &config.ArgoCDSpec{
+				SyncRetry: &config.SyncRetrySpec{
+					Backoff: &config.SyncRetryBackoffSpec{Duration: &duration},
+				},
+			}},
+			want: bundlercfg.ArgoCDSettings{SyncRetryBackoffDuration: &duration},
+		},
+		{
+			name: "same setting in set and argocd is rejected",
+			dep: &config.DeploymentSpec{
+				Set:    []string{"deployer:project=other"},
+				ArgoCD: &config.ArgoCDSpec{Project: &project},
+			},
+			errSubstr: []string{"spec.bundle.deployment.set and spec.bundle.deployment.argocd conflict", "set twice"},
+		},
+		{
+			name: "invalid argocd field names the argocd block",
+			dep: &config.DeploymentSpec{ArgoCD: &config.ArgoCDSpec{
+				SyncRetry: &config.SyncRetrySpec{Limit: &negative},
+			}},
+			errSubstr: []string{"invalid spec.bundle.deployment.argocd", "sync retry limit -1: must be >= 0"},
+		},
+		{
+			name: "invalid deployer entry next to an argocd block names set",
+			dep: &config.DeploymentSpec{
+				Set:    []string{"deployer:cascadeDelete=maybe"},
+				ArgoCD: &config.ArgoCDSpec{Project: &project},
+			},
+			errSubstr: []string{"invalid spec.bundle.deployment.set", "cascadeDelete"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := (&config.BundleSpec{Deployment: tt.dep}).Resolve()
+			if len(tt.errSubstr) > 0 {
+				if err == nil {
+					t.Fatalf("Resolve() succeeded, want an error containing %q", tt.errSubstr)
+				}
+				for _, want := range tt.errSubstr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error = %v, want it to contain %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Resolve() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.ArgoCD, tt.want) {
+				t.Errorf("ArgoCD = %+v, want %+v", got.ArgoCD, tt.want)
+			}
+		})
+	}
+}
+
+// spec.validate.evidence.cncf resolves to a typed view that shares nothing
+// with the spec: the vendor block is copied, documented entries are
+// deep-copied, and an absent vendor stays nil.
+func TestValidateResolve_EvidenceCNCF(t *testing.T) {
+	tr := true
+	v := &config.ValidateSpec{Evidence: &config.EvidenceSpec{CNCF: &config.EvidenceCNCFSpec{
+		Dir:            "./submission",
+		CNCFSubmission: &tr,
+		NotApplicable:  map[string]string{"cluster_autoscaling": "fixed-size pools"},
+		Vendor: &config.EvidenceCNCFVendorSpec{
+			Name: "Vendor", PlatformName: "Platform", PlatformVersion: "1.0", Description: "d", ContactEmail: "o@v.example",
+			WebsiteURL: "https://v.example", DocumentationURL: "https://v.example/docs", RepoURL: "https://github.com/v/p",
+			ProductLogoURL: "https://v.example/l.svg", K8sConformanceURL: "https://github.com/cncf/k8s-conformance/tree/master/v1.37/p",
+		},
+		Documented: map[string]config.EvidenceCNCFDocumentedSpec{
+			"cluster_autoscaling": {Evidence: []string{"https://v.example/autoscaling"}, Notes: "scales"},
+		},
+	}}}
+	got, err := v.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	c := got.EvidenceCNCF
+	if c == nil || c.Dir != "./submission" || !c.CNCFSubmission || c.NotApplicable["cluster_autoscaling"] != "fixed-size pools" {
+		t.Fatalf("EvidenceCNCF = %+v", c)
+	}
+	if c.Vendor == nil || *c.Vendor != *v.Evidence.CNCF.Vendor || c.Vendor == v.Evidence.CNCF.Vendor {
+		t.Errorf("Vendor = %+v, want a copy of the spec block", c.Vendor)
+	}
+	doc := c.Documented["cluster_autoscaling"]
+	if doc.Notes != "scales" || len(doc.Evidence) != 1 || doc.Evidence[0] != "https://v.example/autoscaling" {
+		t.Errorf("Documented = %+v", c.Documented)
+	}
+	v.Evidence.CNCF.Documented["cluster_autoscaling"].Evidence[0] = "mutated"
+	if c.Documented["cluster_autoscaling"].Evidence[0] != "https://v.example/autoscaling" {
+		t.Error("Documented shares its evidence slice with the spec")
+	}
+
+	v.Evidence.CNCF.Vendor, v.Evidence.CNCF.Documented = nil, nil
+	got, err = v.Resolve()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.EvidenceCNCF.Vendor != nil || got.EvidenceCNCF.Documented != nil {
+		t.Errorf("absent vendor and documented must resolve nil: %+v", got.EvidenceCNCF)
+	}
+}

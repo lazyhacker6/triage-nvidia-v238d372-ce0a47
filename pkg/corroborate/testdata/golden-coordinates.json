@@ -1,0 +1,42 @@
+{
+  "_comment": "Golden vectors for Contract 1 (recipe->coordinate). The owning pkg/recipe golden test asserts every row. base for url is the illustrative Pages origin; only the path after #/ is host-agnostic and frozen.",
+  "base": "https://nvidia.github.io/aicr-testgrid",
+  "vectors": [
+    {
+      "name": "h100-eks-ubuntu-training-kubeflow",
+      "criteria": {"service": "eks", "accelerator": "h100", "os": "ubuntu", "intent": "training", "platform": "kubeflow"},
+      "coordinate": {"group": "eks", "dashboard": "h100-ubuntu", "tab": "training-kubeflow"},
+      "path": "eks/h100-ubuntu/training-kubeflow",
+      "url": "https://nvidia.github.io/aicr-testgrid/#/eks/h100-ubuntu/training-kubeflow"
+    },
+    {
+      "name": "h100-gke-cos-training-kubeflow",
+      "criteria": {"service": "gke", "accelerator": "h100", "os": "cos", "intent": "training", "platform": "kubeflow"},
+      "coordinate": {"group": "gke", "dashboard": "h100-cos", "tab": "training-kubeflow"},
+      "path": "gke/h100-cos/training-kubeflow",
+      "url": "https://nvidia.github.io/aicr-testgrid/#/gke/h100-cos/training-kubeflow"
+    },
+    {
+      "name": "h100-eks-ubuntu-inference-dynamo",
+      "criteria": {"service": "eks", "accelerator": "h100", "os": "ubuntu", "intent": "inference", "platform": "dynamo"},
+      "coordinate": {"group": "eks", "dashboard": "h100-ubuntu", "tab": "inference-dynamo"},
+      "path": "eks/h100-ubuntu/inference-dynamo",
+      "url": "https://nvidia.github.io/aicr-testgrid/#/eks/h100-ubuntu/inference-dynamo"
+    },
+    {
+      "name": "no-platform-yields-bare-intent-tab",
+      "criteria": {"service": "gke", "accelerator": "h100", "os": "cos", "intent": "training", "platform": ""},
+      "coordinate": {"group": "gke", "dashboard": "h100-cos", "tab": "training"},
+      "path": "gke/h100-cos/training",
+      "url": "https://nvidia.github.io/aicr-testgrid/#/gke/h100-cos/training"
+    },
+    {
+      "name": "h100-kind-training-kubeflow",
+      "_comment": "os-agnostic recipe (nvkind, DC5 #1278): overlays declare no os, so the resolved criteria carry os=any and the dashboard segment is the literal h100-any (kept, not dropped).",
+      "criteria": {"service": "kind", "accelerator": "h100", "os": "any", "intent": "training", "platform": "kubeflow"},
+      "coordinate": {"group": "kind", "dashboard": "h100-any", "tab": "training-kubeflow"},
+      "path": "kind/h100-any/training-kubeflow",
+      "url": "https://nvidia.github.io/aicr-testgrid/#/kind/h100-any/training-kubeflow"
+    }
+  ]
+}

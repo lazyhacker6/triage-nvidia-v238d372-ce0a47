@@ -1,0 +1,154 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package uatbroker
+
+// Recognized cloud values for a reservation row. "kind" is not a cloud but a
+// self-hosted GPU-runner lane (nvkind on real silicon, DC5 #1278): it slots
+// into the same reservation → uat-run → uat-<cloud> dispatch model so it rides
+// the nightly batch and shares tests/uat/<cloud>/run + tests/uat/lib exactly
+// like the cloud lanes. Its "reservation" is the single self-hosted GPU runner
+// (an Actions concurrency lease), not a cloud capacity reservation.
+const (
+	CloudAWS   = "aws"
+	CloudGCP   = "gcp"
+	CloudAzure = "azure"
+	CloudKind  = "kind"
+)
+
+// validClouds is the set of accepted Reservation.Cloud values.
+var validClouds = map[string]bool{CloudAWS: true, CloudGCP: true, CloudAzure: true, CloudKind: true}
+
+// Recognized recipe-intent values. The daytime human-access rotation (#1281,
+// DC8) picks one flavor per reservation via Reservation.DaytimeIntent; these
+// mirror the intents the per-cloud UAT pipelines accept.
+const (
+	IntentTraining  = "training"
+	IntentInference = "inference"
+)
+
+// validIntents is the set of accepted intent values (Reservation.DaytimeIntent
+// and, downstream, the pipeline's intent input).
+var validIntents = map[string]bool{IntentTraining: true, IntentInference: true}
+
+// Reservation is one row of the UAT reservation registry
+// (infra/uat/reservations.yaml). Each row maps a reservation Name — the key
+// the day/night broker leases via the GitHub Actions concurrency group
+// "uat-<Name>" — to the cloud-specific identifiers and the on-disk
+// cluster/test configuration a UAT run consumes.
+type Reservation struct {
+	// Name is the lease key (concurrency group uat-<name>). It is also
+	// interpolated into the daytime guard/teardown `grep -E` scans as the legacy
+	// discovery prefix during the ADR-017 migration, so Validate constrains it to
+	// an ERE-safe, cluster-name-safe charset (^[a-z]([a-z0-9-]*[a-z0-9])?$).
+	Name string `yaml:"name"`
+	// Slug is the short (2-4 char), registry-unique discovery key the daytime
+	// cluster name embeds: aicr-uat-day-<slug>-<slot>-<run_id> (ADR-017). The
+	// pre-batch guard and evening teardown scan the (slug, slot) prefix to find
+	// a held daytime cluster across runs. It is the account-stable, slot-ready
+	// key the reservation Name is too long and only cloud-unique to be, and it
+	// keeps the daytime name inside GKE's 40-char cluster-name cap. Validate
+	// enforces non-emptiness, registry-wide uniqueness, and the
+	// ^[a-z][a-z0-9]{1,3}$ charset. The kind row carries one for field
+	// uniformity even though the nvkind lane provisions no cloud cluster.
+	Slug  string `yaml:"slug"`
+	Cloud string `yaml:"cloud"`
+	// ReservationID is the cloud capacity-reservation identifier, the
+	// fully-qualified resource path on GCP. It is empty for quota-backed
+	// capacity such as Azure subscription quota.
+	// [Registry.CheckClusterConfigReservations] verifies it matches every
+	// reservation target in ClusterConfigPath.
+	ReservationID     string `yaml:"reservation-id"`
+	Accelerator       string `yaml:"accelerator"`
+	GPUCount          int    `yaml:"gpu-count"`
+	ClusterConfigPath string `yaml:"cluster-config-path"`
+	TestConfigDir     string `yaml:"test-config-dir"`
+	// NightlyIntents lists the recipe intents the nightly version-matrix batch
+	// (#1274, DC1) runs on this reservation, each a full CUJ per version cell:
+	// "training", "inference", or both. Absent defaults to ["training"]; an
+	// explicit empty list opts out of the nightly batch entirely — see
+	// NightlyIntentsOrDefault. DC3 (#1276) sets it to
+	// [training, inference] on every reservation so both CUJs run nightly on
+	// both clouds; the batch dispatches them SEQUENTIALLY through the shared
+	// per-reservation lease (intent inner-loop, version outer-loop), so there is
+	// never contention and `main` lands both intents before any release cell.
+	// Entries must be recognized intents and unique (a duplicate would
+	// double-run the same cell).
+	//
+	// AUTHORING CAVEAT: to opt out, the value must be an explicit empty
+	// list (`nightly-intents: []`). A bare `nightly-intents:` (YAML null)
+	// decodes to nil — indistinguishable from an absent key — and therefore
+	// opts the reservation INTO the [training] default, provisioning real
+	// GPU capacity. KnownFields cannot catch this (the key is valid);
+	// TestParseRegistryBareNullNightlyIntents locks the behavior.
+	NightlyIntents []string `yaml:"nightly-intents"`
+	// DaytimeIntent opts this reservation into the daytime human-access
+	// rotation (#1281, DC8) and picks the flavor stood up on it during the
+	// working day: "training" or "inference". Empty means the reservation is
+	// NOT part of the daytime rotation (nightly batch only). This is the
+	// configurable cloud→flavor default — data, not code — so the split
+	// (AWS=training, GCP=inference at launch) can change without a workflow edit.
+	DaytimeIntent string `yaml:"daytime-intent"`
+}
+
+// NightlyIntentsOrDefault returns the reservation's nightly-batch intents.
+// An ABSENT nightly-intents field (nil) defaults to [IntentTraining] — the
+// pre-DC3 behavior, so an un-annotated reservation keeps running the training
+// CUJ nightly. An EXPLICIT empty list ([]) is a nightly opt-out and returns
+// empty: the reservation stays manually dispatchable through uat-run.yaml but
+// the nightly batch skips it (used for bring-up of a new cloud before its
+// pipeline has earned nightly enrollment). Validate guarantees any listed
+// value is a recognized, non-duplicate intent. The returned slice is a fresh
+// copy the caller may mutate freely.
+func (r *Reservation) NightlyIntentsOrDefault() []string {
+	if r.NightlyIntents == nil {
+		return []string{IntentTraining}
+	}
+	out := make([]string, len(r.NightlyIntents))
+	copy(out, r.NightlyIntents)
+	return out
+}
+
+// DaytimeAssignment is one reservation's slot in the daytime human-access
+// rotation: the reservation to lease and the intent (flavor) to stand up on
+// it. The daytime scheduler (uat-daytime.yaml) consumes a JSON array of these
+// as its dispatch matrix.
+type DaytimeAssignment struct {
+	Reservation string `json:"reservation"`
+	Intent      string `json:"intent"`
+}
+
+// Registry is the parsed reservations.yaml document.
+type Registry struct {
+	Reservations []Reservation `yaml:"reservations"`
+}
+
+// Cell is one unit of work in the nightly version matrix: a single UAT run
+// of one AICRVersion against one Reservation. IsMain marks the tip-of-main
+// cell, whose AICRVersion is empty (DC5 installs from source until it wires
+// version-parameterized install; a release cell carries its tag).
+type Cell struct {
+	Reservation string `json:"reservation"`
+	AICRVersion string `json:"aicr_version"`
+	IsMain      bool   `json:"is_main"`
+	// Intents are the nightly intents eligible at this cell's version, in
+	// registry order (see EligibleNightlyIntents). The main cell carries every
+	// listed intent; a release cell drops any intent below its harness-compat
+	// floor (tests/uat/compat.yaml). The controller dispatches one run per
+	// entry, so an empty list means the cell dispatches nothing.
+	Intents []string `json:"intents"`
+	// Skipped lists the intents a harness-compat floor dropped from this
+	// release cell, so the controller can announce each skip.
+	Skipped []SkippedIntent `json:"skipped,omitempty"`
+}

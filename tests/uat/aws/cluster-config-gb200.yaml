@@ -1,0 +1,205 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# EKS GB200 UAT cluster (reservation aws-gb200, infra/uat/reservations.yaml).
+#
+# Differs from the p5 cluster-config.yaml (aws-h100) in three structural ways,
+# all forced by GB200 hardware and its Capacity Block:
+#   1. CROSS-ACCOUNT — the Capacity Block is held in tenancy 897722687756
+#      (dgx-cloud-runai-prod-22), not the standard UAT account. The AWS
+#      pipeline assumes the OIDC role in .deployment.tenancy below — this field
+#      is the single source of truth for the account (the reservation carries no
+#      account field; the pipeline derives AWS_ACCOUNT_ID from here). Prereq:
+#      apply infra/uat-aws-account in 897722687756 first (GitHub OIDC provider
+#      + github-actions-role-aicr).
+#   2. LOCAL ZONE — p6e-gb200 capacity lives in us-east-1-dfw-2a (parent AZ
+#      us-east-1d). The EKS control plane cannot live in a Local Zone, so the
+#      GPU worker + pod subnets are in the Local Zone while control-plane /
+#      system / public subnets stay in region AZs (incl. us-east-1d, the
+#      parent). Local-Zone worker egress routes through a region NAT.
+#   3. arm64 + Capacity Block — GB200 is Grace/arm64 and the reservation is a
+#      time-bounded Capacity Block (marketType below), not a standing CR.
+#
+# Two mchmarny/cluster actuator workarounds are load-bearing (see the inline
+# notes on the worker nodeGroup and adminRoles).
+
+apiVersion: github.com/mchmarny/cluster/v1alpha1
+kind: Cluster
+
+deployment:
+  id: aicr-uat-gb200            # workflow overrides with a run-scoped id
+  provider: eks
+  tenancy: "897722687756"       # dgx-cloud-runai-prod-22 (GB200 Capacity Block)
+  location: us-east-1
+  state: tenancy                # remote TF state in this account's S3
+  destroy: false
+  tags:
+    env: dev
+
+cluster:
+  eks:
+    version: "1.35"
+    # Empty: the CI OIDC role (github-actions-role-aicr) is the cluster
+    # CREATOR and gets cluster-admin automatically
+    # (bootstrap_cluster_creator_admin_permissions=true). The actuator ALSO
+    # writes an explicit access entry per adminRole; listing the creator's own
+    # role here collides with the bootstrap entry and 409s. Human admins can
+    # add this account's SSO admin role once its name is known (it differs from
+    # the standard account's AWSReservedSSO_CS-Admin_55d42b5a9a2a8c35).
+    adminRoles:
+      - nvsentinel-e2e-runner-role
+    controlPlane:
+      allowedCidrs:
+        - 216.228.127.128/30
+        - 52.41.222.58/32
+        - 54.68.11.139/32
+        - 128.77.49.32/30
+        - 35.236.84.119/32
+    addOns:
+      coreDns: ""
+      kubeProxy: ""
+      vpcCni: ""
+
+network:
+  eks:
+    # One securityGroups.additionalRules entry, for NVSentinel's MongoDB
+    # store. AICR's own NVSentinel install leaves that store off (the chart
+    # default); NVSentinel's e2e pipeline reinstalls on these clusters with
+    # it on (values-aicr-aws-uat.yaml in the NVSentinel repo), pinning the
+    # MongoDB replica set behind Service mongodb-headless (TCP 27017) to
+    # nodeGroup: system-worker. platform-connectors is a DaemonSet that
+    # tolerates every taint, so it also runs on the GPU nodes and connects to
+    # MongoDB from there.
+    #
+    # Without this rule the system security group drops that connection.
+    # Because addOns.vpcCni is set, the pinned actuator (EKS_IMAGE in
+    # .github/workflows/uat-aws.yaml, v0.5.3) enables VPC CNI custom
+    # networking and writes per-zone ENIConfigs that give each pod its node
+    # group's subnet and security group: MongoDB pods carry the system group,
+    # and GPU-node pods take IPs from the worker subnet. From outside itself,
+    # the system group admits only 443, 8080, 9090, 10250, 53, and NodePorts
+    # from the public subnets — the worker group, by contrast, admits all
+    # traffic from the system subnets — so platform-connectors on the GPU
+    # nodes exits on a MongoDB server-selection timeout.
+    #
+    # A rule's source can only be CIDR blocks, not a security group.
+    # 10.0.128.0/17 is the worker subnet, the range GPU-node pods actually use.
+    # 100.65.0.0/16 is the pod CIDR; the pinned actuator assigns no pod IPs
+    # from it, since its ENIConfigs cover only the system and worker subnets,
+    # but the NATS rule described below listed it too, so it stays.
+    #
+    # This block once carried a single 4222 ingress rule for NATS, which AICR
+    # no longer installs by default as of the dynamo-platform 1.4+ bump
+    # (#1983) — the subchart is still bundled, the chart just defaults
+    # global.nats.install to false.
+    #
+    # Its replacement planes need no rule here. Dynamo now talks
+    # frontend<->worker directly: request and response streams on OS-assigned
+    # TCP ports, KV events over ZMQ on fixed TCP 5557. UAT puts both roles on
+    # the gpu-worker node group (SERVE_GPU_NODE_SELECTOR_* in
+    # tests/uat/lib/phases.sh), and the actuator's worker security group
+    # already allows all traffic from itself, so that traffic never needs an
+    # explicit rule — nor does it if the roles move between worker node
+    # groups, which share that security group.
+    #
+    # Two things WOULD need rules. Re-enabling NATS on a standing cluster
+    # (docs/user/component-catalog.md) brings back the 4222 requirement.
+    # Splitting Frontend and Worker across separate security groups instead
+    # needs bidirectional OS-assigned-port rules plus TCP 5557 — see
+    # docs/integrator/eks-dynamo-networking.md for that contract.
+    securityGroups:
+      additionalRules:
+        - target: system
+          direction: ingress
+          fromPort: 27017
+          toPort: 27017
+          protocol: tcp
+          cidrBlocks: ["10.0.128.0/17", "100.65.0.0/16"]  # worker subnet + pod CIDR
+          description: "Allow NVSentinel MongoDB from GPU worker pods"
+    cidrs:
+      host: 10.0.0.0/16
+      pod: 100.65.0.0/16
+    subnets:
+      # Control-plane / system / public subnets MUST be in region AZs (the EKS
+      # control plane cannot live in a Local Zone). Include us-east-1d — the
+      # Local Zone's parent — so cross-zone routing to the workers is local.
+      public:
+        - cidr: 10.0.1.0/27
+          zone: us-east-1a
+        - cidr: 10.0.2.0/27
+          zone: us-east-1d
+      system:
+        - cidr: 10.0.4.0/22
+          zone: us-east-1a
+        - cidr: 10.0.8.0/22
+          zone: us-east-1d
+      # GPU workers + pods live in the Local Zone where the Capacity Block is.
+      worker:
+        - cidr: 10.0.128.0/17
+          zone: us-east-1-dfw-2a
+          disableEndpoints: true
+      pod:
+        - cidr: 100.65.0.0/16
+          zone: us-east-1-dfw-2a
+          disableEndpoints: true
+
+compute:
+  eks:
+    nodeGroups:
+      system:
+        instanceType: m7i.xlarge
+        capacity:
+          desired: 4
+        labels:
+          nodeGroup: system-worker
+          dedicated: system-workload
+      workers:
+        - name: gpu-worker
+          instanceType: p6e-gb200.36xlarge
+          architecture: arm64               # GB200 = Grace/arm64 (arm64 Ubuntu EKS AMI)
+          # Pin the worker AMI. Absent imageId, the actuator resolves
+          # data.aws_ami.ubuntu_eks (most_recent Canonical ubuntu-eks/k8s_1.35
+          # for this arch), which drifted to ubuntu-resolute-26.04 on 2026-08-05
+          # and broke the GPU stack (no nvidia.com/gpu advertised → prep fails,
+          # both intents). This pins the last 24.04 (noble) arm64 build,
+          # ubuntu-noble-24.04-arm64-server-20260714, k8s 1.35, us-east-1.
+          # Re-resolve when eks.version bumps (AMI is version- and region-specific).
+          imageId: ami-06be8c2e8ec2ed261
+          gpuType: gb200
+          # REQUIRED: auto-derivation breaks on the "p6e-gb200.*" name — the
+          # actuator keys its accelerator map on "p6e" but split(".")[0] yields
+          # "p6e-gb200", so it falls through to the generic-GPU EFA branch and
+          # emits an invalid launch template (device_index=1 on a 1-device
+          # network card) → CreateAutoScalingGroup ValidationError. The explicit
+          # value selects the correct GB200 branch.
+          accelerator: gb200
+          capacity:
+            # Two GPU nodes: activates the multi-node NCCL East-West fabric
+            # check (nccl-all-reduce-bw-net) and lets the TrainJob (numNodes: 2)
+            # span both nodes.
+            desired: 2
+            reservation:
+              preference: capacity-reservations-only
+              # Capacity Block CR ID removed: the GB200 block is retired and this
+              # lane is no longer in the reservation registry. Re-fill with the
+              # successor reservation's id before re-enabling.
+              target: ""
+              marketType: capacity-block    # REQUIRED — GB200 CRs are Capacity Blocks
+          labels:
+            nodeGroup: gpu-worker
+            dedicated: user-workload
+          taints:
+            - key: skyhook.nvidia.com
+              value: runtime-required
+              effect: NoSchedule

@@ -1,0 +1,412 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package snapshotter
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/NVIDIA/aicr/pkg/collector"
+	"github.com/NVIDIA/aicr/pkg/collector/k8s"
+	"github.com/NVIDIA/aicr/pkg/collector/topology"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/fingerprint"
+	"github.com/NVIDIA/aicr/pkg/header"
+	"github.com/NVIDIA/aicr/pkg/measurement"
+	"github.com/NVIDIA/aicr/pkg/recipe/oskind"
+	"github.com/NVIDIA/aicr/pkg/serializer"
+)
+
+// NodeSnapshotter collects system configuration measurements from the current node.
+// It coordinates multiple collectors in parallel to gather data about Kubernetes,
+// GPU hardware, OS configuration, and systemd services, then serializes the results.
+// If AgentConfig is provided with Enabled=true, it deploys a Kubernetes Job instead.
+type NodeSnapshotter struct {
+	// Version is the snapshotter version.
+	Version string
+
+	// Factory is the collector factory to use. If nil, the default factory is used.
+	Factory collector.Factory
+
+	// Serializer is the serializer to use for output. If nil, a default stdout JSON serializer is used.
+	Serializer serializer.Serializer
+
+	// AgentConfig contains configuration for agent deployment mode. If nil or Enabled=false, runs locally.
+	AgentConfig *AgentConfig
+
+	// RequireGPU when true causes the snapshot to fail if no GPU is detected.
+	RequireGPU bool
+
+	// AKSGPUPoolsPath, when set, points at an operator-supplied
+	// `az aks nodepool list -o json` dump. Local mode projects it into
+	// the K8s measurement's aks-gpu-pools subtype up front (fail-loud —
+	// explicit operator input never rides the collectSafe degrade-to-
+	// warning policy). Agent Job mode carries the equivalent field on
+	// AgentConfig and merges controller-side after retrieval.
+	AKSGPUPoolsPath string
+
+	// OKEAddonsPath, when set, points at an operator-supplied
+	// `oci ce cluster list-addons --cluster-id <cluster-ocid> --all --output json` dump. Same
+	// contract as AKSGPUPoolsPath: projected fail-loud into the K8s
+	// measurement's oke-addons subtype before any collector runs.
+	OKEAddonsPath string
+
+	// GKEGPUPoolsPath, when set, points at an operator-supplied
+	// `gcloud container node-pools list --cluster <cluster>
+	// --format=json` dump, projected fail-loud into the K8s measurement's
+	// gke-gpu-pools subtype before any collector runs.
+	GKEGPUPoolsPath string
+}
+
+// Measure collects configuration measurements and serializes the snapshot.
+// When AgentConfig is set, it deploys a Kubernetes Job to capture the snapshot
+// on a GPU node. Otherwise, it runs collectors locally in parallel.
+// Individual collector failures are logged and skipped — the snapshot
+// contains all measurements that could be successfully collected.
+func (n *NodeSnapshotter) Measure(ctx context.Context) error {
+	if n.AgentConfig != nil {
+		return n.measureWithAgent(ctx)
+	}
+
+	// Local measurement mode (used in tests and in-cluster execution)
+	return n.measure(ctx)
+}
+
+// parseMaxNodesPerEntryEnv reads the AICR_MAX_NODES_PER_ENTRY env var set by the agent Job.
+// Returns 0 (no limit) when unset or invalid.
+func parseMaxNodesPerEntryEnv() int {
+	val := os.Getenv("AICR_MAX_NODES_PER_ENTRY")
+	if val == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		slog.Warn("invalid AICR_MAX_NODES_PER_ENTRY value, using 0", slog.String("value", val))
+		return 0
+	}
+	return n
+}
+
+// parseOSEnv reads the AICR_OS env var set by the agent Job, normalizes
+// it (lowercase, trimmed), and validates it against the supported OS
+// values in pkg/recipe/oskind. Returns the empty string when unset OR
+// when set to an unrecognized value (with a warning logged in the latter
+// case). Defense-in-depth — the controller-side CLI already validates,
+// but a silent fallback to the systemd default would be hard to debug if
+// AICR_OS ever leaked in via another path.
+func parseOSEnv() string {
+	val := strings.ToLower(strings.TrimSpace(os.Getenv("AICR_OS")))
+	if val == "" {
+		return ""
+	}
+	if !oskind.IsKnown(val) {
+		slog.Warn("invalid AICR_OS value, ignoring (preserving default backend)",
+			slog.String("value", val))
+		return ""
+	}
+	return val
+}
+
+// parseClusterConfigPathEnv reads AICR_CLUSTER_CONFIG_PATH, set by the
+// agent Job when --cluster-config was supplied at the CLI. Empty when
+// unset; the network collector treats an empty path as "file mode
+// disabled."
+func parseClusterConfigPathEnv() string {
+	return strings.TrimSpace(os.Getenv("AICR_CLUSTER_CONFIG_PATH"))
+}
+
+// parseDiscoverNetworkEnv reads AICR_DISCOVER_NETWORK. Returns true only
+// when the env var parses cleanly as a positive boolean — silent fallback
+// to false on garbage to avoid accidentally turning on live discovery from
+// a malformed config.
+func parseDiscoverNetworkEnv() bool {
+	val := strings.TrimSpace(os.Getenv("AICR_DISCOVER_NETWORK"))
+	if val == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(val)
+	if err != nil {
+		slog.Warn("invalid AICR_DISCOVER_NETWORK value, ignoring",
+			slog.String("value", val))
+		return false
+	}
+	return b
+}
+
+// measure collects configuration measurements from the current node.
+func (n *NodeSnapshotter) measure(ctx context.Context) error {
+	// The pool projection is explicit operator input: project it before
+	// any collector runs so a bad file fails the snapshot immediately —
+	// it must never ride the collectSafe degrade-to-warning policy below
+	// and masquerade as a snapshot whose reading is merely unavailable.
+	var projections []measurement.Subtype
+	if n.AKSGPUPoolsPath != "" {
+		subtype, err := k8s.ProjectAKSGPUPools(ctx, n.AKSGPUPoolsPath)
+		if err != nil {
+			return err
+		}
+		projections = append(projections, subtype)
+	}
+	if n.OKEAddonsPath != "" {
+		subtype, err := k8s.ProjectOKEAddons(ctx, n.OKEAddonsPath)
+		if err != nil {
+			return err
+		}
+		projections = append(projections, subtype)
+	}
+	if n.GKEGPUPoolsPath != "" {
+		subtype, err := k8s.ProjectGKEGPUPools(ctx, n.GKEGPUPoolsPath)
+		if err != nil {
+			return err
+		}
+		projections = append(projections, subtype)
+	}
+
+	if n.Factory == nil {
+		var opts []collector.Option
+		if maxNodes := parseMaxNodesPerEntryEnv(); maxNodes > 0 {
+			opts = append(opts, collector.WithMaxNodesPerEntry(maxNodes))
+		}
+		if osVal := parseOSEnv(); osVal != "" {
+			opts = append(opts, collector.WithOS(osVal))
+		}
+		if ccPath := parseClusterConfigPathEnv(); ccPath != "" {
+			opts = append(opts, collector.WithClusterConfigPath(ccPath))
+		}
+		if parseDiscoverNetworkEnv() {
+			opts = append(opts, collector.WithDiscoverNetwork(true))
+		}
+		// In agent mode the in-cluster config is auto-resolved by l8k's
+		// kubeclient.New (kubeconfigPath == "" → InClusterConfig). In
+		// local mode (AICR_AGENT_MODE=false) we honor KUBECONFIG from
+		// the environment, which l8k.kubeclient.New also picks up. No
+		// explicit WithKubeconfigPath in this path.
+		n.Factory = collector.NewDefaultFactory(opts...)
+	}
+
+	slog.Debug("starting node snapshot")
+
+	// Track overall snapshot collection duration
+	start := time.Now()
+	defer func() {
+		snapshotCollectionDuration.Observe(time.Since(start).Seconds())
+	}()
+
+	var mu sync.Mutex
+
+	// Initialize snapshot structure
+	snap := NewSnapshot()
+	snap.Measurements = make([]*measurement.Measurement, 0, 6)
+
+	// collectSafe runs a named collector, appending its measurement on success
+	// and logging a warning on failure. Snapshot collection never fails due to
+	// an individual collector error — returns nil to maintain non-fatal semantics.
+	// Takes ctx as a parameter (rather than capturing the outer ctx) so that
+	// the errgroup-derived context is honored once errgroup.WithContext is in
+	// use; this makes per-collector cancellation responsive to sibling errors
+	// if and when collectSafe stops swallowing them.
+	collectSafe := func(ctx context.Context, name string, c collector.Collector) func() error {
+		return func() error {
+			collectorStart := time.Now()
+			defer func() {
+				snapshotCollectorDuration.WithLabelValues(name).Observe(time.Since(collectorStart).Seconds())
+			}()
+
+			m, err := c.Collect(ctx)
+			if err != nil {
+				slog.Warn("failed to collect "+name+" - skipping",
+					slog.String("collector", name),
+					slog.String("error", err.Error()))
+				return nil
+			}
+			slog.Info("collector completed",
+				slog.String("collector", name),
+				slog.Duration("duration", time.Since(collectorStart)))
+			if m == nil {
+				// Inactive collector (e.g. the network collector when
+				// neither --cluster-config nor --discover-network was
+				// supplied). Treat as a no-op — appending nil would
+				// pollute the Measurements slice and fail downstream
+				// nil-guards in fingerprint / validator code paths.
+				slog.Debug("collector returned nil measurement - inactive, skipping",
+					slog.String("collector", name))
+				return nil
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			snap.Measurements = append(snap.Measurements, m)
+			return nil
+		}
+	}
+
+	// Collect metadata (synchronous — needed before parallel collectors)
+	metadataStart := time.Now()
+	nodeName := k8s.GetNodeName()
+	snap.Init(header.KindSnapshot, FullAPIVersion, n.Version)
+	snap.Metadata["source-node"] = nodeName
+	snapshotCollectorDuration.WithLabelValues("metadata").Observe(time.Since(metadataStart).Seconds())
+	slog.Debug("obtained node metadata", slog.String("name", nodeName), slog.String("version", n.Version))
+
+	// Launch all collectors in parallel — each degrades gracefully on error.
+	// errgroup.WithContext is used so that a future collector returning a
+	// real error (e.g., a GPU-required pre-check) cancels siblings instead
+	// of letting them race to completion. Today collectSafe swallows all
+	// errors so cancellation never fires; switching to WithContext now
+	// makes the invariant fail-safe rather than convention-only.
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(collectSafe(gctx, "k8s", n.Factory.CreateKubernetesCollector()))
+	g.Go(collectSafe(gctx, "systemd", n.Factory.CreateSystemDCollector()))
+	g.Go(collectSafe(gctx, "os", n.Factory.CreateOSCollector()))
+	g.Go(collectSafe(gctx, "gpu", n.Factory.CreateGPUCollector()))
+	g.Go(collectSafe(gctx, "topology", n.Factory.CreateNodeTopologyCollector()))
+	g.Go(collectSafe(gctx, "network", n.Factory.CreateNetworkCollector()))
+
+	_ = g.Wait() // Individual collector errors are logged and swallowed today; reserved for future cancel-on-error.
+
+	for _, projection := range projections {
+		attachProviderProjection(snap, projection)
+	}
+
+	// Enforce GPU requirement if requested
+	if n.RequireGPU {
+		if err := verifyGPUCollected(snap); err != nil {
+			return err
+		}
+	}
+
+	// Derive cluster fingerprint from the assembled measurements.
+	// Populated after all collectors finish so missing signals
+	// surface as zero-value dimensions rather than partial state.
+	snap.Fingerprint = fingerprint.FromMeasurements(snap.Measurements)
+
+	snapshotCollectionTotal.WithLabelValues("success").Inc()
+	snapshotMeasurementCount.Set(float64(len(snap.Measurements)))
+
+	slog.Debug("snapshot collection complete", slog.Int("total_configs", len(snap.Measurements)))
+
+	// Serialize output
+	if n.Serializer == nil {
+		n.Serializer = serializer.NewStdoutWriter(serializer.FormatJSON)
+	}
+
+	if err := n.Serializer.Serialize(ctx, snap); err != nil {
+		slog.Error("failed to serialize", slog.String("error", err.Error()))
+		return errors.Wrap(errors.ErrCodeInternal, "failed to serialize snapshot", err)
+	}
+
+	return nil
+}
+
+// hasGPUData returns true when snap contains a GPU measurement with gpu-count > 0.
+// Uses st.GetInt64 which handles int, int64, and float64 (YAML/JSON round-trips
+// deliver integers as float64).
+func hasGPUData(snap *Snapshot) bool {
+	for _, m := range snap.Measurements {
+		if m == nil || m.Type != measurement.TypeGPU {
+			continue
+		}
+		for i := range m.Subtypes {
+			count, err := m.Subtypes[i].GetInt64(measurement.KeyGPUCount)
+			if err == nil && count > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// verifyGPUCollected checks that the snapshot contains a GPU measurement with
+// gpu-count > 0. Returns an error if no GPU was detected.
+func verifyGPUCollected(snap *Snapshot) error {
+	if hasGPUData(snap) {
+		return nil
+	}
+	return errors.New(errors.ErrCodeNotFound,
+		"--require-gpu was set but no GPU was detected (neither NFD PCI enumeration nor nvidia-smi found GPUs)")
+}
+
+// hasGPUNodesInTopology returns true when any topology label key starts with
+// gpuNodeLabelPrefix (covers both gpu.present and gpu.product NFD labels).
+//
+// The test is against the label's true key: the folded encoding synthesizes
+// "nvidia.com/gpu.true" from a multi-valued label named exactly
+// "nvidia.com/gpu", which satisfies the prefix with no NFD label present.
+func hasGPUNodesInTopology(snap *Snapshot) bool {
+	for _, m := range snap.Measurements {
+		if m == nil || m.Type != measurement.TypeNodeTopology {
+			continue
+		}
+		readings, err := topology.LabelReadings(m.GetSubtype("label"))
+		if err != nil {
+			// Advisory hint only — degrade quietly rather than fail an
+			// otherwise complete snapshot.
+			slog.Debug("skipping GPU placement detection: topology label readings could not be decoded",
+				slog.String("error", err.Error()))
+			continue
+		}
+		for _, r := range readings {
+			if strings.HasPrefix(r.Key, gpuNodeLabelPrefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// detectGPUPlacementMismatch returns true when the snapshot has no GPU data
+// but the cluster topology shows GPU-capable nodes via NFD labels.
+// This indicates the agent Job likely ran on a non-GPU node.
+func detectGPUPlacementMismatch(snap *Snapshot) bool {
+	return !hasGPUData(snap) && hasGPUNodesInTopology(snap)
+}
+
+// warnOnGPUPlacementMismatch emits a slog.Warn when detectGPUPlacementMismatch
+// returns true, providing actionable remediation steps.
+func warnOnGPUPlacementMismatch(snap *Snapshot) {
+	if !detectGPUPlacementMismatch(snap) {
+		return
+	}
+	slog.Warn("snapshot has no GPU data but cluster topology shows GPU-capable nodes — agent likely ran on a non-GPU node",
+		slog.String("detection_note", "relies on nvidia.com/gpu.present/product labels (NFD); clusters without these labels are not detected"),
+		slog.String("fix_1", "--node-selector nvidia.com/gpu.present=true (after GPU Operator/NFD)"),
+		slog.String("fix_2", "--node-selector kubernetes.io/hostname=<gpu-node> (before GPU Operator)"),
+		slog.String("fix_3", "--require-gpu (requests nvidia.com/gpu resource; needs Device Plugin)"),
+		slog.String("fix_4", "--runtime-class nvidia (nvidia-smi access without consuming a GPU slot)"),
+	)
+}
+
+// attachProviderProjection merges an operator-supplied provider projection
+// (aks-gpu-pools, oke-addons, gke-gpu-pools) into the snapshot's K8s measurement. The
+// projection is explicit input, not cluster state, so a degraded
+// collection (no K8s measurement at all) still carries it — a minimal K8s
+// measurement is created if needed.
+func attachProviderProjection(snap *Snapshot, subtype measurement.Subtype) {
+	for _, m := range snap.Measurements {
+		if m != nil && m.Type == measurement.TypeK8s {
+			m.Subtypes = append(m.Subtypes, subtype)
+			return
+		}
+	}
+	snap.Measurements = append(snap.Measurements,
+		measurement.NewMeasurement(measurement.TypeK8s).WithSubtype(subtype).Build())
+}

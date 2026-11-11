@@ -1,0 +1,715 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package v1
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/allocpolicy"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+	"gopkg.in/yaml.v3"
+)
+
+// draDriverRef builds a nvidia-dra-driver-gpu componentRef with the given
+// switch/waiver values as inline overrides (no valuesFile — hydration merges
+// overrides on top, so inline-only refs exercise the same lookup path).
+func draDriverRef(gpusEnabled, override bool) recipe.ComponentRef {
+	return recipe.ComponentRef{
+		Name: "nvidia-dra-driver-gpu",
+		Overrides: map[string]any{
+			"gpuResourcesEnabledOverride": override,
+			"resources": map[string]any{
+				"gpus": map[string]any{"enabled": gpusEnabled},
+			},
+		},
+	}
+}
+
+// draDriverOCPRef builds a nvidia-dra-driver-gpu-ocp componentRef with the
+// same switch/waiver shape as draDriverRef — the OCP alias reuses the
+// upstream chart, so the values paths are identical.
+func draDriverOCPRef(gpusEnabled, override bool) recipe.ComponentRef {
+	ref := draDriverRef(gpusEnabled, override)
+	ref.Name = "nvidia-dra-driver-gpu-ocp"
+	return ref
+}
+
+// gpuOperatorRef builds a gpu-operator componentRef pinning
+// devicePlugin.enabled.
+func gpuOperatorRef(devicePluginEnabled bool) recipe.ComponentRef {
+	return recipe.ComponentRef{
+		Name: "gpu-operator",
+		Overrides: map[string]any{
+			"devicePlugin": map[string]any{"enabled": devicePluginEnabled},
+		},
+	}
+}
+
+// TestResolveGPUAllocationPolicy pins the #1327 contract table: the seven
+// configuration rows plus component-absent, component-disabled, and
+// no-recipe-context resolution.
+func TestResolveGPUAllocationPolicy(t *testing.T) {
+	tests := []struct {
+		name    string
+		recipe  *recipe.RecipeResult
+		want    string
+		wantErr bool
+		// wantMsg, when non-empty, must appear in the error text — pins the
+		// actionable guidance on the promoted rejection rows.
+		wantMsg string
+	}{
+		{
+			// Row 1: production default.
+			name: "gpus disabled, waiver off, device plugin on: device-plugin policy",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(false, false), gpuOperatorRef(true),
+			}},
+			want: GPUAllocationPolicyDevicePluginExtendedResource,
+		},
+		{
+			// Row 2: the three-part experimental DRA opt-in (gpus.enabled=true
+			// + waiver=true + devicePlugin.enabled=false) still resolves
+			// dra-resource-claim cleanly after the row-3/5 promotion.
+			name: "gpus enabled, waiver on, device plugin off: dra-resource-claim",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(true, true), gpuOperatorRef(false),
+			}},
+			want: GPUAllocationPolicyDRAResourceClaim,
+		},
+		{
+			// Row 3: dual advertisement — rejected since the
+			// production-default flip (was a transitional warning).
+			name: "gpus enabled, waiver on, device plugin on: invalid (dual advertisement)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(true, true), gpuOperatorRef(true),
+			}},
+			wantErr: true,
+			wantMsg: "dual advertisement",
+		},
+		{
+			// Row 4: the upstream chart install guard rejects this.
+			name: "gpus enabled without waiver: invalid",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(true, false), gpuOperatorRef(true),
+			}},
+			wantErr: true,
+		},
+		{
+			// Row 5: inert waiver — rejected since the production-default
+			// flip (was a transitional warning).
+			name: "gpus disabled with inert waiver, device plugin on: invalid (inert waiver)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(false, true), gpuOperatorRef(true),
+			}},
+			wantErr: true,
+			wantMsg: "inert waiver",
+		},
+		{
+			// Row 6: no whole-GPU advertiser at all.
+			name: "gpus disabled and device plugin disabled: invalid",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(false, false), gpuOperatorRef(false),
+			}},
+			wantErr: true,
+		},
+		{
+			// Row 7: standalone runs.
+			name:   "no recipe context: unspecified",
+			recipe: nil,
+			want:   GPUAllocationPolicyUnspecified,
+		},
+		{
+			name: "DRA driver component absent: device-plugin policy",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				gpuOperatorRef(true),
+			}},
+			want: GPUAllocationPolicyDevicePluginExtendedResource,
+		},
+		{
+			name: "DRA driver component disabled: device-plugin policy despite gpus.enabled=true",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				func() recipe.ComponentRef {
+					ref := draDriverRef(true, true)
+					ref.Overrides["enabled"] = false
+					return ref
+				}(),
+				gpuOperatorRef(true),
+			}},
+			want: GPUAllocationPolicyDevicePluginExtendedResource,
+		},
+		{
+			name: "DRA driver absent and device plugin explicitly disabled: invalid",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				gpuOperatorRef(false),
+			}},
+			wantErr: true,
+		},
+		{
+			// The chart's DECLARED default is gpus.enabled=true, so an
+			// enabled DRA component with the switch absent must fail closed
+			// rather than silently resolve device-plugin while Helm would
+			// deploy full-GPU DRA (or trip the chart guard). Stock recipes
+			// always pin the value via the component values.
+			name: "enabled DRA component without an explicit gpus.enabled: invalid",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				{Name: "nvidia-dra-driver-gpu"}, {Name: "gpu-operator"},
+			}},
+			wantErr: true,
+		},
+		{
+			// Row 6 via component absence: no enabled GPU operator component
+			// means no device-plugin advertiser — externally managed
+			// advertisers are an explicit #1327 non-goal.
+			name: "no GPU operator component at all and DRA disabled: invalid (no advertiser)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(false, false),
+			}},
+			wantErr: true,
+		},
+		{
+			name: "gpu-operator disabled and DRA disabled: invalid (no advertiser)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(false, false),
+				func() recipe.ComponentRef {
+					ref := gpuOperatorRef(true)
+					ref.Overrides["enabled"] = false
+					return ref
+				}(),
+			}},
+			wantErr: true,
+		},
+		{
+			// OCP recipes disable gpu-operator and carry gpu-operator-ocp,
+			// whose values pin devicePlugin.enabled: true.
+			name: "gpu-operator-ocp provides the device-plugin advertiser",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(false, false),
+				{
+					Name: "gpu-operator-ocp",
+					Overrides: map[string]any{
+						"devicePlugin": map[string]any{"enabled": true},
+					},
+				},
+			}},
+			want: GPUAllocationPolicyDevicePluginExtendedResource,
+		},
+		{
+			// The REAL OCP recipe shape (recipes/overlays/ocp.yaml): canonical
+			// gpu-operator present but DISABLED, nvidia-dra-driver-gpu present
+			// but DISABLED, gpu-operator-ocp enabled with the devicePlugin pin
+			// — must resolve device-plugin, never the row-6 error.
+			name: "real OCP shape: disabled gpu-operator + disabled DRA + enabled gpu-operator-ocp",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				func() recipe.ComponentRef {
+					ref := draDriverRef(true, true) // values irrelevant once disabled
+					ref.Overrides["enabled"] = false
+					return ref
+				}(),
+				func() recipe.ComponentRef {
+					ref := gpuOperatorRef(true)
+					ref.Overrides["enabled"] = false
+					return ref
+				}(),
+				{
+					Name: "gpu-operator-ocp",
+					Overrides: map[string]any{
+						"devicePlugin": map[string]any{"enabled": true},
+					},
+				},
+			}},
+			want: GPUAllocationPolicyDevicePluginExtendedResource,
+		},
+		{
+			name: "gpu-operator-ocp enabled without the devicePlugin key defaults to enabled",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				{Name: "gpu-operator-ocp"},
+			}},
+			want: GPUAllocationPolicyDevicePluginExtendedResource,
+		},
+		{
+			// Two GPU operators on one cluster collide at the operand level
+			// regardless of devicePlugin enablement at any operator level or external
+			// advertisers presence, so enabling both fails closed.
+			// (ErrCodeInvalidRequest) instead of silently preferring one (#1685
+			// and #1327).
+			name: "both gpu-operator and gpu-operator-ocp enabled: invalid (rejected)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				gpuOperatorRef(true),
+				{
+					Name: "gpu-operator-ocp",
+					Overrides: map[string]any{
+						"devicePlugin": map[string]any{"enabled": false},
+					},
+				},
+			}},
+			wantErr: true,
+			wantMsg: "invalid GPU allocation configuration: components \"gpu-operator\" and \"gpu-operator-ocp\" are both enabled",
+		},
+		{
+			// Regression for the #1685 orientation gap: a custom recipe with
+			// gpu-operator devicePlugin.enabled=false and gpu-operator-ocp
+			// devicePlugin.enabled=true previously resolved dra-resource-claim
+			// (gpu-operator won) while the OCP ClusterPolicy still rendered an
+			// enabled device plugin — the dual-advertisement state #1327
+			// rejects. Enabling both operators must fail closed before any
+			// policy is derived, regardless of which side carries the
+			// divergent pin.
+			name: "both operators enabled with divergent devicePlugin pins: invalid (orientation gap)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(true, true),
+				gpuOperatorRef(false),
+				{
+					Name: "gpu-operator-ocp",
+					Overrides: map[string]any{
+						"devicePlugin": map[string]any{"enabled": true},
+					},
+				},
+			}},
+			wantErr: true,
+			wantMsg: "invalid GPU allocation configuration: components \"gpu-operator\" and \"gpu-operator-ocp\" are both enabled",
+		},
+		{
+			// OCP recipes carry the DRA driver under its -ocp alias; the
+			// opt-in must resolve through the alias fallback, not silently
+			// fall back to device-plugin (which would skip every DRA gate).
+			name: "OCP DRA opt-in via nvidia-dra-driver-gpu-ocp: dra-resource-claim",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverOCPRef(true, true),
+				{
+					Name: "gpu-operator-ocp",
+					Overrides: map[string]any{
+						"devicePlugin": map[string]any{"enabled": false},
+					},
+				},
+			}},
+			want: GPUAllocationPolicyDRAResourceClaim,
+		},
+		{
+			// The dual-advertisement rejection must fire through the alias
+			// too — this is the gate an OCP opt-in previously bypassed.
+			name: "OCP DRA opt-in with device plugin on: invalid (dual advertisement)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverOCPRef(true, true),
+				{
+					Name: "gpu-operator-ocp",
+					Overrides: map[string]any{
+						"devicePlugin": map[string]any{"enabled": true},
+					},
+				},
+			}},
+			wantErr: true,
+			wantMsg: "dual advertisement",
+		},
+		{
+			// Both DRA components enabled: the canonical component wins
+			// (warn) — if the -ocp values were read instead, this shape
+			// would reject as dual advertisement.
+			name: "both nvidia-dra-driver-gpu and -ocp enabled: canonical resolves the policy",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(false, false),
+				draDriverOCPRef(true, true),
+				gpuOperatorRef(true),
+			}},
+			want: GPUAllocationPolicyDevicePluginExtendedResource,
+		},
+		{
+			// DRA opt-in stands on its own: no operator component needed.
+			name: "DRA enabled with no GPU operator component: dra-resource-claim",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(true, true),
+			}},
+			want: GPUAllocationPolicyDRAResourceClaim,
+		},
+		{
+			name: "non-boolean switch value: invalid (fail closed)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				{
+					Name: "nvidia-dra-driver-gpu",
+					Overrides: map[string]any{
+						"resources": map[string]any{
+							"gpus": map[string]any{"enabled": "true"},
+						},
+					},
+				},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "non-map path segment: invalid (fail closed)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				{
+					Name:      "nvidia-dra-driver-gpu",
+					Overrides: map[string]any{"resources": "oops"},
+				},
+			}},
+			wantErr: true,
+		},
+		{
+			// Symmetric fail-closed coverage: the waiver shares the same
+			// malformed-value contract as the switch.
+			name: "non-boolean override waiver: invalid (fail closed)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				{
+					Name: "nvidia-dra-driver-gpu",
+					Overrides: map[string]any{
+						"resources":                   map[string]any{"gpus": map[string]any{"enabled": true}},
+						"gpuResourcesEnabledOverride": "yes",
+					},
+				},
+			}},
+			wantErr: true,
+		},
+		{
+			// Explicit YAML null is the "empty this map" idiom — it must
+			// behave exactly like an absent key, not like a malformed value
+			// (devicePlugin: null == devicePlugin: {} == key absent).
+			name: "devicePlugin: null treated as absent (chart default true)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(false, false),
+				{
+					Name:      "gpu-operator",
+					Overrides: map[string]any{"devicePlugin": nil},
+				},
+			}},
+			want: GPUAllocationPolicyDevicePluginExtendedResource,
+		},
+		{
+			// Null on the DRA resources map likewise reads as absent — and
+			// an ENABLED DRA component with the switch absent is the
+			// explicit-pin rejection, not a malformed-value error.
+			name: "resources: null on enabled DRA component: explicit-pin rejection",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				{
+					Name:      "nvidia-dra-driver-gpu",
+					Overrides: map[string]any{"resources": nil},
+				},
+				gpuOperatorRef(true),
+			}},
+			wantErr: true,
+		},
+		{
+			// Symmetric fail-closed coverage: devicePlugin.enabled on the
+			// operator component shares the malformed-value contract.
+			name: "non-boolean devicePlugin.enabled: invalid (fail closed)",
+			recipe: &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+				draDriverRef(false, false),
+				{
+					Name: "gpu-operator",
+					Overrides: map[string]any{
+						"devicePlugin": map[string]any{"enabled": 1},
+					},
+				},
+			}},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ResolveGPUAllocationPolicy(context.Background(), tt.recipe)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				if errorstest.ReportedCode(err) != errors.ErrCodeInvalidRequest {
+					t.Errorf("error code = %v, want ErrCodeInvalidRequest", err)
+				}
+				if tt.wantMsg != "" && !strings.Contains(err.Error(), tt.wantMsg) {
+					t.Errorf("error %q does not contain %q", err.Error(), tt.wantMsg)
+				}
+				return
+			}
+			if got != tt.want {
+				t.Errorf("policy = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestToValidationInputWithContext(t *testing.T) {
+	t.Run("nil recipe returns nil input and no error", func(t *testing.T) {
+		got, err := ToValidationInputWithContext(context.Background(), nil)
+		if err != nil || got != nil {
+			t.Fatalf("got (%v, %v), want (nil, nil)", got, err)
+		}
+	})
+
+	t.Run("populates resolved policy", func(t *testing.T) {
+		r := &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+			draDriverRef(true, true), gpuOperatorRef(false),
+		}}
+		got, err := ToValidationInputWithContext(context.Background(), r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.GPUAllocationPolicy != GPUAllocationPolicyDRAResourceClaim {
+			t.Errorf("GPUAllocationPolicy = %q, want %q",
+				got.GPUAllocationPolicy, GPUAllocationPolicyDRAResourceClaim)
+		}
+	})
+
+	t.Run("invalid allocation configuration fails closed", func(t *testing.T) {
+		r := &recipe.RecipeResult{ComponentRefs: []recipe.ComponentRef{
+			draDriverRef(true, false),
+		}}
+		if _, err := ToValidationInputWithContext(context.Background(), r); err == nil {
+			t.Fatal("expected error for gpus.enabled=true without the chart-guard waiver")
+		}
+	})
+}
+
+// TestValidationInputGPUAllocationPolicyRoundTrip verifies the field survives
+// the same serialization path the validator Job ConfigMap uses (yaml.Marshal
+// → validation.yaml → deserialization in validators.LoadContext), and that
+// it is omitted when empty (older consumers see no new field).
+func TestValidationInputGPUAllocationPolicyRoundTrip(t *testing.T) {
+	in := &ValidationInput{GPUAllocationPolicy: GPUAllocationPolicyDRAResourceClaim}
+	data, err := yaml.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+	if !strings.Contains(string(data), "gpuAllocationPolicy: dra-resource-claim") {
+		t.Fatalf("serialized form missing gpuAllocationPolicy key:\n%s", data)
+	}
+	var out ValidationInput
+	if unmarshalErr := yaml.Unmarshal(data, &out); unmarshalErr != nil {
+		t.Fatalf("unmarshal error: %v", unmarshalErr)
+	}
+	if out.GPUAllocationPolicy != GPUAllocationPolicyDRAResourceClaim {
+		t.Errorf("round-trip policy = %q, want %q",
+			out.GPUAllocationPolicy, GPUAllocationPolicyDRAResourceClaim)
+	}
+
+	empty, err := yaml.Marshal(&ValidationInput{})
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+	if strings.Contains(string(empty), "gpuAllocationPolicy") {
+		t.Errorf("empty policy must be omitted (omitempty):\n%s", empty)
+	}
+}
+
+func TestGetGPUAllocationPolicy(t *testing.T) {
+	tests := []struct {
+		name  string
+		input *ValidationInput
+		want  string
+	}{
+		{"nil input", nil, GPUAllocationPolicyUnspecified},
+		{"empty field", &ValidationInput{}, GPUAllocationPolicyUnspecified},
+		{"populated field",
+			&ValidationInput{GPUAllocationPolicy: GPUAllocationPolicyDevicePluginExtendedResource},
+			GPUAllocationPolicyDevicePluginExtendedResource},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.input.GetGPUAllocationPolicy(); got != tt.want {
+				t.Errorf("GetGPUAllocationPolicy() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// advertiserProfileRecipe builds a profile-bearing recipe declaring the
+// given advertiser over the given component refs.
+func advertiserProfileRecipe(advertiser string, refs ...recipe.ComponentRef) *recipe.RecipeResult {
+	return &recipe.RecipeResult{
+		APIVersion:    recipe.RecipeProfileAPIVersion,
+		ComponentRefs: refs,
+		Metadata: recipe.RecipeResultMetadata{SelectedProfile: &recipe.SelectedProfile{
+			Name: "gpuStack", Value: "gke-default", Advertiser: advertiser,
+			OwnedPaths: map[string][]string{
+				"gpu-operator": {"devicePlugin.enabled", "enabled"},
+			},
+		}},
+	}
+}
+
+// externalProfileRecipe builds a profile-bearing recipe declaring
+// advertiser "external" (the GKE gke-default shape) over the given
+// component refs.
+func externalProfileRecipe(refs ...recipe.ComponentRef) *recipe.RecipeResult {
+	return advertiserProfileRecipe(allocpolicy.AdvertiserExternal, refs...)
+}
+
+// TestResolveGPUAllocationPolicyExternalAdvertiser pins the ADR-015 #1327
+// amendment: a declared external advertiser counts as THE advertiser in
+// the exactly-one invariant, the dual-advertisement gates extend to it
+// fail-closed, and the resolved policy value is unchanged
+// (device-plugin-extended-resource names the request mechanism, not
+// provider ownership).
+func TestResolveGPUAllocationPolicyExternalAdvertiser(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		recipe  *recipe.RecipeResult
+		want    string
+		wantErr bool
+		wantMsg string
+	}{
+		{
+			// The GKE gke-default happy path: operator plugin off, DRA off.
+			name:   "external advertiser with device plugin off and DRA off resolves to device-plugin policy",
+			recipe: externalProfileRecipe(draDriverRef(false, false), gpuOperatorRef(false)),
+			want:   GPUAllocationPolicyDevicePluginExtendedResource,
+		},
+		{
+			// External is also THE advertiser when no operator component
+			// exists at all — the pre-amendment "no whole-GPU advertiser"
+			// rejection must not fire for a declared external advertiser.
+			name:   "external advertiser without any operator component resolves",
+			recipe: externalProfileRecipe(draDriverRef(false, false)),
+			want:   GPUAllocationPolicyDevicePluginExtendedResource,
+		},
+		{
+			name:    "external advertiser with device plugin enabled is dual advertisement",
+			recipe:  externalProfileRecipe(draDriverRef(false, false), gpuOperatorRef(true)),
+			wantErr: true,
+			wantMsg: "devicePlugin.enabled=true",
+		},
+		{
+			// Two GPU operators on one cluster collide at the operand level
+			// regardless of devicePlugin enablement on any operator level or external
+			// advertisers presence, so enabling both fails closed.
+			// (ErrCodeInvalidRequest) instead of silently preferring one (#1685
+			// and #1327).
+			name: "external advertiser with gpu-operator plugin off but gpu-operator-ocp plugin on is dual advertisement (rejected)",
+			recipe: externalProfileRecipe(
+				draDriverRef(false, false),
+				gpuOperatorRef(false),
+				recipe.ComponentRef{
+					Name: "gpu-operator-ocp",
+					Overrides: map[string]any{
+						"devicePlugin": map[string]any{"enabled": true},
+					},
+				},
+			),
+			wantErr: true,
+			wantMsg: "invalid GPU allocation configuration: components \"gpu-operator\" and \"gpu-operator-ocp\" are both enabled",
+		},
+		{
+			// Two GPU operators on one cluster collide at the operand level
+			// regardless of devicePlugin enablement on any operator level or external
+			// advertisers presence, so enabling both fails closed.
+			// (ErrCodeInvalidRequest) instead of silently preferring one (#1685
+			// and #1327).
+			name: "external advertiser with both operator components' plugins off (rejected)",
+			recipe: externalProfileRecipe(
+				draDriverRef(false, false),
+				gpuOperatorRef(false),
+				recipe.ComponentRef{
+					Name: "gpu-operator-ocp",
+					Overrides: map[string]any{
+						"devicePlugin": map[string]any{"enabled": false},
+					},
+				},
+			),
+			wantErr: true,
+			wantMsg: "invalid GPU allocation configuration: components \"gpu-operator\" and \"gpu-operator-ocp\" are both enabled",
+		},
+		{
+			// Two GPU operators on one cluster collide at the operand level
+			// regardless of devicePlugin enablement on any operator level or external
+			// advertisers presence, so enabling both fails closed.
+			// (ErrCodeInvalidRequest) instead of silently preferring one (#1685
+			// and #1327).
+			name: "external advertiser with gpu-operator-ocp missing the devicePlugin key is dual advertisement (rejected)",
+			recipe: externalProfileRecipe(
+				draDriverRef(false, false),
+				gpuOperatorRef(false),
+				recipe.ComponentRef{Name: "gpu-operator-ocp"},
+			),
+			wantErr: true,
+			wantMsg: "invalid GPU allocation configuration: components \"gpu-operator\" and \"gpu-operator-ocp\" are both enabled",
+		},
+		{
+			name:    "external advertiser with DRA gpus enabled is dual advertisement",
+			recipe:  externalProfileRecipe(draDriverRef(true, true), gpuOperatorRef(false)),
+			wantErr: true,
+			wantMsg: "resources.gpus.enabled=true",
+		},
+		{
+			name:    "external advertiser with an inert waiver is rejected",
+			recipe:  externalProfileRecipe(draDriverRef(false, true), gpuOperatorRef(false)),
+			wantErr: true,
+			wantMsg: "inert waiver",
+		},
+		{
+			// The absent-pin gate (an enabled nvidia-dra-driver-gpu without
+			// an explicit resources.gpus.enabled) runs BEFORE the
+			// external-advertiser branch: a declared external advertiser
+			// must not bypass the deploy-time divergence guard.
+			name: "external advertiser with enabled DRA component missing the gpus.enabled pin is rejected",
+			recipe: externalProfileRecipe(
+				recipe.ComponentRef{Name: "nvidia-dra-driver-gpu"},
+				gpuOperatorRef(false),
+			),
+			wantErr: true,
+			wantMsg: "is not set",
+		},
+		{
+			// An empty advertiser on a profile-bearing recipe is the
+			// undeclared shape: it takes the ordinary (non-external)
+			// resolution path and resolves from the operator plugin state.
+			name:   "profile with empty advertiser resolves through the ordinary path",
+			recipe: advertiserProfileRecipe("", draDriverRef(false, false), gpuOperatorRef(true)),
+			want:   GPUAllocationPolicyDevicePluginExtendedResource,
+		},
+		{
+			// The vocabulary gate must run for typed Go callers too:
+			// only the exact "external" string reaches the declared-
+			// advertiser branch, so a wrong-case value must fail closed
+			// here rather than fall through and resolve as an ordinary
+			// undeclared recipe.
+			name:    "wrong-case advertiser is rejected, not resolved as undeclared",
+			recipe:  advertiserProfileRecipe("External", draDriverRef(false, false), gpuOperatorRef(false)),
+			wantErr: true,
+			wantMsg: "unknown advertiser",
+		},
+		{
+			name:    "unknown advertiser vocabulary is rejected",
+			recipe:  advertiserProfileRecipe("csp", draDriverRef(false, false), gpuOperatorRef(true)),
+			wantErr: true,
+			wantMsg: "unknown advertiser",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ResolveGPUAllocationPolicy(context.Background(), tt.recipe)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ResolveGPUAllocationPolicy() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				// Every rejection in this table is a configuration defect
+				// the caller must surface as invalid input.
+				if errorstest.ReportedCode(err) != errors.ErrCodeInvalidRequest {
+					t.Errorf("expected ErrCodeInvalidRequest, got %v", err)
+				}
+				if tt.wantMsg != "" && !strings.Contains(err.Error(), tt.wantMsg) {
+					t.Fatalf("error %v does not contain %q", err, tt.wantMsg)
+				}
+				return
+			}
+			if got != tt.want {
+				t.Errorf("policy = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

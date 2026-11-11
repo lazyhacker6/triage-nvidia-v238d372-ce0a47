@@ -1,0 +1,402 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cli-bundle-dynamic
+spec:
+  description: |
+    Tests --dynamic flag for install-time values in bundle output.
+    Covers Helm deployer (cluster-values.yaml split) and Argo CD deployer
+    (Helm chart app-of-apps with helm.values). No cluster needed.
+  timeouts:
+    exec: 60s
+  steps:
+    - name: setup
+      description: Generate recipe used by all dynamic value tests.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              rm -rf "${WORK}" && mkdir -p "${WORK}"
+              ${AICR_BIN} recipe --service eks --accelerator gb200 --os ubuntu \
+                --intent training -o "${WORK}/recipe.yaml"
+
+    - name: helm-dynamic-generates-cluster-values
+      description: --dynamic creates cluster-values.yaml with the extracted value.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              ${AICR_BIN} bundle -r "${WORK}/recipe.yaml" -o "${WORK}/helm-dynamic" \
+                --dynamic gpuoperator:driver.version
+              # Components live in NNN-<name>/ folders (per-component bundle layout).
+              # gpu-operator is mixed (helm + manifests): the upstream-helm half holds
+              # cluster-values.yaml. Index can shift, so glob the prefix.
+              CV=$(ls "${WORK}"/helm-dynamic/[0-9][0-9][0-9]-gpu-operator/cluster-values.yaml 2>/dev/null \
+                | grep -v -- '-gpu-operator-post' | head -1)
+              [ -n "${CV}" ] || { echo "cluster-values.yaml not found for gpu-operator" >&2; exit 1; }
+
+    - name: assert-cluster-values-structure
+      description: cluster-values.yaml has the dynamic path at the correct YAML location.
+      try:
+        - script:
+            content: |
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              CV=$(ls "${WORK}"/helm-dynamic/[0-9][0-9][0-9]-gpu-operator/cluster-values.yaml 2>/dev/null \
+                | grep -v -- '-gpu-operator-post' | head -1)
+              [ -n "${CV}" ] || { echo "cluster-values.yaml not found for gpu-operator" >&2; exit 1; }
+              printf 'apiVersion: helm/v1\nkind: Values\n' > "${WORK}/cluster-values-check.yaml"
+              sed '/^---$/d' "${CV}" >> "${WORK}/cluster-values-check.yaml"
+              chainsaw assert \
+                --resource "${WORK}/cluster-values-check.yaml" \
+                --file ./assert-cluster-values.yaml \
+                --no-color --timeout 5s
+
+    - name: helm-all-components-have-cluster-values
+      description: All components get cluster-values.yaml for per-cluster overrides.
+      try:
+        - script:
+            content: |
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              for dir in "${WORK}"/helm-dynamic/[0-9]*/; do
+                comp=$(basename "$dir")
+                test -f "${dir}cluster-values.yaml" \
+                  || { echo "${comp} missing cluster-values.yaml" >&2; exit 1; }
+              done
+              # Only gpu-operator's should have dynamic content
+              CV=$(ls "${WORK}"/helm-dynamic/[0-9][0-9][0-9]-gpu-operator/cluster-values.yaml 2>/dev/null \
+                | grep -v -- '-gpu-operator-post' | head -1)
+              grep -q "driver" "${CV}"
+            check:
+              ($error == null): true
+
+    - name: helm-install-scripts-reference-cluster-values
+      description: |
+        Each per-component install.sh references cluster-values.yaml (via -f).
+        deploy.sh is now a generic loop that delegates to install.sh; the
+        cluster-values.yaml reference moved into install.sh in #662.
+      try:
+        - script:
+            content: |
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              # Spot-check at least one folder's install.sh references cluster-values.yaml
+              INSTALL=$(ls "${WORK}"/helm-dynamic/[0-9][0-9][0-9]-gpu-operator/install.sh 2>/dev/null \
+                | grep -v -- "-post/" | head -1)
+              [ -n "${INSTALL}" ] || { echo "gpu-operator install.sh not found" >&2; exit 1; }
+              grep -q "cluster-values.yaml" "${INSTALL}"
+            check:
+              ($error == null): true
+
+    - name: helm-no-dynamic-still-has-cluster-values
+      description: Without --dynamic, cluster-values.yaml exists (empty) for all components.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              ${AICR_BIN} bundle -r "${WORK}/recipe.yaml" -o "${WORK}/helm-nodynamic"
+              # Every component should have cluster-values.yaml
+              for dir in "${WORK}"/helm-nodynamic/[0-9]*/; do
+                test -f "${dir}cluster-values.yaml" \
+                  || { echo "$(basename "$dir") missing cluster-values.yaml" >&2; exit 1; }
+              done
+              # Each per-component install.sh should reference cluster-values.yaml
+              # (deploy.sh is generic; the reference now lives in install.sh per #662).
+              for sh in "${WORK}"/helm-nodynamic/[0-9]*/install.sh; do
+                grep -q "cluster-values.yaml" "${sh}" \
+                  || { echo "$(dirname "${sh}") install.sh missing cluster-values.yaml reference" >&2; exit 1; }
+              done
+            check:
+              ($error == null): true
+
+    - name: argocd-helm-creates-helm-chart
+      description: --deployer argocd-helm produces Helm chart (Chart.yaml + templates/).
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              ${AICR_BIN} bundle -r "${WORK}/recipe.yaml" -o "${WORK}/argocd-dynamic" \
+                --deployer argocd-helm \
+                --dynamic gpuoperator:driver.version
+              test -d "${WORK}/argocd-dynamic/templates"
+              # Flat Argo CD artifacts should NOT exist
+              ! test -f "${WORK}/argocd-dynamic/app-of-apps.yaml"
+
+    - name: assert-argocd-chart-yaml
+      description: Chart.yaml has valid Helm chart metadata.
+      try:
+        - script:
+            content: |
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              # Prepend synthetic apiVersion/kind for chainsaw assert (Chart.yaml uses Helm's apiVersion v2)
+              printf 'apiVersion: helm/v1\nkind: ChartMeta\n' > "${WORK}/chart-check.yaml"
+              sed '/^apiVersion:/d; /^---$/d' "${WORK}/argocd-dynamic/Chart.yaml" >> "${WORK}/chart-check.yaml"
+              chainsaw assert \
+                --resource "${WORK}/chart-check.yaml" \
+                --file ./assert-helm-chart.yaml \
+                --no-color --timeout 5s
+
+    - name: argocd-template-has-values-object
+      description: At least one Argo CD Application template references helm.values.
+      try:
+        - script:
+            content: |
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              found=false
+              for tmpl in "${WORK}"/argocd-dynamic/templates/*.yaml; do
+                [ -f "$tmpl" ] || continue
+                grep -q "values:" "$tmpl" && { found=true; break; }
+              done
+              [ "$found" = "true" ]
+            check:
+              ($error == null): true
+
+    - name: argocd-no-dynamic-backwards-compatible
+      description: Argo CD without --dynamic produces flat manifests (backwards compatible).
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              ${AICR_BIN} bundle -r "${WORK}/recipe.yaml" -o "${WORK}/argocd-nodynamic" \
+                --deployer argocd
+              test -f "${WORK}/argocd-nodynamic/app-of-apps.yaml"
+              ! test -f "${WORK}/argocd-nodynamic/Chart.yaml"
+            check:
+              ($error == null): true
+
+    - name: argocd-helm-template-roundtrip
+      description: |
+        Generated Argo CD Helm chart is valid — helm template renders without
+        errors when the user supplies repoURL/targetRevision via --set. The
+        chart's templates/aicr-stack.yaml uses `required` on .Values.repoURL,
+        which makes the URL a mandatory install-time parameter (the bundle
+        is URL-portable; same artifact bytes work for any registry).
+
+        Requires the `helm` CLI on PATH (installed alongside chainsaw and
+        aicr by `make tools-setup`). The check below fails early with a
+        clear message instead of a cryptic "command not found".
+      try:
+        - script:
+            content: |
+              command -v helm >/dev/null 2>&1 \
+                || { echo "ERROR: helm CLI not on PATH; run 'make tools-setup' or install helm before running chainsaw tests" >&2; exit 1; }
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              # helm template validates Chart.yaml, values.yaml, and all templates
+              # are syntactically correct and renderable. repoURL/targetRevision
+              # are mandatory (consumed by the parent Application's source).
+              output=$(helm template test-release "${WORK}/argocd-dynamic" \
+                --set repoURL=oci://example/aicr-bundle \
+                --set targetRevision=v1 2>&1)
+              if [ $? -ne 0 ]; then
+                echo "helm template failed:" >&2
+                echo "$output" >&2
+                exit 1
+              fi
+              # Output should contain Argo CD Application resources
+              echo "$output" | grep -q "kind: Application" \
+                || { echo "rendered output should contain Argo CD Applications" >&2; exit 1; }
+              # Output should contain values: (proves template references resolve)
+              echo "$output" | grep -q "values:" \
+                || { echo "rendered output should contain values:" >&2; exit 1; }
+              # The user-supplied repoURL must reach the parent Application's source.
+              echo "$output" | grep -q "oci://example/aicr-bundle" \
+                || { echo "rendered output should contain user-supplied repoURL" >&2; exit 1; }
+            check:
+              ($error == null): true
+
+    - name: argocd-helm-template-fails-without-repoURL
+      description: |
+        helm template MUST fail with a clear "repoURL is required" message when
+        the user omits --set repoURL. This guards against accidentally publishing
+        a chart whose Application would point at an empty URL.
+      try:
+        - script:
+            content: |
+              command -v helm >/dev/null 2>&1 \
+                || { echo "ERROR: helm CLI not on PATH; run 'make tools-setup' or install helm before running chainsaw tests" >&2; exit 1; }
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              if output=$(helm template test-release "${WORK}/argocd-dynamic" 2>&1); then
+                echo "expected helm template to fail without --set repoURL, but it succeeded:" >&2
+                echo "$output" >&2
+                exit 1
+              fi
+              echo "$output" | grep -q "repoURL is required" \
+                || { echo "expected error to mention 'repoURL is required', got: $output" >&2; exit 1; }
+            check:
+              ($error == null): true
+
+    - name: helm-dynamic-combined-with-set
+      description: --dynamic and --set flags work together correctly.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              ${AICR_BIN} bundle -r "${WORK}/recipe.yaml" -o "${WORK}/helm-combined" \
+                --dynamic gpuoperator:driver.version \
+                --set gpuoperator:gds.enabled=true
+              CV=$(ls "${WORK}"/helm-combined/[0-9][0-9][0-9]-gpu-operator/cluster-values.yaml 2>/dev/null \
+                | grep -v -- '-gpu-operator-post' | head -1)
+              [ -n "${CV}" ] || { echo "cluster-values.yaml not found for gpu-operator" >&2; exit 1; }
+              VAL=$(ls "${WORK}"/helm-combined/[0-9][0-9][0-9]-gpu-operator/values.yaml 2>/dev/null \
+                | grep -v -- '-gpu-operator-post' | head -1)
+              [ -n "${VAL}" ] || { echo "values.yaml not found for gpu-operator" >&2; exit 1; }
+              grep -q "gds" "${VAL}"
+            check:
+              ($error == null): true
+
+    - name: helm-multiple-dynamic-components
+      description: --dynamic on two different components creates cluster-values.yaml for each.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              ${AICR_BIN} bundle -r "${WORK}/recipe.yaml" -o "${WORK}/helm-multi-dynamic" \
+                --dynamic gpuoperator:driver.version \
+                --dynamic certmanager:crds.enabled
+              # Both components should have cluster-values.yaml
+              GPU_CV=$(ls "${WORK}"/helm-multi-dynamic/[0-9][0-9][0-9]-gpu-operator/cluster-values.yaml 2>/dev/null \
+                | grep -v -- '-gpu-operator-post' | head -1)
+              [ -n "${GPU_CV}" ] || { echo "gpu-operator cluster-values.yaml missing" >&2; exit 1; }
+              CM_CV=$(ls "${WORK}"/helm-multi-dynamic/[0-9][0-9][0-9]-cert-manager/cluster-values.yaml 2>/dev/null | head -1)
+              [ -n "${CM_CV}" ] || { echo "cert-manager cluster-values.yaml missing" >&2; exit 1; }
+              # Dynamic components should have pre-populated content
+              grep -q "driver" "${GPU_CV}"
+              grep -q "crds" "${CM_CV}"
+              # All components should have cluster-values.yaml (empty for non-dynamic)
+              for dir in "${WORK}"/helm-multi-dynamic/[0-9]*/; do
+                test -f "${dir}cluster-values.yaml" \
+                  || { echo "$(basename "$dir") missing cluster-values.yaml" >&2; exit 1; }
+              done
+            check:
+              ($error == null): true
+
+    - name: helm-dynamic-nonexistent-path
+      description: --dynamic with a path not in recipe values creates cluster-values.yaml with empty stub.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              ${AICR_BIN} bundle -r "${WORK}/recipe.yaml" -o "${WORK}/helm-nonexistent" \
+                --dynamic gpuoperator:nonexistent.field
+              CV=$(ls "${WORK}"/helm-nonexistent/[0-9][0-9][0-9]-gpu-operator/cluster-values.yaml 2>/dev/null \
+                | grep -v -- '-gpu-operator-post' | head -1)
+              [ -n "${CV}" ] || { echo "gpu-operator cluster-values.yaml missing" >&2; exit 1; }
+              grep -q "nonexistent" "${CV}"
+              # The nonexistent path should be stubbed to empty string
+              grep -q 'field: ""' "${CV}" || grep -q "field: ''" "${CV}"
+            check:
+              ($error == null): true
+
+    - name: helm-disabled-component-with-dynamic
+      description: >-
+        --dynamic on a component removed from the bundle is REJECTED. This
+        step previously pinned the opposite (the declaration was silently
+        dropped and the bundle succeeded) — the exact silent discard the
+        absent-component override gate removes: a dynamic path on an absent
+        component exports nothing, so the two flags ask for contradictory
+        things.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              set +e
+              OUT=$(${AICR_BIN} bundle -r "${WORK}/recipe.yaml" -o "${WORK}/helm-disabled-dynamic" \
+                --set awsebscsidriver:enabled=false \
+                --dynamic awsebscsidriver:controller.replicaCount 2>&1)
+              RC=$?
+              set -e
+              [ "${RC}" -ne 0 ] || { echo "expected rejection, bundle succeeded" >&2; exit 1; }
+              echo "${OUT}" | grep -q -- "--dynamic awsebscsidriver:controller.replicaCount cannot take effect" \
+                || { echo "missing rejection message; got: ${OUT}" >&2; exit 1; }
+              # Nothing may be emitted for a rejected bundle.
+              [ ! -d "${WORK}/helm-disabled-dynamic" ] \
+                || { echo "rejected bundle emitted output" >&2; exit 1; }
+            check:
+              ($error == null): true
+
+    - name: assert-values-no-dynamic-key
+      description: values.yaml for dynamic component should NOT contain the extracted path.
+      try:
+        - script:
+            content: |
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              VALUES=$(ls "${WORK}"/helm-dynamic/[0-9][0-9][0-9]-gpu-operator/values.yaml 2>/dev/null \
+                | grep -v -- '-gpu-operator-post' | head -1)
+              CLUSTER=$(ls "${WORK}"/helm-dynamic/[0-9][0-9][0-9]-gpu-operator/cluster-values.yaml 2>/dev/null \
+                | grep -v -- '-gpu-operator-post' | head -1)
+              [ -n "${VALUES}" ] && [ -n "${CLUSTER}" ] \
+                || { echo "gpu-operator values.yaml or cluster-values.yaml missing" >&2; exit 1; }
+              # 1. driver section should still exist in values.yaml (driver.enabled remains)
+              grep -q "driver:" "${VALUES}"
+              # 2. driver.version must NOT appear anywhere in values.yaml
+              if yq e '.driver.version' "${VALUES}" 2>/dev/null | grep -qv "null"; then
+                echo "values.yaml still contains driver.version after dynamic split" >&2
+                exit 1
+              fi
+              # 3. driver.version must be present in cluster-values.yaml
+              yq e '.driver.version' "${CLUSTER}" | grep -qv "null"
+              # 4. Structural assert: driver.enabled still present in values.yaml
+              printf 'apiVersion: helm/v1\nkind: Values\n' > "${WORK}/values-check.yaml"
+              sed '/^---$/d; /^#/d' "${VALUES}" >> "${WORK}/values-check.yaml"
+              chainsaw assert \
+                --resource "${WORK}/values-check.yaml" \
+                --file ./assert-values-no-dynamic.yaml \
+                --no-color --timeout 5s
+            check:
+              ($error == null): true
+
+    - name: helm-dynamic-on-required-node-selector-is-rejected
+      description: >-
+        --dynamic on a path a component's requireNodeSelector marks as
+        required is REJECTED. The flag defers the value to install time,
+        the same unpinned state requireNodeSelector exists to reject.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-dynamic"
+              ${AICR_BIN} recipe --service eks --accelerator h100 --os ubuntu \
+                --intent training --platform slurm -o "${WORK}/slurm-recipe.yaml"
+              set +e
+              OUT=$(${AICR_BIN} bundle -r "${WORK}/slurm-recipe.yaml" -o "${WORK}/helm-slurm-dynamic" \
+                --system-node-selector nodeGroup=system-pool \
+                --accelerated-node-selector nodeGroup=gpu-worker \
+                --dynamic slinkyslurm:controller.podSpec.nodeSelector 2>&1)
+              RC=$?
+              set -e
+              [ "${RC}" -ne 0 ] || { echo "expected rejection, bundle succeeded" >&2; exit 1; }
+              echo "${OUT}" | grep -q -- "cannot use --dynamic on controller.podSpec.nodeSelector" \
+                || { echo "missing rejection message; got: ${OUT}" >&2; exit 1; }
+              [ ! -d "${WORK}/helm-slurm-dynamic" ] \
+                || { echo "rejected bundle emitted output" >&2; exit 1; }
+            check:
+              ($error == null): true
+
+    - name: cleanup
+      description: Remove test artifacts.
+      try:
+        - script:
+            content: |
+              rm -rf /tmp/chainsaw-bundle-dynamic

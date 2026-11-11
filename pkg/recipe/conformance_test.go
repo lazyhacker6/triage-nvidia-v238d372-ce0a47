@@ -1,0 +1,1000 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// conformance_test.go verifies that conformance-critical recipes contain
+// all CNCF-required components and conformance checks. These tests catch
+// regressions at PR time (no cluster needed) — e.g., a component removal
+// or a conformance check accidentally dropped from an overlay.
+//
+// Area of Concern: Recipe-level conformance guarantees
+// - Required components present in resolved recipe
+// - Conformance validation checks declared in overlay chain
+// - DRA constraint (K8s >= 1.34) present for all conformance recipes
+
+package recipe
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+func TestConformanceRecipeInvariants(t *testing.T) {
+	tests := []struct {
+		name               string
+		criteria           func() *Criteria
+		requiredComponents []string
+		// requiredManifestComponents lists components that must carry
+		// manifestFiles in the resolved recipe. The bundler wraps a
+		// component's manifest files into its "<name>-post" helmfile
+		// release (e.g. kubeflow-trainer-post), so a dropped manifest
+		// file silently removes that release from generated bundles.
+		requiredManifestComponents []string
+		requiredChecks             []string
+		wantDRAConstraint          bool // K8s >= 1.34 required for DRA GA
+	}{
+		{
+			name: "h100-kind-inference",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceKind
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentInference
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"agentgateway-crds",
+				"agentgateway",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"inference-gateway",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+				"cluster-autoscaling",
+			},
+			wantDRAConstraint: false,
+		},
+		{
+			name: "h100-kind-inference-dynamo",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceKind
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentInference
+				c.Platform = CriteriaPlatformDynamo
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"agentgateway-crds",
+				"agentgateway",
+				"grove",
+				"dynamo-platform",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"inference-gateway",
+				"robust-controller",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+				"cluster-autoscaling",
+			},
+			wantDRAConstraint: true,
+		},
+		{
+			name: "h100-kind-training",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceKind
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentTraining
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+				"cluster-autoscaling",
+			},
+			wantDRAConstraint: true,
+		},
+		{
+			name: "h100-kind-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceKind
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"kubeflow-trainer",
+			},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+				"cluster-autoscaling",
+				"robust-controller",
+			},
+			wantDRAConstraint: true,
+		},
+		{
+			// gb200 EKS + OKE Dynamo leaves: pinned by name so gang-scheduling
+			// cannot silently drop out again (#2390). requiredChecks is a
+			// subset assertion, so listing it here is what makes the check
+			// asserted rather than only covered by catalog golden digests.
+			name: "gb200-eks-ubuntu-inference-dynamo",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorGB200
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentInference
+				c.Platform = CriteriaPlatformDynamo
+				return c
+			},
+			requiredComponents: []string{
+				"kai-scheduler",
+				"grove",
+				"dynamo-platform",
+			},
+			requiredChecks: []string{
+				"gang-scheduling",
+				"inference-gateway",
+			},
+		},
+		{
+			name: "gb200-oke-ubuntu-inference-dynamo",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceOKE
+				c.Accelerator = CriteriaAcceleratorGB200
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentInference
+				c.Platform = CriteriaPlatformDynamo
+				return c
+			},
+			requiredComponents: []string{
+				"kai-scheduler",
+				"grove",
+				"dynamo-platform",
+			},
+			requiredChecks: []string{
+				"gang-scheduling",
+				"inference-gateway",
+			},
+		},
+		{
+			name: "h100-eks-ubuntu-inference-dynamo",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorH100
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentInference
+				c.Platform = CriteriaPlatformDynamo
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"agentgateway-crds",
+				"agentgateway",
+				"grove",
+				"dynamo-platform",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"inference-gateway",
+				"robust-controller",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+			},
+			wantDRAConstraint: true,
+		},
+		{
+			name: "h100-eks-ubuntu-training",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorH100
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+			},
+			wantDRAConstraint: false,
+		},
+		{
+			name: "rtx-pro-6000-lke-ubuntu-training",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceLKE
+				c.Accelerator = CriteriaAcceleratorRTXPro6000
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+			},
+			wantDRAConstraint: false,
+		},
+		{
+			name: "rtx-pro-6000-lke-ubuntu-inference",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceLKE
+				c.Accelerator = CriteriaAcceleratorRTXPro6000
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentInference
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"agentgateway-crds",
+				"agentgateway",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"inference-gateway",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: false,
+		},
+		{
+			name: "rtx-pro-6000-eks-inference",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorRTXPro6000
+				c.Intent = CriteriaIntentInference
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"agentgateway-crds",
+				"agentgateway",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"inference-gateway",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: false,
+		},
+		{
+			name: "rtx-pro-6000-eks-ubuntu-inference",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorRTXPro6000
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentInference
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"agentgateway-crds",
+				"agentgateway",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"inference-gateway",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: false,
+		},
+		{
+			name: "rtx-pro-6000-eks-ubuntu-inference-dynamo",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorRTXPro6000
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentInference
+				c.Platform = CriteriaPlatformDynamo
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"agentgateway-crds",
+				"agentgateway",
+				"grove",
+				"dynamo-platform",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"inference-gateway",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"robust-controller",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: true,
+		},
+		{
+			name: "rtx-pro-6000-eks-ubuntu-inference-nim",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorRTXPro6000
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentInference
+				c.Platform = CriteriaPlatformNIM
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"agentgateway-crds",
+				"agentgateway",
+				"k8s-nim-operator",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"inference-gateway",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"robust-controller",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: true,
+		},
+		{
+			name: "rtx-pro-6000-eks-training",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorRTXPro6000
+				c.Intent = CriteriaIntentTraining
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+			},
+			wantDRAConstraint: false,
+		},
+		{
+			name: "rtx-pro-6000-eks-ubuntu-training",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorRTXPro6000
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+			},
+			wantDRAConstraint: false,
+		},
+		{
+			name: "rtx-pro-6000-eks-ubuntu-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorRTXPro6000
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"kubeflow-trainer",
+			},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"robust-controller",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: false,
+		},
+		{
+			name: "a100-oke-ubuntu-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceOKE
+				c.Accelerator = CriteriaAcceleratorA100
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"kubeflow-trainer",
+			},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"robust-controller",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: false,
+		},
+		{
+			name: "h100-gke-cos-inference-dynamo",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceGKE
+				c.Accelerator = CriteriaAcceleratorH100
+				c.OS = CriteriaOSCOS
+				c.Intent = CriteriaIntentInference
+				c.Platform = CriteriaPlatformDynamo
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"agentgateway-crds",
+				"agentgateway",
+				"grove",
+				"dynamo-platform",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"inference-gateway",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"robust-controller",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: true,
+		},
+		// The five training-kubeflow leaves added for #2564. Each must resolve
+		// kubeflow-trainer (with its manifest, which the bundler turns into the
+		// kubeflow-trainer-post release) and declare robust-controller, which
+		// routes to checkRobustKubeflowTrainer only when kubeflow-trainer is
+		// present in the recipe.
+		{
+			name: "h100-bcm-ubuntu-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceBCM
+				c.Accelerator = CriteriaAcceleratorH100
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents:         []string{"gpu-operator", "kubeflow-trainer"},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks:             []string{"platform-health", "robust-controller"},
+			wantDRAConstraint:          true,
+		},
+		{
+			name: "h200-eks-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorH200
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents:         []string{"gpu-operator", "kubeflow-trainer"},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks:             []string{"platform-health", "robust-controller", "secure-accelerator-access", "driver-runtime-management"},
+		},
+		{
+			name: "rtx-pro-6000-lke-ubuntu-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceLKE
+				c.Accelerator = CriteriaAcceleratorRTXPro6000
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents:         []string{"gpu-operator", "kubeflow-trainer"},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks:             []string{"platform-health", "robust-controller", "secure-accelerator-access", "driver-runtime-management"},
+		},
+		{
+			name: "l40s-oke-inference",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceOKE
+				c.Accelerator = CriteriaAcceleratorL40S
+				c.OS = CriteriaOSOracleLinux
+				c.Intent = CriteriaIntentInference
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"agentgateway-crds",
+				"agentgateway",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: false,
+		},
+		{
+			name: "l40s-oke-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceOKE
+				c.Accelerator = CriteriaAcceleratorL40S
+				c.OS = CriteriaOSOracleLinux
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents:         []string{"gpu-operator", "kubeflow-trainer"},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks:             []string{"platform-health", "robust-controller", "secure-accelerator-access", "driver-runtime-management"},
+		},
+		{
+			name: "vr200-rke2-ubuntu-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceRKE2
+				c.Accelerator = CriteriaAcceleratorVR200
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents:         []string{"gpu-operator", "kubeflow-trainer"},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks:             []string{"platform-health", "robust-controller", "secure-accelerator-access", "driver-runtime-management"},
+			wantDRAConstraint:          true,
+		},
+		{
+			name: "gb200-eks-ubuntu-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorGB200
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents: []string{
+				"gpu-operator",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"kubeflow-trainer",
+			},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"robust-controller",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: true,
+		},
+		{
+			name: "gb200-oke-ubuntu-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceOKE
+				c.Accelerator = CriteriaAcceleratorGB200
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents: []string{
+				"gpu-operator",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"kubeflow-trainer",
+			},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"robust-controller",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: true,
+		},
+		{
+			name: "gb300-eks-ubuntu-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceEKS
+				c.Accelerator = CriteriaAcceleratorGB300
+				c.OS = CriteriaOSUbuntu
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents: []string{
+				"gpu-operator",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"kubeflow-trainer",
+			},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"robust-controller",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: true,
+		},
+		{
+			name: "gb200-gke-cos-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceGKE
+				c.Accelerator = CriteriaAcceleratorGB200
+				c.OS = CriteriaOSCOS
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents: []string{
+				"gpu-operator",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"kubeflow-trainer",
+			},
+			requiredManifestComponents: []string{"kubeflow-trainer"},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"robust-controller",
+				"secure-accelerator-access",
+				"driver-runtime-management",
+			},
+			wantDRAConstraint: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			builder := NewBuilder()
+			criteria := tt.criteria()
+
+			result, err := builder.BuildFromCriteria(ctx, criteria)
+			if err != nil {
+				t.Fatalf("BuildFromCriteria failed: %v", err)
+			}
+			if result == nil {
+				t.Fatal("Recipe result is nil")
+			}
+
+			// 1. All required components present
+			for _, name := range tt.requiredComponents {
+				if comp := result.GetComponentRef(name); comp == nil {
+					t.Errorf("Required component %q not found in resolved recipe", name)
+				}
+			}
+
+			// 1b. Manifest-carrying components keep their manifest files
+			// (source of the bundler's "<name>-post" release)
+			for _, name := range tt.requiredManifestComponents {
+				comp := result.GetComponentRef(name)
+				if comp == nil {
+					t.Errorf("Required manifest component %q not found in resolved recipe", name)
+					continue
+				}
+				if len(comp.ManifestFiles) == 0 {
+					t.Errorf("Component %q has no manifestFiles; its %s-post bundle release would be dropped", name, name)
+				}
+			}
+
+			// 2. Conformance validation configured
+			if result.Validation == nil {
+				t.Fatal("result.Validation is nil")
+			}
+			if result.Validation.Conformance == nil {
+				t.Fatal("result.Validation.Conformance is nil")
+			}
+
+			// 3. All required conformance checks present
+			checkSet := make(map[string]bool)
+			for _, c := range result.Validation.Conformance.Checks {
+				checkSet[c] = true
+			}
+			for _, check := range tt.requiredChecks {
+				if !checkSet[check] {
+					t.Errorf("Required conformance check %q not found (have: %v)",
+						check, result.Validation.Conformance.Checks)
+				}
+			}
+
+			// 4. No fewer checks than expected (guards against accidental removal)
+			if len(result.Validation.Conformance.Checks) < len(tt.requiredChecks) {
+				t.Errorf("Conformance checks count = %d, want >= %d",
+					len(result.Validation.Conformance.Checks), len(tt.requiredChecks))
+			}
+
+			// 5. DRA constraint present (K8s >= 1.34 required for DRA GA)
+			if tt.wantDRAConstraint {
+				var hasDRAConstraint bool
+				for _, c := range result.Constraints {
+					if c.Name == testK8sVersionConstant && strings.Contains(c.Value, "1.34") {
+						hasDRAConstraint = true
+						break
+					}
+				}
+				if !hasDRAConstraint {
+					t.Error("Missing K8s >= 1.34 constraint (required for DRA GA)")
+				}
+			}
+
+			t.Logf("Recipe %s: %d components, %d conformance checks",
+				tt.name, len(result.ComponentRefs), len(result.Validation.Conformance.Checks))
+		})
+	}
+}

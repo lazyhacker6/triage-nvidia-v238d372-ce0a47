@@ -1,0 +1,246 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package recipe
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+)
+
+const hydratedNameKey = "name"
+
+// HydrateResult builds a fully hydrated map from a RecipeResult.
+// Component values are merged via GetValuesForComponent so the output
+// contains the final resolved configuration, not file references.
+//
+// Internally derives a defaults.FileReadTimeout-bounded context so a hung
+// backing store still returns instead of blocking the goroutine. Callers
+// that hold a context.Context should use HydrateResultWithContext so the
+// caller's deadline propagates to the underlying values reads.
+func HydrateResult(result *RecipeResult) (map[string]any, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaults.FileReadTimeout)
+	defer cancel()
+	return HydrateResultWithContext(ctx, result)
+}
+
+// projectObservedStates copies the snapshot-observed metadata states into
+// metadata. They are omitempty in the recipe schema, so each is projected
+// only when recorded to keep `aicr query` output matching the recipe YAML
+// and the OpenAPI schema.
+func projectObservedStates(metadata map[string]any, m *RecipeResultMetadata) {
+	for key, value := range map[string]string{
+		"gpuDriverState":           m.GPUDriverState,
+		"mariaDBOperatorState":     m.MariaDBOperatorState,
+		"defaultStorageClassState": m.DefaultStorageClassState,
+		"perconaOperatorState":     m.PerconaOperatorState,
+		"rdmaNamespaceMode":        m.RDMANamespaceMode,
+	} {
+		if value != "" {
+			metadata[key] = value
+		}
+	}
+}
+
+// HydrateResultWithContext builds a fully hydrated map from a RecipeResult,
+// honoring ctx for cancellation/timeout on the underlying values reads.
+func HydrateResultWithContext(ctx context.Context, result *RecipeResult) (map[string]any, error) {
+	if result == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "recipe result is nil")
+	}
+
+	metadata := map[string]any{
+		"version":            result.Metadata.Version,
+		"appliedOverlays":    result.Metadata.AppliedOverlays,
+		"excludedOverlays":   result.Metadata.ExcludedOverlays,
+		"constraintWarnings": result.Metadata.ConstraintWarnings,
+	}
+	projectObservedStates(metadata, &result.Metadata)
+	if result.Metadata.SelectedProfile != nil {
+		metadata["selectedProfile"] = map[string]any{
+			hydratedNameKey: result.Metadata.SelectedProfile.Name,
+			"value":         result.Metadata.SelectedProfile.Value,
+			"ownedPaths":    cloneOwnedPaths(result.Metadata.SelectedProfile.OwnedPaths),
+		}
+		if result.Metadata.SelectedProfile.Advertiser != "" {
+			metadata["selectedProfile"].(map[string]any)["advertiser"] =
+				result.Metadata.SelectedProfile.Advertiser
+		}
+	}
+
+	hydrated := map[string]any{
+		"kind":            result.Kind,
+		"apiVersion":      result.APIVersion,
+		"metadata":        metadata,
+		"deploymentOrder": result.DeploymentOrder,
+	}
+
+	if result.Criteria != nil {
+		hydrated["criteria"] = map[string]any{
+			"service":     string(result.Criteria.Service),
+			"accelerator": string(result.Criteria.Accelerator),
+			"intent":      string(result.Criteria.Intent),
+			"os":          string(result.Criteria.OS),
+			"platform":    string(result.Criteria.Platform),
+			"nodes":       result.Criteria.Nodes,
+		}
+	}
+	if result.Configuration != nil {
+		configuration := make(map[string]any)
+		if result.Configuration.Slurm != nil {
+			slurm := make(map[string]any)
+			if result.Configuration.Slurm.Accounting != nil {
+				slurm["accounting"] = map[string]any{
+					"mode": string(result.Configuration.Slurm.Accounting.Mode),
+				}
+			}
+			configuration["slurm"] = slurm
+		}
+		// Every section of RecipeConfiguration must be projected here or the
+		// decision is invisible to `aicr query --selector` and absent from
+		// hydrated output, even though the recipe records it.
+		if result.Configuration.RuntimeInventory != nil {
+			configuration["runtimeInventory"] = map[string]any{
+				"mode": string(result.Configuration.RuntimeInventory.Mode),
+			}
+		}
+		if result.Configuration.GKE != nil {
+			mapping := make([]any, 0, len(result.Configuration.GKE.TCPXOInterfaces))
+			for _, entry := range result.Configuration.GKE.TCPXOInterfaces {
+				mapping = append(mapping, map[string]any{"interfaceName": entry.InterfaceName, "network": entry.Network})
+			}
+			configuration["gke"] = map[string]any{"tcpxoInterfaces": mapping}
+		}
+		hydrated["configuration"] = configuration
+	}
+
+	if len(result.Constraints) > 0 {
+		constraintList := make([]map[string]any, 0, len(result.Constraints))
+		for _, c := range result.Constraints {
+			entry := map[string]any{
+				hydratedNameKey: c.Name,
+				keyValue:        c.Value,
+			}
+			if c.Severity != "" {
+				entry["severity"] = c.Severity
+			}
+			if c.Remediation != "" {
+				entry["remediation"] = c.Remediation
+			}
+			if c.Unit != "" {
+				entry["unit"] = c.Unit
+			}
+			constraintList = append(constraintList, entry)
+		}
+		hydrated["constraints"] = constraintList
+	}
+
+	components := make(map[string]any, len(result.ComponentRefs))
+	for _, ref := range result.ComponentRefs {
+		comp := map[string]any{
+			hydratedNameKey: ref.Name,
+			"type":          string(ref.Type),
+			"source":        ref.Source,
+		}
+
+		if ref.Namespace != "" {
+			comp["namespace"] = ref.Namespace
+		}
+		// Expose the chart the component actually deploys: a source-only
+		// Helm ref falls back to the component name (EffectiveChart, the
+		// deployers' rule), so components.<name>.chart resolves for every
+		// deployable external chart. Manifest-only Helm refs and Kustomize
+		// refs stay chartless; a raw Chart on a non-external ref (rejected
+		// by coherence, but query also serves directly-constructed results)
+		// is surfaced as-is rather than hidden.
+		switch {
+		case ref.HasExternalChart():
+			comp["chart"] = ref.EffectiveChart()
+		case ref.Chart != "":
+			comp["chart"] = ref.Chart
+		}
+		if ref.Version != "" {
+			comp["version"] = ref.Version
+		}
+		if ref.Tag != "" {
+			comp["tag"] = ref.Tag
+		}
+		if ref.Path != "" {
+			comp["path"] = ref.Path
+		}
+		if len(ref.DependencyRefs) > 0 {
+			comp["dependencyRefs"] = ref.DependencyRefs
+		}
+
+		values, err := result.GetValuesForComponentWithContext(ctx, ref.Name)
+		if err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInternal,
+				fmt.Sprintf("failed to hydrate values for component %q", ref.Name), err)
+		}
+		if len(values) > 0 {
+			comp["values"] = values
+		}
+
+		components[ref.Name] = comp
+	}
+	hydrated["components"] = components
+
+	return hydrated, nil
+}
+
+// Select walks a dot-path selector against a hydrated map and returns
+// the value at that path. Returns ErrCodeNotFound for invalid paths.
+// An empty selector returns the entire map.
+func Select(hydrated map[string]any, selector string) (any, error) {
+	selector = strings.TrimPrefix(selector, ".")
+	if selector == "" {
+		return hydrated, nil
+	}
+
+	parts := strings.Split(selector, ".")
+	var current any = hydrated
+
+	for _, part := range parts {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return nil, errors.New(errors.ErrCodeNotFound,
+				fmt.Sprintf("selector %q: cannot descend into non-map value at %q", selector, part))
+		}
+
+		val, exists := m[part]
+		if !exists {
+			available := sortedKeys(m)
+			return nil, errors.New(errors.ErrCodeNotFound,
+				fmt.Sprintf("selector %q: key %q not found, available keys: %s", selector, part, strings.Join(available, ", ")))
+		}
+		current = val
+	}
+
+	return current, nil
+}
+
+// sortedKeys returns the keys of a map in sorted order.
+func sortedKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}

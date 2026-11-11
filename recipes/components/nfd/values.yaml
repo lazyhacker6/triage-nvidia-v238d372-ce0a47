@@ -1,0 +1,112 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Node Feature Discovery standalone deployment
+# Shared by gpu-operator and network-operator
+#
+# The chart carries the topology-updater RBAC that upstream's
+# action-required items call for: pods list/watch for the node-scoped Pod
+# informer (since 0.19.0) and create/patch on noderesourcetopologies for
+# server-side apply (since 0.20.0). No AICR-side RBAC configuration is
+# needed.
+
+# Explicitly pin master/worker enable so behavior doesn't drift with
+# upstream chart defaults on future chart upgrades.
+master:
+  enable: true
+
+worker:
+  enable: true
+  # Publish labels, not raw features. nfd-worker still discovers every
+  # feature and computes every label, including its own sources.custom
+  # rules, from the full set; noPublishFeatures only drops these keys from
+  # the NodeFeature object it writes. nfd-master caches one NodeFeature per
+  # node, and on a 1720-node GB300 cluster the raw features (about 334 KB per
+  # node, mostly kernel.config) pushed it past 4Gi (#3038).
+  #
+  # Only cluster-side NodeFeatureRule and NodeFeatureGroup objects read
+  # published features. kernel.loadedmodule stays published for the GPU
+  # Operator's opt-in nvidia-kernel-modules rule (gpuoperator
+  # nfd.nodefeaturerules). values-nvidia-nics*.yaml computes the Mellanox NIC
+  # label on the node; for one release network-operator's chart rule (and the
+  # AKS nfd-network-rule manifest) also produce it, so the label does not
+  # drop while workers roll. TestNFDFeaturePublishingContract fails when a shipped
+  # rule other than those two transitional rules reads a stripped key; its
+  # chart-rule table must be re-checked when a chart that ships
+  # NodeFeatureRules is bumped.
+  config:
+    core:
+      noPublishFeatures:
+        - "cpu.*"
+        - "kernel.config"
+        - "kernel.enabledmodule"
+        - "kernel.kvm"
+        - "kernel.selinux"
+        - "kernel.version"
+        - "local.*"
+        - "memory.*"
+        - "network.*"
+        - "pci.*"
+        - "storage.*"
+        - "system.*"
+        - "usb.*"
+
+# Disable the chart's post-delete prune hook. Its Job runs `nfd-master -prune`,
+# which strips every NFD-owned node label, including the nvidia.com/* and
+# pci-15b3.present labels that the GPU Operator, Network Operator and DRA
+# DaemonSets select on, so deleting this release tears those stacks down.
+# Argo CD before 3.4.1 also never finishes deleting an Application whose
+# post-delete hooks include cluster-scoped objects, and re-runs the prune
+# every time the Job's TTL expires. Labels left behind after an uninstall are
+# reconciled on reinstall.
+postDeleteCleanup: false
+
+# Topology Updater disabled by default (enable via overlay override)
+topologyUpdater:
+  enable: false
+  # Install the noderesourcetopologies CRD via the chart on overlays
+  # that flip enable=true; managed K8s control planes (EKS / AKS /
+  # GKE / OKE / LKE) do not preinstall it. The chart guards the CRD
+  # template on (enable && createCRDs), so this is a no-op when TU
+  # is off.
+  createCRDs: true
+  # Disable the broader /var/lib/kubelet hostPath. TU only needs the
+  # pod-resources gRPC socket, which is mounted via a dedicated
+  # hostPath; setting kubeletStateDir to empty stops the chart from
+  # mounting kubelet state files (TLS material, pod manifests,
+  # checkpoint data) into the TU container.
+  kubeletStateDir: ""
+  # Raise the topology-updater memory limit above the chart default
+  # (60Mi). topologyUpdater is only enabled on GPU-node recipes, whose
+  # workers are high-core (e.g. 144-vCPU GB200/Grace, 192-vCPU p5). The
+  # Go binary leaves GOMAXPROCS=nproc, so the runtime sizes for every
+  # core and the pod-resources/NUMA scan over a large multi-NUMA node
+  # pushes the working set past 60Mi → OOMKilled → CrashLoopBackOff (seen
+  # on GB200/EKS, 144-vCPU nodes). A core-count-independent limit bump is
+  # the deterministic fix — same class as the aws-ebs-csi sidecar OOM
+  # (#1693). Requests raised too so the DaemonSet keeps Burstable QoS with
+  # headroom.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+# GC enabled for cleanup of stale NodeFeature/NodeResourceTopology CRs
+gc:
+  enable: true
+
+prometheus:
+  enable: true

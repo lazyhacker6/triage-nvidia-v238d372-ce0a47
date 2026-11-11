@@ -1,0 +1,1087 @@
+// Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+
+	bundlercfg "github.com/NVIDIA/aicr/pkg/bundler/config"
+	"github.com/NVIDIA/aicr/pkg/bundler/verifier"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/oci"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+	"github.com/NVIDIA/aicr/pkg/snapshotter"
+	"github.com/NVIDIA/aicr/pkg/validator"
+)
+
+// BundleResolved is the typed-domain projection of BundleSpec produced by
+// (*BundleSpec).Resolve. Every field is converted from its wire form
+// exactly once at the conversion boundary; CLI and API consumers layer
+// flag overrides on top of these values rather than re-parsing strings.
+//
+// Zero values mean "config did not set this field." Maps and slices
+// preserve the nil-vs-explicitly-empty distinction from the wire spec —
+// callers can therefore detect whether a user wrote `selector: {}` to
+// clear an inherited default vs. omitted the key entirely.
+type BundleResolved struct {
+	// RecipeInput is spec.bundle.input.recipe.
+	RecipeInput string
+
+	// OutputTarget is the parsed spec.bundle.output.target. Nil when
+	// config did not set a target. OutputTargetRaw preserves the original
+	// string for log/error messages.
+	OutputTarget    *oci.Reference
+	OutputTargetRaw string
+
+	// ImageRefs is spec.bundle.output.imageRefs.
+	ImageRefs string
+
+	// Deployer is the parsed spec.bundle.deployment.deployer. Empty
+	// (zero) when config did not set a deployer.
+	Deployer bundlercfg.DeployerType
+
+	// Repo is spec.bundle.deployment.repo.
+	Repo string
+
+	// ValueOverrides is spec.bundle.deployment.set, parsed.
+	// Nil if config did not set the field; non-nil (possibly empty) if
+	// config provided an explicit list (including `set: []`).
+	ValueOverrides []bundlercfg.ComponentPath
+
+	// DynamicValues is spec.bundle.deployment.dynamic, parsed.
+	// Same nil-vs-empty semantics as ValueOverrides.
+	DynamicValues []bundlercfg.ComponentPath
+
+	// SystemNodeSelector is spec.bundle.scheduling.systemNodeSelector.
+	// Nil if config did not set it; non-nil empty if `{}` was explicit.
+	SystemNodeSelector map[string]string
+
+	// SystemNodeTolerations is spec.bundle.scheduling.systemNodeTolerations,
+	// parsed. Nil if config did not set the field.
+	SystemNodeTolerations []corev1.Toleration
+
+	// AcceleratedNodeSelector is spec.bundle.scheduling.acceleratedNodeSelector.
+	AcceleratedNodeSelector map[string]string
+
+	// AcceleratedNodeTolerations is the parsed slice.
+	AcceleratedNodeTolerations []corev1.Toleration
+
+	// DRAEvictionNodeLabel is the parsed
+	// spec.bundle.scheduling.draEvictionNodeLabel. Nil when unset so command
+	// consumers can apply the NVIDIA-documented default.
+	DRAEvictionNodeLabel *bundlercfg.NodeLabel
+
+	// WorkloadGate is the parsed spec.bundle.scheduling.workloadGate taint.
+	// Nil when config did not set it.
+	WorkloadGate *corev1.Taint
+
+	// WorkloadSelector is spec.bundle.scheduling.workloadSelector.
+	WorkloadSelector map[string]string
+
+	// Nodes is spec.bundle.scheduling.nodes; 0 when unset.
+	Nodes int
+
+	// StorageClass is spec.bundle.scheduling.storageClass.
+	StorageClass string
+
+	// SharedStorageClass is spec.bundle.scheduling.sharedStorageClass.
+	SharedStorageClass string
+
+	// Attest is spec.bundle.attestation.enabled.
+	Attest bool
+
+	// CertIDRegexp is spec.bundle.attestation.certificateIdentityRegexp.
+	CertIDRegexp string
+
+	// OIDCDeviceFlow is spec.bundle.attestation.oidcDeviceFlow.
+	OIDCDeviceFlow bool
+
+	// FulcioURL is spec.bundle.attestation.fulcioURL; empty leaves the
+	// public-good Sigstore default in place.
+	FulcioURL string
+
+	// RekorURL is spec.bundle.attestation.rekorURL; empty leaves the
+	// public-good Sigstore default in place.
+	RekorURL string
+
+	// SigningKey is spec.bundle.attestation.signingKey; a durable, non-secret
+	// KMS key reference that selects KMS-backed signing. Empty leaves keyless
+	// OIDC signing in place. See #407.
+	SigningKey string
+
+	// InsecureTLS is spec.bundle.registry.insecureTLS.
+	InsecureTLS bool
+
+	// PlainHTTP is spec.bundle.registry.plainHTTP.
+	PlainHTTP bool
+
+	// VendorCharts is spec.bundle.deployment.vendorCharts. When true,
+	// upstream Helm chart bytes are pulled into the bundle at bundle time
+	// so the resulting artifact is air-gap deployable. Off by default.
+	VendorCharts bool
+
+	// AppName is spec.bundle.deployment.appName, validated as a DNS-1123
+	// subdomain. Empty means each deployer applies its own default. See #1011.
+	AppName string
+
+	// ArgoCD is spec.bundle.deployment.argocd, flattened and validated. A
+	// setting also given as a deprecated deployer:<key> entry in
+	// spec.bundle.deployment.set is rejected. See #3264.
+	ArgoCD bundlercfg.ArgoCDSettings
+}
+
+// Resolve converts a BundleSpec from the wire-string form to a typed
+// BundleResolved. It is nil-receiver tolerant and never returns a nil
+// pointer — callers reach into fields, so nil would just relocate the
+// nil-pointer dereference.
+//
+// Errors are attributed to their source spec path (for example,
+// "spec.bundle.deployment.set") so callers can surface the location of
+// invalid input without reconstructing the path themselves.
+func (b *BundleSpec) Resolve() (*BundleResolved, error) {
+	out := &BundleResolved{}
+	if b == nil {
+		return out, nil
+	}
+
+	if b.Input != nil {
+		out.RecipeInput = b.Input.Recipe
+	}
+
+	if b.Output != nil {
+		out.OutputTargetRaw = b.Output.Target
+		out.ImageRefs = b.Output.ImageRefs
+		if b.Output.Target != "" {
+			ref, err := oci.ParseOutputTarget(b.Output.Target)
+			if err != nil {
+				return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+					"invalid spec.bundle.output.target", err)
+			}
+			out.OutputTarget = ref
+		}
+	}
+
+	if b.Deployment != nil {
+		out.Repo = b.Deployment.Repo
+		if b.Deployment.Deployer != "" {
+			d, err := bundlercfg.ParseDeployerType(b.Deployment.Deployer)
+			if err != nil {
+				return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+					"invalid spec.bundle.deployment.deployer", err)
+			}
+			out.Deployer = d
+		}
+		if b.Deployment.Set != nil {
+			paths, err := bundlercfg.ParseValueOverrides(b.Deployment.Set)
+			if err != nil {
+				return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+					"invalid spec.bundle.deployment.set", err)
+			}
+			out.ValueOverrides = paths
+		}
+		if b.Deployment.Dynamic != nil {
+			paths, err := bundlercfg.ParseDynamicValues(b.Deployment.Dynamic)
+			if err != nil {
+				return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+					"invalid spec.bundle.deployment.dynamic", err)
+			}
+			out.DynamicValues = paths
+		}
+		out.VendorCharts = b.Deployment.VendorCharts
+		if b.Deployment.AppName != "" {
+			if err := bundlercfg.ValidateAppName(b.Deployment.AppName); err != nil {
+				return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+					"invalid spec.bundle.deployment.appName", err)
+			}
+			out.AppName = b.Deployment.AppName
+		}
+		out.ArgoCD = b.Deployment.ArgoCD.settings()
+		if err := validateArgoCD(bundlercfg.LegacyDeployerOverrides(out.ValueOverrides), out.ArgoCD); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := resolveScheduling(b.Scheduling, out); err != nil {
+		return nil, err
+	}
+
+	if err := resolveAttestation(b.Attestation, out); err != nil {
+		return nil, err
+	}
+
+	if b.Registry != nil {
+		out.InsecureTLS = b.Registry.InsecureTLS
+		out.PlainHTTP = b.Registry.PlainHTTP
+	}
+
+	return out, nil
+}
+
+// resolveScheduling copies s onto out. It returns an error naming the offending
+// spec.bundle.scheduling key for any invalid value, including a selector or
+// toleration the API server would reject. A nil s is a no-op.
+func resolveScheduling(s *SchedulingSpec, out *BundleResolved) error {
+	if s == nil {
+		return nil
+	}
+	if s.Nodes < 0 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("spec.bundle.scheduling.nodes must be >= 0, got %d", s.Nodes))
+	}
+	out.Nodes = s.Nodes
+	out.StorageClass = s.StorageClass
+	out.SharedStorageClass = s.SharedStorageClass
+
+	selectors := []struct {
+		path     string
+		selector map[string]string
+	}{
+		{"spec.bundle.scheduling.systemNodeSelector", s.SystemNodeSelector},
+		{"spec.bundle.scheduling.acceleratedNodeSelector", s.AcceleratedNodeSelector},
+		{"spec.bundle.scheduling.workloadSelector", s.WorkloadSelector},
+	}
+	for _, sel := range selectors {
+		if err := bundlercfg.ValidateNodeSelector(sel.selector); err != nil {
+			return errors.Wrap(errors.ErrCodeInvalidRequest, "invalid "+sel.path, err)
+		}
+	}
+
+	// maps.Clone keeps a nil selector nil and an empty one empty.
+	out.SystemNodeSelector = maps.Clone(s.SystemNodeSelector)
+	out.AcceleratedNodeSelector = maps.Clone(s.AcceleratedNodeSelector)
+	out.WorkloadSelector = maps.Clone(s.WorkloadSelector)
+	var err error
+	out.DRAEvictionNodeLabel, err = resolveDRAEvictionNodeLabel(s.DRAEvictionNodeLabel)
+	if err != nil {
+		return err
+	}
+
+	if s.SystemNodeTolerations != nil {
+		tols, err := snapshotter.ParseTolerations(s.SystemNodeTolerations)
+		if err != nil {
+			return errors.Wrap(errors.ErrCodeInvalidRequest,
+				"invalid spec.bundle.scheduling.systemNodeTolerations", err)
+		}
+		out.SystemNodeTolerations = tols
+	}
+	if s.AcceleratedNodeTolerations != nil {
+		tols, err := snapshotter.ParseTolerations(s.AcceleratedNodeTolerations)
+		if err != nil {
+			return errors.Wrap(errors.ErrCodeInvalidRequest,
+				"invalid spec.bundle.scheduling.acceleratedNodeTolerations", err)
+		}
+		out.AcceleratedNodeTolerations = tols
+	}
+	if s.WorkloadGate != "" {
+		t, err := snapshotter.ParseTaint(s.WorkloadGate)
+		if err != nil {
+			return errors.Wrap(errors.ErrCodeInvalidRequest,
+				"invalid spec.bundle.scheduling.workloadGate", err)
+		}
+		out.WorkloadGate = t
+	}
+	return nil
+}
+
+// resolveAttestation projects the bundle attestation spec onto the resolved
+// output. It is a no-op when a is nil (the section is optional). Signing
+// endpoints, signing mode, and the signing key's normal form are all settled at
+// this conversion boundary so a malformed config value fails here with
+// spec-path attribution (and is caught for non-CLI callers of Resolve too),
+// rather than only later in CLI flag parsing.
+func resolveAttestation(a *AttestationSpec, out *BundleResolved) error {
+	if a == nil {
+		return nil
+	}
+	if err := validateAttestationEndpoints(a); err != nil {
+		return err
+	}
+	signingKey, err := resolveSigningKey(a)
+	if err != nil {
+		return err
+	}
+	out.Attest = a.Enabled
+	out.CertIDRegexp = a.CertificateIdentityRegexp
+	out.OIDCDeviceFlow = a.OIDCDeviceFlow
+	out.FulcioURL = a.FulcioURL
+	out.RekorURL = a.RekorURL
+	out.SigningKey = signingKey
+	return nil
+}
+
+// resolveSigningKey returns the normalized spec.bundle.attestation.signingKey,
+// rejecting a present-but-blank value and the one keyless setting that cannot
+// coexist with it.
+//
+// Signing mode is exclusive: a KMS key or keyless OIDC, never both.
+// attestation.ResolveAttesterLazy takes the KMS branch whenever SigningKey is
+// non-empty, so a document setting both would sign with the key while its
+// fulcioURL setting did nothing — the caller believing they signed against a
+// named Fulcio.
+//
+// oidcDeviceFlow is deliberately NOT part of that rule here, unlike fulcioURL.
+// Resolve runs before the CLI's flag-over-config merge, so rejecting the pair
+// eagerly would reject a document that sets both signingKey and
+// oidcDeviceFlow: true even when the caller passes --oidc-device-flow=false
+// specifically to correct it: the error would fire before that flag is ever
+// read. It is rejected after every caller's own precedence is applied instead,
+// by attestation.checkSigningMode, so no path reaches signing with both.
+// rekorURL is not a conflict either; it has its own exclusivity rule against
+// signingConfig.
+//
+// Trimming happens here rather than at a consumer because a YAML block scalar
+// carries surrounding whitespace, and an untrimmed key fails late in the KMS
+// URI parser instead of at the boundary that produced it.
+func resolveSigningKey(a *AttestationSpec) (string, error) {
+	key := strings.TrimSpace(a.SigningKey)
+	if a.SigningKey != "" && key == "" {
+		return "", errors.New(errors.ErrCodeInvalidRequest,
+			"spec.bundle.attestation.signingKey must not be blank")
+	}
+	if key != "" && a.FulcioURL != "" {
+		return "", errors.New(errors.ErrCodeInvalidRequest,
+			"spec.bundle.attestation.signingKey is mutually exclusive with "+
+				"spec.bundle.attestation.fulcioURL")
+	}
+	return key, nil
+}
+
+// validateAttestationEndpoints rejects malformed private Sigstore endpoints in
+// the bundle attestation spec. ValidateHTTPSURL returns a pkg/errors
+// StructuredError with the right code, so its result is returned as-is.
+func validateAttestationEndpoints(a *AttestationSpec) error {
+	if err := bundlercfg.ValidateHTTPSURL("spec.bundle.attestation.fulcioURL", a.FulcioURL); err != nil {
+		return err
+	}
+	return bundlercfg.ValidateHTTPSURL("spec.bundle.attestation.rekorURL", a.RekorURL)
+}
+
+func resolveDRAEvictionNodeLabel(raw string) (*bundlercfg.NodeLabel, error) {
+	if raw == "" {
+		return nil, nil //nolint:nilnil // nil means the config omitted the optional label.
+	}
+	label, err := bundlercfg.ParseNodeLabel(raw)
+	if err != nil {
+		return nil, errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest,
+			"invalid spec.bundle.scheduling.draEvictionNodeLabel")
+	}
+	return &label, nil
+}
+
+// ValidateResolved is the typed-domain projection of ValidateSpec produced
+// by (*ValidateSpec).Resolve. Conversion from the wire form happens
+// exactly once at this boundary; CLI consumers layer flag overrides on
+// top of these values rather than re-parsing the spec strings.
+//
+// Zero values mean "config did not set this field." Maps and slices
+// preserve nil-vs-explicitly-empty from the wire spec — callers can
+// detect whether a user wrote `nodeSelector: {}` to clear an inherited
+// default vs. omitted the field entirely.
+type ValidateResolved struct {
+	// RecipePath is spec.validate.input.recipe.
+	RecipePath string
+
+	// SnapshotPath is spec.validate.input.snapshot.
+	SnapshotPath string
+
+	// Namespace is spec.validate.agent.namespace.
+	Namespace string
+
+	// Image is spec.validate.agent.image.
+	Image string
+
+	// ImagePullSecrets is spec.validate.agent.imagePullSecrets. Nil if
+	// config did not set the field.
+	ImagePullSecrets []string
+
+	// JobName is spec.validate.agent.jobName — an optional Job name
+	// prefix, not a required name. Empty (config unset and no
+	// --job-name) lets the CLI's own default prefix ("aicr-validate")
+	// apply instead; either way the run ID is appended, so the deployed
+	// Job name is always run-scoped.
+	JobName string
+
+	// ServiceAccountName is spec.validate.agent.serviceAccountName. It is
+	// exact-if-exists: when a ServiceAccount of exactly this name already
+	// exists in the namespace, the live snapshot-capture agent runs as it
+	// verbatim and creates no RBAC for the run; otherwise it is an
+	// optional name prefix with the same empty-value behavior as JobName.
+	// See pkg/snapshotter.AgentConfig.ServiceAccountName.
+	ServiceAccountName string
+
+	// ValidatorServiceAccountName is
+	// spec.validate.agent.validatorServiceAccountName: an existing,
+	// administrator-provisioned ServiceAccount the validator Jobs run as
+	// instead of a per-run one. Empty keeps per-run RBAC. See
+	// pkg/validator.Validator.ServiceAccountName.
+	ValidatorServiceAccountName string
+
+	// NodeSelector is spec.validate.agent.nodeSelector. Nil if unset;
+	// non-nil empty if `{}` was explicit.
+	NodeSelector map[string]string
+
+	// Tolerations is the parsed spec.validate.agent.tolerations slice.
+	// Nil if config did not set the field.
+	Tolerations []corev1.Toleration
+
+	// RequireGPU is spec.validate.agent.requireGpu.
+	RequireGPU bool
+
+	// Phases is spec.validate.execution.phases. Nil if unset.
+	Phases []string
+
+	// SkipChecks is spec.validate.execution.skipChecks. Nil if unset. The
+	// names are not validated against the check catalog here: the catalog is
+	// resolved from the recipe at validation time, and this layer has no
+	// recipe. pkg/validator's preflight rejects an unmatched name before any
+	// cluster work, so a typo still fails closed.
+	SkipChecks []string
+
+	// FailOnError is spec.validate.execution.failOnError. Nil pointer
+	// signals "config did not set the field" so the caller can defer to
+	// the CLI flag's default.
+	FailOnError *bool
+
+	// FailFast is spec.validate.execution.failFast. Nil means "not set in
+	// config; fall back to CLI flag default (false)".
+	FailFast *bool
+
+	// NoCluster is spec.validate.execution.noCluster.
+	NoCluster bool
+
+	// NoCleanup is spec.validate.execution.noCleanup.
+	NoCleanup bool
+
+	// Timeout is the parsed spec.validate.execution.timeout. Nil pointer
+	// signals "config did not set the field" so callers can fall through
+	// to the CLI flag's default duration; non-nil preserves an explicit
+	// "0s" / disabled-timeout value distinct from absence.
+	Timeout *time.Duration
+
+	// Nil when spec.validate.evidence.cncf is unset.
+	EvidenceCNCF *EvidenceCNCFResolved
+
+	// Nil when spec.validate.evidence.attestation is unset.
+	EvidenceAttestation *EvidenceAttestationResolved
+}
+
+// EvidenceCNCFResolved is the typed view of spec.validate.evidence.cncf.
+// Bool fields flatten the spec layer's *bool to plain bool: nil
+// (absent in YAML/JSON) becomes false, and downstream consumers do
+// not need to distinguish nil from &false for these specific feature
+// toggles (default is false in both cases).
+type EvidenceCNCFResolved struct {
+	Dir            string
+	CNCFSubmission bool
+	NotApplicable  map[string]string
+
+	// ConformanceVersion is spec.validate.evidence.cncf.conformanceVersion.
+	ConformanceVersion string
+
+	// Vendor is nil when spec.validate.evidence.cncf.vendor is unset.
+	Vendor *EvidenceCNCFVendorSpec
+
+	// Documented is spec.validate.evidence.cncf.documented, copied.
+	Documented map[string]EvidenceCNCFDocumentedSpec
+}
+
+// EvidenceAttestationResolved is the typed view of
+// spec.validate.evidence.attestation. See EvidenceCNCFResolved for the
+// nil-flatten rationale.
+type EvidenceAttestationResolved struct {
+	Out         string
+	BOM         string
+	Push        string
+	PlainHTTP   bool
+	InsecureTLS bool
+}
+
+// validPhasesSet derives the accepted spec.validate.execution.phases
+// vocabulary from validator.PhaseNames so it cannot drift from the CLI
+// parser when phases are added or removed. Recomputed once at package
+// init from the canonical slice.
+var validPhasesSet = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(validator.PhaseNames))
+	for _, p := range validator.PhaseNames {
+		m[p] = struct{}{}
+	}
+	return m
+}()
+
+// Resolve converts a ValidateSpec from the wire-string form to a typed
+// ValidateResolved. It is nil-receiver tolerant and never returns a nil
+// pointer — callers reach into fields, so nil would just relocate the
+// nil-pointer dereference.
+//
+// Errors are attributed to their source spec path (for example,
+// "spec.validate.agent.tolerations") so callers can surface the location
+// of invalid input without reconstructing the path themselves.
+func (v *ValidateSpec) Resolve() (*ValidateResolved, error) {
+	out := &ValidateResolved{}
+	if v == nil {
+		return out, nil
+	}
+
+	if v.Input != nil {
+		out.RecipePath = v.Input.Recipe
+		out.SnapshotPath = v.Input.Snapshot
+	}
+
+	if v.Agent != nil {
+		out.Namespace = v.Agent.Namespace
+		out.Image = v.Agent.Image
+		out.JobName = v.Agent.JobName
+		out.ServiceAccountName = v.Agent.ServiceAccountName
+		out.ValidatorServiceAccountName = v.Agent.ValidatorServiceAccountName
+		out.RequireGPU = v.Agent.RequireGPU
+		out.ImagePullSecrets = slices.Clone(v.Agent.ImagePullSecrets)
+		if err := bundlercfg.ValidateNodeSelector(v.Agent.NodeSelector); err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInvalidRequest, "invalid spec.validate.agent.nodeSelector", err)
+		}
+		out.NodeSelector = maps.Clone(v.Agent.NodeSelector)
+		if v.Agent.Tolerations != nil {
+			if len(v.Agent.Tolerations) == 0 {
+				// Preserve the explicit-clear intent: `tolerations: []`
+				// means "drop the default tolerate-all," not "use it."
+				// snapshotter.ParseTolerations would otherwise normalize
+				// an empty input to DefaultTolerations() (a single bare
+				// Exists entry that matches every taint), collapsing
+				// "operator opted out" into "operator opted in."
+				out.Tolerations = []corev1.Toleration{}
+			} else {
+				tols, err := snapshotter.ParseTolerations(v.Agent.Tolerations)
+				if err != nil {
+					return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+						"invalid spec.validate.agent.tolerations", err)
+				}
+				out.Tolerations = tols
+			}
+		}
+	}
+
+	if v.Execution != nil {
+		for _, p := range v.Execution.Phases {
+			if _, ok := validPhasesSet[p]; !ok {
+				return nil, errors.New(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("invalid spec.validate.execution.phases entry %q: must be one of: %s",
+						p, strings.Join(validator.PhaseNames, ", ")))
+			}
+		}
+		out.Phases = slices.Clone(v.Execution.Phases)
+		for _, c := range v.Execution.SkipChecks {
+			if strings.TrimSpace(c) == "" {
+				return nil, errors.New(errors.ErrCodeInvalidRequest,
+					"invalid spec.validate.execution.skipChecks entry: check names must not be empty")
+			}
+		}
+		out.SkipChecks = slices.Clone(v.Execution.SkipChecks)
+		out.NoCluster = v.Execution.NoCluster
+		out.NoCleanup = v.Execution.NoCleanup
+		if v.Execution.FailOnError != nil {
+			b := *v.Execution.FailOnError
+			out.FailOnError = &b
+		}
+		if v.Execution.FailFast != nil {
+			b := *v.Execution.FailFast
+			out.FailFast = &b
+		}
+		if v.Execution.Timeout != "" {
+			d, err := time.ParseDuration(v.Execution.Timeout)
+			if err != nil {
+				return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+					"invalid spec.validate.execution.timeout", err)
+			}
+			if d < 0 {
+				return nil, errors.New(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("spec.validate.execution.timeout must be >= 0, got %s", d))
+			}
+			out.Timeout = &d
+		}
+	}
+
+	if v.Evidence != nil {
+		if v.Evidence.CNCF != nil {
+			c := v.Evidence.CNCF
+			out.EvidenceCNCF = &EvidenceCNCFResolved{
+				Dir:                c.Dir,
+				CNCFSubmission:     boolPtrOrFalse(c.CNCFSubmission),
+				NotApplicable:      maps.Clone(c.NotApplicable),
+				Documented:         cloneDocumented(c.Documented),
+				ConformanceVersion: c.ConformanceVersion,
+			}
+			if c.Vendor != nil {
+				v := *c.Vendor
+				out.EvidenceCNCF.Vendor = &v
+			}
+		}
+		if v.Evidence.Attestation != nil {
+			a := v.Evidence.Attestation
+			out.EvidenceAttestation = &EvidenceAttestationResolved{
+				Out:         a.Out,
+				BOM:         a.BOM,
+				Push:        a.Push,
+				PlainHTTP:   boolPtrOrFalse(a.PlainHTTP),
+				InsecureTLS: boolPtrOrFalse(a.InsecureTLS),
+			}
+		}
+	}
+
+	return out, nil
+}
+
+// VerifyResolved is the typed-domain projection of VerifySpec produced by
+// (*VerifySpec).Resolve. Field names mirror the verifier structs the CLI
+// hands them to (verifier.Policy and verifier.VerifyOptions) rather than the
+// wire path, so the CLI can layer flag overrides and pass them straight
+// through.
+//
+// Zero values mean "config did not set this field," letting each CLI flag's
+// own default flow through — notably MinTrustLevel, whose flag defaults to
+// "max".
+type VerifyResolved struct {
+	// MinTrustLevel is spec.verify.policy.minTrustLevel.
+	MinTrustLevel string
+
+	// RequireCreator is spec.verify.policy.requireCreator.
+	RequireCreator string
+
+	// VersionConstraint is spec.verify.policy.cliVersionConstraint.
+	VersionConstraint string
+
+	// CertificateIdentityRegexp is
+	// spec.verify.trust.certificateIdentityRegexp.
+	CertificateIdentityRegexp string
+
+	// Key is spec.verify.trust.key.
+	Key string
+
+	// TrustRoot is spec.verify.trust.trustRoot.
+	TrustRoot string
+}
+
+// minTrustLevelMax is the meta-value accepted by --min-trust-level (and
+// spec.verify.policy.minTrustLevel) that auto-detects the highest trust level
+// achievable for the bundle. It is not a real level, so
+// verifier.ParseTrustLevel rejects it and it must be special-cased here.
+const minTrustLevelMax = "max"
+
+// Resolve converts a VerifySpec from the wire form to a typed
+// VerifyResolved. It is nil-receiver tolerant and never returns a nil
+// pointer — callers reach into fields, so nil would just relocate the
+// nil-pointer dereference.
+//
+// Every value that has a parser is validated here against the same parser
+// `aicr verify` uses at verification time, so a typo in a committed config
+// fails at load with spec-path attribution instead of after a full
+// verification run. Key and TrustRoot are passed through unvalidated: they
+// are references whose resolution (KMS reachability, file contents) belongs
+// to the verifier, which reports far better errors than a syntactic check
+// here could.
+func (v *VerifySpec) Resolve() (*VerifyResolved, error) {
+	out := &VerifyResolved{}
+	if v == nil {
+		return out, nil
+	}
+
+	if v.Policy != nil {
+		if v.Policy.MinTrustLevel != "" && v.Policy.MinTrustLevel != minTrustLevelMax {
+			if _, err := verifier.ParseTrustLevel(v.Policy.MinTrustLevel); err != nil {
+				return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+					"invalid spec.verify.policy.minTrustLevel", err)
+			}
+		}
+		if v.Policy.CLIVersionConstraint != "" {
+			if _, err := verifier.ParseVersionConstraint(v.Policy.CLIVersionConstraint); err != nil {
+				return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+					"invalid spec.verify.policy.cliVersionConstraint", err)
+			}
+		}
+		out.MinTrustLevel = v.Policy.MinTrustLevel
+		out.RequireCreator = v.Policy.RequireCreator
+		out.VersionConstraint = v.Policy.CLIVersionConstraint
+	}
+
+	if v.Trust != nil {
+		if v.Trust.CertificateIdentityRegexp != "" {
+			if err := verifier.ValidateIdentityPattern(v.Trust.CertificateIdentityRegexp); err != nil {
+				return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+					"invalid spec.verify.trust.certificateIdentityRegexp", err)
+			}
+		}
+		out.CertificateIdentityRegexp = v.Trust.CertificateIdentityRegexp
+		out.Key = v.Trust.Key
+		out.TrustRoot = v.Trust.TrustRoot
+	}
+
+	return out, nil
+}
+
+// SnapshotResolved is the typed-domain projection of SnapshotSpec produced
+// by (*SnapshotSpec).Resolve. Conversion from the wire form happens
+// exactly once at this boundary; CLI consumers layer flag overrides on
+// top of these values rather than re-parsing the spec strings.
+//
+// Zero values mean "config did not set this field." Maps and slices
+// preserve the nil-vs-explicitly-empty distinction from the wire spec —
+// callers can detect whether a user wrote `nodeSelector: {}` to clear an
+// inherited default vs. omitted the field entirely.
+type SnapshotResolved struct {
+	// OutputPath is spec.snapshot.output.path.
+	OutputPath string
+
+	// OutputFormat is spec.snapshot.output.format (validated against the
+	// serializer's known formats but left as a string; the CLI parses
+	// the flag form anyway).
+	OutputFormat string
+
+	// OutputTemplate is spec.snapshot.output.template.
+	OutputTemplate string
+
+	// Namespace is spec.snapshot.agent.namespace.
+	Namespace string
+
+	// Image is spec.snapshot.agent.image.
+	Image string
+
+	// ImagePullSecrets is spec.snapshot.agent.imagePullSecrets. Nil if
+	// config did not set the field.
+	ImagePullSecrets []string
+
+	// JobName is spec.snapshot.agent.jobName — an optional Job name
+	// prefix, not a required name. Empty (config unset and no
+	// --job-name) lets the CLI's own default prefix ("aicr") apply
+	// instead; either way the run ID is appended, so the deployed Job
+	// name is always run-scoped.
+	JobName string
+
+	// ServiceAccountName is spec.snapshot.agent.serviceAccountName. It is
+	// exact-if-exists: when a ServiceAccount of exactly this name already
+	// exists in the namespace, the agent runs as it verbatim and creates
+	// no RBAC for the run; otherwise it is an optional name prefix with
+	// the same empty-value behavior as JobName. See
+	// pkg/snapshotter.AgentConfig.ServiceAccountName.
+	ServiceAccountName string
+
+	// NodeSelector is spec.snapshot.agent.nodeSelector. Nil if unset;
+	// non-nil empty if `{}` was explicit.
+	NodeSelector map[string]string
+
+	// Tolerations is the parsed spec.snapshot.agent.tolerations slice.
+	// Nil if config did not set the field.
+	Tolerations []corev1.Toleration
+
+	// RequireGPU is spec.snapshot.agent.requireGpu.
+	RequireGPU bool
+
+	// RuntimeClassName is spec.snapshot.agent.runtimeClassName.
+	RuntimeClassName string
+
+	// OS is spec.snapshot.agent.os.
+	OS string
+
+	// Requests is spec.snapshot.agent.requests (raw "name=quantity,..." form).
+	Requests string
+
+	// Limits is spec.snapshot.agent.limits (raw "name=quantity,..." form).
+	Limits string
+
+	// Timeout is the parsed spec.snapshot.execution.timeout. Nil pointer
+	// signals "config did not set the field" so callers can fall through
+	// to the CLI flag's default duration.
+	Timeout *time.Duration
+
+	// NoCleanup is spec.snapshot.execution.noCleanup.
+	NoCleanup bool
+
+	// Privileged is spec.snapshot.execution.privileged. Nil pointer
+	// signals "config did not set the field" so the CLI flag's default
+	// (true) flows through; *false preserves an explicit opt-out.
+	Privileged *bool
+
+	// MaxNodesPerEntry is spec.snapshot.execution.maxNodesPerEntry.
+	MaxNodesPerEntry int
+}
+
+// Resolve converts a SnapshotSpec from the wire-string form to a typed
+// SnapshotResolved. It is nil-receiver tolerant and never returns a nil
+// pointer — callers reach into fields, so nil would just relocate the
+// nil-pointer dereference.
+//
+// Errors are attributed to their source spec path (for example,
+// "spec.snapshot.agent.tolerations") so callers can surface the location
+// of invalid input without reconstructing the path themselves.
+func (s *SnapshotSpec) Resolve() (*SnapshotResolved, error) {
+	out := &SnapshotResolved{}
+	if s == nil {
+		return out, nil
+	}
+
+	if s.Output != nil {
+		out.OutputPath = s.Output.Path
+		out.OutputFormat = s.Output.Format
+		out.OutputTemplate = s.Output.Template
+	}
+
+	if s.Agent != nil {
+		out.Namespace = s.Agent.Namespace
+		out.Image = s.Agent.Image
+		out.JobName = s.Agent.JobName
+		out.ServiceAccountName = s.Agent.ServiceAccountName
+		out.RequireGPU = s.Agent.RequireGPU
+		out.RuntimeClassName = s.Agent.RuntimeClassName
+		out.OS = s.Agent.OS
+		out.Requests = s.Agent.Requests
+		out.Limits = s.Agent.Limits
+		out.ImagePullSecrets = slices.Clone(s.Agent.ImagePullSecrets)
+		if err := bundlercfg.ValidateNodeSelector(s.Agent.NodeSelector); err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInvalidRequest, "invalid spec.snapshot.agent.nodeSelector", err)
+		}
+		out.NodeSelector = maps.Clone(s.Agent.NodeSelector)
+		if s.Agent.Tolerations != nil {
+			if len(s.Agent.Tolerations) == 0 {
+				// Preserve the explicit-clear intent: `tolerations: []`
+				// means "drop the default tolerate-all," not "use it."
+				out.Tolerations = []corev1.Toleration{}
+			} else {
+				tols, err := snapshotter.ParseTolerations(s.Agent.Tolerations)
+				if err != nil {
+					return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+						"invalid spec.snapshot.agent.tolerations", err)
+				}
+				out.Tolerations = tols
+			}
+		}
+	}
+
+	if s.Execution != nil {
+		out.NoCleanup = s.Execution.NoCleanup
+		if s.Execution.MaxNodesPerEntry < 0 {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("spec.snapshot.execution.maxNodesPerEntry must be >= 0, got %d", s.Execution.MaxNodesPerEntry))
+		}
+		out.MaxNodesPerEntry = s.Execution.MaxNodesPerEntry
+		if s.Execution.Privileged != nil {
+			b := *s.Execution.Privileged
+			out.Privileged = &b
+		}
+		if s.Execution.Timeout != "" {
+			d, err := time.ParseDuration(s.Execution.Timeout)
+			if err != nil {
+				return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+					"invalid spec.snapshot.execution.timeout", err)
+			}
+			if d < 0 {
+				return nil, errors.New(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("spec.snapshot.execution.timeout must be >= 0, got %s", d))
+			}
+			out.Timeout = &d
+		}
+	}
+
+	return out, nil
+}
+
+// ResolveCriteriaWithRegistry converts the recipe criteria spec from
+// wire-string form to a typed *recipe.Criteria, validating each enum value
+// against the supplied per-provider registry. A nil reg falls back to a
+// fresh ephemeral registry (recipe.NewCriteriaRegistry) — only the
+// hardcoded OSS fast-path values will validate. Use this nil-fallback only
+// for early validation paths that run before the Client/Builder is wired
+// (e.g., YAML config load); production resolution must pass the
+// provider-bound registry from GetCriteriaRegistryFor.
+//
+// Unlike recipe.NewCriteria, the returned Criteria does NOT default
+// unset fields to "any": empty enum fields signal "config did not set
+// this slot" so callers can detect what to copy onto a target Criteria.
+// Nodes < 0 is rejected; Nodes == 0 means unset.
+func (r *RecipeSpec) ResolveCriteriaWithRegistry(reg *recipe.CriteriaRegistry) (*recipe.Criteria, error) {
+	if reg == nil {
+		reg = recipe.NewCriteriaRegistry()
+	}
+	out := &recipe.Criteria{}
+	if r == nil || r.Criteria == nil {
+		return out, nil
+	}
+	c := r.Criteria
+	if c.Service != "" {
+		v, err := reg.ParseService(c.Service)
+		if err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+				"invalid spec.recipe.criteria.service", err)
+		}
+		out.Service = v
+	}
+	if c.Accelerator != "" {
+		v, err := reg.ParseAccelerator(c.Accelerator)
+		if err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+				"invalid spec.recipe.criteria.accelerator", err)
+		}
+		out.Accelerator = v
+	}
+	if c.Intent != "" {
+		v, err := reg.ParseIntent(c.Intent)
+		if err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+				"invalid spec.recipe.criteria.intent", err)
+		}
+		out.Intent = v
+	}
+	if c.OS != "" {
+		v, err := reg.ParseOS(c.OS)
+		if err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+				"invalid spec.recipe.criteria.os", err)
+		}
+		out.OS = v
+	}
+	if c.Platform != "" {
+		v, err := reg.ParsePlatform(c.Platform)
+		if err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
+				"invalid spec.recipe.criteria.platform", err)
+		}
+		out.Platform = v
+	}
+	if c.Nodes < 0 {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("spec.recipe.criteria.nodes must be >= 0, got %d", c.Nodes))
+	}
+	out.Nodes = c.Nodes
+	return out, nil
+}
+
+// ResolveAccountingMode parses spec.recipe.configuration.slurm.accounting.mode.
+// The bool reports whether the field was explicitly present; Slurm recipe
+// generation materializes disabled when it is absent.
+func (r *RecipeSpec) ResolveAccountingMode() (recipe.AccountingMode, bool, error) {
+	if r == nil || r.Configuration == nil || r.Configuration.Slurm == nil ||
+		r.Configuration.Slurm.Accounting == nil {
+
+		return "", false, nil
+	}
+	mode, err := recipe.ParseAccountingMode(r.Configuration.Slurm.Accounting.Mode)
+	if err != nil {
+		return "", false, errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest,
+			"invalid spec.recipe.configuration.slurm.accounting.mode")
+	}
+	return mode, true, nil
+}
+
+// ResolveRuntimeInventoryMode parses
+// spec.recipe.configuration.runtimeInventory.mode. The bool reports whether the
+// field was explicitly present; absence leaves the recipe's own declaration
+// alone rather than materializing a default, because unlike Slurm accounting
+// there is no meaningful "off by default" for a component the recipe may not
+// declare at all.
+func (r *RecipeSpec) ResolveRuntimeInventoryMode() (recipe.RuntimeInventoryMode, bool, error) {
+	if r == nil || r.Configuration == nil || r.Configuration.RuntimeInventory == nil {
+		return "", false, nil
+	}
+	mode, err := recipe.ParseRuntimeInventoryMode(r.Configuration.RuntimeInventory.Mode)
+	if err != nil {
+		return "", false, errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest,
+			"invalid spec.recipe.configuration.runtimeInventory.mode")
+	}
+	return mode, true, nil
+}
+
+// ResolveGKETCPXOInterfaces validates
+// spec.recipe.configuration.gke.tcpxoInterfaces. The bool reports whether
+// the field was explicitly present; there is no default — the mapping is
+// cluster-specific and recipe generation fails closed when a TCPXO recipe
+// omits it.
+func (r *RecipeSpec) ResolveGKETCPXOInterfaces() ([]recipe.NetworkInterfaceMapping, bool, error) {
+	if r == nil || r.Configuration == nil || r.Configuration.GKE == nil {
+		return nil, false, nil
+	}
+	mapping := r.Configuration.GKE.TCPXOInterfaces
+	if err := recipe.ValidateGKETCPXOInterfaces(mapping); err != nil {
+		return nil, false, errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest,
+			"invalid spec.recipe.configuration.gke.tcpxoInterfaces")
+	}
+	return mapping, true, nil
+}
+
+// boolPtrOrFalse dereferences a *bool, treating nil (absent in
+// YAML/JSON) as false. Used at the spec → resolved boundary so the
+// resolved layer can stay plain bool for downstream consumers.
+func boolPtrOrFalse(p *bool) bool {
+	return p != nil && *p
+}
+
+// validateArgoCD checks the Argo CD settings this document gives in either
+// spelling, naming the key that failed. Backoff without a limit is not
+// rejected here: a CLI flag may supply the limit, and the bundler checks the
+// layered result. A document using only the deprecated spelling is checked
+// at bundle time, as it was before the argocd block existed.
+func validateArgoCD(legacy map[string]string, settings bundlercfg.ArgoCDSettings) error {
+	if settings.IsZero() {
+		return nil
+	}
+	if err := bundlercfg.ValidateArgoCDSource(nil, settings); err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest, "invalid spec.bundle.deployment.argocd", err)
+	}
+	if err := bundlercfg.ValidateArgoCDSource(legacy, bundlercfg.ArgoCDSettings{}); err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest, "invalid spec.bundle.deployment.set", err)
+	}
+	if err := bundlercfg.ValidateArgoCDSource(legacy, settings); err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest,
+			"spec.bundle.deployment.set and spec.bundle.deployment.argocd conflict", err)
+	}
+	return nil
+}
+
+// settings flattens s into the bundler's ArgoCDSettings. A nil s is the
+// zero value.
+func (s *ArgoCDSpec) settings() bundlercfg.ArgoCDSettings {
+	if s == nil {
+		return bundlercfg.ArgoCDSettings{}
+	}
+	out := bundlercfg.ArgoCDSettings{
+		NamePrefix:        s.NamePrefix,
+		DestinationServer: s.DestinationServer,
+		Project:           s.Project,
+		CascadeDelete:     s.CascadeDelete,
+	}
+	if r := s.SyncRetry; r != nil {
+		out.SyncRetryLimit = r.Limit
+		if b := r.Backoff; b != nil {
+			out.SyncRetryBackoffDuration = b.Duration
+			out.SyncRetryBackoffFactor = b.Factor
+			out.SyncRetryBackoffMaxDuration = b.MaxDuration
+		}
+	}
+	return out.Clone()
+}
+
+// cloneDocumented deep-copies the documented map so the resolved view shares
+// no slice with the spec.
+func cloneDocumented(in map[string]EvidenceCNCFDocumentedSpec) map[string]EvidenceCNCFDocumentedSpec {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]EvidenceCNCFDocumentedSpec, len(in))
+	for k, v := range in {
+		out[k] = EvidenceCNCFDocumentedSpec{Evidence: append([]string(nil), v.Evidence...), Notes: v.Notes}
+	}
+	return out
+}

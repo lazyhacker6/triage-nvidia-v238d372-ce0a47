@@ -1,0 +1,362 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package verifier
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestTrustLevel_String(t *testing.T) {
+	tests := []struct {
+		level TrustLevel
+		want  string
+	}{
+		{TrustUnknown, "unknown"},
+		{TrustUnverified, "unverified"},
+		{TrustAttested, "attested"},
+		{TrustVerified, "verified"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := tt.level.String(); got != tt.want {
+				t.Errorf("TrustLevel(%s).String() = %q, want %q", tt.level, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTrustLevel_MeetsMinimum(t *testing.T) {
+	tests := []struct {
+		name    string
+		level   TrustLevel
+		minimum TrustLevel
+		want    bool
+	}{
+		{"verified meets verified", TrustVerified, TrustVerified, true},
+		{"verified meets attested", TrustVerified, TrustAttested, true},
+		{"attested does not meet verified", TrustAttested, TrustVerified, false},
+		{"unverified meets unverified", TrustUnverified, TrustUnverified, true},
+		{"unknown does not meet unverified", TrustUnknown, TrustUnverified, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.level.MeetsMinimum(tt.minimum); got != tt.want {
+				t.Errorf("%s.MeetsMinimum(%s) = %v, want %v", tt.level, tt.minimum, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateIdentityPattern(t *testing.T) {
+	tests := []struct {
+		pattern string
+		wantErr bool
+	}{
+		// Valid — begins with https://github.com/NVIDIA/aicr/ (leading "^"
+		// optional, escaped-dot form accepted).
+		{TrustedRepositoryPattern, false},
+		{`https://github.com/NVIDIA/aicr/.github/workflows/.*`, false},
+		{`https://github.com/NVIDIA/aicr/.github/workflows/build-attested\.yaml@.*`, false},
+
+		// Invalid — does not begin with the required repository prefix.
+		{`https://github.com/attacker/aicr/.*`, true},
+		{`https://github.com/NVIDIA/other-repo/.*`, true},
+		{`.*`, true},
+		{"", true},
+
+		// Bypass attempts
+		{`https://github.com/attacker/NVIDIA/aicr/.*`, true},           // prefix under wrong owner
+		{`NVIDIA/aicr`, true},                                          // missing scheme and domain
+		{`NVIDIA/aicr/`, true},                                         // missing scheme and domain
+		{`github.com/NVIDIA/aicr/.*`, true},                            // missing scheme ://
+		{`https://evil.com/github.com/NVIDIA/aicr/.*`, true},           // github.com as path, not domain
+		{`https://evil.com/redirect?to=github.com/NVIDIA/aicr/`, true}, // github.com in query string
+
+		// Widening bypasses: each BEGINS with the required repository prefix
+		// and compiles cleanly, but is not CONFINED to it. Left unguarded
+		// these reduce the gate to the OIDC issuer pin alone, which any GitHub
+		// Actions workflow in any repository satisfies.
+		{`^https://github\.com/NVIDIA/aicr/.*|.*$`, true},                             // trailing alternation matches anything
+		{`.*|https://github.com/NVIDIA/aicr/.*`, true},                                // leading alternation matches anything
+		{`https://github.com/NVIDIA/aicr/.*|^https://github\.com/evil/repo/.*`, true}, // alternation to a foreign repo
+		{`(https://github.com/NVIDIA/aicr/|)`, true},                                  // empty alternation branch matches anything
+		{`https://github.com/NVIDIA/aicr/.*|`, true},                                  // trailing empty branch
+		{`(?s)https://github\.com/NVIDIA/aicr/.*|(?s).*`, true},                       // inline flags plus alternation
+
+		// Nested alternation. The root op here is OpCapture, not OpAlternate,
+		// so a root-only structural check misses it; and the foreign branch
+		// names a repository no fixed canary set can enumerate. Rejected
+		// because the pattern does not BEGIN with the repository prefix.
+		{`(https://github.com/NVIDIA/aicr/.*|https://github.com/attacker/isolated/.*)`, true},
+		{`(?:https://github.com/NVIDIA/aicr/.*|https://github.com/attacker/x/.*)`, true},
+		{`(https://github.com/NVIDIA/aicr/|https://github.com/evil/repo/).*`, true},
+
+		// Alternatives placed AFTER the prefix stay valid: every branch is
+		// already behind the pin, so the match cannot leave the repository.
+		{`^https://github\.com/NVIDIA/aicr/\.github/workflows/(on-tag|release)\.yaml@.*`, false},
+		{`https://github.com/NVIDIA/aicr/\.github/workflows/(a|b)\.yaml@refs/tags/.*`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.pattern, func(t *testing.T) {
+			err := ValidateIdentityPattern(tt.pattern)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateIdentityPattern(%q) error = %v, wantErr %v", tt.pattern, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateIdentityPattern_RejectionNamesTheRepository pins that every
+// rejection reason tells the operator what to anchor to.
+//
+// The CLI surfaces only the message, not the structured context, so a reason
+// that omits the repository leaves the reader with "that is wrong" and no way
+// to fix it. The e2e coverage in
+// tests/chainsaw/signing/bundle-attestation-ci asserts on this substring
+// rather than the prose, so that a reworded message does not break it — this
+// test is what keeps that assertion honest.
+func TestValidateIdentityPattern_RejectionNamesTheRepository(t *testing.T) {
+	rejected := []string{
+		`.*`, // no prefix
+		`^https://github\.com/NVIDIA/aicr/.*|.*$`, // top-level alternation
+		`(https://github.com/NVIDIA/aicr/|)`,      // nested, prefix not at the start
+		`https://github.com/attacker/aicr/.*`,     // wrong owner
+	}
+	for _, pattern := range rejected {
+		t.Run(pattern, func(t *testing.T) {
+			err := ValidateIdentityPattern(pattern)
+			if err == nil {
+				t.Fatalf("ValidateIdentityPattern(%q) = nil, want rejection", pattern)
+			}
+			if !strings.Contains(err.Error(), "NVIDIA/aicr") {
+				t.Errorf("rejection does not name the required repository: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseTrustLevel(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    TrustLevel
+		wantErr bool
+	}{
+		{"unknown", TrustUnknown, false},
+		{"unverified", TrustUnverified, false},
+		{"attested", TrustAttested, false},
+		{"verified", TrustVerified, false},
+		{"VERIFIED", TrustVerified, false},
+		{"invalid", "", true},
+		{"", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := ParseTrustLevel(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseTrustLevel(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("ParseTrustLevel(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckPolicy_ToolVersionConstraint(t *testing.T) {
+	tests := []struct {
+		name        string
+		toolVersion string
+		constraint  string
+		wantFail    bool
+	}{
+		// Bare version defaults to >= semantics
+		{"bare version equal", "0.8.0", "0.8.0", false},
+		{"bare version with v prefix in constraint", "0.8.0", "v0.8.0", false},
+		{"bare version with v prefix in result", "v0.8.0", "0.8.0", false},
+		{"bare version newer than required", "0.9.0", "0.8.0", false},
+		{"bare version older than required", "0.7.0", "0.8.0", true},
+
+		// Explicit >= operator
+		{">= equal", "0.8.0", ">= 0.8.0", false},
+		{">= newer", "0.9.0", ">= 0.8.0", false},
+		{">= older", "0.7.0", ">= 0.8.0", true},
+		{">= with v prefix", "0.8.0", ">= v0.8.0", false},
+
+		// Explicit > operator
+		{"> strictly newer", "0.8.1", "> 0.8.0", false},
+		{"> equal fails", "0.8.0", "> 0.8.0", true},
+		{"> older fails", "0.7.0", "> 0.8.0", true},
+
+		// Explicit == operator
+		{"== exact match", "0.8.0", "== 0.8.0", false},
+		{"== with v in result", "v0.8.0", "== 0.8.0", false},
+		{"== mismatch", "0.9.0", "== 0.8.0", true},
+
+		// Explicit < operator
+		{"< older passes", "0.7.0", "< 0.8.0", false},
+		{"< equal fails", "0.8.0", "< 0.8.0", true},
+
+		// Explicit <= operator
+		{"<= equal passes", "0.8.0", "<= 0.8.0", false},
+		{"<= older passes", "0.7.0", "<= 0.8.0", false},
+		{"<= newer fails", "0.9.0", "<= 0.8.0", true},
+
+		// Explicit != operator
+		{"!= different passes", "0.9.0", "!= 0.8.0", false},
+		{"!= same fails", "0.8.0", "!= 0.8.0", true},
+
+		// Empty tool version in result (unattested bundle)
+		{"empty tool version fails", "", "0.8.0", true},
+
+		// Empty constraint (no check)
+		{"empty constraint skips check", "0.8.0", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := &VerifyResult{
+				TrustLevel:      TrustVerified,
+				ChecksumsPassed: true,
+				BundleAttested:  true,
+				ToolVersion:     tt.toolVersion,
+			}
+			policy := Policy{VersionConstraint: tt.constraint}
+			failure, err := result.CheckPolicy(policy)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if (failure != "") != tt.wantFail {
+				t.Errorf("CheckPolicy() failure = %q, wantFail %v", failure, tt.wantFail)
+			}
+		})
+	}
+}
+
+func TestMaxAchievableTrustLevel(t *testing.T) {
+	tests := []struct {
+		name   string
+		result *VerifyResult
+		want   TrustLevel
+	}{
+		{
+			"nil result",
+			nil,
+			TrustUnknown,
+		},
+		{
+			"checksums failed",
+			&VerifyResult{ChecksumsPassed: false},
+			TrustUnknown,
+		},
+		{
+			"checksums only (no --attest flag)",
+			&VerifyResult{ChecksumsPassed: true, BundleAttested: false},
+			TrustUnverified,
+		},
+		{
+			"attested with external data",
+			&VerifyResult{ChecksumsPassed: true, BundleAttested: true, HasExternalData: true},
+			TrustAttested,
+		},
+		{
+			"full chain no external data",
+			&VerifyResult{ChecksumsPassed: true, BundleAttested: true, HasExternalData: false},
+			TrustVerified,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.result.MaxAchievableTrustLevel()
+			if got != tt.want {
+				t.Errorf("MaxAchievableTrustLevel() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetTrustLevels(t *testing.T) {
+	levels := GetTrustLevels()
+
+	expected := []string{"attested", "unknown", "unverified", "verified"}
+	if len(levels) != len(expected) {
+		t.Fatalf("got %d levels, want %d", len(levels), len(expected))
+	}
+	for i, v := range levels {
+		if v != expected[i] {
+			t.Errorf("levels[%d] = %q, want %q", i, v, expected[i])
+		}
+	}
+}
+
+// TestParseVersionConstraint covers the grammar shared by the CLI flag and
+// spec.verify.policy.cliVersionConstraint. The bare-version default is the
+// behavior worth pinning: "0.8.0" must mean ">= 0.8.0", not "== 0.8.0".
+func TestParseVersionConstraint(t *testing.T) {
+	tests := []struct {
+		name    string
+		expr    string
+		wantErr bool
+		// satisfied is a version the parsed constraint must accept.
+		satisfied string
+		// rejected is a version the parsed constraint must refuse.
+		rejected string
+	}{
+		{name: "bare version defaults to >=", expr: "0.8.0", satisfied: "0.9.0", rejected: "0.7.0"},
+		{name: "explicit >=", expr: ">= 0.8.0", satisfied: "0.8.0", rejected: "0.7.9"},
+		{name: "explicit ==", expr: "== 0.8.0", satisfied: "0.8.0", rejected: "0.8.1"},
+		{name: "explicit !=", expr: "!= 0.8.0", satisfied: "0.8.1", rejected: "0.8.0"},
+		{name: "explicit <", expr: "< 0.8.0", satisfied: "0.7.0", rejected: "0.8.0"},
+		{name: "explicit >", expr: "> 0.8.0", satisfied: "0.8.1", rejected: "0.8.0"},
+		{name: "explicit <=", expr: "<= 0.8.0", satisfied: "0.8.0", rejected: "0.9.0"},
+		{name: "surrounding whitespace tolerated", expr: "  0.8.0  ", satisfied: "0.9.0", rejected: "0.7.0"},
+		{name: "empty expression rejected", expr: "", wantErr: true},
+		{name: "operator with no version rejected", expr: ">=", wantErr: true},
+		// A bare "!" is invalid syntax that the shared parser rejects
+		// outright. Prepending ">=" would hide it from that check, so the
+		// bare-version default must not apply to "!"-prefixed input.
+		{name: "bare ! prefix rejected, not coerced to >=", expr: "!0.8.0", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseVersionConstraint(tt.expr)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseVersionConstraint(%q) error = nil, want an error", tt.expr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseVersionConstraint(%q) error = %v, want nil", tt.expr, err)
+			}
+
+			ok, evalErr := got.Evaluate(tt.satisfied)
+			if evalErr != nil {
+				t.Fatalf("Evaluate(%q) error = %v", tt.satisfied, evalErr)
+			}
+			if !ok {
+				t.Errorf("constraint %q rejected %q, want it satisfied", tt.expr, tt.satisfied)
+			}
+
+			ok, evalErr = got.Evaluate(tt.rejected)
+			if evalErr != nil {
+				t.Fatalf("Evaluate(%q) error = %v", tt.rejected, evalErr)
+			}
+			if ok {
+				t.Errorf("constraint %q accepted %q, want it rejected", tt.expr, tt.rejected)
+			}
+		})
+	}
+}

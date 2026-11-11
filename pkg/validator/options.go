@@ -1,0 +1,166 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package validator
+
+import (
+	"slices"
+
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/NVIDIA/aicr/pkg/recipe"
+)
+
+// Option is a functional option for configuring Validator instances.
+type Option func(*Validator)
+
+// WithVersion sets the validator version string (typically the CLI version).
+func WithVersion(version string) Option {
+	return func(v *Validator) {
+		v.Version = version
+	}
+}
+
+// WithCommit sets the git commit SHA (typically the CLI build commit).
+// Used for resolving dev-build validator images to SHA-tagged images.
+func WithCommit(commit string) Option {
+	return func(v *Validator) {
+		v.Commit = commit
+	}
+}
+
+// WithKubeconfig sets an explicit, run-scoped kubeconfig path for all
+// Kubernetes API operations performed by the validation run. The file is
+// reloaded for each run. Empty uses the shared default Kubernetes client and
+// its standard KUBECONFIG, ~/.kube/config, then in-cluster discovery chain.
+func WithKubeconfig(kubeconfig string) Option {
+	return func(v *Validator) {
+		v.Kubeconfig = kubeconfig
+	}
+}
+
+// WithNamespace sets the Kubernetes namespace for validation Jobs.
+// Default: "aicr-validation".
+func WithNamespace(namespace string) Option {
+	return func(v *Validator) {
+		v.Namespace = namespace
+	}
+}
+
+// WithRunID sets the RunID for this validation run.
+// Used when resuming a previous run.
+func WithRunID(runID string) Option {
+	return func(v *Validator) {
+		v.RunID = runID
+	}
+}
+
+// WithCleanup controls whether to delete Jobs, ConfigMaps, and RBAC after validation.
+// Default: true.
+func WithCleanup(cleanup bool) Option {
+	return func(v *Validator) {
+		v.Cleanup = cleanup
+	}
+}
+
+// WithServiceAccountName runs validator Jobs as an existing,
+// administrator-provisioned ServiceAccount instead of a per-run one. See
+// Validator.ServiceAccountName. Default: empty (per-run RBAC).
+func WithServiceAccountName(name string) Option {
+	return func(v *Validator) {
+		v.ServiceAccountName = name
+	}
+}
+
+// WithImagePullSecrets sets image pull secrets for validator Jobs.
+func WithImagePullSecrets(secrets []string) Option {
+	return func(v *Validator) {
+		v.ImagePullSecrets = secrets
+	}
+}
+
+// WithNoCluster controls cluster access. When true, all validators are reported
+// as skipped and no K8s API calls are made. Default: false.
+func WithNoCluster(noCluster bool) Option {
+	return func(v *Validator) {
+		v.NoCluster = noCluster
+	}
+}
+
+// WithTolerations sets tolerations to override inner workload scheduling.
+// When set, validators pass these tolerations to the workloads they create (e.g., NCCL
+// benchmark pods), replacing default tolerate-all policy. Does not affect the orchestrator Job.
+func WithTolerations(tolerations []corev1.Toleration) Option {
+	return func(v *Validator) {
+		v.Tolerations = tolerations
+	}
+}
+
+// WithNodeSelector sets node selector labels to override inner workload scheduling.
+// When set, validators pass these selectors to the workloads they create (e.g., NCCL
+// benchmark pods), replacing platform-specific defaults. Does not affect the orchestrator Job.
+func WithNodeSelector(nodeSelector map[string]string) Option {
+	return func(v *Validator) {
+		v.NodeSelector = nodeSelector
+	}
+}
+
+// WithImageRegistryOverride sets the image registry prefix override for
+// validator container images. When non-empty, replaces the default registry
+// (e.g., ghcr.io/nvidia) with the specified prefix (e.g., localhost:5001).
+// Forwarded to validator Jobs via the AICR_VALIDATOR_IMAGE_REGISTRY env var.
+func WithImageRegistryOverride(override string) Option {
+	return func(v *Validator) {
+		v.ImageRegistryOverride = override
+	}
+}
+
+// WithImageTagOverride sets the image tag override for validator container
+// images. When non-empty, overrides the resolved tag on every validator image.
+// Intended for feature-branch dev builds whose commit SHA has no published
+// image. Forwarded to validator Jobs via the AICR_VALIDATOR_IMAGE_TAG env var.
+func WithImageTagOverride(override string) Option {
+	return func(v *Validator) {
+		v.ImageTagOverride = override
+	}
+}
+
+// WithDataProvider binds the recipe DataProvider used to load the validator
+// catalog. When unset, the catalog loads from the package-global provider.
+func WithDataProvider(dp recipe.DataProvider) Option {
+	return func(v *Validator) {
+		v.dataProvider = dp
+	}
+}
+
+// WithFailFast controls whether ValidatePhases stops after the first phase
+// whose status is blocking per ctrf.IsFailingStatus (StatusFailed or
+// StatusOther — an inconclusive outcome fails closed). Default: false (all
+// phases run regardless of earlier failures). Set true to restore the
+// historical fail-fast behavior.
+func WithFailFast(failFast bool) Option {
+	return func(v *Validator) {
+		v.FailFast = failFast
+	}
+}
+
+// WithSkipChecks names checks to withhold from every requested phase. Each is
+// reported as skipped rather than dropped, and the run is rejected up front if
+// a name matches no validator in the catalog or if the list would empty a
+// requested phase. Default: none. See skip_checks.go.
+func WithSkipChecks(names ...string) Option {
+	return func(v *Validator) {
+		v.SkipChecks = slices.Clone(names)
+	}
+}

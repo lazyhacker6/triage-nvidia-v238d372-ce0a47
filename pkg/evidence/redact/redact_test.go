@@ -1,0 +1,977 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package redact_test
+
+import (
+	"bytes"
+	"reflect"
+	"slices"
+	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/evidence/redact"
+	"github.com/NVIDIA/aicr/pkg/fingerprint"
+	"github.com/NVIDIA/aicr/pkg/header"
+	"github.com/NVIDIA/aicr/pkg/measurement"
+	"github.com/NVIDIA/aicr/pkg/serializer"
+	"github.com/NVIDIA/aicr/pkg/snapshotter"
+	"github.com/NVIDIA/aicr/pkg/validator/ctrf"
+	validatorv1 "github.com/NVIDIA/aicr/pkg/validator/v1"
+)
+
+// fullSnapshot builds a snapshot exercising every collector measurement type
+// and the sensitive fields the minimal policy must remove.
+func fullSnapshot() *snapshotter.Snapshot {
+	s := snapshotter.NewSnapshot()
+	s.Kind = header.KindSnapshot
+	s.APIVersion = header.GroupVersionV1
+	s.Metadata = map[string]string{
+		"timestamp":   "2026-06-22T00:00:00Z",
+		"version":     "0.11.1",
+		"source-node": "ip-10-0-248-107.ec2.internal",
+	}
+	s.Measurements = []*measurement.Measurement{
+		measurement.NewMeasurement(measurement.TypeK8s).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("server").
+				SetString("version", "v1.33.1")).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("node").
+				SetString("source-node", "ip-10-0-248-107.ec2.internal").
+				SetString("provider-id", "aws:///us-west-2a/i-0123456789abcdef0").
+				SetString("provider", "eks").
+				SetString("container-runtime-id", "containerd://abc123").
+				SetString("container-runtime-name", "containerd").
+				SetString("container-runtime-version", "1.7.0").
+				SetString("kubelet-version", "v1.33.1").
+				SetString("kernel-version", "5.10.0-26").
+				SetString("operating-system", "linux").
+				SetString("os-image", "Amazon Linux 2")).
+			WithSubtype(measurement.Subtype{
+				Name: "slinky-slurm",
+				Data: map[string]measurement.Reading{
+					"collection-state": measurement.Str("detected"),
+				},
+				Items: []measurement.ItemEntry{{
+					Context: map[string]string{
+						"id":   "controller/slurm/cluster",
+						"name": "internal-cluster-name",
+					},
+				}},
+			}).
+			WithSubtype(measurement.Subtype{
+				Name: "mariadb-operator",
+				Data: map[string]measurement.Reading{
+					"collection-state": measurement.Str("crs-detected"),
+				},
+			}).
+			Build(),
+		measurement.NewMeasurement(measurement.TypeGPU).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("hardware").
+				SetBool("gpu-present", true).
+				SetInt("gpu-count", 8).
+				SetString("model", "h100")).
+			Build(),
+		measurement.NewMeasurement(measurement.TypeOS).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("release").
+				SetString("ID", "ubuntu").
+				SetString("VERSION_ID", "22.04")).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("grub").
+				SetString("hugepagesz", "1G")).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("sysctl").
+				SetString("/proc/sys/kernel/hostname", "secret-host")).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("kmod").
+				SetBool("nvidia", true)).
+			Build(),
+		measurement.NewMeasurement(measurement.TypeSystemD).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("containerd.service").
+				SetString("ActiveState", "active").
+				SetString("ControlGroup", "/system.slice/containerd.service")).
+			Build(),
+		measurement.NewMeasurement(measurement.TypeNodeTopology).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("summary").
+				SetInt("node-count", 4)).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("label").
+				SetString("nvidia.com/gpu.product", "NVIDIA-H100|node1,node2")).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("taint").
+				SetString("nvidia.com/gpu.NoSchedule", "present|node1")).
+			Build(),
+	}
+	return s
+}
+
+// findSubtype returns the named subtype of the named measurement type, or nil.
+func findSubtype(s *snapshotter.Snapshot, t measurement.Type, sub string) *measurement.Subtype {
+	for _, m := range s.Measurements {
+		if m.Type == t {
+			return m.GetSubtype(sub)
+		}
+	}
+	return nil
+}
+
+func findMeasurement(s *snapshotter.Snapshot, t measurement.Type) *measurement.Measurement {
+	for _, m := range s.Measurements {
+		if m.Type == t {
+			return m
+		}
+	}
+	return nil
+}
+
+func TestSnapshotKeepsAllowlistedSubtypesAndKeys(t *testing.T) {
+	out, _ := redact.Snapshot(fullSnapshot())
+
+	// K8s server kept entirely.
+	if st := findSubtype(out, measurement.TypeK8s, "server"); st == nil || !st.Has("version") {
+		t.Fatalf("K8s.server.version must be kept")
+	}
+
+	// K8s node: only allowlisted keys survive.
+	node := findSubtype(out, measurement.TypeK8s, "node")
+	if node == nil {
+		t.Fatalf("K8s.node subtype must be kept")
+	}
+	for _, dropped := range []string{"source-node", "provider-id", "container-runtime-id"} {
+		if node.Has(dropped) {
+			t.Errorf("K8s.node.%s must be dropped", dropped)
+		}
+	}
+	for _, kept := range []string{"provider", "kubelet-version", "kernel-version", "operating-system", "os-image", "container-runtime-name", "container-runtime-version"} {
+		if !node.Has(kept) {
+			t.Errorf("K8s.node.%s must be kept", kept)
+		}
+	}
+
+	// GPU hardware kept entirely.
+	if st := findSubtype(out, measurement.TypeGPU, "hardware"); st == nil || !st.Has("model") {
+		t.Errorf("GPU.hardware must be kept")
+	}
+
+	// OS release kept; grub/sysctl/kmod dropped.
+	if st := findSubtype(out, measurement.TypeOS, "release"); st == nil || !st.Has("ID") {
+		t.Errorf("OS.release must be kept")
+	}
+	for _, sub := range []string{"grub", "sysctl", "kmod"} {
+		if findSubtype(out, measurement.TypeOS, sub) != nil {
+			t.Errorf("OS.%s subtype must be dropped", sub)
+		}
+	}
+
+	// NodeTopology: summary kept; label/taint dropped.
+	if st := findSubtype(out, measurement.TypeNodeTopology, "summary"); st == nil || !st.Has("node-count") {
+		t.Errorf("NodeTopology.summary must be kept")
+	}
+	for _, sub := range []string{"label", "taint"} {
+		if findSubtype(out, measurement.TypeNodeTopology, sub) != nil {
+			t.Errorf("NodeTopology.%s subtype must be dropped", sub)
+		}
+	}
+
+	// SystemD measurement dropped entirely.
+	if findMeasurement(out, measurement.TypeSystemD) != nil {
+		t.Errorf("SystemD measurement must be dropped entirely")
+	}
+	for _, sub := range []string{"slinky-slurm", "mariadb-operator"} {
+		if findSubtype(out, measurement.TypeK8s, sub) != nil {
+			t.Errorf("K8s.%s must be dropped from minimal evidence", sub)
+		}
+	}
+}
+
+func TestSnapshotKeyConstrainsAllKeptSubtypes(t *testing.T) {
+	// Each formerly keep-all subtype now carries an extra unknown/sensitive
+	// key alongside its known keys; the unknown key must be dropped.
+	s := snapshotter.NewSnapshot()
+	s.Measurements = []*measurement.Measurement{
+		measurement.NewMeasurement(measurement.TypeK8s).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("server").
+				SetString("version", "v1.33.1").
+				SetString("future-leak", "secret")).
+			Build(),
+		measurement.NewMeasurement(measurement.TypeGPU).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("hardware").
+				SetString("model", "h100").
+				SetString("serial-number", "GPU-SENSITIVE-123")).
+			Build(),
+		measurement.NewMeasurement(measurement.TypeOS).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("release").
+				SetString("ID", "ubuntu").
+				SetString("VERSION_ID", "22.04").
+				// non-standard / operator-influenced os-release keys
+				SetString("HOME_URL", "https://internal.example.com").
+				SetString("CUSTOM_TENANT", "acct-123")).
+			Build(),
+		measurement.NewMeasurement(measurement.TypeNodeTopology).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("summary").
+				SetInt("node-count", 4).
+				SetString("internal-detail", "leak")).
+			Build(),
+	}
+	out, _ := redact.Snapshot(s)
+
+	cases := []struct {
+		typ        measurement.Type
+		sub        string
+		keptKey    string
+		droppedKey string
+	}{
+		{measurement.TypeK8s, "server", "version", "future-leak"},
+		{measurement.TypeGPU, "hardware", "model", "serial-number"},
+		{measurement.TypeOS, "release", "ID", "HOME_URL"},
+		{measurement.TypeOS, "release", "VERSION_ID", "CUSTOM_TENANT"},
+		{measurement.TypeNodeTopology, "summary", "node-count", "internal-detail"},
+	}
+	for _, c := range cases {
+		st := findSubtype(out, c.typ, c.sub)
+		if st == nil {
+			t.Errorf("%s.%s must be kept", c.typ, c.sub)
+			continue
+		}
+		if !st.Has(c.keptKey) {
+			t.Errorf("%s.%s.%s must be kept", c.typ, c.sub, c.keptKey)
+		}
+		if st.Has(c.droppedKey) {
+			t.Errorf("%s.%s.%s must be dropped (key-level fail-closed)", c.typ, c.sub, c.droppedKey)
+		}
+	}
+}
+
+func TestSnapshotHeaderMetadataIsAllowlisted(t *testing.T) {
+	in := fullSnapshot()
+	// A future/unknown metadata key must be dropped (fail-closed), not just
+	// the known-sensitive source-node.
+	in.Metadata["future-sensitive-key"] = "tenant-acct-123"
+	out, _ := redact.Snapshot(in)
+	for _, dropped := range []string{"source-node", "future-sensitive-key"} {
+		if _, ok := out.Metadata[dropped]; ok {
+			t.Errorf("Header metadata %q must be dropped (fail-closed allowlist)", dropped)
+		}
+	}
+	for _, kept := range []string{"timestamp", "version"} {
+		if _, ok := out.Metadata[kept]; !ok {
+			t.Errorf("Header metadata %s must be kept", kept)
+		}
+	}
+}
+
+func TestSnapshotKeepsAdvisoryFingerprint(t *testing.T) {
+	in := fullSnapshot()
+	in.Fingerprint = &fingerprint.Fingerprint{}
+	in.Fingerprint.Accelerator = fingerprint.Dimension{Value: "h100"}
+	out, _ := redact.Snapshot(in)
+	if out.Fingerprint == nil || out.Fingerprint.Accelerator.Value != "h100" {
+		t.Errorf("advisory fingerprint must be preserved")
+	}
+}
+
+func TestSnapshotDoesNotMutateInput(t *testing.T) {
+	in := fullSnapshot()
+	before, err := serializer.MarshalYAMLDeterministic(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	_, _ = redact.Snapshot(in)
+	after, err := serializer.MarshalYAMLDeterministic(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("Snapshot must not mutate its input")
+	}
+}
+
+func TestSnapshotDeterministic(t *testing.T) {
+	a, _ := redact.Snapshot(fullSnapshot())
+	b, _ := redact.Snapshot(fullSnapshot())
+	ab, err := serializer.MarshalYAMLDeterministic(a)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	bb, err := serializer.MarshalYAMLDeterministic(b)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(ab) != string(bb) {
+		t.Errorf("redaction must be deterministic")
+	}
+}
+
+func TestSnapshotAppliedRulesSortedNonEmpty(t *testing.T) {
+	_, rules := redact.Snapshot(fullSnapshot())
+	if len(rules) == 0 {
+		t.Fatalf("expected applied rules")
+	}
+	if !sortedUnique(rules) {
+		t.Errorf("applied rules must be sorted and unique: %v", rules)
+	}
+}
+
+func TestSnapshotDropsSubtypeWithNoAllowlistedKeys(t *testing.T) {
+	s := snapshotter.NewSnapshot()
+	s.Measurements = []*measurement.Measurement{
+		// node subtype carries ONLY non-allowlisted keys.
+		measurement.NewMeasurement(measurement.TypeK8s).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("node").
+				SetString("source-node", "n1").
+				SetString("provider-id", "p1")).
+			Build(),
+	}
+	out, _ := redact.Snapshot(s)
+	// Subtype retains nothing → dropped → measurement (no surviving subtype) dropped.
+	if findMeasurement(out, measurement.TypeK8s) != nil {
+		t.Errorf("K8s measurement with only non-allowlisted node keys must be dropped, not shipped with empty data")
+	}
+}
+
+func TestSnapshotDropsSubtypeContext(t *testing.T) {
+	s := snapshotter.NewSnapshot()
+	st := measurement.NewSubtypeBuilder("server").SetString("version", "v1.33").Build()
+	st.Context = map[string]string{"secret-ctx": "leak-me"}
+	s.Measurements = []*measurement.Measurement{
+		{Type: measurement.TypeK8s, Subtypes: []measurement.Subtype{st}},
+	}
+	out, _ := redact.Snapshot(s)
+	got := findSubtype(out, measurement.TypeK8s, "server")
+	if got == nil {
+		t.Fatalf("server subtype must be kept")
+	}
+	if got.Context != nil {
+		t.Errorf("subtype Context must be dropped (fail-closed), got %v", got.Context)
+	}
+}
+
+func TestSnapshotNilReturnsNil(t *testing.T) {
+	out, rules := redact.Snapshot(nil)
+	if out != nil || rules != nil {
+		t.Errorf("nil snapshot should yield nil, nil; got %v %v", out, rules)
+	}
+}
+
+func sampleReport() *ctrf.Report {
+	return &ctrf.Report{
+		ReportFormat: ctrf.ReportFormatCTRF,
+		SpecVersion:  ctrf.SpecVersion,
+		GeneratedBy:  "aicr",
+		Results: ctrf.Results{
+			Tool:    ctrf.Tool{Name: "chainsaw", Version: "0.2.0"},
+			Summary: ctrf.Summary{Tests: 2, Passed: 1, Failed: 1},
+			Tests: []ctrf.TestResult{
+				{Name: "t1", Status: ctrf.StatusPassed, Duration: 10, Suite: []string{"deploy"},
+					Stdout: []string{"connected to 10.0.0.5", "https://internal.example.com"},
+					// Mix of allowlisted counts and an unknown, node-identifying key.
+					Extra: map[string]string{"nodesValidated": "1", "nodesTotal": "2", "podName": "nvidia-smi-verify-ip-10-0-0-5"}},
+				{Name: "t2", Status: ctrf.StatusFailed, Duration: 20,
+					Message: "cert secret my-tls-secret not found", Stdout: []string{"line"},
+					// Only non-allowlisted keys → must drop to nil (no empty extra:{}).
+					Extra: map[string]string{"internalIP": "10.0.0.5"}},
+			},
+		},
+	}
+}
+
+func TestCTRFOmitsStdoutAndMessage(t *testing.T) {
+	out, _ := redact.CTRF(sampleReport())
+	for i, tr := range out.Results.Tests {
+		if tr.Stdout != nil {
+			t.Errorf("test[%d] stdout must be omitted, got %v", i, tr.Stdout)
+		}
+		if tr.Message != "" {
+			t.Errorf("test[%d] message must be omitted, got %q", i, tr.Message)
+		}
+	}
+}
+
+func TestCTRFPreservesSignal(t *testing.T) {
+	in := sampleReport()
+	out, _ := redact.CTRF(in)
+	if !reflect.DeepEqual(out.Results.Summary, in.Results.Summary) {
+		t.Errorf("summary counts must be preserved")
+	}
+	if len(out.Results.Tests) != 2 {
+		t.Fatalf("test count must be preserved")
+	}
+	if out.Results.Tests[0].Name != "t1" || out.Results.Tests[0].Status != ctrf.StatusPassed {
+		t.Errorf("test name/status must be preserved")
+	}
+	if out.Results.Tests[1].Status != ctrf.StatusFailed {
+		t.Errorf("failed status must be preserved")
+	}
+	if !reflect.DeepEqual(out.Results.Tests[0].Suite, []string{"deploy"}) {
+		t.Errorf("suite must be preserved")
+	}
+}
+
+func TestCTRFAllowlistsExtra(t *testing.T) {
+	tests := []struct {
+		name string
+		in   map[string]string
+		want map[string]string // nil means Extra must drop to nil (no empty map)
+	}{
+		{
+			name: "allowlisted counts survive, unknown key dropped",
+			in:   map[string]string{"nodesValidated": "1", "nodesTotal": "2", "podName": "nvidia-smi-verify-ip-10-0-0-5"},
+			want: map[string]string{"nodesValidated": "1", "nodesTotal": "2"},
+		},
+		{
+			// The RDMA fabric gate (#1952) reuses these same count keys to
+			// disclose a cordoned RDMA node narrowing its cohort (validated < total).
+			// No new key or skipReason is minted, so the allowlist is unchanged and
+			// the coverage survives redaction into the signed bundle verbatim.
+			name: "rdma cordoned-narrowed coverage survives",
+			in:   map[string]string{"nodesValidated": "1", "nodesTotal": "2"},
+			want: map[string]string{"nodesValidated": "1", "nodesTotal": "2"},
+		},
+		{
+			name: "valid skip reason enum survives",
+			in:   map[string]string{"skipReason": "no-gpu-nodes"},
+			want: map[string]string{"skipReason": "no-gpu-nodes"},
+		},
+		{
+			// #3681: the marker that keeps an observation from rendering
+			// PASSED must reach the signed bundle, and only as a boolean.
+			name: "observation-only marker survives",
+			in:   map[string]string{"observationOnly": "true"},
+			want: map[string]string{"observationOnly": "true"},
+		},
+		{
+			name: "observation-only marker with free text is dropped",
+			in:   map[string]string{"observationOnly": "yes, on aks-prod-cluster"},
+			want: nil,
+		},
+		{
+			// #3703: the stamp that lets the aggregation tell an image that
+			// never marked observations from one that chose not to must
+			// reach the signed bundle, and only as a known version.
+			name: "result schema stamp survives",
+			in:   map[string]string{"resultSchema": "1"},
+			want: map[string]string{"resultSchema": "1"},
+		},
+		{
+			name: "result schema stamp of an unknown version is dropped",
+			in:   map[string]string{"resultSchema": "2-dev on aks-prod-cluster"},
+			want: nil,
+		},
+		{
+			name: "another listed skip code survives",
+			in:   map[string]string{"skipReason": "no-schedulable-gpu-nodes"},
+			want: map[string]string{"skipReason": "no-schedulable-gpu-nodes"},
+		},
+		{
+			// pkg/validator mints this for a check the CALLER withheld
+			// (--skip-check). It has to clear the allowlist or the signed
+			// bundle records WHICH check was withheld but not WHY: the
+			// message that used to carry the reason is blanked above.
+			name: "caller-declared skip code survives",
+			in:   map[string]string{"skipReason": "named-in-skip-checks"},
+			want: map[string]string{"skipReason": "named-in-skip-checks"},
+		},
+		{
+			name: "well-formed but unlisted skip code is dropped",
+			in:   map[string]string{"skipReason": "customer-prod-cluster"},
+			want: nil,
+		},
+		{
+			name: "only non-allowlisted keys drop to nil",
+			in:   map[string]string{"internalIP": "10.0.0.5"},
+			want: nil,
+		},
+		{
+			name: "IP smuggled under a count key is dropped",
+			in:   map[string]string{"nodesValidated": "1", "nodesTotal": "10.0.0.5"},
+			want: map[string]string{"nodesValidated": "1"},
+		},
+		{
+			name: "hostname smuggled under skipReason is dropped",
+			in:   map[string]string{"skipReason": "node-a.example"},
+			want: nil,
+		},
+		{
+			name: "negative and non-decimal counts are dropped",
+			in:   map[string]string{"nodesValidated": "-1", "nodesTotal": "1.5"},
+			want: nil,
+		},
+		{
+			name: "over-long count exceeding the digit bound is dropped",
+			in:   map[string]string{"nodesValidated": "2", "nodesTotal": "123456"},
+			want: map[string]string{"nodesValidated": "2"},
+		},
+		{
+			name: "uppercase / free-text enum code is dropped",
+			in:   map[string]string{"skipReason": "No GPU Nodes"},
+			want: nil,
+		},
+		{
+			name: "all allowed keys with invalid values drop to nil (no empty map)",
+			in:   map[string]string{"nodesTotal": "1.5", "skipReason": "10.0.0.5"},
+			want: nil,
+		},
+		{
+			name: "empty extra drops to nil",
+			in:   map[string]string{},
+			want: nil,
+		},
+		{
+			// #2297 provenance: the closed-set runtime-source code survives
+			// minimal redaction so a reader can tell a delivered-artifact number
+			// from a cluster-capability one without --full.
+			name: "listed runtime source survives",
+			in:   map[string]string{"runtimeSource": "delivered-artifact"},
+			want: map[string]string{"runtimeSource": "delivered-artifact"},
+		},
+		{
+			name: "unlisted runtime source is dropped",
+			in:   map[string]string{"runtimeSource": "my-cluster-runtime"},
+			want: nil,
+		},
+		{
+			// Digests and paths that back a delivered-artifact claim are stdout
+			// (--full) evidence; under Extra they are unlisted keys and drop.
+			name: "runtime digests are not an Extra carrier",
+			in: map[string]string{
+				"runtimeSource":        "delivered-artifact",
+				"shippedRuntimeDigest": "cab912550bf2999744b2c685f40cd96ec010bf7e615da59847ce55090cae4bae",
+			},
+			want: map[string]string{"runtimeSource": "delivered-artifact"},
+		},
+		{
+			name: "nccl bandwidth outcome and scope survive",
+			in: map[string]string{
+				"achievedGbps": "305.4", "thresholdGbps": "300", "tolerancePct": "10",
+				"passMargin": "+1.8", "workerNodes": "2", "gpusInvolved": "16",
+				"transport": "net", "fabric": "efa",
+			},
+			want: map[string]string{
+				"achievedGbps": "305.4", "thresholdGbps": "300", "tolerancePct": "10",
+				"passMargin": "+1.8", "workerNodes": "2", "gpusInvolved": "16",
+				"transport": "net", "fabric": "efa",
+			},
+		},
+		{
+			name: "negative pass margin survives",
+			in:   map[string]string{"passMargin": "-12.3"},
+			want: map[string]string{"passMargin": "-12.3"},
+		},
+		{
+			name: "decimal finer than one place is dropped",
+			in:   map[string]string{"achievedGbps": "305.42", "ttftP99Ms": "182.3"},
+			want: map[string]string{"ttftP99Ms": "182.3"},
+		},
+		{
+			name: "unsigned or malformed margin is dropped",
+			in:   map[string]string{"passMargin": "1.8", "achievedGbps": "-1"},
+			want: nil,
+		},
+		{
+			name: "decimal exceeding the digit bound is dropped",
+			in:   map[string]string{"throughputTokPerSec": "1234567"},
+			want: nil,
+		},
+		{
+			name: "NaN and Inf measurements are dropped",
+			in:   map[string]string{"achievedGbps": "NaN", "passMargin": "+Inf"},
+			want: nil,
+		},
+		{
+			name: "unlisted transport or fabric is dropped",
+			in:   map[string]string{"transport": "socket", "fabric": "10.0.0.5"},
+			want: nil,
+		},
+		{
+			name: "readiness gate counts survive",
+			in: map[string]string{
+				"draReady": "8", "draDesired": "8", "nodewrightComplete": "3",
+				"nodewrightExpected": "3", "namespacesActive": "6", "namespacesExpected": "6",
+			},
+			want: map[string]string{
+				"draReady": "8", "draDesired": "8", "nodewrightComplete": "3",
+				"nodewrightExpected": "3", "namespacesActive": "6", "namespacesExpected": "6",
+			},
+		},
+		{
+			name: "inference metrics and scope survive",
+			in: map[string]string{
+				"throughputTokPerSec": "4120.5", "ttftP99Ms": "182.3", "throughputThreshold": "5000",
+				"ttftThresholdMs": "200", "scaledThreshold": "2500", "gpusBenchmarked": "4", "gpusPerNode": "8",
+			},
+			want: map[string]string{
+				"throughputTokPerSec": "4120.5", "ttftP99Ms": "182.3", "throughputThreshold": "5000",
+				"ttftThresholdMs": "200", "scaledThreshold": "2500", "gpusBenchmarked": "4", "gpusPerNode": "8",
+			},
+		},
+		{
+			name: "allocation policy codes survive",
+			in:   map[string]string{"configuredPolicy": "dra-resource-claim", "resolvedMode": "device-plugin-extended-resource", "nodeLocal": "true"},
+			want: map[string]string{"configuredPolicy": "dra-resource-claim", "resolvedMode": "device-plugin-extended-resource", "nodeLocal": "true"},
+		},
+		{
+			name: "unknown policy, unresolvable mode, non-boolean flag are dropped",
+			in:   map[string]string{"configuredPolicy": "my-policy", "resolvedMode": "unspecified", "nodeLocal": "yes"},
+			want: nil,
+		},
+		{
+			name: "operator version and verdict survive",
+			in:   map[string]string{"detectedVersion": "v25.3.0", "versionSatisfied": "false"},
+			want: map[string]string{"detectedVersion": "v25.3.0", "versionSatisfied": "false"},
+		},
+		{
+			name: "two-component version survives",
+			in:   map[string]string{"detectedVersion": "v25.10"},
+			want: map[string]string{"detectedVersion": "v25.10"},
+		},
+		{
+			name: "one-component version survives",
+			in:   map[string]string{"detectedVersion": "v25"},
+			want: map[string]string{"detectedVersion": "v25"},
+		},
+		{
+			name: "pre-release versions survive",
+			in:   map[string]string{"detectedVersion": "v25.3.0-rc.1", "versionSatisfied": "true"},
+			want: map[string]string{"detectedVersion": "v25.3.0-rc.1", "versionSatisfied": "true"},
+		},
+		{
+			name: "undotted pre-release survives",
+			in:   map[string]string{"detectedVersion": "v26.7-beta2"},
+			want: map[string]string{"detectedVersion": "v26.7-beta2"},
+		},
+		{
+			name: "pre-release with build metadata is dropped",
+			in:   map[string]string{"detectedVersion": "v25.3.0-rc.1+acme"},
+			want: nil,
+		},
+		{
+			name: "over-long pre-release number is dropped",
+			in:   map[string]string{"detectedVersion": "v25.3.0-rc.12345"},
+			want: nil,
+		},
+		{
+			name: "non-numeric version is dropped",
+			in:   map[string]string{"detectedVersion": "vlatest"},
+			want: nil,
+		},
+		{
+			name: "version with free-text suffix is dropped",
+			in:   map[string]string{"detectedVersion": "v25.3.0-acme-prod"},
+			want: nil,
+		},
+		{
+			name: "version with build metadata is dropped",
+			in:   map[string]string{"detectedVersion": "v25.3.0+acme"},
+			want: nil,
+		},
+		{
+			name: "unprefixed version is dropped",
+			in:   map[string]string{"detectedVersion": "25.3.0"},
+			want: nil,
+		},
+		{
+			name: "non-canonical version is dropped",
+			in:   map[string]string{"detectedVersion": "v025.03.0"},
+			want: nil,
+		},
+		{
+			name: "over-long version component is dropped",
+			in:   map[string]string{"detectedVersion": "v12345.0.0"},
+			want: nil,
+		},
+		{
+			name: "new skip codes survive",
+			in:   map[string]string{"skipReason": "component-not-in-recipe"},
+			want: map[string]string{"skipReason": "component-not-in-recipe"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, _ := redact.CTRF(reportWithExtra(tt.in))
+			got := out.Results.Tests[0].Extra
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("redacted Extra = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCTRFKeepsEveryGPUAllocationPolicy checks that every pkg/validator/v1 GPU
+// allocation policy survives redaction as configuredPolicy.
+func TestCTRFKeepsEveryGPUAllocationPolicy(t *testing.T) {
+	for _, policy := range []string{
+		validatorv1.GPUAllocationPolicyUnspecified,
+		validatorv1.GPUAllocationPolicyDevicePluginExtendedResource,
+		validatorv1.GPUAllocationPolicyDRAResourceClaim,
+		validatorv1.GPUAllocationPolicyDRAExtendedResource,
+	} {
+		t.Run(policy, func(t *testing.T) {
+			out, _ := redact.CTRF(reportWithExtra(map[string]string{"configuredPolicy": policy}))
+			if got := out.Results.Tests[0].Extra["configuredPolicy"]; got != policy {
+				t.Errorf("configuredPolicy %q dropped by redaction (got %q)", policy, got)
+			}
+		})
+	}
+}
+
+// reportWithExtra builds a minimal one-test CTRF report carrying extra, for
+// exercising the Extra allowlist in isolation.
+func reportWithExtra(extra map[string]string) *ctrf.Report {
+	return &ctrf.Report{
+		ReportFormat: ctrf.ReportFormatCTRF,
+		SpecVersion:  ctrf.SpecVersion,
+		GeneratedBy:  "aicr",
+		Results: ctrf.Results{
+			Tool:    ctrf.Tool{Name: "chainsaw", Version: "0.2.0"},
+			Summary: ctrf.Summary{Tests: 1, Passed: 1},
+			Tests: []ctrf.TestResult{
+				{Name: "t", Status: ctrf.StatusPassed, Suite: []string{"deploy"}, Extra: extra},
+			},
+		},
+	}
+}
+
+func TestCTRFAppliedRulesIncludeExtraAllowlist(t *testing.T) {
+	_, rules := redact.CTRF(sampleReport())
+	found := slices.Contains(rules, "ctrf.tests.extra.allowlist")
+	if !found {
+		t.Errorf("applied rules must include ctrf.tests.extra.allowlist, got %v", rules)
+	}
+}
+
+func TestCTRFDoesNotMutateInput(t *testing.T) {
+	in := sampleReport()
+	_, _ = redact.CTRF(in)
+	if in.Results.Tests[0].Stdout == nil || in.Results.Tests[1].Message == "" {
+		t.Errorf("CTRF must not mutate its input")
+	}
+	// The input Extra maps must be untouched (rebuilt fresh, not filtered in place).
+	if _, ok := in.Results.Tests[0].Extra["podName"]; !ok {
+		t.Errorf("CTRF must not mutate input Extra: podName was removed from t1")
+	}
+	if in.Results.Tests[1].Extra["internalIP"] != "10.0.0.5" {
+		t.Errorf("CTRF must not mutate input Extra: t2 internalIP altered")
+	}
+}
+
+func TestCTRFAppliedRulesSortedNonEmpty(t *testing.T) {
+	_, rules := redact.CTRF(sampleReport())
+	if len(rules) == 0 {
+		t.Fatalf("expected applied rules")
+	}
+	if !sortedUnique(rules) {
+		t.Errorf("applied rules must be sorted and unique: %v", rules)
+	}
+}
+
+func TestCTRFNilReturnsNil(t *testing.T) {
+	out, rules := redact.CTRF(nil)
+	if out != nil || rules != nil {
+		t.Errorf("nil report should yield nil, nil")
+	}
+}
+
+func sortedUnique(s []string) bool {
+	for i := 1; i < len(s); i++ {
+		if s[i-1] >= s[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestSnapshotDropsItemsFromAllowlistedSubtype pins the second redaction layer.
+//
+// The allowlist drops label/taint by name, so Items on those never reach
+// copySubtype. This covers the other case: an *allowlisted* subtype that
+// carries Items. copySubtype rebuilds the subtype from the allowlisted Data
+// keys alone and never assigns Items, so node names or other identifiers
+// attached as items cannot cross the publication boundary.
+//
+// Without this, a future "carry Items through" change would be a one-line
+// fail-open with a fully green suite.
+func TestSnapshotDropsItemsFromAllowlistedSubtype(t *testing.T) {
+	snap := &snapshotter.Snapshot{
+		Measurements: []*measurement.Measurement{
+			measurement.NewMeasurement(measurement.TypeNodeTopology).
+				WithSubtype(measurement.Subtype{
+					Name: "summary",
+					Data: map[string]measurement.Reading{
+						"node-count":  measurement.Int(3),
+						"label-count": measurement.Int(9),
+					},
+					// Identifiers deliberately attached to an allowlisted subtype.
+					Items: []measurement.ItemEntry{{
+						Context: map[string]string{"key": "kubernetes.io/hostname", "value": "gpu-node-01"},
+						Data: map[string]measurement.Reading{
+							"node-count": measurement.Int(2),
+							"node-list":  measurement.Str("gpu-node-01,gpu-node-02"),
+							"truncated":  measurement.Bool(false),
+						},
+					}},
+				}).
+				Build(),
+		},
+	}
+
+	got, _ := redact.Snapshot(snap)
+
+	for _, m := range got.Measurements {
+		for i := range m.Subtypes {
+			st := &m.Subtypes[i]
+			if len(st.Items) != 0 {
+				t.Errorf("subtype %q retained %d items after redaction; Items must never cross "+
+					"the publication boundary", st.Name, len(st.Items))
+			}
+		}
+	}
+
+	// The allowlisted Data keys must still survive — this is a drop of Items,
+	// not of the subtype.
+	st := got.Measurements[0].GetSubtype("summary")
+	if st == nil {
+		t.Fatal("allowlisted summary subtype was dropped entirely")
+	}
+	if _, err := st.GetInt64("node-count"); err != nil {
+		t.Errorf("allowlisted key node-count did not survive redaction: %v", err)
+	}
+}
+
+func reportWithProvenance(p *ctrf.RuntimeProvenance) *ctrf.Report {
+	r := reportWithExtra(nil)
+	r.Results.Tests[0].RuntimeProvenance = p
+	return r
+}
+
+// TestCTRFBoundsRuntimeProvenance covers #2297's evidence carrier policy: the
+// record survives minimal redaction only as digests plus template KEYS, with
+// operator-authored keys collapsed and ill-formed records dropped whole.
+func TestCTRFBoundsRuntimeProvenance(t *testing.T) {
+	sha := func(c byte) string { return string(bytes.Repeat([]byte{c}, 64)) }
+	tests := []struct {
+		name string
+		in   *ctrf.RuntimeProvenance
+		want *ctrf.RuntimeProvenance
+	}{
+		{"absent stays absent", nil, nil},
+		{
+			name: "well-formed record survives with selectors collapsed, keys sorted and deduplicated",
+			in: &ctrf.RuntimeProvenance{ShippedDigest: sha('a'), DerivedDigest: sha('b'),
+				OverriddenPaths: []string{"spec.containers[node].image", "spec.containers[node].args", "spec.containers[node].args"},
+				InheritedPaths:  []string{"spec.containers[node].env[NCCL_SOCKET_IFNAME].value"}},
+			want: &ctrf.RuntimeProvenance{ShippedDigest: sha('a'), DerivedDigest: sha('b'),
+				OverriddenPaths: []string{"spec.containers[*].args", "spec.containers[*].image"},
+				InheritedPaths:  []string{"spec.containers[*].env[NCCL_SOCKET_IFNAME].value"}},
+		},
+		{
+			name: "malformed digest drops the whole record",
+			in:   &ctrf.RuntimeProvenance{ShippedDigest: "ABC", DerivedDigest: sha('b'), InheritedPaths: []string{"spec.hostNetwork"}},
+			want: nil,
+		},
+		{
+			name: "exact vendor keys kept, operator keys and list names collapsed, free text dropped",
+			in: &ctrf.RuntimeProvenance{ShippedDigest: sha('a'), DerivedDigest: sha('b'),
+				InheritedPaths: []string{
+					"metadata.annotations.networking.gke.io/interfaces",
+					"metadata.annotations.devices.gke.io/container.tcpxo-daemon",
+					"metadata.annotations.evil.gke.io/customer-x",              // subdomain is not ownership
+					"metadata.annotations.networking.gke.io/customer-prod",     // exact domain, operator local part
+					"spec.containers[node].env[NCCL_CUSTOMER_ACME_PROD].value", // allowed prefix, operator name
+					"spec.initContainers[setup].resources.limits.acme.internal/project-prod",
+					"spec.containers[node].resources.limits.nvidia.com/gpu",
+					"spec.containers[node].resources.requests.memory",
+					"spec.overhead.acme.internal/tax",
+					"spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution.labelSelector.matchLabels.team-x",
+					"spec.volumes[cache].csi.volumeAttributes.bucket-customer-prod",
+					"metadata.labels.team-payments-prod",
+					"spec.nodeSelector.cloud.google.com/gke-accelerator",
+					"spec.nodeSelector.my-org/private-pool-10.0.0.5",
+					"spec.nodeSelector.pool",
+					"spec.volumes[nvtcpxo-libraries].hostPath.path",
+					"spec.volumes[customer-secret-cache].secret.secretName",
+					"spec.containers[node].env[PROJECT_X_TOKEN].value",
+					"spec.containers[node].env[NCCL_FASTRAK_IFNAME].value",
+					"spec.containers[node].env[LD_LIBRARY_PATH].value",
+					"spec.containers[node].volumeMounts[customer-secret-cache].mountPath",
+					"spec.initContainers[tcpxo-daemon].image",
+					"free text with spaces",
+					"spec.containers[node].env[X].value=10.0.0.5",
+					"spec.customer-prod-cluster",             // non-schema structural segment
+					"spec.containers[node].acmeTenant.value", // camelCase but not a field
+					"acme.internal/x",                        // no schema root at all
+				}},
+			want: &ctrf.RuntimeProvenance{ShippedDigest: sha('a'), DerivedDigest: sha('b'),
+				InheritedPaths: []string{
+					"metadata.annotations",
+					"metadata.annotations.devices.gke.io/container.tcpxo-daemon",
+					"metadata.annotations.networking.gke.io/interfaces",
+					"metadata.labels",
+					"spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution.labelSelector.matchLabels",
+					"spec.containers[*].env[*].value",
+					"spec.containers[*].env[LD_LIBRARY_PATH].value",
+					"spec.containers[*].env[NCCL_FASTRAK_IFNAME].value",
+					"spec.containers[*].resources.limits.nvidia.com/gpu",
+					"spec.containers[*].resources.requests",
+					"spec.containers[*].volumeMounts[*].mountPath",
+					"spec.initContainers[*].image",
+					"spec.initContainers[*].resources.limits",
+					"spec.nodeSelector",
+					"spec.nodeSelector.cloud.google.com/gke-accelerator",
+					"spec.overhead",
+					"spec.volumes[*].csi.volumeAttributes",
+					"spec.volumes[*].hostPath.path",
+					"spec.volumes[*].secret.secretName",
+				}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, rules := redact.CTRF(reportWithProvenance(tt.in))
+			got := out.Results.Tests[0].RuntimeProvenance
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("bounded provenance = %+v, want %+v", got, tt.want)
+			}
+			if !slices.Contains(rules, "ctrf.tests.runtimeProvenance.bound") {
+				t.Errorf("applied rules must name the provenance bound, got %v", rules)
+			}
+		})
+	}
+}
+
+func TestCTRFRuntimeProvenancePathBounds(t *testing.T) {
+	sha := func(c byte) string { return string(bytes.Repeat([]byte{c}, 64)) }
+	// Distinct, schema-valid structural paths: pairs of real field names.
+	fields := []string{"affinity", "containers", "dnsConfig", "hostAliases", "initContainers", "os", "overhead",
+		"resourceClaims", "schedulingGates", "securityContext", "tolerations", "topologySpreadConstraints", "volumes",
+		"ephemeralContainers", "readinessGates", "imagePullSecrets", "hostname", "subdomain", "nodeName", "priority",
+		"runtimeClassName", "serviceAccountName", "schedulerName", "restartPolicy", "hostNetwork", "hostPID", "hostIPC",
+		"shareProcessNamespace", "enableServiceLinks", "preemptionPolicy", "setHostnameAsFQDN", "hostUsers", "resources", "name"}
+	many := make([]string, 0, len(fields)*len(fields))
+	for _, a := range fields {
+		for _, b := range fields {
+			many = append(many, "spec."+a+"."+b)
+		}
+	}
+	if len(many) <= 1024 {
+		t.Fatalf("control: need more than 1024 distinct paths, have %d", len(many))
+	}
+	out, _ := redact.CTRF(reportWithProvenance(&ctrf.RuntimeProvenance{
+		ShippedDigest: sha('a'), DerivedDigest: sha('b'),
+		OverriddenPaths: many,
+		InheritedPaths:  []string{"has space", "bad;char"},
+	}))
+	got := out.Results.Tests[0].RuntimeProvenance
+	if got == nil {
+		t.Fatal("well-formed digests must keep the record")
+	}
+	if len(got.OverriddenPaths) != 1024 {
+		t.Errorf("override list = %d entries, want capped at 1024", len(got.OverriddenPaths))
+	}
+	if got.InheritedPaths != nil {
+		t.Errorf("paths failing the key grammar must drop to nil, got %v", got.InheritedPaths)
+	}
+}

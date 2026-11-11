@@ -1,0 +1,131 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package header provides common header types for AICR data structures.
+//
+// This package defines the Header type used across recipes, snapshots, and other
+// AICR data structures to provide consistent metadata and versioning information.
+//
+// # Header Structure
+//
+// The Header contains standard fields for API versioning and metadata:
+//
+//	type Header struct {
+//	    Kind       Kind              `json:"kind,omitempty" yaml:"kind,omitempty"`             // Resource type (Snapshot, Recipe, RecipeResult)
+//	    APIVersion string            `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"` // API version (e.g., "aicr.run/v1")
+//	    Metadata   map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`     // Free-form string metadata (timestamp, version, etc.)
+//	}
+//
+// Metadata is a flat map[string]string populated by Init / InitWithTime with
+// the unprefixed keys "timestamp" (RFC3339 UTC) and "version" (when supplied).
+//
+// # Usage
+//
+// Initialize a header for a recipe via Init:
+//
+//	var h header.Header
+//	h.Init(header.KindRecipe, header.StableGroupVersion, "v1.0.0")
+//	// h.Metadata == map[string]string{"timestamp": "...", "version": "v1.0.0"}
+//
+// KindRecipe shown here is the legacy input kind, distinct from
+// KindRecipeResult and normalized to it per ADR-022 §2; both sit on the stable
+// artifact track alongside Snapshot, hence StableGroupVersion. An authored
+// catalog RecipeMetadata is colloquially a "recipe" too but sits on the
+// authoring track, and a profile-bearing artifact on its own track, so those
+// emitters pass AuthoringGroupVersion or ProfileGroupVersion instead; see the
+// API Versioning section below.
+//
+// For reproducible-build callers (SLSA, signed artifacts) inject a fixed
+// timestamp via InitWithTime instead of Init:
+//
+//	var h header.Header
+//	h.InitWithTime(header.KindSnapshot, header.StableGroupVersion, "v1.0.0", buildTime)
+//
+// # Serialization
+//
+// Headers serialize consistently to JSON and YAML:
+//
+//	{
+//	  "apiVersion": "aicr.run/v1",
+//	  "kind": "Recipe",
+//	  "metadata": {
+//	    "timestamp": "2025-12-30T10:30:00Z",
+//	    "version": "v1.0.0"
+//	  }
+//	}
+//
+// # API Versioning
+//
+// The APIVersion field enables evolution of data formats. APIGroup derives
+// from Domain. Per ADR-013 the move from the legacy aicr.nvidia.com/v1alpha1
+// group was a hard break — the old value is rejected, not migrated.
+//
+// ADR-022 splits artifacts across three schema tracks. An emitter aliases the
+// constant for its track — StableGroupVersion, AuthoringGroupVersion, or
+// ProfileGroupVersion — never the string it happens to equal. The three carried
+// one shared value before the v0.22 switch (#2416), so aliasing by value rather
+// than by track compiled and passed tests while emitting the wrong version
+// later. That switch separated them, which turns the mistake into a visible
+// wrong value instead of a latent one.
+//
+// Callers should select the gate for the artifact's schema track rather than
+// comparing literals, so the single source of truth in this package stays
+// authoritative. IsSupportedAPIVersion covers the stable artifact track. Since
+// ADR-022 N+2 (#2417) an absent apiVersion is not special-cased: it fails the
+// gate like any other unaccepted value, and RetirementNote supplies the clause
+// that tells its author why an artifact that used to load no longer does:
+//
+//	if !header.IsSupportedAPIVersion(h.APIVersion) {
+//	    return errors.New(errors.ErrCodeInvalidRequest,
+//	        fmt.Sprintf("unsupported apiVersion %q%s; expected %q",
+//	            h.APIVersion, header.RetirementNote(h.APIVersion),
+//	            header.GroupVersionV1))
+//	}
+//
+// RetirementNote is the right default. Only a reader that itself accepted a
+// headerless artifact until AlphaRemovedIn substitutes RetirementNoteWithAbsent;
+// the tolerance varied by track, so the empty case is opt-in rather than a
+// property of the value.
+//
+// # Kind Field
+//
+// The Kind field is a typed constant identifying the resource:
+//   - KindSnapshot ("Snapshot"): System configuration capture
+//   - KindRecipe ("Recipe"): Configuration recommendations
+//   - KindRecipeResult ("RecipeResult"): Resolved recipe with hydrated values
+//
+// # Custom Metadata
+//
+// Because Metadata is a flat map[string]string, callers may add their own
+// keys alongside the Init-populated "timestamp" and "version":
+//
+//	h.Metadata["node"] = "gpu-node-1"
+//	h.Metadata["cluster"] = "production"
+//	h.Metadata["environment"] = "staging"
+//
+// # Timestamps
+//
+// Init writes the timestamp using RFC3339 format in UTC:
+//
+//	h.Init(header.KindRecipe, header.StableGroupVersion, "v1.0.0")
+//	// h.Metadata["timestamp"] == "2025-12-30T10:30:00Z"
+//
+// # Validation
+//
+// While Header doesn't enforce validation, consumers should verify:
+//   - APIVersion is supported
+//   - Kind is recognized
+//   - Metadata["timestamp"] is reasonable
+//   - Version is a valid semantic version (if present)
+package header

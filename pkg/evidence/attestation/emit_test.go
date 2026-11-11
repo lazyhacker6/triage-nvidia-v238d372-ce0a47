@@ -1,0 +1,493 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package attestation
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	bundleattest "github.com/NVIDIA/aicr/pkg/bundler/attestation"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
+	"github.com/NVIDIA/aicr/pkg/evidence/redact"
+	"github.com/NVIDIA/aicr/pkg/measurement"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+	"github.com/NVIDIA/aicr/pkg/snapshotter"
+	"github.com/NVIDIA/aicr/pkg/validator/catalog"
+)
+
+// snapshotWithSensitiveData builds a snapshot whose measurements include the
+// sensitive fields the minimal policy must strip from the shipped bundle.
+func snapshotWithSensitiveData() *snapshotter.Snapshot {
+	s := snapshotter.NewSnapshot()
+	s.Metadata = map[string]string{"source-node": "ip-10-0-248-107.ec2.internal", "version": "0.0.0"}
+	s.Measurements = []*measurement.Measurement{
+		measurement.NewMeasurement(measurement.TypeK8s).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("server").SetString("version", "v1.33.1")).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("node").
+				SetString("source-node", "ip-10-0-248-107.ec2.internal").
+				SetString("provider-id", "aws:///us-west-2a/i-0123456789abcdef0").
+				SetString("provider", "eks")).
+			WithSubtype(measurement.Subtype{
+				Name: "slinky-slurm",
+				Data: map[string]measurement.Reading{
+					"collection-state": measurement.Str("detected"),
+				},
+				Items: []measurement.ItemEntry{{
+					Context: map[string]string{"id": "controller/slurm/cluster"},
+				}},
+			}).
+			WithSubtype(measurement.Subtype{
+				Name: "mariadb-operator",
+				Data: map[string]measurement.Reading{
+					"collection-state": measurement.Str("crs-detected"),
+				},
+			}).
+			Build(),
+		measurement.NewMeasurement(measurement.TypeGPU).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("hardware").
+				SetBool("gpu-present", true).SetString("model", "h100")).
+			Build(),
+		measurement.NewMeasurement(measurement.TypeNodeTopology).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("summary").SetInt("node-count", 2)).
+			WithSubtypeBuilder(measurement.NewSubtypeBuilder("label").
+				SetString("custom-cost-center", "acct-99887766|node1,node2").
+				// region is sourced ONLY from this label subtype, which the
+				// minimal policy drops — so the fingerprint can only carry it
+				// if computed from the raw (pre-redaction) snapshot.
+				SetString("topology.kubernetes.io/region", "us-west-2|node1,node2")).
+			Build(),
+	}
+	return s
+}
+
+func emitRecipe() *recipe.RecipeResult {
+	return &recipe.RecipeResult{
+		Kind:       "RecipeResult",
+		APIVersion: "aicr.run/v1",
+		Criteria: &recipe.Criteria{
+			Service:     recipe.CriteriaServiceEKS,
+			Accelerator: recipe.CriteriaAcceleratorH100,
+			Intent:      recipe.CriteriaIntentTraining,
+		},
+		ComponentRefs: []recipe.ComponentRef{
+			{Name: "gpu-operator", Type: recipe.ComponentTypeHelm, Chart: "gpu-operator", Version: "v25.10.1"},
+		},
+	}
+}
+
+func TestEmit_MinimalByDefault_RedactsSnapshotAndRecordsPolicy(t *testing.T) {
+	dir := t.TempDir()
+	res, err := Emit(context.Background(), EmitOptions{
+		OutDir:      dir,
+		Recipe:      emitRecipe(),
+		Snapshot:    snapshotWithSensitiveData(),
+		AICRVersion: "v0.0.0-test",
+	})
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "summary-bundle", "snapshot.yaml"))
+	if err != nil {
+		t.Fatalf("read snapshot.yaml: %v", err)
+	}
+	for _, secret := range []string{
+		"source-node", "provider-id", "i-0123456789abcdef0",
+		"custom-cost-center", "acct-99887766", "slinky-slurm",
+		"mariadb-operator", "controller/slurm/cluster",
+	} {
+		if strings.Contains(string(body), secret) {
+			t.Errorf("redacted snapshot.yaml still contains %q:\n%s", secret, body)
+		}
+	}
+	// Allowlisted signal survives.
+	if !strings.Contains(string(body), "v1.33.1") || !strings.Contains(string(body), "h100") {
+		t.Errorf("redacted snapshot dropped allowlisted signal:\n%s", body)
+	}
+
+	if res.Bundle.Predicate.Redaction == nil {
+		t.Fatalf("minimal bundle must record a redaction policy")
+	}
+	if res.Bundle.Predicate.Redaction.Policy != "minimal" || res.Bundle.Predicate.Redaction.Version != redact.PolicyVersion {
+		t.Errorf("unexpected redaction provenance: %+v", res.Bundle.Predicate.Redaction)
+	}
+	if len(res.Bundle.Predicate.Redaction.Applied) == 0 {
+		t.Errorf("expected applied rules recorded")
+	}
+}
+
+func TestEmit_StampsAICRCommitIntoStatement(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	dir := t.TempDir()
+	res, err := Emit(context.Background(), EmitOptions{
+		OutDir:      dir,
+		Recipe:      emitRecipe(),
+		Snapshot:    snapshotWithSensitiveData(),
+		AICRVersion: "main",
+		AICRCommit:  sha,
+	})
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if res.Bundle.Predicate.AICRCommit != sha {
+		t.Errorf("predicate AICRCommit = %q, want %q", res.Bundle.Predicate.AICRCommit, sha)
+	}
+	stmt, err := os.ReadFile(filepath.Join(dir, SummaryBundleDirName, StatementFilename))
+	if err != nil {
+		t.Fatalf("read statement: %v", err)
+	}
+	var parsed struct {
+		Predicate Predicate `json:"predicate"`
+	}
+	if err := json.Unmarshal(stmt, &parsed); err != nil {
+		t.Fatalf("parse statement: %v", err)
+	}
+	if parsed.Predicate.AICRCommit != sha {
+		t.Errorf("statement predicate aicrCommit = %q, want %q", parsed.Predicate.AICRCommit, sha)
+	}
+}
+
+func TestEmit_FullKeepsRawSnapshotAndNoRedaction(t *testing.T) {
+	dir := t.TempDir()
+	res, err := Emit(context.Background(), EmitOptions{
+		OutDir:      dir,
+		Full:        true,
+		Recipe:      emitRecipe(),
+		Snapshot:    snapshotWithSensitiveData(),
+		AICRVersion: "v0.0.0-test",
+	})
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "summary-bundle", "snapshot.yaml"))
+	if err != nil {
+		t.Fatalf("read snapshot.yaml: %v", err)
+	}
+	if !strings.Contains(string(body), "provider-id") ||
+		!strings.Contains(string(body), "custom-cost-center") ||
+		!strings.Contains(string(body), "slinky-slurm") ||
+		!strings.Contains(string(body), "mariadb-operator") {
+
+		t.Errorf("full bundle must retain raw snapshot detail:\n%s", body)
+	}
+	if res.Bundle.Predicate.Redaction != nil {
+		t.Errorf("full bundle must not record redaction; got %+v", res.Bundle.Predicate.Redaction)
+	}
+}
+
+func TestEmit_MinimalPreservesFingerprintSignal(t *testing.T) {
+	minDir, fullDir := t.TempDir(), t.TempDir()
+	minRes, err := Emit(context.Background(), EmitOptions{
+		OutDir: minDir, Recipe: emitRecipe(), Snapshot: snapshotWithSensitiveData(), AICRVersion: "v0.0.0-test",
+	})
+	if err != nil {
+		t.Fatalf("minimal Emit: %v", err)
+	}
+	fullRes, err := Emit(context.Background(), EmitOptions{
+		OutDir: fullDir, Full: true, Recipe: emitRecipe(), Snapshot: snapshotWithSensitiveData(), AICRVersion: "v0.0.0-test",
+	})
+	if err != nil {
+		t.Fatalf("full Emit: %v", err)
+	}
+	mp, fp := minRes.Bundle.Predicate, fullRes.Bundle.Predicate
+	if mp.Fingerprint != fp.Fingerprint {
+		t.Errorf("fingerprint must be identical regardless of redaction:\nmin=%+v\nfull=%+v", mp.Fingerprint, fp.Fingerprint)
+	}
+	if mp.Fingerprint.Accelerator.Value != "h100" {
+		t.Errorf("expected accelerator signal preserved, got %+v", mp.Fingerprint.Accelerator)
+	}
+	// Region is sourced only from the NodeTopology label subtype, which the
+	// minimal policy drops from the shipped snapshot. Its presence in the
+	// minimal predicate proves the fingerprint was computed from the raw
+	// snapshot — a regression that computed it from the redacted bytes would
+	// leave Region empty.
+	if mp.Fingerprint.Region.Value != "us-west-2" {
+		t.Errorf("region must survive in the predicate (computed from raw snapshot), got %+v", mp.Fingerprint.Region)
+	}
+}
+
+func TestEmit_HappyPathNoPush(t *testing.T) {
+	dir := t.TempDir()
+	rec := &recipe.RecipeResult{
+		Kind:       "RecipeResult",
+		APIVersion: "aicr.run/v1",
+		Criteria: &recipe.Criteria{
+			Service:     recipe.CriteriaServiceEKS,
+			Accelerator: recipe.CriteriaAcceleratorH100,
+			Intent:      recipe.CriteriaIntentTraining,
+		},
+		ComponentRefs: []recipe.ComponentRef{
+			{Name: "gpu-operator", Type: recipe.ComponentTypeHelm, Chart: "gpu-operator", Version: "v25.10.1"},
+		},
+	}
+	snap := &snapshotter.Snapshot{}
+
+	res, err := Emit(context.Background(), EmitOptions{
+		OutDir:      dir,
+		Recipe:      rec,
+		Snapshot:    snap,
+		AICRVersion: "v0.0.0-test",
+	})
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if res == nil || res.Bundle == nil {
+		t.Fatalf("expected populated EmitResult, got %+v", res)
+	}
+	if res.Sign != nil || res.PushSummary != nil {
+		t.Errorf("no-push path must not populate Sign/PushSummary; got %+v / %+v", res.Sign, res.PushSummary)
+	}
+
+	if _, err := os.Stat(res.PointerPath); err != nil {
+		t.Errorf("pointer.yaml missing: %v", err)
+	}
+	for _, name := range []string{"manifest.json", "statement.intoto.json", "recipe.yaml", "snapshot.yaml", "bom.cdx.json"} {
+		p := filepath.Join(dir, "summary-bundle", name)
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s missing under summary-bundle: %v", name, err)
+		}
+	}
+}
+
+func TestEmit_InvalidPushReference(t *testing.T) {
+	dir := t.TempDir()
+	rec := &recipe.RecipeResult{Criteria: &recipe.Criteria{Accelerator: recipe.CriteriaAcceleratorH100}}
+	snap := &snapshotter.Snapshot{}
+	_, err := Emit(context.Background(), EmitOptions{
+		OutDir:      dir,
+		Push:        "oci://not a valid ref",
+		Recipe:      rec,
+		Snapshot:    snap,
+		AICRVersion: "v0.0.0-test",
+	})
+	if err == nil {
+		t.Fatalf("expected error for malformed Push reference")
+	}
+}
+
+func TestBuildPointerInputsFromOutcome_Unsigned(t *testing.T) {
+	bundle := &Bundle{RecipeName: "x", Predicate: &Predicate{}}
+	in := buildPointerInputsFromOutcome(bundle, emitOutcome{})
+	if in.Signer != nil {
+		t.Errorf("unsigned outcome should leave Signer nil; got %+v", in.Signer)
+	}
+	if in.BundleOCI != "" || in.BundleHash != "" {
+		t.Errorf("unsigned outcome should leave OCI/hash empty; got %q / %q", in.BundleOCI, in.BundleHash)
+	}
+}
+
+func TestBuildPointerInputsFromOutcome_SignedWithRekorIndex(t *testing.T) {
+	bundle := &Bundle{RecipeName: "x", Predicate: &Predicate{}}
+	in := buildPointerInputsFromOutcome(bundle, emitOutcome{
+		Sign: &bundleattest.SignedAttestation{
+			Identity:      "u@x",
+			Issuer:        "iss",
+			RekorLogIndex: 42,
+		},
+	})
+	if in.Signer == nil {
+		t.Fatalf("signed outcome should produce non-nil Signer")
+	}
+	if in.Signer.Identity != "u@x" || in.Signer.Issuer != "iss" {
+		t.Errorf("Identity/Issuer mismatch: %+v", in.Signer)
+	}
+	if in.Signer.RekorLogIndex == nil || *in.Signer.RekorLogIndex != 42 {
+		t.Errorf("RekorLogIndex = %v, want *int64(42)", in.Signer.RekorLogIndex)
+	}
+}
+
+func TestBuildPointerInputsFromOutcome_SignedWithoutRekorLeavesIndexNil(t *testing.T) {
+	bundle := &Bundle{RecipeName: "x", Predicate: &Predicate{}}
+	in := buildPointerInputsFromOutcome(bundle, emitOutcome{
+		Sign: &bundleattest.SignedAttestation{Identity: "u@x", Issuer: "iss", RekorLogIndex: 0},
+	})
+	if in.Signer == nil {
+		t.Fatalf("signed outcome should produce non-nil Signer")
+	}
+	if in.Signer.RekorLogIndex != nil {
+		t.Errorf("zero Rekor index should yield nil pointer; got *%d", *in.Signer.RekorLogIndex)
+	}
+}
+
+// TestBuildPointerInputsFromOutcome_PushedUnsigned covers the --no-sign
+// outcome: the bundle was pushed (so bundle.oci/digest are populated) but
+// not signed (Sign nil), so the resulting pointer carries a content
+// reference with an empty signer block — the "pending signature" state the
+// fork-based signing workflow later completes.
+func TestBuildPointerInputsFromOutcome_PushedUnsigned(t *testing.T) {
+	bundle := &Bundle{RecipeName: "x", Predicate: &Predicate{}}
+	in := buildPointerInputsFromOutcome(bundle, emitOutcome{
+		PushSummary: &PushResult{
+			Reference: "oci://ghcr.io/owner/aicr-evidence:tag",
+			Digest:    "sha256:abc",
+		},
+	})
+	if in.Signer != nil {
+		t.Errorf("pushed-unsigned outcome should leave Signer nil; got %+v", in.Signer)
+	}
+	if in.BundleOCI != "ghcr.io/owner/aicr-evidence:tag" {
+		t.Errorf("BundleOCI should be the scheme-trimmed push reference; got %q", in.BundleOCI)
+	}
+	if in.BundleHash != "sha256:abc" {
+		t.Errorf("BundleHash = %q, want sha256:abc", in.BundleHash)
+	}
+}
+
+func TestSignAndPush_NoPushReturnsZeroOutcome(t *testing.T) {
+	bundle := &Bundle{SummaryDir: "/tmp/x"}
+	out, err := signAndPush(context.Background(), bundle, signPushOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Sign != nil || out.PushSummary != nil {
+		t.Errorf("expected zero outcome when Push absent; got %+v", out)
+	}
+}
+
+// emitCatalog builds a validator catalog whose images carry the given tags.
+func emitCatalog(tags ...string) *catalog.ValidatorCatalog {
+	cat := &catalog.ValidatorCatalog{}
+	for i, tag := range tags {
+		cat.Validators = append(cat.Validators, catalog.ValidatorEntry{
+			Name:  fmt.Sprintf("check-%d", i),
+			Phase: "conformance",
+			Image: "ghcr.io/nvidia/aicr-validators/performance:" + tag,
+		})
+	}
+	return cat
+}
+
+func TestMutableValidatorImages(t *testing.T) {
+	tests := []struct {
+		name   string
+		images []ValidatorImage
+		want   []string
+	}{
+		{"nil", nil, nil},
+		{"all immutable", []ValidatorImage{
+			{Image: "ghcr.io/nvidia/aicr-validators/performance:v1.0.0"},
+			{Image: "ghcr.io/nvidia/aicr-validators/conformance:sha-1f27c0dc6e4617db9b505eb10ee9d910a08968aa"},
+		}, nil},
+		{"one mutable", []ValidatorImage{
+			{Image: "ghcr.io/nvidia/aicr-validators/performance:v1.0.0"},
+			{Image: "ghcr.io/nvidia/aicr-validators/conformance:edge"},
+		}, []string{"ghcr.io/nvidia/aicr-validators/conformance:edge"}},
+		{"all mutable, order preserved", []ValidatorImage{
+			{Image: "ghcr.io/nvidia/aicr-validators/performance:latest"},
+			{Image: "ghcr.io/nvidia/aicr-validators/conformance:edge"},
+		}, []string{
+			"ghcr.io/nvidia/aicr-validators/performance:latest",
+			"ghcr.io/nvidia/aicr-validators/conformance:edge",
+		}},
+		{"empty ref is skipped", []ValidatorImage{{Image: ""}}, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MutableValidatorImages(tt.images)
+			if len(got) != len(tt.want) {
+				t.Fatalf("MutableValidatorImages() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("MutableValidatorImages()[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestEmit_RejectsMutableValidatorTag(t *testing.T) {
+	dir := t.TempDir()
+	_, err := Emit(context.Background(), EmitOptions{
+		OutDir:      dir,
+		Recipe:      emitRecipe(),
+		Snapshot:    snapshotWithSensitiveData(),
+		Catalog:     emitCatalog("v1.0.0", "edge"),
+		AICRVersion: "v0.0.0-test",
+	})
+	if err == nil {
+		t.Fatal("expected Emit to fail closed on a mutable validator tag")
+	}
+	if errorstest.ReportedCode(err) != errors.ErrCodeInvalidRequest {
+		t.Errorf("error code = %v, want ErrCodeInvalidRequest", err)
+	}
+	// The offending ref must be named — the operator has to know which
+	// override to drop.
+	if !strings.Contains(err.Error(), "aicr-validators/performance:edge") {
+		t.Errorf("error must name the mutable ref, got: %v", err)
+	}
+
+	// Fail closed means fail EARLY: nothing may be written to disk, or a
+	// half-built bundle invites a partial publish.
+	if entries, rerr := os.ReadDir(dir); rerr == nil && len(entries) > 0 {
+		t.Errorf("Emit wrote %d entries before failing closed: %v", len(entries), entries)
+	}
+}
+
+func TestEmit_AllowMutableValidatorTagsOptsOut(t *testing.T) {
+	dir := t.TempDir()
+	res, err := Emit(context.Background(), EmitOptions{
+		OutDir:                    dir,
+		Recipe:                    emitRecipe(),
+		Snapshot:                  snapshotWithSensitiveData(),
+		Catalog:                   emitCatalog("edge"),
+		AllowMutableValidatorTags: true,
+		AICRVersion:               "v0.0.0-test",
+	})
+	if err != nil {
+		t.Fatalf("Emit with AllowMutableValidatorTags: %v", err)
+	}
+	// The override records the tag verbatim — that is the point of the
+	// escape hatch, and why the predicate still shows what actually ran.
+	imgs := res.Bundle.Predicate.ValidatorImages
+	if len(imgs) != 1 || imgs[0].Image != "ghcr.io/nvidia/aicr-validators/performance:edge" {
+		t.Errorf("predicate validatorImages = %+v, want the :edge ref recorded", imgs)
+	}
+}
+
+func TestEmit_ImmutableValidatorTagsPass(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Emit(context.Background(), EmitOptions{
+		OutDir:      dir,
+		Recipe:      emitRecipe(),
+		Snapshot:    snapshotWithSensitiveData(),
+		Catalog:     emitCatalog("v1.0.0", "sha-1f27c0dc6e4617db9b505eb10ee9d910a08968aa", "uat-19283746"),
+		AICRVersion: "v0.0.0-test",
+	}); err != nil {
+		t.Fatalf("Emit with immutable validator tags: %v", err)
+	}
+}
+
+// TestEmit_NilCatalogPasses guards the documented "pass nil when no catalog
+// was loaded" contract: no catalog means no validatorImages to vouch for, and
+// the gate must not turn that into a failure.
+func TestEmit_NilCatalogPasses(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Emit(context.Background(), EmitOptions{
+		OutDir:      dir,
+		Recipe:      emitRecipe(),
+		Snapshot:    snapshotWithSensitiveData(),
+		AICRVersion: "v0.0.0-test",
+	}); err != nil {
+		t.Fatalf("Emit with nil catalog: %v", err)
+	}
+}

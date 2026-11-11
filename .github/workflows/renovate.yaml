@@ -1,0 +1,148 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Renovate
+
+# Self-hosted Renovate runner. Configuration: .github/renovate.json5
+# Modeled on NVIDIA/gpu-operator/.github/workflows/renovate.yaml.
+# Uses GITHUB_TOKEN (no PAT/App). GitHub fires no workflow event for a push its
+# own token authored, and nothing in this repo substitutes for that: `/ok-to-test`
+# dispatches qualification.yaml, and a dispatched merge-gate.yaml run attaches its
+# checks to the commit but never to the PR's status-check rollup, so neither
+# produces the `gate` aggregate the branch ruleset requires (measured on PR #2780:
+# 27 check-runs on the commit, 0 in the rollup). A maintainer clicking "Update
+# branch" is what re-binds a bot PR's checks — see .github/RENOVATE.md.
+
+on:
+  schedule:
+    # Weekdays 05:00 UTC. This cron is Renovate's only schedule — there is no
+    # second-layer `schedule:` in renovate.json5 (see comment there). Patch
+    # auto-merge drains low-risk PRs between runs without human attention.
+    - cron: "0 5 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: "Renovate log level"
+        default: "info"
+        type: choice
+        options:
+          - debug
+          - info
+          - warn
+      dryRun:
+        description: "Run in dry-run mode (no PRs created)"
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  renovate:
+    name: Renovate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      # Renovate calls POST /repos/{owner}/{repo}/statuses/{sha} after each
+      # branch creation to write a "stability" status check (tied to the
+      # cooldown / merge-confidence flow). Without statuses:write the call
+      # 403s with "integration-unauthorized" and Renovate maps that error
+      # internally to "repository-changed", aborting the whole run with
+      # the misleading "Repository has changed during renovation" message.
+      statuses: write
+      # Renovate calls GET /repos/{owner}/{repo}/dependabot/alerts on every
+      # run to surface vulnerability alerts in PR bodies and prioritize CVE
+      # patches. Without this scope the call 403s and Renovate logs
+      # "Cannot access vulnerability alerts" — functional but noisy.
+      security-events: read
+    timeout-minutes: 30
+    steps:
+      # Mirrors NVIDIA/gpu-operator's known-working pattern. The action
+      # itself clones the repo into the Docker container, but having the
+      # outer checkout in place keeps the host-side git state consistent
+      # with what Renovate's pre/post hooks expect. `persist-credentials:
+      # false` keeps the token out of /home/runner/work/.../.git/config —
+      # Renovate uses its own RENOVATE_TOKEN env passed into the container,
+      # so the host-side git config never needs the credential.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Conditionally set RENOVATE_DRY_RUN only when the dispatcher asked
+      # for it. Setting it to an empty string on every run was suspected
+      # of confusing Renovate's option parsing; setting the env var
+      # conditionally avoids that ambiguity entirely.
+      - name: Configure dry-run mode
+        if: ${{ inputs.dryRun }}
+        run: echo "RENOVATE_DRY_RUN=full" >> "$GITHUB_ENV"
+
+      # Do NOT pass `configurationFile:` here — confirmed in production
+      # (run 25346453345, regex manager stats `fileCount: 4, depCount: 56`
+      # vs expected 2/28): the action mounts the file as global config
+      # AND Renovate auto-discovers `.github/renovate.json5` from the
+      # cloned working tree. Both loads register the same customManagers,
+      # every annotation gets extracted twice, and downstream commits log
+      # "Cannot find replaceString in current file content. Was it
+      # already updated?" warnings on the second pass. Renovate does NOT
+      # dedupe by manager identity in this case — that earlier hypothesis
+      # was wrong. PR #6 re-added this input chasing the
+      # "repository-changed" aborts; the actual cause was the missing
+      # `statuses: write` permission (fixed in PR #7), not the absence
+      # of a global config.
+      #
+      # `renovate-version` carries the tag AND digest pin: the action
+      # constructs the image as `${renovate-image}:${renovate-version}`,
+      # so passing `43@sha256:...` produces a digest-verified reference.
+      # Keep this digest in lockstep with RENOVATE_VALIDATOR_IMAGE in
+      # the Makefile.
+      - name: Run Renovate
+        uses: renovatebot/github-action@1c0cf989c02653fba0efe7ca5772338860ca71dc  # v46.3.12
+        with:
+          renovate-version: '43@sha256:00185c0d63462acec8331cc9a94dcd74a763f2765fca0edcc3ff568af1dc8104'
+        env:
+          RENOVATE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RENOVATE_REPOSITORIES: '["${{ github.repository }}"]'
+          RENOVATE_ONBOARDING: "false"
+          # Allow the per-arch SHA256 checksum refresh hooks. Renovate refuses
+          # to run any postUpgradeTask command that does not match an entry in
+          # this allowlist — silently, with only a warn-level log line. Keep
+          # the regex broad enough to cover every tools/update-*-checksums
+          # script so adding a new checksum-pinned dependency (see the
+          # postUpgradeTasks entries in .github/renovate.json5) does not
+          # require a parallel edit here. Symptom of a mismatch is stale
+          # checksums getting committed alongside a version bump (the version
+          # changes but the helmfile_checksums/chainsaw_checksums block does
+          # not), which then breaks E2E/CLI E2E at the sha256 verify step.
+          # `[a-z-]+` (not `[a-z]+`) so hyphenated tool names match too, e.g.
+          # tools/update-helm-diff-checksums.
+          #
+          # A hook that runs but *fails* (renamed asset, egress blip) leaves the
+          # new version pinned against the old checksums. That used to be caught
+          # unevenly: helmfile/chainsaw digests feed setup-build-tools on
+          # PR-gating jobs and fail there, but helm_diff_checksums is read
+          # solely by tests/uat/lib/phases.sh, so a stale helm-diff pin passed
+          # every PR check and first surfaced in nightly UAT, across all clouds
+          # (PR #2801).
+          #
+          # The merge-gate `settings-checksums` job now closes that gap for all
+          # seven checksum-pinned tools by re-deriving each digest from upstream
+          # (tools/check-settings-checksums), so a stale pin fails the required
+          # gate pre-merge rather than reaching UAT. Renovate's "Artifact update
+          # problem" warning in the PR body is still the earliest signal, and
+          # helm-diff is deliberately not auto-merged, so a human sees it first.
+          RENOVATE_ALLOWED_POST_UPGRADE_COMMANDS: '["^\\./tools/update-[a-z-]+-checksums "]'
+          LOG_LEVEL: ${{ inputs.logLevel || 'info' }}

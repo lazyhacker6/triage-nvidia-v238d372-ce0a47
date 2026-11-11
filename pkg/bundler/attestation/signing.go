@@ -1,0 +1,501 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package attestation
+
+import (
+	"context"
+	"crypto/x509"
+	"encoding/asn1"
+	stderrors "errors"
+	"log/slog"
+	"time"
+
+	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
+	"github.com/sigstore/sigstore-go/pkg/root"
+	"github.com/sigstore/sigstore-go/pkg/sign"
+	"google.golang.org/protobuf/encoding/protojson"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+)
+
+// SignOptions controls cosign keyless OIDC signing for an in-toto
+// Statement. Empty Fulcio/Rekor URLs fall back to Sigstore's
+// public-good defaults.
+type SignOptions struct {
+	// OIDCToken is the ambient OIDC token used to obtain a Fulcio
+	// signing certificate. Required.
+	OIDCToken string
+
+	// FulcioURL is the Fulcio certificate authority URL. Empty falls
+	// back to defaults.SigstoreFulcioURL.
+	FulcioURL string
+
+	// RekorURL is the Rekor transparency log URL. Empty falls back to
+	// defaults.SigstoreRekorURL. Ignored when SigningConfigPath or
+	// UseTUFSigningConfig is set (both take precedence).
+	RekorURL string
+
+	// SigningConfigPath, when non-empty, is the path to a Sigstore SigningConfig
+	// JSON file (e.g. the TUF-distributed signing_config_rekor_v2 target written
+	// to disk). It takes precedence over UseTUFSigningConfig and RekorURL and
+	// drives transparency-log and timestamp-authority selection via
+	// root.SelectServices — this is how AICR targets Rekor v2. See #1650.
+	SigningConfigPath string
+
+	// UseTUFSigningConfig selects the Rekor v2 signing config from the local TUF
+	// cache (populated by "aicr trust update"). It is the preferred, rotation-safe
+	// way to target Rekor v2 — the endpoint set is Sigstore-maintained and nothing
+	// is hardcoded. Ignored when SigningConfigPath is set. See #1650.
+	UseTUFSigningConfig bool
+
+	// SigningConfig is an already-parsed signing config that takes precedence
+	// over all three fields above.
+	//
+	// It exists for callers that must INSPECT a config before signing with it:
+	// Client.SignCatalog rejects a config naming non-public-good endpoints, and
+	// re-loading from SigningConfigPath afterwards would sign against whatever
+	// the file holds at that later moment, not what was validated. Passing the
+	// parsed config makes the checked bytes and the used bytes the same bytes.
+	SigningConfig *root.SigningConfig
+}
+
+// SignOptionsFromResolve maps a resolved OIDC token plus the signing-target
+// fields of a ResolveOptions into SignOptions. It is the single source of that
+// mapping, shared by the keyless attester and the evidence signing paths so a
+// new signing field (e.g. SigningConfigPath / UseTUFSigningConfig) cannot be
+// silently dropped by one caller — the drift that would otherwise leave a path
+// signing to the wrong Rekor. OIDC source selection is already resolved into
+// token, so only the transparency-target fields are copied.
+func SignOptionsFromResolve(token string, o ResolveOptions) SignOptions {
+	return SignOptions{
+		OIDCToken:           token,
+		FulcioURL:           o.FulcioURL,
+		RekorURL:            o.RekorURL,
+		SigningConfigPath:   o.SigningConfigPath,
+		UseTUFSigningConfig: o.UseTUFSigningConfig,
+		SigningConfig:       o.SigningConfig,
+	}
+}
+
+// SignedAttestation is the result of SignStatement: a Sigstore bundle
+// (DSSE envelope wrapping the in-toto Statement, plus Fulcio cert and
+// Rekor inclusion proof) serialized as protobuf-JSON, together with
+// the identity claims extracted from the Fulcio cert.
+type SignedAttestation struct {
+	// BundleJSON is the serialized Sigstore bundle in protobuf-JSON
+	// form. Writable directly to an attestation.sigstore.json file
+	// or pushable to an OCI artifact.
+	BundleJSON []byte
+
+	// Identity is the SAN claim from the Fulcio cert (email for
+	// interactive OIDC, URI for workload OIDC). Empty if extraction
+	// failed or the cert has no email/URI SAN — callers must not treat
+	// empty as an error signal.
+	Identity string
+
+	// Issuer is the OIDC issuer URL recorded in the Fulcio cert
+	// (Fulcio-specific X.509 extension). Empty if extraction failed.
+	Issuer string
+
+	// RekorLogIndex is the Rekor transparency-log inclusion-proof log
+	// index. 0 if no Rekor entry exists.
+	RekorLogIndex int64
+
+	// KeyFingerprint is the PublicKeyFingerprint of the signing key when the
+	// signature is key-based (KMS), and empty for a keyless signature.
+	KeyFingerprint string
+}
+
+// SignStatement DSSE-wraps an in-toto Statement and signs it via
+// cosign keyless OIDC (Fulcio certificate issuance + Rekor
+// transparency log entry). It is the predicate-agnostic signing
+// primitive shared between `aicr bundle --attest` (SLSA Provenance v1
+// predicate) and `aicr validate --emit-attestation` (recipe-evidence
+// v1 predicate); callers construct statementJSON according to their
+// own predicate type.
+//
+// statementJSON must be the protobuf-JSON-encoded intoto.Statement
+// bytes — typically the output of attestation.BuildStatement for the
+// bundle path, or of evidence/attestation.BuildStatement for the
+// recipe-evidence path. SignStatement does not interpret the
+// predicate.
+//
+// The returned SignedAttestation carries the Sigstore bundle plus the
+// signer-identity claims extracted from the Fulcio certificate so
+// callers do not need to re-parse the cert.
+//
+// SignStatement is the keyless specialization of the composable core
+// SignStatementWith: it builds a keyless Fulcio identity and a Rekor
+// transparency policy from opts and delegates the signing plumbing there.
+func SignStatement(ctx context.Context, statementJSON []byte, opts SignOptions) (*SignedAttestation, error) {
+	if len(statementJSON) == 0 {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "empty statement")
+	}
+	if opts.OIDCToken == "" {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "OIDC token is required for keyless signing")
+	}
+	id := NewKeylessIdentity(opts.OIDCToken, opts.FulcioURL)
+	tlog, err := transparencyForOptions(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return SignStatementWith(ctx, statementJSON, id, tlog)
+}
+
+// transparencyForOptions selects the transparency policy from SignOptions,
+// in precedence order: an explicit SigningConfig file, then the TUF-distributed
+// Rekor v2 signing config, then the single Rekor v1 URL policy. The first two
+// are SigningConfig-driven (Rekor v2 + timestamp authority). ctx bounds the TUF
+// fetch the v2 path may perform on a cold cache.
+func transparencyForOptions(ctx context.Context, opts SignOptions) (TransparencyPolicy, error) {
+	switch {
+	case opts.SigningConfig != nil:
+		// First, ahead of the path: when a caller validated a config it must be
+		// the one signed with, not a re-read of the same path.
+		return NewSigningConfigPolicy(opts.SigningConfig)
+	case opts.SigningConfigPath != "":
+		return NewSigningConfigPolicyFromPath(opts.SigningConfigPath)
+	case opts.UseTUFSigningConfig:
+		// Bound the Rekor v2 signing-config resolution (cache read plus a
+		// possible network TUF fetch on a cold cache) so an unbounded caller
+		// context cannot hang here, before SignStatementWith applies its own
+		// sign deadline. Shared by keyless SignStatement and KMSAttester.Attest.
+		//
+		// Budget note: when the caller ctx already carries a sign deadline (the
+		// evidence path passes EvidenceBundleSignTimeout), a cold-cache fetch here
+		// draws from that same budget before SignStatementWith's retry loop, so a
+		// first-ever cold sign has less than the full retry budget (see
+		// TestSigstoreRetryBudgetInvariant). It fails closed, and release CI
+		// pre-warms the cache via `aicr trust update`, so the retry loop keeps its
+		// budget in practice; only cold ad-hoc signing is affected.
+		tufCtx, cancel := context.WithTimeout(ctx, defaults.SigstoreSignTimeout)
+		defer cancel()
+		return NewSigningConfigPolicyFromTUF(tufCtx)
+	default:
+		return NewRekorPolicy(opts.RekorURL), nil
+	}
+}
+
+// SignStatementWith DSSE-wraps an in-toto Statement and signs it using the
+// given identity and transparency policy. It is the composable core shared by
+// keyless signing (SignStatement) and KMS signing (KMSAttester); #409 and
+// #1150 reuse it with different identity/policy pairings.
+//
+// When the identity supplies no Fulcio certificate (KMS), the resulting
+// Sigstore bundle carries a public-key verification material instead of a
+// certificate, and the signer identity is taken from id.FallbackIdentity().
+func SignStatementWith(ctx context.Context, statementJSON []byte, id SigningIdentity, tlog TransparencyPolicy) (*SignedAttestation, error) {
+	if len(statementJSON) == 0 {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "empty statement")
+	}
+	if id == nil || tlog == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "signing identity and transparency policy are required")
+	}
+
+	content := &sign.DSSEData{
+		Data:        statementJSON,
+		PayloadType: "application/vnd.in-toto+json",
+	}
+
+	// Bound the entire signing flow — key resolution (for KMS, the provider
+	// lookup and PublicKey RPC, which would otherwise escape this deadline)
+	// plus the Fulcio + Rekor calls — so a hung peer cannot block the CLI
+	// indefinitely. Honors any tighter deadline the caller already attached.
+	signCtx, cancel := context.WithTimeout(ctx, defaults.SigstoreSignTimeout)
+	defer cancel()
+
+	keypair, err := id.Keypair(signCtx)
+	if err != nil {
+		return nil, err // already classified by the identity
+	}
+
+	certProvider, certOpts := id.CertProvider()
+
+	bundle, err := signWithRetry(signCtx, func(attemptCtx context.Context) (*protobundle.Bundle, error) {
+		return sign.Bundle(content, keypair, sign.BundleOptions{
+			CertificateProvider:        certProvider,
+			CertificateProviderOptions: certOpts,
+			TransparencyLogs:           tlog.Logs(),
+			TimestampAuthorities:       tlog.TimestampAuthorities(),
+			Context:                    attemptCtx,
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	bundleJSON, err := protojson.Marshal(bundle)
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to marshal sigstore bundle", err)
+	}
+
+	identity, issuer := extractSignerClaims(bundle)
+	if identity == "" {
+		identity = id.FallbackIdentity() // KMS: the key URI
+	}
+	var keyFingerprint string
+	if bundle.GetVerificationMaterial().GetPublicKey() != nil {
+		keyFingerprint, err = PublicKeyFingerprint(keypair.GetPublicKey())
+		if err != nil {
+			return nil, err
+		}
+	}
+	rekorIndex := extractRekorLogIndex(bundle)
+
+	// Identity (Fulcio SAN) is user PII for interactive OIDC — keep it off the
+	// INFO log. Rekor inclusion proofs are public by design, so the log index
+	// is safe to surface. Callers that need the identity for auditing get it
+	// via the returned SignedAttestation.
+	slog.Info("in-toto statement signed", "rekorLogIndex", rekorIndex)
+	slog.Debug("sigstore signer claims", "identity", identity, "issuer", issuer)
+
+	return &SignedAttestation{
+		BundleJSON:     bundleJSON,
+		Identity:       identity,
+		Issuer:         issuer,
+		RekorLogIndex:  rekorIndex,
+		KeyFingerprint: keyFingerprint,
+	}, nil
+}
+
+// SignStatementWithKey DSSE-wraps an in-toto Statement and signs it with the
+// KMS key opts.SigningKey names: the key-based counterpart of SignStatement,
+// for callers that sign their own predicate rather than going through an
+// Attester. The transparency entry follows opts the same way KMSAttester does:
+// none when DisableTLogUpload is set, otherwise the Rekor target the signing
+// config, TUF config or Rekor URL selects. OIDC token sources in opts are
+// ignored, except DeviceFlow, which conflicts with a key and is rejected.
+func SignStatementWithKey(ctx context.Context, statementJSON []byte, opts ResolveOptions) (*SignedAttestation, error) {
+	if opts.SigningKey == "" {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "a signing key is required for key-based signing")
+	}
+	if err := checkSigningMode(opts); err != nil {
+		return nil, err
+	}
+	var tlog TransparencyPolicy
+	if opts.DisableTLogUpload {
+		tlog = NewNoTLogPolicy()
+	} else {
+		var err error
+		tlog, err = transparencyForOptions(ctx, SignOptionsFromResolve("", opts))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return SignStatementWith(ctx, statementJSON, NewKMSIdentity(opts.SigningKey), tlog)
+}
+
+// extractSignerClaims parses the Fulcio cert and returns the SAN
+// identity (email or URI) plus the OIDC issuer URL.
+// Returns empty strings when the certificate or claims are absent.
+func extractSignerClaims(bundle *protobundle.Bundle) (identity, issuer string) {
+	if bundle.GetVerificationMaterial() == nil {
+		return "", ""
+	}
+
+	var certDER []byte
+	if cert := bundle.GetVerificationMaterial().GetCertificate(); cert != nil {
+		certDER = cert.GetRawBytes()
+	} else if chain := bundle.GetVerificationMaterial().GetX509CertificateChain(); chain != nil {
+		certs := chain.GetCertificates()
+		if len(certs) > 0 {
+			certDER = certs[0].GetRawBytes()
+		}
+	}
+	if len(certDER) == 0 {
+		return "", ""
+	}
+
+	parsed, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		slog.Debug("failed to parse signing certificate for claim extraction", "error", err)
+		return "", ""
+	}
+
+	// Fulcio certificates encode identity as SAN: email for interactive OIDC,
+	// URI for workload identity (GitHub Actions OIDC).
+	if len(parsed.EmailAddresses) > 0 {
+		identity = parsed.EmailAddresses[0]
+	} else if len(parsed.URIs) > 0 {
+		identity = parsed.URIs[0].String()
+	}
+
+	// Fulcio embeds the OIDC issuer in extension OID 1.3.6.1.4.1.57264.1.1
+	// (legacy) and 1.3.6.1.4.1.57264.1.8 (current); extractIssuerExtension
+	// prefers the current OID and falls back to legacy.
+	issuer = extractIssuerExtension(parsed)
+	return identity, issuer
+}
+
+// extractIssuerExtension reads the Fulcio OIDC-issuer claim from the
+// signing certificate. Two extensions encode it:
+//   - Legacy OID 1.3.6.1.4.1.57264.1.1: raw UTF-8 bytes.
+//   - Current OID 1.3.6.1.4.1.57264.1.8: DER-encoded ASN.1 UTF8String
+//     (per https://github.com/sigstore/fulcio/blob/main/docs/oid-info.md).
+//
+// Treating both as raw bytes corrupts current-OID values by leaving the
+// ASN.1 tag/length prefix in the returned string.
+//
+// The current OID takes precedence: scan for it first and fall back to
+// the legacy OID only if it is absent. A single-pass switch would make
+// the result depend on X.509 extension ordering — in practice Fulcio
+// stamps one or the other, but transitional certs that carry both (with
+// any encoding divergence) would otherwise resolve silently and
+// non-deterministically.
+func extractIssuerExtension(cert *x509.Certificate) string {
+	const (
+		legacy  = "1.3.6.1.4.1.57264.1.1"
+		current = "1.3.6.1.4.1.57264.1.8"
+	)
+	for _, ext := range cert.Extensions {
+		if ext.Id.String() == current {
+			var decoded string
+			rest, err := asn1.Unmarshal(ext.Value, &decoded)
+			if err != nil {
+				slog.Debug("failed to ASN.1-decode Fulcio issuer extension", "oid", current, "error", err)
+				return ""
+			}
+			// A well-formed Fulcio extension contains exactly one
+			// ASN.1 UTF8String; trailing bytes mean the value was
+			// either truncated or carries appended data we don't
+			// understand. Reject rather than silently honor the
+			// first part.
+			if len(rest) != 0 {
+				slog.Debug("Fulcio issuer extension has trailing bytes", "oid", current, "trailing", len(rest))
+				return ""
+			}
+			return decoded
+		}
+	}
+	for _, ext := range cert.Extensions {
+		if ext.Id.String() == legacy {
+			return string(ext.Value)
+		}
+	}
+	return ""
+}
+
+// extractRekorLogIndex returns the first Rekor transparency-log entry's
+// LogIndex from a Sigstore bundle, or 0 if none.
+func extractRekorLogIndex(bundle *protobundle.Bundle) int64 {
+	vm := bundle.GetVerificationMaterial()
+	if vm == nil {
+		return 0
+	}
+	entries := vm.GetTlogEntries()
+	if len(entries) == 0 {
+		return 0
+	}
+	return entries[0].GetLogIndex()
+}
+
+// signBundleAttempt is the function signature for one attempt at
+// producing a Sigstore bundle. Extracted from sign.Bundle's concrete
+// signature so signWithRetry can be unit-tested against synthetic
+// failure sequences without depending on the real Fulcio / Rekor /
+// sigstore-go stack.
+type signBundleAttempt func(ctx context.Context) (*protobundle.Bundle, error)
+
+// signWithRetry wraps a sign-attempt closure with exponential-backoff
+// retry on transient failures. Each attempt is bounded by
+// defaults.SigstoreAttemptTimeout (a sub-context of ctx); the outer
+// ctx (typically bounded by SigstoreSignTimeout) is the ceiling and
+// terminates the whole flow when it expires.
+//
+// Retry policy:
+//
+//   - outer ctx DeadlineExceeded → ErrCodeTimeout, no retry (the whole
+//     signing budget is gone; further retries would just chew through
+//     it without any chance of success).
+//   - outer ctx Canceled → ErrCodeCanceled, no retry (caller signaled
+//     they don't want to wait).
+//   - per-attempt failure with outer ctx alive → retry until
+//     SigstoreRetryBudget is exhausted, then return ErrCodeUnavailable.
+//     This is the transient class (Fulcio refused / Rekor 5xx / network
+//     glitch / per-attempt deadline that's tighter than outer ctx).
+//
+// Backoff between attempts is exponential and interruptible by the
+// outer ctx — a slow Rekor recovering 10s later doesn't waste the
+// remaining budget.
+//
+// See issue #1249 for the failure pattern this absorbs (Sigstore
+// Rekor flakes observed in #1244 and #1245).
+func signWithRetry(ctx context.Context, attempt signBundleAttempt) (*protobundle.Bundle, error) {
+	var bundle *protobundle.Bundle
+	var lastErr error
+	backoff := defaults.SigstoreRetryInitialBackoff
+	for n := 1; n <= defaults.SigstoreRetryBudget; n++ {
+		// Pre-attempt ctx check — avoid paying the cost of an attempt
+		// the caller's deadline / cancellation has already made
+		// pointless. Per PR #1251 review and the repo's "always check
+		// ctx.Done() in loops" guideline.
+		if err := ctx.Err(); err != nil {
+			if stderrors.Is(err, context.DeadlineExceeded) {
+				return nil, errors.Wrap(errors.ErrCodeTimeout,
+					"sigstore signing timed out before attempt", err)
+			}
+			return nil, errors.Wrap(errors.ErrCodeCanceled,
+				"sigstore signing canceled before attempt", err)
+		}
+
+		attemptCtx, cancel := context.WithTimeout(ctx, defaults.SigstoreAttemptTimeout)
+		bundle, lastErr = attempt(attemptCtx)
+		cancel()
+		if lastErr == nil {
+			return bundle, nil
+		}
+
+		// Outer ctx exhausted? Classify and stop — no retry can help.
+		if stderrors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, errors.Wrap(errors.ErrCodeTimeout, "sigstore signing timed out", lastErr)
+		}
+		if stderrors.Is(ctx.Err(), context.Canceled) {
+			return nil, errors.Wrap(errors.ErrCodeCanceled, "sigstore signing canceled", lastErr)
+		}
+
+		// Outer ctx alive; this attempt failed (per-attempt timeout or
+		// non-ctx error). Retry if budget remains.
+		if n >= defaults.SigstoreRetryBudget {
+			return nil, errors.Wrap(errors.ErrCodeUnavailable,
+				"sigstore signing failed after retries", lastErr)
+		}
+		slog.Warn("sigstore signing attempt failed, retrying",
+			"attempt", n,
+			"budget", defaults.SigstoreRetryBudget,
+			"backoff", backoff,
+			"error", lastErr)
+
+		// Interruptible backoff. If outer ctx expires during the sleep,
+		// classify the exit using the outer ctx's reason.
+		select {
+		case <-ctx.Done():
+			if stderrors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, errors.Wrap(errors.ErrCodeTimeout,
+					"sigstore signing timed out during retry backoff", lastErr)
+			}
+			return nil, errors.Wrap(errors.ErrCodeCanceled,
+				"sigstore signing canceled during retry backoff", lastErr)
+		case <-time.After(backoff):
+		}
+		backoff *= time.Duration(defaults.SigstoreRetryBackoffFactor)
+	}
+	// Unreachable: the loop returns inside on every iteration after the
+	// final attempt. The static-analysis-required fallthrough surfaces
+	// any future refactor that breaks that invariant as a clear
+	// "missing return" rather than a silent nil.
+	return nil, errors.Wrap(errors.ErrCodeInternal,
+		"signWithRetry loop exited without returning", lastErr)
+}

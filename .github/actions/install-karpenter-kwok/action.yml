@@ -1,0 +1,67 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: 'Install Karpenter + KWOK'
+description: 'Install Karpenter with KWOK provider and apply NodePool for GPU testing'
+
+inputs:
+  cluster_name:
+    description: 'Kind cluster name (used for kubectl context)'
+    required: true
+  kwok_helm_timeout:
+    description: 'Timeout for KWOK controller Helm install'
+    required: false
+    default: '300s'
+  ko_build_timeout:
+    description: 'Timeout for Karpenter KWOK provider ko build'
+    required: false
+    default: '900s'
+  karpenter_helm_timeout:
+    description: 'Timeout for Karpenter Helm install'
+    required: false
+    default: '300s'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve versions
+      id: versions
+      shell: bash
+      run: bash "${{ github.action_path }}/resolve-versions.sh"
+    - name: Install ko
+      uses: ./.github/actions/setup-build-tools
+      with:
+        install_ko: 'true'
+        ko_version: ${{ steps.versions.outputs.ko }}
+
+    - name: Cache Karpenter Go build cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: |
+          ~/.cache/go-build
+        key: karpenter-${{ runner.os }}-${{ steps.versions.outputs.go }}-${{ steps.versions.outputs.karpenter }}-gobuild-v2
+        restore-keys: |
+          karpenter-${{ runner.os }}-${{ steps.versions.outputs.go }}-${{ steps.versions.outputs.karpenter }}-gobuild-
+          karpenter-${{ runner.os }}-${{ steps.versions.outputs.go }}-gobuild-
+          karpenter-${{ runner.os }}-gobuild-
+
+    - name: Install Karpenter + KWOK
+      shell: bash
+      env:
+        KIND_CLUSTER_NAME: ${{ inputs.cluster_name }}
+        KARPENTER_VERSION: ${{ steps.versions.outputs.karpenter }}
+        KWOK_HELM_TIMEOUT: ${{ inputs.kwok_helm_timeout }}
+        KO_BUILD_TIMEOUT: ${{ inputs.ko_build_timeout }}
+        KARPENTER_HELM_TIMEOUT: ${{ inputs.karpenter_helm_timeout }}
+      run: bash "${{ github.action_path }}/install-karpenter-kwok.sh"

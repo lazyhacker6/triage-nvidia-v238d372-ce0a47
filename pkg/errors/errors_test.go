@@ -1,0 +1,374 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package errors
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+)
+
+func TestIsTransient(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"context deadline", context.DeadlineExceeded, true},
+		{"context canceled", context.Canceled, true},
+		{"timeout code", New(ErrCodeTimeout, "slow"), true},
+		{"wrapped timeout code", Wrap(ErrCodeTimeout, "outer", New(ErrCodeTimeout, "inner")), true},
+		{"wrapped context deadline", fmt.Errorf("outer: %w", context.DeadlineExceeded), true},
+		{"internal is deterministic", New(ErrCodeInternal, "boom"), false},
+		{"invalid request is deterministic", New(ErrCodeInvalidRequest, "bad"), false},
+		{"plain error is deterministic", errors.New("plain"), false},
+		// Mixed-code chains: a deterministic outer code does not hide a transient
+		// cause — the deadline/timeout in the chain still makes it retryable.
+		{"internal wrapping deadline is transient", Wrap(ErrCodeInternal, "io", context.DeadlineExceeded), true},
+		{"internal wrapping timeout code is transient", Wrap(ErrCodeInternal, "io", New(ErrCodeTimeout, "inner")), true},
+		{"timeout wrapping deterministic cause is transient", Wrap(ErrCodeTimeout, "io", New(ErrCodeInternal, "inner")), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsTransient(tt.err); got != tt.want {
+				t.Errorf("IsTransient(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNew(t *testing.T) {
+	t.Parallel()
+	err := New(ErrCodeNotFound, "resource not found")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+		return // Help linter understand this path doesn't continue
+	}
+	if err.Code != ErrCodeNotFound {
+		t.Errorf("expected code %s, got %s", ErrCodeNotFound, err.Code)
+	}
+	if err.Message != "resource not found" {
+		t.Errorf("expected message 'resource not found', got %s", err.Message)
+	}
+	if err.Cause != nil {
+		t.Errorf("expected nil cause, got %v", err.Cause)
+	}
+}
+
+func TestWrap(t *testing.T) {
+	t.Parallel()
+	cause := errors.New("underlying error")
+	err := Wrap(ErrCodeInternal, "operation failed", cause)
+
+	if err.Code != ErrCodeInternal {
+		t.Errorf("expected code %s, got %s", ErrCodeInternal, err.Code)
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("expected cause to be wrapped")
+	}
+}
+
+func TestWrapWithContext(t *testing.T) {
+	t.Parallel()
+	cause := errors.New("timeout")
+	ctx := map[string]any{
+		"command": "nvidia-smi",
+		"node":    "node-1",
+	}
+
+	err := WrapWithContext(ErrCodeTimeout, "GPU collection failed", cause, ctx)
+
+	if err.Code != ErrCodeTimeout {
+		t.Errorf("expected code %s, got %s", ErrCodeTimeout, err.Code)
+	}
+	if err.Context == nil {
+		t.Fatal("expected context to be set")
+	}
+	if err.Context["command"] != "nvidia-smi" {
+		t.Errorf("expected command to be nvidia-smi")
+	}
+}
+
+func TestError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		err      *StructuredError
+		expected string
+	}{
+		{
+			name:     "error without cause",
+			err:      New(ErrCodeNotFound, "not found"),
+			expected: "[NOT_FOUND] not found",
+		},
+		{
+			name:     "error with cause",
+			err:      Wrap(ErrCodeInternal, "failed", errors.New("root cause")),
+			expected: "[INTERNAL] failed: root cause",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := tt.err.Error()
+			if got != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, got)
+			}
+		})
+	}
+}
+
+func TestIs_CodeMatching(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		err    error
+		target error
+		want   bool
+	}{
+		{
+			name:   "same code matches",
+			err:    New(ErrCodeNotFound, "x"),
+			target: New(ErrCodeNotFound, ""),
+			want:   true,
+		},
+		{
+			name:   "different code does not match",
+			err:    New(ErrCodeNotFound, "x"),
+			target: New(ErrCodeInternal, ""),
+			want:   false,
+		},
+		{
+			name:   "wrapped error matches by code via errors.Is",
+			err:    Wrap(ErrCodeTimeout, "wrapped", errors.New("inner")),
+			target: New(ErrCodeTimeout, ""),
+			want:   true,
+		},
+		{
+			name:   "non-structured target does not match",
+			err:    New(ErrCodeNotFound, "x"),
+			target: errors.New("plain"),
+			want:   false,
+		},
+		{
+			// Defensive guard: two zero-value StructuredErrors must not
+			// match each other on Is — otherwise a literal &StructuredError{}
+			// sentinel used in test code would silently match any other
+			// uncoded error in an errors.Is chain.
+			name:   "two empty codes do not match",
+			err:    &StructuredError{},
+			target: &StructuredError{},
+			want:   false,
+		},
+		{
+			name:   "empty target code never matches",
+			err:    New(ErrCodeNotFound, "x"),
+			target: &StructuredError{},
+			want:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := errors.Is(tt.err, tt.target)
+			if got != tt.want {
+				t.Errorf("errors.Is = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPropagateOrWrap pins the helper that callers use to avoid
+// overwriting an inner StructuredError's Code with the outer
+// fallback. Without this, a path that returns ErrCodeInvalidRequest
+// (e.g., a recipe parse error) would be reclassified as
+// ErrCodeInternal by a generic wrapper at the next layer up.
+func TestPropagateOrWrap(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		in       error
+		wantCode ErrorCode
+	}{
+		{
+			name:     "nil propagates as nil",
+			in:       nil,
+			wantCode: "",
+		},
+		{
+			name:     "coded error propagates code",
+			in:       New(ErrCodeInvalidRequest, "bad input"),
+			wantCode: ErrCodeInvalidRequest,
+		},
+		{
+			name:     "wrapped coded error propagates code",
+			in:       Wrap(ErrCodeNotFound, "outer", New(ErrCodeNotFound, "inner")),
+			wantCode: ErrCodeNotFound,
+		},
+		{
+			name:     "uncoded error gets fallback code",
+			in:       errors.New("plain"),
+			wantCode: ErrCodeInternal,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := PropagateOrWrap(tt.in, ErrCodeInternal, "outer")
+			if tt.in == nil {
+				if got != nil {
+					t.Errorf("got %v, want nil", got)
+				}
+				return
+			}
+			var se *StructuredError
+			if !errors.As(got, &se) {
+				t.Fatalf("expected StructuredError, got %T", got)
+			}
+			if se.Code != tt.wantCode {
+				t.Errorf("code = %q, want %q", se.Code, tt.wantCode)
+			}
+		})
+	}
+}
+
+// TestWrapCtxErr pins the code split that distinguishes an operator abort
+// from a deadline: the same fallbackCode input must classify differently
+// depending on whether cause chains context.Canceled or
+// context.DeadlineExceeded. A test asserting only the deadline path would not
+// catch a regression that collapses both back onto one code.
+func TestWrapCtxErr(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		cause    error
+		wantCode ErrorCode
+	}{
+		{
+			name:     "canceled maps to ErrCodeCanceled regardless of fallback",
+			cause:    context.Canceled,
+			wantCode: ErrCodeCanceled,
+		},
+		{
+			name:     "wrapped canceled still maps to ErrCodeCanceled",
+			cause:    fmt.Errorf("outer: %w", context.Canceled),
+			wantCode: ErrCodeCanceled,
+		},
+		{
+			name:     "deadline exceeded falls back to the supplied code",
+			cause:    context.DeadlineExceeded,
+			wantCode: ErrCodeTimeout,
+		},
+		{
+			name:     "unrelated error falls back to the supplied code",
+			cause:    errors.New("boom"),
+			wantCode: ErrCodeTimeout,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := WrapCtxErr(tt.cause, ErrCodeTimeout, "wait ended")
+			if got.Code != tt.wantCode {
+				t.Errorf("code = %q, want %q", got.Code, tt.wantCode)
+			}
+			if !errors.Is(got, tt.cause) {
+				t.Errorf("Unwrap chain lost cause %v", tt.cause)
+			}
+		})
+	}
+}
+
+func TestWrapCtxErrWithContext(t *testing.T) {
+	t.Parallel()
+	got := WrapCtxErrWithContext(context.Canceled, ErrCodeTimeout, "wait ended",
+		map[string]any{"namespace": "default"})
+	if got.Code != ErrCodeCanceled {
+		t.Errorf("code = %q, want %q", got.Code, ErrCodeCanceled)
+	}
+	if got.Context["namespace"] != "default" {
+		t.Errorf("context = %v, want namespace=default", got.Context)
+	}
+}
+
+func TestUnwrap(t *testing.T) {
+	t.Parallel()
+	cause := errors.New("root cause")
+	err := Wrap(ErrCodeInternal, "wrapped", cause)
+
+	unwrapped := err.Unwrap()
+	if !errors.Is(unwrapped, cause) {
+		t.Errorf("expected unwrapped error to be original cause")
+	}
+
+	if !errors.Is(err, cause) {
+		t.Errorf("errors.Is should work with Unwrap")
+	}
+}
+
+func TestNewWithContext(t *testing.T) {
+	t.Parallel()
+	ctx := map[string]any{
+		"component": "gpu-collector",
+		"timeout":   "10s",
+	}
+	err := NewWithContext(ErrCodeTimeout, "operation timed out", ctx)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+		return
+	}
+	if err.Code != ErrCodeTimeout {
+		t.Errorf("expected code %s, got %s", ErrCodeTimeout, err.Code)
+	}
+	if err.Message != "operation timed out" {
+		t.Errorf("expected message 'operation timed out', got %s", err.Message)
+	}
+	if err.Context == nil {
+		t.Fatal("expected context to be set")
+	}
+	if err.Context["component"] != "gpu-collector" {
+		t.Errorf("expected component to be gpu-collector, got %v", err.Context["component"])
+	}
+	if err.Context["timeout"] != "10s" {
+		t.Errorf("expected timeout to be 10s, got %v", err.Context["timeout"])
+	}
+	if err.Cause != nil {
+		t.Errorf("expected nil cause, got %v", err.Cause)
+	}
+}
+
+func TestErrorCodes(t *testing.T) {
+	t.Parallel()
+	codes := []ErrorCode{
+		ErrCodeNotFound,
+		ErrCodeUnauthorized,
+		ErrCodeTimeout,
+		ErrCodeInternal,
+		ErrCodeInvalidRequest,
+		ErrCodeRateLimitExceeded,
+		ErrCodeMethodNotAllowed,
+		ErrCodeUnavailable,
+		ErrCodeConflict,
+	}
+
+	for _, code := range codes {
+		if string(code) == "" {
+			t.Errorf("error code should not be empty: %v", code)
+		}
+	}
+}

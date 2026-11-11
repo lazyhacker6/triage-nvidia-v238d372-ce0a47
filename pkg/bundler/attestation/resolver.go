@@ -1,0 +1,327 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package attestation
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"sync"
+
+	"github.com/sigstore/sigstore-go/pkg/root"
+
+	"github.com/NVIDIA/aicr/pkg/errors"
+)
+
+// ResolveOptions selects an OIDC token source for keyless signing. Callers
+// (CLI, API, tests) populate this from their own surface — flags, env vars,
+// or hard-coded values — and ResolveAttester walks the precedence below
+// without itself reading the runtime environment.
+type ResolveOptions struct {
+	// Attest gates attestation entirely. When false, ResolveAttester returns
+	// a NoOpAttester regardless of the other fields.
+	Attest bool
+
+	// IdentityToken is a pre-fetched OIDC identity token (e.g., from
+	// COSIGN_IDENTITY_TOKEN, a cloud workload-identity exchange, or another
+	// cosign invocation). When non-empty it short-circuits all OIDC fetch
+	// flows — the token is used as-is.
+	IdentityToken string
+
+	// AmbientURL and AmbientToken provide GitHub Actions ambient OIDC
+	// credentials (the ACTIONS_ID_TOKEN_REQUEST_URL and
+	// ACTIONS_ID_TOKEN_REQUEST_TOKEN env vars). Both must be non-empty to
+	// activate the ambient branch.
+	AmbientURL   string
+	AmbientToken string
+
+	// DeviceFlow opts in to the OAuth 2.0 Device Authorization Grant
+	// (RFC 8628) for headless hosts where a browser callback is unavailable.
+	DeviceFlow bool
+
+	// FulcioURL and RekorURL point keyless signing at a private Sigstore
+	// instance (a self-hosted Fulcio CA and/or Rekor transparency log).
+	// Empty falls back to the public-good defaults (defaults.SigstoreFulcioURL
+	// / defaults.SigstoreRekorURL); the two are independent, so an org can run
+	// private Fulcio with public Rekor or vice versa. See issue #408.
+	FulcioURL string
+	RekorURL  string
+
+	// SigningConfigPath points keyless signing at a Sigstore SigningConfig JSON
+	// file (e.g. the TUF-distributed signing_config_rekor_v2 target) instead of a
+	// single Rekor URL. It takes precedence over UseTUFSigningConfig and RekorURL
+	// and is how release signing targets Rekor v2. Honored by both keyless and
+	// KMS signing. See issue #1650.
+	SigningConfigPath string
+
+	// UseTUFSigningConfig points signing at the Rekor v2 signing config in the
+	// local TUF cache (populated by "aicr trust update"). Preferred, rotation-safe
+	// way to target Rekor v2. Honored by both keyless and KMS signing. See issue
+	// #1650.
+	UseTUFSigningConfig bool
+
+	// SigningConfig is an already-parsed signing config that takes precedence
+	// over SigningConfigPath, UseTUFSigningConfig, and RekorURL.
+	//
+	// Set it when the config had to be inspected before use: re-loading from
+	// SigningConfigPath after validating it would sign against whatever the file
+	// holds at that later moment. Client.SignCatalog populates this after
+	// checking the config targets public-good Sigstore. See SignOptions.SigningConfig.
+	SigningConfig *root.SigningConfig
+
+	// SigningKey selects KMS-backed (key-based) signing instead of keyless OIDC.
+	// When non-empty it is a cosign-style KMS URI (awskms:// | gcpkms:// |
+	// azurekms:// | hashivault://) and takes precedence over the OIDC source
+	// fields, which are keyless-only — except DeviceFlow, which ResolveAttester
+	// and ResolveAttesterLazy reject rather than override (see checkSigningMode).
+	// The remaining keyless settings are additionally rejected at their own
+	// boundaries: fulcioURL at the config conversion (config.resolveSigningKey)
+	// and --identity-token at the CLI (pkg/cli). See issue #407.
+	SigningKey string
+
+	// DisableTLogUpload skips the Rekor transparency-log upload for KMS
+	// (SigningKey) signing, enabling fully offline / air-gapped bundle
+	// attestation (#409). The zero value (false) is the safe default: a caller
+	// constructing ResolveOptions without setting it still gets a Rekor entry.
+	//
+	// It affects ONLY the KMS path. Keyless (OIDC) signing never honors it
+	// and always uploads to Rekor, because keyless needs Fulcio + Rekor network
+	// access to produce a verifiable certificate; that is a fail-safe. The CLI
+	// boundary (pkg/cli) rejects DisableTLogUpload without a SigningKey so a
+	// keyless caller cannot silently expect an offline signature.
+	DisableTLogUpload bool
+
+	// PromptWriter receives user-facing prompts emitted by the interactive
+	// and device-code flows (verification URL + short code). Pass os.Stderr
+	// for typical CLI behavior, io.Discard to suppress, or nil (treated as
+	// io.Discard).
+	PromptWriter io.Writer
+}
+
+// OIDCSourceKind identifies which keyless OIDC token source ResolveOIDCToken
+// will consult for a given ResolveOptions. It is the single source of truth
+// for the source-precedence decision, shared by ResolveOIDCToken and by
+// callers (e.g. the CLI identity-disclosure gate) that must reason about
+// whether an interactive login is about to open without driving the login
+// themselves.
+type OIDCSourceKind int
+
+const (
+	// OIDCSourceIdentityToken — a pre-fetched token (no login, no prompt).
+	OIDCSourceIdentityToken OIDCSourceKind = iota
+	// OIDCSourceAmbient — GitHub Actions ambient OIDC (no login, no prompt).
+	OIDCSourceAmbient
+	// OIDCSourceDeviceFlow — RFC 8628 device-code login (interactive).
+	OIDCSourceDeviceFlow
+	// OIDCSourceBrowser — interactive browser callback login (interactive).
+	OIDCSourceBrowser
+)
+
+// Interactive reports whether the source opens a user-facing login (browser
+// callback or device-code) that mints a Fulcio certificate from the signer's
+// identity. The pre-fetched-token and ambient sources are non-interactive.
+func (k OIDCSourceKind) Interactive() bool {
+	return k == OIDCSourceDeviceFlow || k == OIDCSourceBrowser
+}
+
+// SelectOIDCSource reports which token source ResolveOIDCToken will use for
+// opts, following the precedence below. It does not read the environment or
+// perform any network/login work — it is a pure classification of opts.
+//
+// Precedence (highest first):
+//  1. IdentityToken — explicit pre-fetched token.
+//  2. AmbientURL+AmbientToken — GitHub Actions ambient OIDC (both required).
+//  3. DeviceFlow — RFC 8628 device-code flow.
+//  4. Interactive browser flow (default).
+//
+// KMS (SigningKey) signing is not an OIDC source: it is selected earlier, in
+// ResolveAttester / ResolveAttesterLazy, before ResolveOIDCToken is reached,
+// so it is intentionally outside this classifier.
+func SelectOIDCSource(opts ResolveOptions) OIDCSourceKind {
+	switch {
+	case opts.IdentityToken != "":
+		return OIDCSourceIdentityToken
+	case opts.AmbientURL != "" && opts.AmbientToken != "":
+		return OIDCSourceAmbient
+	case opts.DeviceFlow:
+		return OIDCSourceDeviceFlow
+	default:
+		return OIDCSourceBrowser
+	}
+}
+
+// ResolveOIDCToken walks the OIDC source precedence chain and returns the
+// resulting identity token string. Suitable for callers that build their
+// own signer around a raw token and do not want the bundler's Attester
+// abstraction. The branch taken is decided by SelectOIDCSource, so callers
+// can predict it without driving a login.
+//
+// Errors from the OIDC helpers are returned as-is to preserve their
+// pkg/errors classification (timeout / unavailable / internal). The
+// function does not read the runtime environment itself — callers
+// populate ResolveOptions from their own surface (flags, env vars).
+func ResolveOIDCToken(ctx context.Context, opts ResolveOptions) (string, error) {
+	switch SelectOIDCSource(opts) { //nolint:exhaustive // OIDCSourceBrowser is the default branch (the lowest-precedence fallback)
+	case OIDCSourceIdentityToken:
+		slog.Info("using pre-fetched OIDC identity token")
+		return opts.IdentityToken, nil
+	case OIDCSourceAmbient:
+		return FetchAmbientOIDCToken(ctx, opts.AmbientURL, opts.AmbientToken)
+	case OIDCSourceDeviceFlow:
+		return FetchDeviceCodeOIDCToken(ctx, opts.PromptWriter)
+	default: // OIDCSourceBrowser
+		slog.Info("no ambient OIDC token, attempting interactive authentication")
+		return FetchInteractiveOIDCToken(ctx, opts.PromptWriter)
+	}
+}
+
+// checkSigningMode rejects a SigningKey combined with DeviceFlow, the one
+// pairing the resolver would otherwise decide silently: the KMS branch below
+// wins on a non-empty SigningKey and issues no OIDC token at all, so a caller
+// asking for device flow would be handed a key signature and never see the
+// verification prompt they were waiting for.
+//
+// Enforced here rather than where the values are parsed because this is the
+// layer every caller reaches after its own precedence has been applied. The
+// CLI merges flags over config first, so --oidc-device-flow=false still
+// corrects a config that sets both and never arrives here in conflict; an SDK
+// caller that derives options straight from a document and never merges
+// anything gets the same guarantee at the point the mode is actually chosen.
+//
+// FulcioURL is deliberately not part of this check. It is rejected earlier, at
+// the config conversion boundary (config.resolveSigningKey), where it can carry
+// spec-path attribution; a caller who reaches here with both has already passed
+// that gate by assembling options by hand.
+func checkSigningMode(opts ResolveOptions) error {
+	if opts.SigningKey != "" && opts.DeviceFlow {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"signing key is mutually exclusive with OIDC device flow: "+
+				"a signing key selects KMS signing, which issues no OIDC token")
+	}
+	return nil
+}
+
+// ResolveAttester returns the Attester implementation selected by opts.
+// Wraps ResolveOIDCToken with the NoOpAttester short-circuit for
+// callers that gate attestation behind opts.Attest.
+func ResolveAttester(ctx context.Context, opts ResolveOptions) (Attester, error) {
+	if !opts.Attest {
+		return NewNoOpAttester(), nil
+	}
+	if err := checkSigningMode(opts); err != nil {
+		return nil, err
+	}
+	if opts.SigningKey != "" {
+		var kopts []KMSAttesterOption
+		if opts.DisableTLogUpload {
+			kopts = append(kopts, WithoutTransparencyLog())
+		}
+		return NewKMSAttester(opts.SigningKey, SignOptionsFromResolve("", opts), kopts...), nil
+	}
+	token, err := ResolveOIDCToken(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return NewKeylessAttesterFromOptions(token, opts), nil
+}
+
+// ResolveAttesterLazy is the deferred-token variant of ResolveAttester.
+// When opts.Attest is true the returned Attester resolves the OIDC token
+// on first Attest() call, not at construction. Use this when there is a
+// meaningful gap between attester setup and the first Attest() call:
+// Fulcio binds the certificate to a fresh nonce at token-issue time, so a
+// token resolved minutes ahead of signing can fail with
+// "error processing the identity token" once the gap exceeds Fulcio's
+// tolerance.
+//
+// The disabled (Attest=false) and NoOpAttester branches match
+// ResolveAttester exactly so callers can swap entry points without
+// changing the test surface. Token-resolution errors are deferred to
+// Attest; the error returned here is the signing-mode conflict below.
+func ResolveAttesterLazy(_ context.Context, opts ResolveOptions) (Attester, error) {
+	if !opts.Attest {
+		return NewNoOpAttester(), nil
+	}
+	if err := checkSigningMode(opts); err != nil {
+		return nil, err
+	}
+	if opts.SigningKey != "" {
+		var kopts []KMSAttesterOption
+		if opts.DisableTLogUpload {
+			kopts = append(kopts, WithoutTransparencyLog())
+		}
+		return NewKMSAttester(opts.SigningKey, SignOptionsFromResolve("", opts), kopts...), nil
+	}
+	return NewLazyKeylessAttester(opts), nil
+}
+
+// LazyKeylessAttester defers OIDC token resolution to the first Attest()
+// call. The underlying KeylessAttester is created on first use and cached
+// for subsequent calls so a single attester produces consistent identity
+// across the run.
+//
+// mu serializes lazy initialization (and the Identity() read) so the
+// attester is safe to share across goroutines — bundler.Make does not
+// invoke Attest concurrently today, but the Attester interface is held
+// long enough across other call sites that defensive locking is cheaper
+// than the next data-race bug.
+type LazyKeylessAttester struct {
+	opts ResolveOptions
+
+	mu    sync.Mutex
+	inner *KeylessAttester
+}
+
+// NewLazyKeylessAttester returns an Attester that resolves the OIDC token
+// via the ResolveOIDCToken precedence chain on first Attest() call.
+func NewLazyKeylessAttester(opts ResolveOptions) *LazyKeylessAttester {
+	return &LazyKeylessAttester{opts: opts}
+}
+
+// Attest resolves the OIDC token on first call, then delegates to the
+// cached KeylessAttester for this and every subsequent call. Resolver
+// errors propagate as-is so the pkg/errors classification reaches the
+// caller.
+func (l *LazyKeylessAttester) Attest(ctx context.Context, subject AttestSubject) ([]byte, error) {
+	l.mu.Lock()
+	if l.inner == nil {
+		token, err := ResolveOIDCToken(ctx, l.opts)
+		if err != nil {
+			l.mu.Unlock()
+			return nil, err
+		}
+		l.inner = NewKeylessAttesterFromOptions(token, l.opts)
+	}
+	inner := l.inner
+	l.mu.Unlock()
+	return inner.Attest(ctx, subject)
+}
+
+// Identity returns the cached KeylessAttester's identity after the first
+// successful Attest() call; empty string before that.
+func (l *LazyKeylessAttester) Identity() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.inner == nil {
+		return ""
+	}
+	return l.inner.Identity()
+}
+
+// HasRekorEntry mirrors the eager attester: keyless signing always
+// records a Rekor transparency log entry.
+func (l *LazyKeylessAttester) HasRekorEntry() bool {
+	return true
+}

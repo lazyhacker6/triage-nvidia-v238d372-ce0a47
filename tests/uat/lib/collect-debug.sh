@@ -1,0 +1,498 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# shellcheck shell=bash
+#
+# Cloud-agnostic cluster debug-bundle collector, sourced by the per-cloud UAT
+# `run` scripts (tests/uat/{aws,gcp}/run) and invoked as the `debug` phase from
+# the workflows on failure — AFTER the failing phase, BEFORE teardown, while the
+# cluster is still alive.
+#
+# The pre-existing `Upload failure debug` artifact only captured files already on
+# the runner's disk (report.json, recipe, snapshot); it carried ZERO live cluster
+# state, so a deployment-phase failure (e.g. a skyhook/nodewright tuning reboot
+# re-opening status=in_progress, or a check Job's pod evicted by that reboot) had
+# to be reconstructed from raw CI step logs. This collector snapshots the cluster
+# state that actually explains those failures: node conditions + taints, the
+# operator CRs (Skyhook status history the readiness gate keys off of), cluster
+# events (reboots, evictions), and operator/check-Job pod logs (incl. --previous
+# to survive a restart across a reboot).
+#
+# Everything here is BEST-EFFORT: every kubectl call is guarded with `|| true`,
+# bounded by a per-command timeout (CLUSTER_DEBUG_CMD_TIMEOUT) so one hung call
+# cannot starve later sections, and the whole collector is wrapped so it never
+# fails the run or delays teardown (the caller also bounds it with a workflow
+# `timeout-minutes`).
+#
+# Privacy: no Kubernetes Secret objects are fetched, and `kubectl describe pods`
+# (which renders literal, non-Secret env values) is limited to the operator/check
+# namespaces in CLUSTER_DEBUG_LOG_NAMESPACES — every other namespace gets only
+# get/events. This is NOT a guarantee the bundle is credential-free: describe on
+# the allowlisted namespaces and pod logs (incl. --previous) can still contain
+# app-emitted credentials or PII. The bundle uploads as an Actions artifact on a
+# PUBLIC repo (downloadable per the repo's artifact access) — treat it as
+# sensitive. Redaction is deliberately not attempted (fragile); the namespace
+# allowlist is the primary mitigation.
+#
+# On a GPU-count shortfall the bundle also carries driver-level state obtained by
+# `kubectl exec` (read-only) into the on-node nvidia-dcgm pod: GPU UUIDs, PCI bus
+# IDs, board serial numbers, and NVIDIA-driver `dmesg` (NVRM/Xid) lines. These
+# are hardware identifiers / driver diagnostics — no Secrets, and intentionally
+# captured for RMA (issue #1860) — but treated as sensitive like the rest.
+
+# Platform-to-workload-CRD map (platform_workload_crd,
+# platform_workload_platforms), shared with phase_conformance's coordinate
+# cross-check so the CRs captured here cannot drift from the platforms the gate
+# knows. Sourced explicitly rather than relying on the caller's source order;
+# the map file has no side effects at source time, so sourcing it twice in one
+# shell (phases.sh sources it too) is harmless.
+# shellcheck source=./platform-crd-map.sh
+source "$(dirname "${BASH_SOURCE[0]}")/platform-crd-map.sh"
+
+# Directory the bundle is written into (relative to $PWD, matching serve-logs/
+# and train-logs/); the workflow adds `cluster-debug/**` to the upload artifact.
+CLUSTER_DEBUG_DIR="${CLUSTER_DEBUG_DIR:-cluster-debug}"
+
+# Readiness-gate time-series log. phase_readiness appends each gate attempt's
+# `validate --phase deployment` output (timestamped) here -- plus, for a failed
+# attempt, the failing validators' message and stdout (e.g. expected-resources'
+# "Failed resources:" block) from that attempt's CTRF report -- so the bundle carries
+# the actual status.status progression across the tuning-settling window — the
+# complete→in_progress flips AS THEY HAPPEN — rather than only a single snapshot
+# taken minutes later at teardown. This is the highest-value signal for the
+# skyhook re-tuning race: a teardown snapshot can miss the flip (status may have
+# re-converged), but the gate series records every sample.
+CLUSTER_DEBUG_GATE_LOG="${CLUSTER_DEBUG_GATE_LOG:-${CLUSTER_DEBUG_DIR}/readiness-gate.log}"
+
+# Per-pod log tail. Bounds bundle size on a busy cluster; 2000 lines is enough to
+# see a crash/reboot loop without shipping gigabytes.
+CLUSTER_DEBUG_LOG_TAIL="${CLUSTER_DEBUG_LOG_TAIL:-2000}"
+
+# Namespaces whose pod logs are collected in full (operators + the check Jobs
+# that fail). Other namespaces still get get/describe/events, just not every log —
+# keeps the bundle focused on the GPU/tuning stack that drives deployment-phase
+# failures. Space-separated; overridable.
+#
+# nvidia-network-operator (MOFED/DOCA driver-build pods) and aicr-validation (the
+# NCCL launcher/worker + check Jobs) carry the crash logs behind two failure
+# modes the operator namespaces alone cannot explain: an RDMA driver that never
+# reaches .driver-ready, and a CUJ Job that crash-loops to its deadline. Both run
+# NVIDIA/AICR workloads, not third-party tenants; heed the Privacy note above
+# before adding a namespace that runs token-bearing workloads (e.g. a served
+# model), whose logs can carry app-emitted credentials into the public artifact.
+#
+# nodewright AND skyhook for the same reason the Skyhook-CR capture below scans
+# both: the registry default is nodewright, but a cluster deployed before that
+# move still runs in skyhook and Helm cannot relocate a release. The package
+# apply Jobs live here, so a tuning Init:Error is only explainable from these
+# logs (incl. --previous) — covering one namespace leaves the other's failures
+# status-only (run 36745844287).
+CLUSTER_DEBUG_LOG_NAMESPACES="${CLUSTER_DEBUG_LOG_NAMESPACES:-nodewright skyhook gpu-operator nvidia-dra-driver nvidia-network-operator nvsentinel node-feature-discovery kai-scheduler aicr-validation cert-manager monitoring}"
+
+# Cluster-scoped custom resources most relevant to a deployment-phase failure.
+# Skyhook is first: its status.status is the non-monotonic signal the readiness
+# gate keys off of, and its full YAML carries the per-package/per-node status
+# history that explains a re-tuning race. Best-effort — a kind absent on this
+# cloud/recipe just no-ops.
+CLUSTER_DEBUG_CLUSTER_RESOURCES="${CLUSTER_DEBUG_CLUSTER_RESOURCES:-nodewrights.nodewright.nvidia.com skyhooks.skyhook.nvidia.com clusterpolicies.nvidia.com nodefeatures.nfd.k8s-sigs.io resourceslices.resource.k8s.io deviceclasses.resource.k8s.io}"
+
+# Per-command wall-clock bound. A single slow/unreachable kubectl call (stale
+# creds, an apiserver hiccup, describe over many nodes) must not consume the whole
+# step-level timeout and starve later, higher-value sections (per-namespace pod
+# logs). 30s is generous for a single Get/describe.
+CLUSTER_DEBUG_CMD_TIMEOUT="${CLUSTER_DEBUG_CMD_TIMEOUT:-30}"
+
+# Extended resource used to identify GPU nodes and their advertised GPU count in
+# the GPU driver-state capture. Overridable for a non-standard device plugin.
+CLUSTER_DEBUG_GPU_RESOURCE="${CLUSTER_DEBUG_GPU_RESOURCE:-nvidia.com/gpu}"
+
+# Namespace whose on-node nvidia-dcgm pod the shortfall capture exec's for
+# nvidia-smi/dmesg. Overridable for a non-standard GPU-operator install.
+CLUSTER_DEBUG_GPU_NAMESPACE="${CLUSTER_DEBUG_GPU_NAMESPACE:-gpu-operator}"
+
+# Cap on how many short GPU nodes get the (bounded, per-node) driver-level exec
+# capture, so the section cannot starve the later per-namespace log collection on
+# a pathological large-pool shortfall. UAT pools are 2 nodes today (≤1 can be
+# short), so this is defensive headroom; the always-emitted census is uncapped.
+CLUSTER_DEBUG_GPU_MAX_NODES="${CLUSTER_DEBUG_GPU_MAX_NODES:-3}"
+
+# _cd_bounded runs an EXTERNAL command under CLUSTER_DEBUG_CMD_TIMEOUT when the
+# coreutils `timeout` is present (Linux CI runners), else runs it directly so the
+# collector stays portable to macOS dev boxes that lack `timeout`. Only wrap
+# external commands (kubectl, bash -c) with this — `timeout` cannot invoke a shell
+# function, so self-bounding functions call _cd_bounded on their own kubectl
+# instead of being passed to it.
+_cd_bounded() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${CLUSTER_DEBUG_CMD_TIMEOUT}" "$@"
+  else
+    "$@"
+  fi
+}
+
+# _cd_node_reboot_fingerprint prints a one-line-per-node reboot fingerprint:
+# bootID (changes across a reboot), kernel version, and the Ready condition's
+# lastTransitionTime (a recent transition ⇒ the kubelet just came back). A skyhook
+# tuning package with interrupt:reboot shows up here as a fresh Ready transition /
+# changed bootID, which is the durable proof that a reboot — not a genuine resource
+# gap — re-opened status.status. Never fails.
+_cd_node_reboot_fingerprint() {
+  _cd_bounded kubectl get nodes -o json 2>/dev/null | jq -r '.items[]
+    | "\(.metadata.name)  bootID=\(.status.nodeInfo.bootID)  kernel=\(.status.nodeInfo.kernelVersion)  Ready.lastTransition=\([.status.conditions[]|select(.type=="Ready")|.lastTransitionTime][0])  taints=\(.spec.taints // [])"' 2>/dev/null || true
+}
+
+# capture_skyhook_snapshot dumps a focused, FAST skyhook/node snapshot the moment
+# a failure is detected in the hot path (called inline from phase_conformance on a
+# validate failure), seconds after the chainsaw assert gives up — while
+# status.status is most likely STILL in_progress. Contrast collect_cluster_debug,
+# which runs at the teardown-adjacent failure step minutes later, by when the CR
+# may have re-converged to complete and hidden the flip. Best-effort; never fails
+# the run. $1 is a short label distinguishing multiple captures.
+capture_skyhook_snapshot() {
+  # Immune to the caller's errexit: the run scripts source this under
+  # `set -euo pipefail`, and a best-effort snapshot must never abort the caller.
+  # A `| tee` whose upstream exits non-zero would otherwise kill the run
+  # mid-collection. Running the body in a subshell with `set +e` isolates the
+  # errexit change to this collector (auto-discarded when the subshell exits) and
+  # is portable to every bash the run scripts may use — `local` and positional
+  # params work in a subshell, unlike `local -` which is fatal on bash < 4.4
+  # (e.g. macOS system bash 3.2, per this file's portability note). Always
+  # returns 0: a best-effort snapshot never fails the run.
+  (
+    set +e
+    local label="${1:-snapshot}"
+    command -v kubectl >/dev/null 2>&1 || exit 0
+    mkdir -p "${CLUSTER_DEBUG_DIR}"
+    local out="${CLUSTER_DEBUG_DIR}/skyhook-at-failure-${label}.txt"
+    echo "::group::Capture skyhook snapshot at failure (${label})"
+    {
+      echo "##### skyhook snapshot (${label}) @ $(date -u +%Y-%m-%dT%H:%M:%SZ) #####"
+      echo "# Captured inline seconds after the failure — status.status here is the"
+      echo "# state at (or nearest to) the moment the check failed, not a re-converged"
+      echo "# teardown-time reading."
+      echo
+      echo "----- Skyhook CRs (full YAML: per-package/per-node status) -----"
+      # NodeWright first: from operator v0.18.0 it is the reconciled object and
+      # the only one carrying status, while the mirrored Skyhook stays empty.
+      # Both are dumped because either kind may be absent depending on the
+      # operator version, and `|| true` keeps a missing kind from ending the
+      # capture.
+      _cd_bounded kubectl get nodewrights.nodewright.nvidia.com -A -o yaml 2>&1 || true
+      _cd_bounded kubectl get skyhooks.skyhook.nvidia.com -A -o yaml 2>&1 || true
+      echo
+      echo "----- node reboot fingerprint (bootID / kernel / Ready transition / taints) -----"
+      _cd_node_reboot_fingerprint
+      echo
+      # Both namespaces: the registry default is nodewright, but a cluster
+      # deployed before that move still runs in skyhook and Helm cannot
+      # relocate a release. Collecting only one would come back empty on
+      # exactly the cluster whose upgrade is being debugged.
+      for _cd_nw_ns in nodewright skyhook; do
+        echo "----- ${_cd_nw_ns} namespace pods (tuning package pods) -----"
+        _cd_bounded kubectl get pods -n "${_cd_nw_ns}" -o wide 2>&1 || true
+        echo "----- ${_cd_nw_ns} namespace events (by time) -----"
+        _cd_bounded kubectl get events -n "${_cd_nw_ns}" --sort-by=.lastTimestamp 2>&1 || true
+      done
+    } | tee "${out}"
+    echo "::endgroup::"
+    exit 0
+  )
+  return 0
+}
+
+# _cd_gpu_driver_state writes a per-GPU-node census of advertised GPUs and, when
+# any GPU node advertises fewer than the cohort max (a capacity shortfall — e.g.
+# an H100 node enumerating 7 of 8 GPUs) OR a GPU-marked node advertises none at
+# all (the driver-dead 0/total case, #1860 — invisible to a plain allocatable
+# scan because the resource key is absent, so such a node is identified instead
+# by its GPU taint/label or NVIDIA PCI presence and surfaced as 0), captures
+# DRIVER-LEVEL state on each short
+# node: nvidia-smi -L, per-GPU PCI/serial, the host NVIDIA PCI census, and dmesg
+# NVRM/Xid lines. The Kubernetes API only shows the *symptom* (allocatable count);
+# this exec-based capture — via the privileged on-node nvidia-dcgm pod — is what
+# turns "one GPU missing, cause unknown" into "GPU at PCI 000a failed driver
+# probe", diagnosable after the cluster is gone. The expensive exec path runs
+# ONLY on a detected shortfall; the census itself is always emitted. A
+# gpu-shortfall.txt marker is written on shortfall so the condition is greppable.
+# Best-effort, self-bounding; never fails the run. Requires jq (already a hard
+# dep of this collector).
+_cd_gpu_driver_state() {
+  # Subshell + `set +e` isolates errexit from the caller (same rationale as
+  # capture_skyhook_snapshot); all `local`s are declared here at the top, not
+  # inside the piped `{ … } | tee` block (whose subshell context is portable-safe
+  # for reads but not for declarations on every bash).
+  (
+    set +e
+    command -v kubectl >/dev/null 2>&1 || exit 0
+    command -v jq >/dev/null 2>&1 || exit 0
+    mkdir -p "${CLUSTER_DEBUG_DIR}"
+    local out="${CLUSTER_DEBUG_DIR}/gpu-driver-state.txt"
+    local res="${CLUSTER_DEBUG_GPU_RESOURCE}"
+    local census maxc short node pod
+
+    local ns="${CLUSTER_DEBUG_GPU_NAMESPACE}"
+    census="$(_cd_bounded kubectl get nodes -o json 2>/dev/null \
+      | jq -r --arg r "${res}" '.items[]
+          # A GPU node advertises the resource, OR is marked as GPU hardware by
+          # taint/label while advertising none — the #1860 driver-dead case the
+          # census must still surface (as 0), not silently drop.
+          | select(
+              (.status.allocatable[$r] != null)
+              or (.status.capacity[$r] != null)
+              or (any(.spec.taints[]?; .key == $r))
+              or (.metadata.labels["feature.node.kubernetes.io/pci-10de.present"] == "true")
+            )
+          | "\(.metadata.name) \(.status.allocatable[$r] // "0")"' 2>/dev/null)"
+    # NOTE: "cohort max" is computed across ALL GPU nodes, with no per-product /
+    # per-pool segmentation. Correct for UAT's homogeneous single-SKU GPU pools;
+    # a heterogeneous pool (e.g. a 1-GPU utility node beside 8-GPU workers) would
+    # false-flag the smaller node as short. Best-effort diagnostics, so the only
+    # cost of a false positive is one extra bounded exec + a marker.
+    maxc="$(printf '%s\n' "${census}" | awk '{if($2+0>m)m=$2+0}END{print m+0}')"
+    # Short = below cohort max, OR advertising 0 regardless of max. The `== 0`
+    # arm is #1860: when every GPU node is driver-dead the max is also 0, so a
+    # plain `< max` test would flag nothing; a GPU node advertising 0 is always a
+    # shortfall (it is known GPU hardware, per the census select above).
+    short="$(printf '%s\n' "${census}" | awk -v m="${maxc}" 'NF>=2 && ($2+0 < m || $2+0 == 0) {print $1}')"
+
+    local captured=0
+    echo "::group::Collect GPU driver state"
+    {
+      echo "##### GPU driver state @ $(date -u +%Y-%m-%dT%H:%M:%SZ) #####"
+      echo "----- GPU census (node  allocatable ${res}) -----"
+      if [[ -z "${census}" ]]; then
+        echo "(no nodes advertise ${res})"
+      else
+        printf '%s\n' "${census}"
+      fi
+      echo
+      if [[ -n "${short}" ]]; then
+        echo "----- GPU-count SHORTFALL: node(s) below cohort max ${maxc} (or advertising none) -----"
+        printf '%s\n' "${census}" | awk -v m="${maxc}" 'NF>=2 && ($2+0 < m || $2+0 == 0) {print "  "$1" advertises "$2"/"m}'
+        echo
+        # shellcheck disable=SC2086 # intentional word-split of the node list
+        for node in ${short}; do
+          if [[ "${captured}" -ge "${CLUSTER_DEBUG_GPU_MAX_NODES}" ]]; then
+            echo "(reached CLUSTER_DEBUG_GPU_MAX_NODES=${CLUSTER_DEBUG_GPU_MAX_NODES}; remaining short nodes not exec'd)"
+            break
+          fi
+          captured=$((captured + 1))
+          pod="$(_cd_bounded kubectl get pods -n "${ns}" --field-selector "spec.nodeName=${node}" -o name 2>/dev/null | grep -E 'nvidia-dcgm' | grep -v exporter | head -1)"
+          [[ -z "${pod}" ]] && pod="$(_cd_bounded kubectl get pods -n "${ns}" --field-selector "spec.nodeName=${node}" -o name 2>/dev/null | grep -E 'nvidia-dcgm-exporter' | head -1)"
+          pod="${pod#pod/}"
+          echo "===== driver-level state: node ${node} (short) ====="
+          if [[ -z "${pod}" ]]; then
+            echo "(no on-node nvidia-dcgm pod in ${ns} ns; cannot exec nvidia-smi/dmesg)"
+          else
+            echo "# via pod/${pod} (ns ${ns})"
+            echo "----- nvidia-smi -L -----"
+            _cd_bounded kubectl exec -n "${ns}" "${pod}" -- nvidia-smi -L 2>&1 || true
+            echo "----- nvidia-smi --query-gpu=index,pci.bus_id,serial,uuid (csv) -----"
+            _cd_bounded kubectl exec -n "${ns}" "${pod}" -- nvidia-smi --query-gpu=index,pci.bus_id,serial,uuid --format=csv 2>&1 || true
+            echo "----- host NVIDIA PCI functions (vendor 0x10de) -----"
+            # shellcheck disable=SC2016 # $f must expand in the remote pod's shell, not here
+            _cd_bounded kubectl exec -n "${ns}" "${pod}" -- sh -c 'for f in /sys/bus/pci/devices/*/vendor; do grep -q 0x10de "$f" 2>/dev/null && dirname "$f"; done' 2>&1 || true
+            echo "----- dmesg NVRM/Xid (tail 40) -----"
+            _cd_bounded kubectl exec -n "${ns}" "${pod}" -- sh -c 'dmesg 2>/dev/null | grep -iE "NVRM|Xid" | tail -40' 2>&1 || true
+          fi
+          echo
+        done
+      elif [[ -n "${census}" ]]; then
+        echo "----- No GPU-count shortfall (all GPU nodes advertise ${maxc}) -----"
+      fi
+    } | tee "${out}"
+    echo "::endgroup::"
+
+    if [[ -n "${short}" ]]; then
+      {
+        echo "GPU-count shortfall @ $(date -u +%Y-%m-%dT%H:%M:%SZ); cohort max=${maxc}"
+        printf '%s\n' "${census}" | awk -v m="${maxc}" 'NF>=2 && ($2+0 < m || $2+0 == 0) {print $1" "$2"/"m}'
+      } > "${CLUSTER_DEBUG_DIR}/gpu-shortfall.txt" 2>/dev/null || true
+    fi
+    exit 0
+  )
+  return 0
+}
+
+# _cd_section runs a labeled command group, teeing to both the step log (folded
+# in an Actions ::group::) and a file in the bundle. The command is bounded by
+# CLUSTER_DEBUG_CMD_TIMEOUT (via _cd_bounded), so a single hung call can't starve
+# later sections. Callers must pass an EXTERNAL command (kubectl / bash -c), never
+# a bare shell function — `timeout` cannot invoke a function; route function-based
+# sections directly (see the node-reboot-fingerprint section). Never fails.
+_cd_section() {
+  local label="$1" outfile="$2"; shift 2
+  {
+    echo "##### ${label} #####"
+    echo "\$ $*"
+    _cd_bounded "$@" 2>&1 || true
+    echo
+  } | tee -a "${CLUSTER_DEBUG_DIR}/${outfile}"
+}
+
+# collect_cluster_debug snapshots live cluster state into CLUSTER_DEBUG_DIR.
+# Best-effort and self-bounding: safe to call from an `if: failure()` step.
+collect_cluster_debug() {
+  # Immune to the caller's errexit: the run scripts source this under
+  # `set -euo pipefail`. The MANIFEST block below ends with a `for snap in glob`
+  # loop whose final `[[ -f ]]` test returns 1 when the glob matches nothing
+  # (e.g. an install-phase failure with no inline skyhook-at-failure-*.txt),
+  # which under `pipefail` makes the `{ … } | tee` pipeline exit 1 and, under
+  # `set -e`, would abort this function BEFORE any kubectl runs — truncating the
+  # bundle to a partial MANIFEST. Running the body in a subshell with `set +e`
+  # isolates the errexit change (auto-discarded when the subshell exits) and is
+  # portable to every bash the run scripts may use, unlike `local -` (fatal on
+  # bash < 4.4). The body is intentionally not re-indented to keep the diff
+  # reviewable. Always returns 0: a best-effort collector never fails the run.
+  (
+  set +e
+  mkdir -p "${CLUSTER_DEBUG_DIR}"
+  echo "::group::Collect cluster debug bundle -> ${CLUSTER_DEBUG_DIR}/"
+
+  # --- Self-describing manifest: what failed, on what, when ------------------
+  # So the bundle is diagnosable standalone, without cross-referencing CI logs.
+  {
+    echo "# UAT cluster debug bundle"
+    echo "generatedAt: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "runId: ${RUN_ID:-unknown}"
+    echo "config: ${config:-unknown}"
+    if [[ -f recipe.yaml ]]; then
+      # The emitted recipe carries no metadata.name; its identity is the leaf
+      # (last) applied overlay. Fall back to metadata.name then "unknown".
+      echo "recipe: $(yq -r '.metadata.appliedOverlays[-1] // .metadata.name // "unknown"' recipe.yaml 2>/dev/null || echo unknown)"
+      echo "criteria: $(yq -o=json -I=0 '.criteria // {}' recipe.yaml 2>/dev/null || echo '{}')"
+    fi
+    # Surface the failing check(s) straight from report.json so a reader starts
+    # at the smoking gun rather than grepping. `other` counts as failing (gates
+    # treat it so); include its message (e.g. "pod for job not found").
+    if [[ -f report.json ]]; then
+      echo "failingChecks:"
+      jq -r '.results.tests[]? | select(.status=="failed" or .status=="other")
+             | "  - name: \(.name)\n    status: \(.status)\n    message: \(.message // "none")"' \
+        report.json 2>/dev/null || echo "  (report.json unparseable)"
+    fi
+    # Point the reader at the two highest-value time-series artifacts if present:
+    # the readiness-gate status.status progression (written during phase_readiness)
+    # and any inline skyhook-at-failure snapshot(s).
+    [[ -f "${CLUSTER_DEBUG_GATE_LOG}" ]] && echo "readinessGateSeries: $(basename "${CLUSTER_DEBUG_GATE_LOG}")"
+    # GPU census is always emitted below; gpu-shortfall.txt appears only when a
+    # node is short of its peers (driver-level nvidia-smi/dmesg capture follows).
+    echo "gpuDriverState: gpu-driver-state.txt (gpu-shortfall.txt present iff a GPU-count shortfall was detected)"
+    local snap
+    for snap in "${CLUSTER_DEBUG_DIR}"/skyhook-at-failure-*.txt; do
+      [[ -f "${snap}" ]] && echo "skyhookAtFailure: $(basename "${snap}")"
+    done
+  } | tee "${CLUSTER_DEBUG_DIR}/MANIFEST.yaml"
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    echo "kubectl not on PATH; skipping live cluster collection" \
+      | tee -a "${CLUSTER_DEBUG_DIR}/MANIFEST.yaml"
+    echo "::endgroup::"
+    exit 0
+  fi
+
+  # --- Tier 1: cluster-wide state -------------------------------------------
+  # Nodes carry the reboot/taint evidence central to tuning-race failures.
+  _cd_section "nodes (wide)" nodes.txt kubectl get nodes -o wide
+  _cd_section "nodes (yaml)" nodes.yaml kubectl get nodes -o yaml
+  _cd_section "nodes (describe)" nodes-describe.txt kubectl describe nodes
+  # Reboot fingerprint + taints: bootID (changes across a reboot), kernel, the
+  # Ready condition's lastTransitionTime, and taints. The skyhook.nvidia.com
+  # NoSchedule taint applied during tuning and removed on completion — plus a
+  # fresh Ready transition / changed bootID — is the durable "a reboot re-opened
+  # tuning" signal that distinguishes an in-flight reboot from a genuine resource
+  # gap. Routed directly (not via _cd_section) because it is a shell function,
+  # which `timeout` cannot invoke; the function bounds its own kubectl internally.
+  {
+    echo "##### node reboot fingerprint + taints #####"
+    _cd_node_reboot_fingerprint
+    echo
+  } | tee -a "${CLUSTER_DEBUG_DIR}/node-reboot-fingerprint.txt"
+  # GPU census + driver-level capture on a capacity shortfall (a node short of
+  # its peers). Routed directly (a shell function `timeout` cannot invoke); it
+  # bounds its own kubectl/exec internally and only pays the exec cost when a
+  # shortfall is present.
+  _cd_gpu_driver_state
+  # Events across all namespaces: node Reboot/NotReady, pod evictions (the run-2
+  # "pod for job not found" cause), FailedScheduling, etc.
+  _cd_section "events (all namespaces, by time)" events.txt \
+    kubectl get events -A --sort-by=.lastTimestamp
+  _cd_section "pods (all namespaces, wide)" pods.txt kubectl get pods -A -o wide
+  _cd_section "pods not Running/Completed" pods-notready.txt \
+    bash -c "kubectl get pods -A 2>/dev/null | grep -Ev '\\s+Running\\s+|\\s+Completed\\s+' || true"
+
+  # --- Tier 1: operator custom resources (full YAML) ------------------------
+  # Skyhook first — the status history that the readiness gate's status.status
+  # check reads. Full YAML captures per-package/per-node state + timestamps.
+  for res in ${CLUSTER_DEBUG_CLUSTER_RESOURCES}; do
+    _cd_section "CR ${res} (yaml)" "cr-${res%%.*}.yaml" \
+      kubectl get "${res}" -A -o yaml
+  done
+  # Platform workload CRs (Dynamo / Kubeflow / Slurm) if the CRD exists. The
+  # platform set and its CRD names come from lib/platform-crd-map.sh, the same
+  # map phase_conformance cross-checks the TestGrid coordinate against: a
+  # platform the gate knows must also have its CRs captured here, or the bundle
+  # for a failing cell of that platform arrives missing its workload state.
+  local platform
+  for platform in $(platform_workload_platforms); do
+    res="$(platform_workload_crd "${platform}")" || continue
+    _cd_bounded kubectl get crd "${res}" >/dev/null 2>&1 || continue
+    _cd_section "CR ${res} (yaml)" "cr-${res%%.*}.yaml" \
+      kubectl get "${res}" -A -o yaml
+  done
+
+  # --- Tier 2: per-namespace describe/events + operator/check-Job logs -------
+  local ns
+  for ns in $(_cd_bounded kubectl get ns -o name 2>/dev/null | sed 's|namespace/||'); do
+    local nsfile="ns-${ns}.txt"
+    _cd_section "[${ns}] pods (wide)" "${nsfile}" \
+      kubectl get pods -n "${ns}" -o wide
+    _cd_section "[${ns}] jobs" "${nsfile}" \
+      kubectl get jobs -n "${ns}" -o wide
+    _cd_section "[${ns}] events (by time)" "${nsfile}" \
+      kubectl get events -n "${ns}" --sort-by=.lastTimestamp
+
+    # `describe pods` and full logs are limited to the operator/check namespaces
+    # in the allowlist. `describe` renders literal (non-Secret) env values in its
+    # Environment section; scoping it to trusted operator namespaces — rather than
+    # every namespace — bounds credential/PII exposure in the public-repo artifact
+    # (a UAT recipe override or third-party chart with a literal-env secret would
+    # otherwise leak straight in). The get/events above still cover every namespace.
+    case " ${CLUSTER_DEBUG_LOG_NAMESPACES} " in
+      *" ${ns} "*) ;;
+      *) continue ;;
+    esac
+    _cd_section "[${ns}] describe pods" "${nsfile}" \
+      kubectl describe pods -n "${ns}"
+    local logfile="logs-${ns}.txt" p
+    for p in $(_cd_bounded kubectl get pods -n "${ns}" -o name 2>/dev/null); do
+      {
+        echo "===== ${ns}/${p} (current) ====="
+        _cd_bounded kubectl logs -n "${ns}" "${p#pod/}" --all-containers \
+          --tail="${CLUSTER_DEBUG_LOG_TAIL}" 2>&1 || true
+        # --previous survives a container restart across a reboot — the log that
+        # actually explains a tuning-reboot crash is usually the previous one.
+        echo "===== ${ns}/${p} (previous, if any) ====="
+        _cd_bounded kubectl logs -n "${ns}" "${p#pod/}" --all-containers --previous \
+          --tail="${CLUSTER_DEBUG_LOG_TAIL}" 2>&1 || true
+      } >> "${CLUSTER_DEBUG_DIR}/${logfile}"
+    done
+  done
+
+  echo "cluster debug bundle written to ${CLUSTER_DEBUG_DIR}/ ($(du -sh "${CLUSTER_DEBUG_DIR}" 2>/dev/null | cut -f1))"
+  echo "::endgroup::"
+  exit 0
+  )
+  return 0
+}

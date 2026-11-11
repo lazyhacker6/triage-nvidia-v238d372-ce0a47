@@ -1,0 +1,1322 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config
+
+import (
+	"fmt"
+	"maps"
+	"net/url"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/deprecation"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/serializer"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
+)
+
+// DeployerType represents the type of deployment method used for generated bundles.
+type DeployerType string
+
+// DefaultFluxNamespace is the default Kubernetes namespace where Flux CRs
+// (HelmRelease, sources, ArtifactGenerator) are deployed. Overridable via
+// WithFluxNamespace / --flux-namespace.
+const DefaultFluxNamespace = "flux-system"
+
+// DefaultFleetNamespace is the default Fleet workspace (namespace) where the
+// generated GitRepo or HelmOps are applied. fleet-default targets downstream clusters
+// registered with Rancher; use fleet-local for the Rancher local cluster.
+// Overridable via WithFleetNamespace / --fleet-namespace.
+const DefaultFleetNamespace = "fleet-default"
+
+// Fleet deployer output shapes. FleetModeGitRepo writes a fleet.yaml per
+// component plus a GitRepo; FleetModeHelmOp writes one HelmOp per component.
+const (
+	FleetModeGitRepo = "gitrepo"
+	FleetModeHelmOp  = "helmop"
+)
+
+// ParseFleetMode normalizes a --fleet-mode value. Empty selects
+// FleetModeGitRepo.
+func ParseFleetMode(s string) (string, error) {
+	switch m := strings.ToLower(strings.TrimSpace(s)); m {
+	case "":
+		return FleetModeGitRepo, nil
+	case FleetModeGitRepo, FleetModeHelmOp:
+		return m, nil
+	default:
+		return "", errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("invalid fleet mode %q: must be %q or %q", s, FleetModeGitRepo, FleetModeHelmOp))
+	}
+}
+
+// ValidateFleetName reports whether name is usable as a Fleet object name or
+// workspace: a DNS-1123 label. what names the flag in the error message.
+func ValidateFleetName(what, name string) error {
+	if errs := validation.IsDNS1123Label(name); len(errs) > 0 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("invalid %s %q: must be a DNS-1123 label (%s)", what, name, strings.Join(errs, "; ")))
+	}
+	return nil
+}
+
+// Supported deployer types.
+const (
+	// DeployerHelm generates Helm per-component bundles (default).
+	DeployerHelm DeployerType = "helm"
+	// DeployerArgoCD generates Argo CD App of Apps manifests.
+	DeployerArgoCD DeployerType = "argocd"
+	// DeployerArgoCDHelm generates a Helm chart app-of-apps for Argo CD.
+	// Values are overridable at install time via helm --set, except
+	// profile-owned paths and GPU driver-ownership paths, which lock
+	// templates reject.
+	// Use --dynamic to pre-populate specific paths in root values.yaml.
+	DeployerArgoCDHelm DeployerType = "argocd-helm"
+	// DeployerFlux generates Flux HelmRelease manifests.
+	DeployerFlux DeployerType = "flux"
+	// DeployerHelmfile generates a helmfile.yaml release graph for use with the
+	// upstream helmfile CLI (helmfile apply / diff / destroy). Per-component
+	// chart directories are emitted via the shared localformat writer, so the
+	// bundle is self-contained and air-gap deployable when combined with
+	// --vendor-charts.
+	DeployerHelmfile DeployerType = "helmfile"
+	// DeployerFleet generates a Rancher Fleet bundle chained with dependsOn:
+	// one fleet.yaml per localformat folder plus a GitRepo CR, or, with
+	// FleetModeHelmOp, one HelmOp per folder.
+	DeployerFleet DeployerType = "fleet"
+	// DeployerTerraform generates a Terraform root module (a child module
+	// with --terraform-child-module): one module call per component, with depends_on carrying the recipe's
+	// dependency graph exactly. Per-component chart directories are
+	// emitted via the shared localformat writer, so the bundle is
+	// self-contained and air-gap deployable when combined with
+	// --vendor-charts.
+	DeployerTerraform DeployerType = "terraform"
+)
+
+// allDeployerTypes is the single source of truth for supported deployer types.
+var allDeployerTypes = []DeployerType{
+	DeployerHelm,
+	DeployerArgoCD,
+	DeployerArgoCDHelm,
+	DeployerFlux,
+	DeployerHelmfile,
+	DeployerFleet,
+	DeployerTerraform,
+}
+
+// ParseDeployerType parses a string into a DeployerType.
+// Returns an error if the string is not a valid deployer type.
+func ParseDeployerType(s string) (DeployerType, error) {
+	normalized := strings.ToLower(strings.TrimSpace(s))
+	for _, dt := range allDeployerTypes {
+		if string(dt) == normalized {
+			return dt, nil
+		}
+	}
+	return "", errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("invalid deployer type %q: must be one of %v", s, GetDeployerTypes()))
+}
+
+// GetDeployerTypes returns a sorted slice of all supported deployer types.
+// This is useful for CLI flag validation and usage messages.
+func GetDeployerTypes() []string {
+	types := make([]string, len(allDeployerTypes))
+	for i, dt := range allDeployerTypes {
+		types[i] = string(dt)
+	}
+	sort.Strings(types)
+	return types
+}
+
+// String returns the string representation of the DeployerType.
+func (d DeployerType) String() string {
+	return string(d)
+}
+
+// ValidateAppName reports whether name is a valid parent Argo Application
+// name. The empty string is allowed (means "use the deployer's default"
+// — see WithAppName); non-empty values must be a DNS-1123 subdomain so
+// the rendered Application passes apiserver admission. Rejecting invalid
+// names at bundle/parse time surfaces the error before publish/install
+// rather than as a cryptic apiserver rejection at apply time. See #1011.
+func ValidateAppName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("invalid app name %q: must be a DNS-1123 subdomain (%s)",
+				name, strings.Join(errs, "; ")))
+	}
+	return nil
+}
+
+// ValidateHTTPSURL reports whether raw is a usable absolute https:// endpoint.
+// The empty string is allowed (callers treat it as "use the default"); any
+// non-empty value must parse as an absolute URL with an https scheme and a
+// host, and must not embed credentials. label names the field for the error
+// message (e.g. "fulcio URL"). Used to fail malformed signing endpoints at
+// bundle/parse time rather than at sign time. See #408.
+func ValidateHTTPSURL(label, raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("invalid %s %q", label, raw), err)
+	}
+	// Reject embedded credentials: url.Parse stashes "user:pass@" in u.User
+	// while leaving Scheme/Host intact, so a scheme+host-only check would
+	// otherwise accept "https://user:pass@host". Credentials have no place in
+	// a signing endpoint and would leak via config/flags/process listings.
+	// Hostname() (not Host) is load-bearing: "https://:6443" parses with a
+	// non-empty Host (":6443") but an empty hostname — a port with no host is
+	// never a usable endpoint and must fail closed.
+	if u.Scheme != "https" || u.Hostname() == "" || u.User != nil {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("invalid %s %q: must be an absolute https:// URL with a hostname and without embedded credentials", label, raw))
+	}
+	return nil
+}
+
+// NodeLabel is a single Kubernetes node label used as an exact-match node
+// selector. The GPU Operator DRA eviction contract needs both parts for the
+// DRA kubelet plugin selector, but passes only Key to the Driver Manager.
+type NodeLabel struct {
+	Key   string
+	Value string
+}
+
+// String returns the label in key=value form.
+func (l NodeLabel) String() string {
+	return l.Key + "=" + l.Value
+}
+
+// Validate reports whether the label has a Kubernetes-qualified key and a
+// valid label value.
+func (l NodeLabel) Validate() error {
+	if errs := validation.IsQualifiedName(l.Key); len(errs) > 0 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("invalid node label key %q: %s", l.Key, strings.Join(errs, "; ")))
+	}
+	if errs := validation.IsValidLabelValue(l.Value); len(errs) > 0 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("invalid node label value %q: %s", l.Value, strings.Join(errs, "; ")))
+	}
+	return nil
+}
+
+// ValidateNodeSelector returns an error if any entry of selector is not a valid
+// node label.
+func ValidateNodeSelector(selector map[string]string) error {
+	// Sorted keys make the reported entry deterministic.
+	for _, key := range slices.Sorted(maps.Keys(selector)) {
+		if err := (NodeLabel{Key: key, Value: selector[key]}).Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ValidateTolerations returns an error for any toleration the API server would
+// reject, and for the Lt and Gt operators, which need a feature gate the bundle
+// cannot see.
+func ValidateTolerations(tolerations []corev1.Toleration) error {
+	for _, t := range tolerations {
+		if err := validateToleration(t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateToleration(t corev1.Toleration) error {
+	// Rules from ValidateTolerations in k8s.io/kubernetes pkg/apis/core/validation.
+	if t.Key == "" {
+		if t.Operator != corev1.TolerationOpExists {
+			return invalidTolerationf("toleration with an empty key must use operator Exists, got %q", t.Operator)
+		}
+	} else if errs := validation.IsQualifiedName(t.Key); len(errs) > 0 {
+		return invalidTolerationf("invalid toleration key %q: %s", t.Key, strings.Join(errs, "; "))
+	}
+	if t.TolerationSeconds != nil && t.Effect != corev1.TaintEffectNoExecute {
+		return invalidTolerationf("toleration %q sets tolerationSeconds, which requires effect NoExecute, got %q", t.Key, t.Effect)
+	}
+
+	switch t.Operator {
+	case "", corev1.TolerationOpEqual:
+		if errs := validation.IsValidLabelValue(t.Value); len(errs) > 0 {
+			return invalidTolerationf("invalid toleration value for key %q: %s", t.Key, strings.Join(errs, "; "))
+		}
+	case corev1.TolerationOpExists:
+		if t.Value != "" {
+			return invalidTolerationf("toleration %q uses operator Exists, which requires an empty value, got %q", t.Key, t.Value)
+		}
+	case corev1.TolerationOpLt, corev1.TolerationOpGt:
+		return invalidTolerationf("toleration %q uses operator %s, which needs a Kubernetes feature gate AICR cannot verify", t.Key, t.Operator)
+	default:
+		return invalidTolerationf("invalid toleration operator %q for key %q", t.Operator, t.Key)
+	}
+
+	// An empty effect matches every taint effect.
+	if t.Effect == "" {
+		return nil
+	}
+	return ValidateTaintEffect(t.Effect)
+}
+
+func invalidTolerationf(format string, args ...any) error {
+	return errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(format, args...))
+}
+
+// ValidateTaintEffect returns an error unless effect is NoSchedule,
+// PreferNoSchedule, or NoExecute.
+func ValidateTaintEffect(effect corev1.TaintEffect) error {
+	switch effect {
+	case corev1.TaintEffectNoSchedule, corev1.TaintEffectPreferNoSchedule, corev1.TaintEffectNoExecute:
+		return nil
+	default:
+		return errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("invalid taint effect %q, expected %s, %s, or %s",
+			effect, corev1.TaintEffectNoSchedule, corev1.TaintEffectPreferNoSchedule, corev1.TaintEffectNoExecute))
+	}
+}
+
+// ParseNodeLabel parses and validates a single node label in key=value form.
+func ParseNodeLabel(raw string) (NodeLabel, error) {
+	parts := strings.SplitN(raw, "=", 2)
+	if len(parts) != 2 {
+		return NodeLabel{}, errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("invalid node label %q: expected key=value", raw))
+	}
+	label := NodeLabel{Key: parts[0], Value: parts[1]}
+	if err := label.Validate(); err != nil {
+		return NodeLabel{}, err
+	}
+	return label, nil
+}
+
+// DefaultDRAEvictionNodeLabel returns the node label NVIDIA documents for
+// coordinating DRA kubelet-plugin eviction with GPU Operator driver upgrades.
+func DefaultDRAEvictionNodeLabel() NodeLabel {
+	return NodeLabel{
+		Key:   defaults.DRAEvictionNodeLabelKey,
+		Value: defaults.DRAEvictionNodeLabelValue,
+	}
+}
+
+// Config provides immutable configuration options for bundlers.
+// All fields are read-only after creation to prevent accidental modifications.
+// Use Clone() to create a modified copy or Merge() to combine configurations.
+type Config struct {
+	// includeReadme includes README documentation.
+	includeReadme bool
+
+	// includeChecksums includes checksum file for verification.
+	includeChecksums bool
+
+	// verbose enables detailed output during bundle generation.
+	verbose bool
+
+	// version specifies the bundler version.
+	version string
+
+	// valueOverrides contains user-specified value overrides per bundler.
+	// Map structure: bundler_name -> (path -> value)
+	valueOverrides map[string]map[string]string
+
+	// valueOverridesTyped holds structured (--set-json / --set-file) value
+	// overrides per component. Map structure: component_name -> (path ->
+	// decoded value). Unlike valueOverrides, the values are already-decoded
+	// lists/objects/scalars so list and object fields render as real YAML
+	// structures instead of the bare string `--set` would produce. See #1161.
+	valueOverridesTyped map[string]map[string]any
+
+	// systemNodeSelector contains node selector labels for system components.
+	systemNodeSelector map[string]string
+
+	// systemNodeTolerations contains tolerations for system components.
+	systemNodeTolerations []corev1.Toleration
+
+	// acceleratedNodeSelector contains node selector labels for accelerated/GPU nodes.
+	acceleratedNodeSelector map[string]string
+
+	// acceleratedNodeTolerations contains tolerations for accelerated/GPU nodes.
+	acceleratedNodeTolerations []corev1.Toleration
+
+	// deployer specifies the deployment method (default: DeployerHelm).
+	deployer DeployerType
+
+	// repoURL specifies the Git repository URL for Argo CD applications.
+	repoURL string
+
+	// targetRevision specifies the target revision for the Argo CD repo (default: "main").
+	targetRevision string
+
+	// workloadGateTaint specifies the taint for nodewright-operator runtime required feature.
+	workloadGateTaint *corev1.Taint
+
+	// workloadSelector contains label selector for nodewright-customizations to prevent eviction of running training jobs.
+	workloadSelector map[string]string
+
+	// attest enables bundle attestation and binary verification.
+	attest bool
+
+	// deterministic, when true, suppresses run-specific metadata (random
+	// invocation IDs, wall-clock timestamps) from generated artifacts
+	// (SLSA attestation, BOM) so two runs against identical inputs
+	// produce byte-identical output. Required for SLSA-reproducible
+	// builds.
+	deterministic bool
+
+	// certificateIdentityRegexp overrides the default identity pinning pattern
+	// for binary attestation verification during bundle creation.
+	certificateIdentityRegexp string
+
+	// estimatedNodeCount is the estimated number of GPU nodes (0 = unset). Used by nodewright-operator for estimatedNodeCount Helm value.
+	estimatedNodeCount int
+
+	// dynamicValues declares value paths that should be provided at install time.
+	// Map structure: component_key -> [path1, path2, ...]
+	dynamicValues map[string][]string
+
+	// storageClass is the Kubernetes StorageClass name to inject into components at bundle time.
+	// When non-empty, it overrides the storageClassName at all registry-declared storageClassPaths.
+	storageClass string
+
+	// sharedStorageClass is the Kubernetes StorageClass name to inject into
+	// shared filesystem PVCs at bundle time.
+	sharedStorageClass string
+
+	// draEvictionNodeLabel is the shared label used to place the DRA kubelet
+	// plugin and tell GPU Operator's Driver Manager which pods to evict during
+	// driver upgrades. It is injected only when both components are enabled.
+	draEvictionNodeLabel NodeLabel
+
+	// vendorCharts pulls upstream Helm chart bytes into the bundle at bundle
+	// time so the resulting artifact is self-contained and air-gap
+	// deployable. Off by default — non-vendored bundles preserve the
+	// CVE-yank fail-loud signal and avoid bundle-time network egress.
+	vendorCharts bool
+
+	// ociSourceName is the name of the outer OCIRepository that Flux
+	// sources the bundle from. When non-empty and deployer is flux,
+	// local-chart HelmReleases use ArtifactGenerator + ExternalArtifact
+	// (spec.chartRef) instead of GitRepository (spec.chart.spec.sourceRef).
+	// Empty preserves the existing GitRepository code path.
+	ociSourceName string
+
+	// fluxNamespace is the Kubernetes namespace where Flux CRs (HelmRelease,
+	// sources, ArtifactGenerator) are deployed. Defaults to DefaultFluxNamespace.
+	fluxNamespace string
+
+	// fleetNamespace is the Fleet workspace (namespace) the generated GitRepo or
+	// HelmOps are applied to. Defaults to DefaultFleetNamespace.
+	fleetNamespace string
+
+	// fleetMode selects the Fleet deployer output shape ("gitrepo" or
+	// "helmop"). Empty means the deployer default (gitrepo).
+	fleetMode string
+
+	// bundleChartName overrides the Helm chart name written into Chart.yaml
+	// and used as `source.chart` in the parent Argo Application emitted by
+	// the argocd-helm deployer. Empty means "use the deployer's default"
+	// (currently "aicr-bundle"). For OCI output the CLI sets this to the
+	// last path segment of the published artifact (e.g. "my-bundle" for
+	// "oci://reg/org/my-bundle:v1") so the parent App's `repoURL/chart:
+	// targetRevision` triple resolves against the real artifact. See #1019.
+	bundleChartName string
+
+	// bundleChartVersion overrides only the semantic Helm chart version written
+	// into the argocd-helm bundle's Chart.yaml. Empty keeps the normalized recipe
+	// version. OCI callers set this to the SemVer form decoded from the raw tag.
+	bundleChartVersion string
+
+	// ociParentNamespace is the OCI registry + repository path with the chart-name
+	// segment stripped (e.g. "oci://ghcr.io/nvidia" for "oci://ghcr.io/nvidia/my-bundle:v1").
+	// Baked into the argocd-helm bundle's root values.yaml as the default repoURL.
+	// Empty when --output targets a local directory. See #1342.
+	ociParentNamespace string
+
+	// appName overrides the parent Argo Application's `metadata.name` for
+	// the argocd-helm and argocd deployers, and names the GitRepo and
+	// prefixes every bundle and HelmOp for fleet. Empty means each deployer
+	// applies its own default ("aicr-stack" / "nvidia-stack" / "aicr"). When two
+	// non-overlapping bundles are deployed to the same Argo CD namespace,
+	// each must supply a distinct appName so the parent Applications do not
+	// collide. See #1011.
+	appName string
+
+	// argoCD holds the dedicated Argo CD bundle settings. See #3264.
+	argoCD ArgoCDSettings
+
+	// readinessHooks emits a standalone per-component readiness gate chart
+	// (NNN-<name>-readiness/) for each component that ships a
+	// recipes/components/<name>/readiness.yaml chainsaw Test. The chart runs
+	// the gate CLI as a post-component Job so deployers block on
+	// component-specific readiness signals (e.g. ClusterPolicy.status.state)
+	// that Helm/Argo CD/Flux cannot assess natively. Off by default so
+	// existing bundle output is unchanged; opt-in via --readiness-hooks. See #904.
+	readinessHooks bool
+
+	// serial forces every deployer to sequence components strictly one at a
+	// time in deployment order, disabling the concurrency the other deployers
+	// emit by default: per-tier sync-wave bands for argocd and argocd-helm,
+	// dependsOn for flux, intra-component needs: for helmfile, and depends_on
+	// for terraform. Off by default; opt-in via --serial. An operator
+	// escape hatch for bisecting rollout problems or reproducing the
+	// pre-parallelism ordering. The helm deploy.sh is already serial, so the
+	// flag is a no-op for it.
+	serial bool
+
+	// terraformClusterRollover emits, in each component module of a
+	// --deployer terraform bundle, a terraform_data keyed on
+	// var.cluster_keepers plus a replace_triggered_by pointing at it, so
+	// replacing the cluster replaces every release rather than leaving state
+	// that describes objects in a cluster that no longer exists. Off by
+	// default: the keepers are the caller's statement of what identifies the
+	// cluster, and both forms require the variable.
+	terraformClusterRollover bool
+
+	// terraformChildModule emits a --deployer terraform bundle as a CHILD
+	// module — no provider configuration, no cluster-connection variables —
+	// so the calling configuration owns the provider and the bundle's module
+	// calls inherit it. The shape to use when the cluster is declared
+	// alongside the bundle: a module carrying its own provider block cannot
+	// take depends_on/count/for_each, which is exactly what a caller needs
+	// to sequence the bundle behind the cluster that hosts it.
+	terraformChildModule bool
+
+	// bundlers is a positive filter on recipe component names (the
+	// `bundlers` query parameter on POST /v1/bundle): when non-empty, only
+	// the named components are bundled; every other enabled component is
+	// skipped as if disabled (its dependency edges are treated as satisfied
+	// externally). Empty means all enabled components. A name the recipe
+	// does not declare, or one the recipe/--set disabled, is rejected with
+	// ErrCodeInvalidRequest at bundle time. See #1531.
+	bundlers []string
+
+	// split renders one bundle set partitioned by registry class (ADR-018):
+	// a directory per class with enabled components, under a set root that
+	// holds recipe.yaml, split.yaml, bundle-info.yaml, checksums.txt and,
+	// with Attest, the attestation. Off
+	// by default; the ordinary single bundle is unchanged.
+	split bool
+}
+
+// Getter methods for read-only access
+
+// IncludeReadme returns the include readme setting.
+func (c *Config) IncludeReadme() bool {
+	return c.includeReadme
+}
+
+// IncludeChecksums returns the include checksums setting.
+func (c *Config) IncludeChecksums() bool {
+	return c.includeChecksums
+}
+
+// Verbose returns the verbose setting.
+func (c *Config) Verbose() bool {
+	return c.verbose
+}
+
+// Version returns the bundler version.
+func (c *Config) Version() string {
+	return c.version
+}
+
+// ValueOverrides returns a deep copy of the value overrides to prevent modification.
+func (c *Config) ValueOverrides() map[string]map[string]string {
+	if c.valueOverrides == nil {
+		return nil
+	}
+	overrides := make(map[string]map[string]string, len(c.valueOverrides))
+	for bundler, paths := range c.valueOverrides {
+		overrides[bundler] = make(map[string]string, len(paths))
+		maps.Copy(overrides[bundler], paths)
+	}
+	return overrides
+}
+
+// ValueOverridesTyped returns a deep copy of the structured (--set-json /
+// --set-file) value overrides to prevent callers from mutating the Config's
+// backing maps/slices. Returns nil when no typed overrides were supplied.
+func (c *Config) ValueOverridesTyped() map[string]map[string]any {
+	if len(c.valueOverridesTyped) == 0 {
+		return nil
+	}
+	overrides := make(map[string]map[string]any, len(c.valueOverridesTyped))
+	for component, paths := range c.valueOverridesTyped {
+		copied := make(map[string]any, len(paths))
+		for path, value := range paths {
+			copied[path] = serializer.DeepCopyAny(value)
+		}
+		overrides[component] = copied
+	}
+	return overrides
+}
+
+// SystemNodeSelector returns a copy of the system node selector map.
+func (c *Config) SystemNodeSelector() map[string]string {
+	if c.systemNodeSelector == nil {
+		return nil
+	}
+	result := make(map[string]string, len(c.systemNodeSelector))
+	maps.Copy(result, c.systemNodeSelector)
+	return result
+}
+
+// SystemNodeTolerations returns a copy of the system node tolerations.
+func (c *Config) SystemNodeTolerations() []corev1.Toleration {
+	if c.systemNodeTolerations == nil {
+		return nil
+	}
+	result := make([]corev1.Toleration, len(c.systemNodeTolerations))
+	copy(result, c.systemNodeTolerations)
+	return result
+}
+
+// AcceleratedNodeSelector returns a copy of the accelerated node selector map.
+func (c *Config) AcceleratedNodeSelector() map[string]string {
+	if c.acceleratedNodeSelector == nil {
+		return nil
+	}
+	result := make(map[string]string, len(c.acceleratedNodeSelector))
+	maps.Copy(result, c.acceleratedNodeSelector)
+	return result
+}
+
+// AcceleratedNodeTolerations returns a copy of the accelerated node tolerations.
+func (c *Config) AcceleratedNodeTolerations() []corev1.Toleration {
+	if c.acceleratedNodeTolerations == nil {
+		return nil
+	}
+	result := make([]corev1.Toleration, len(c.acceleratedNodeTolerations))
+	copy(result, c.acceleratedNodeTolerations)
+	return result
+}
+
+// Deployer returns the deployment method (DeployerHelm or DeployerArgoCD).
+func (c *Config) Deployer() DeployerType {
+	return c.deployer
+}
+
+// RepoURL returns the Git repository URL for Argo CD applications.
+func (c *Config) RepoURL() string {
+	return c.repoURL
+}
+
+// TargetRevision returns the target revision for the Argo CD repo.
+func (c *Config) TargetRevision() string {
+	return c.targetRevision
+}
+
+// WorkloadGateTaint returns a copy of the workload gate taint.
+func (c *Config) WorkloadGateTaint() *corev1.Taint {
+	if c.workloadGateTaint == nil {
+		return nil
+	}
+	// Return a copy to prevent modification
+	taint := *c.workloadGateTaint
+	return &taint
+}
+
+// WorkloadSelector returns a copy of the workload selector map.
+func (c *Config) WorkloadSelector() map[string]string {
+	if c.workloadSelector == nil {
+		return nil
+	}
+	result := make(map[string]string, len(c.workloadSelector))
+	maps.Copy(result, c.workloadSelector)
+	return result
+}
+
+// Attest returns whether bundle attestation is enabled.
+func (c *Config) Attest() bool {
+	return c.attest
+}
+
+// Deterministic reports whether generated artifacts (attestation, BOM)
+// should suppress run-specific metadata so output is reproducible.
+func (c *Config) Deterministic() bool {
+	return c.deterministic
+}
+
+// CertificateIdentityRegexp returns the custom identity pinning pattern for
+// binary attestation verification, or empty string for the default.
+func (c *Config) CertificateIdentityRegexp() string {
+	return c.certificateIdentityRegexp
+}
+
+// EstimatedNodeCount returns the estimated number of GPU nodes (0 means unset).
+func (c *Config) EstimatedNodeCount() int {
+	return c.estimatedNodeCount
+}
+
+// DynamicValues returns a deep copy of the dynamic value declarations.
+func (c *Config) DynamicValues() map[string][]string {
+	if c.dynamicValues == nil {
+		return nil
+	}
+	result := make(map[string][]string, len(c.dynamicValues))
+	for component, paths := range c.dynamicValues {
+		pathsCopy := make([]string, len(paths))
+		copy(pathsCopy, paths)
+		result[component] = pathsCopy
+	}
+	return result
+}
+
+// HasDynamicValues returns true if any dynamic value declarations exist.
+func (c *Config) HasDynamicValues() bool {
+	return len(c.dynamicValues) > 0
+}
+
+// StorageClass returns the Kubernetes StorageClass name to inject at bundle time, or empty string if unset.
+func (c *Config) StorageClass() string {
+	return c.storageClass
+}
+
+// SharedStorageClass returns the Kubernetes StorageClass name to inject into
+// shared filesystem PVCs at bundle time, or empty string if unset.
+func (c *Config) SharedStorageClass() string {
+	return c.sharedStorageClass
+}
+
+// DRAEvictionNodeLabel returns the label shared by the DRA kubelet plugin
+// selector and GPU Operator Driver Manager eviction configuration.
+//
+// The zero NodeLabel means the eviction contract was not requested: AICR then
+// injects neither half and the DRA kubelet plugin carries no AICR-introduced
+// placement requirement. Configuring a label opts in (see issue #2469).
+func (c *Config) DRAEvictionNodeLabel() NodeLabel {
+	return c.draEvictionNodeLabel
+}
+
+// VendorCharts reports whether upstream Helm chart bytes should be pulled
+// into the bundle at bundle time. Off by default; opt-in via
+// --vendor-charts on the CLI or vendor-charts=true on the API.
+func (c *Config) VendorCharts() bool {
+	return c.vendorCharts
+}
+
+// OCISourceName returns the name of the outer OCIRepository for Flux
+// ArtifactGenerator mode. Empty means the feature is disabled.
+func (c *Config) OCISourceName() string {
+	return c.ociSourceName
+}
+
+// BundleChartName returns the Helm chart name override for the argocd-helm
+// deployer. Empty means "use the deployer's default". See #1019.
+func (c *Config) BundleChartName() string {
+	return c.bundleChartName
+}
+
+// BundleChartVersion returns the semantic Chart.yaml version override for the
+// argocd-helm deployer. Empty means "use the normalized recipe version".
+func (c *Config) BundleChartVersion() string {
+	return c.bundleChartVersion
+}
+
+// OCIParentNamespace returns the OCI parent namespace baked into the
+// argocd-helm bundle's root values.yaml as the default repoURL. See #1342.
+func (c *Config) OCIParentNamespace() string {
+	return c.ociParentNamespace
+}
+
+// AppName returns the parent Application name override for the argocd-helm
+// and argocd deployers. Empty means "use the deployer's default". See #1011.
+func (c *Config) AppName() string {
+	return c.appName
+}
+
+// ArgoCDSettings returns a copy of the dedicated Argo CD bundle settings.
+func (c *Config) ArgoCDSettings() ArgoCDSettings {
+	return c.argoCD.Clone()
+}
+
+// LegacyDeployerNotice returns the deprecation notice for the deprecated
+// deployer:<key> value overrides, and whether c uses any.
+func (c *Config) LegacyDeployerNotice() (deprecation.Notice, bool) {
+	legacy := c.valueOverrides[DeployerOverrideKey]
+	if len(legacy) == 0 {
+		return deprecation.Notice{}, false
+	}
+	return LegacyDeployerNotice(sortedKeys(legacy)[0]), true
+}
+
+// ReadinessHooks reports whether per-component readiness gate charts should
+// be emitted for components that ship a readiness.yaml. Off by default;
+// opt-in via --readiness-hooks on the CLI. See #904.
+func (c *Config) ReadinessHooks() bool {
+	return c.readinessHooks
+}
+
+// Serial reports whether deployers should sequence components strictly one at
+// a time in deployment order instead of parallelizing independent components.
+// Off by default; opt-in via --serial. Affects the argocd, argocd-helm, flux,
+// helmfile, and terraform deployers (helm is already serial).
+func (c *Config) Serial() bool {
+	return c.serial
+}
+
+// TerraformClusterRollover reports whether the terraform deployer should emit
+// the cluster-rollover containment shim in each component module. Off by
+// default; opt-in via --terraform-cluster-rollover.
+func (c *Config) TerraformClusterRollover() bool {
+	return c.terraformClusterRollover
+}
+
+// TerraformChildModule reports whether the terraform deployer should emit the
+// bundle as a child module rather than a standalone root module. Off by
+// default; opt-in via --terraform-child-module.
+func (c *Config) TerraformChildModule() bool {
+	return c.terraformChildModule
+}
+
+// Split reports whether the bundle is rendered as a class-partitioned set.
+func (c *Config) Split() bool {
+	return c.split
+}
+
+// Bundlers returns a copy of the positive component-name filter. Empty means
+// all enabled components are bundled. See #1531.
+func (c *Config) Bundlers() []string {
+	if c.bundlers == nil {
+		return nil
+	}
+	result := make([]string, len(c.bundlers))
+	copy(result, c.bundlers)
+	return result
+}
+
+// Validate returns an error if any setting of c is invalid, including a node
+// selector or toleration the API server would reject.
+func (c *Config) Validate() error {
+	selectors := []struct {
+		option   string
+		selector map[string]string
+	}{
+		{"WithSystemNodeSelector", c.systemNodeSelector},
+		{"WithAcceleratedNodeSelector", c.acceleratedNodeSelector},
+		{"WithWorkloadSelector", c.workloadSelector},
+	}
+	for _, s := range selectors {
+		if err := ValidateNodeSelector(s.selector); err != nil {
+			return errors.Wrap(errors.ErrCodeInvalidRequest, "invalid "+s.option, err)
+		}
+	}
+	if err := ValidateTolerations(c.systemNodeTolerations); err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest, "invalid WithSystemNodeTolerations", err)
+	}
+	if err := ValidateTolerations(c.acceleratedNodeTolerations); err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest, "invalid WithAcceleratedNodeTolerations", err)
+	}
+
+	if err := c.validateSplit(); err != nil {
+		return err
+	}
+
+	// The zero label means the DRA eviction contract was not requested, which
+	// is the default (issue #2469). Only a configured label is validated.
+	if c.draEvictionNodeLabel == (NodeLabel{}) {
+		return nil
+	}
+	return c.draEvictionNodeLabel.Validate()
+}
+
+// validateSplit enforces the v1 support matrix of ADR-018: a bundle set is
+// Helm-local only, is the provenance unit so it cannot drop checksums, and is
+// the complete partition so it cannot be combined with a component filter.
+func (c *Config) validateSplit() error {
+	if !c.split {
+		return nil
+	}
+	if c.deployer != DeployerHelm {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("--split supports only the helm deployer in this release; got %q (ADR-018 support matrix)", c.deployer))
+	}
+	if !c.includeChecksums {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"--split requires checksums: the bundle set is verified at its root before it is published")
+	}
+	if len(c.bundlers) > 0 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"--split cannot be combined with a component filter (bundlers): the class partition is the only supported subsetting of a split set")
+	}
+	return nil
+}
+
+type Option func(*Config)
+
+// WithIncludeReadme sets whether a README should be included in the bundle.
+func WithIncludeReadme(enabled bool) Option {
+	return func(c *Config) {
+		c.includeReadme = enabled
+	}
+}
+
+// WithIncludeChecksums sets whether a checksums file should be included in the bundle.
+func WithIncludeChecksums(enabled bool) Option {
+	return func(c *Config) {
+		c.includeChecksums = enabled
+	}
+}
+
+// WithVerbose sets whether verbose logging is enabled for the bundler.
+func WithVerbose(enabled bool) Option {
+	return func(c *Config) {
+		c.verbose = enabled
+	}
+}
+
+// WithVersion sets the version for the bundler.
+func WithVersion(version string) Option {
+	return func(c *Config) {
+		c.version = version
+	}
+}
+
+// WithValueOverrides sets value overrides for the bundler.
+func WithValueOverrides(overrides map[string]map[string]string) Option {
+	return func(c *Config) {
+		if overrides == nil {
+			return
+		}
+		// Deep copy to prevent external modifications
+		for bundler, paths := range overrides {
+			if c.valueOverrides[bundler] == nil {
+				c.valueOverrides[bundler] = make(map[string]string)
+			}
+			maps.Copy(c.valueOverrides[bundler], paths)
+		}
+	}
+}
+
+// WithSystemNodeSelector sets the node selector for system components.
+func WithSystemNodeSelector(selector map[string]string) Option {
+	return func(c *Config) {
+		if selector == nil {
+			return
+		}
+		c.systemNodeSelector = make(map[string]string, len(selector))
+		maps.Copy(c.systemNodeSelector, selector)
+	}
+}
+
+// WithSystemNodeTolerations sets the tolerations for system components.
+func WithSystemNodeTolerations(tolerations []corev1.Toleration) Option {
+	return func(c *Config) {
+		if tolerations == nil {
+			return
+		}
+		c.systemNodeTolerations = make([]corev1.Toleration, len(tolerations))
+		copy(c.systemNodeTolerations, tolerations)
+	}
+}
+
+// WithAcceleratedNodeSelector sets the node selector for accelerated/GPU nodes.
+func WithAcceleratedNodeSelector(selector map[string]string) Option {
+	return func(c *Config) {
+		if selector == nil {
+			return
+		}
+		c.acceleratedNodeSelector = make(map[string]string, len(selector))
+		maps.Copy(c.acceleratedNodeSelector, selector)
+	}
+}
+
+// WithAcceleratedNodeTolerations sets the tolerations for accelerated/GPU nodes.
+func WithAcceleratedNodeTolerations(tolerations []corev1.Toleration) Option {
+	return func(c *Config) {
+		if tolerations == nil {
+			return
+		}
+		c.acceleratedNodeTolerations = make([]corev1.Toleration, len(tolerations))
+		copy(c.acceleratedNodeTolerations, tolerations)
+	}
+}
+
+// WithDeployer sets the deployment method.
+func WithDeployer(deployer DeployerType) Option {
+	return func(c *Config) {
+		c.deployer = deployer
+	}
+}
+
+// WithRepoURL sets the Git repository URL for Argo CD applications.
+func WithRepoURL(repoURL string) Option {
+	return func(c *Config) {
+		c.repoURL = repoURL
+	}
+}
+
+// WithTargetRevision sets the target revision for the Argo CD repo.
+func WithTargetRevision(targetRevision string) Option {
+	return func(c *Config) {
+		c.targetRevision = targetRevision
+	}
+}
+
+// WithWorkloadGateTaint sets the taint for nodewright-operator runtime required feature.
+func WithWorkloadGateTaint(taint *corev1.Taint) Option {
+	return func(c *Config) {
+		if taint == nil {
+			return
+		}
+		// Create a copy to prevent external modifications
+		taintCopy := *taint
+		c.workloadGateTaint = &taintCopy
+	}
+}
+
+// WithWorkloadSelector sets the label selector for nodewright-customizations to prevent eviction of running training jobs.
+func WithWorkloadSelector(selector map[string]string) Option {
+	return func(c *Config) {
+		if selector == nil {
+			return
+		}
+		c.workloadSelector = make(map[string]string, len(selector))
+		maps.Copy(c.workloadSelector, selector)
+	}
+}
+
+// WithAttest enables bundle attestation and binary verification.
+func WithAttest(attest bool) Option {
+	return func(c *Config) {
+		c.attest = attest
+	}
+}
+
+// WithDeterministic enables deterministic mode for generated artifacts.
+// When enabled, attestation invocation IDs are derived (UUIDv5) and
+// wall-clock timestamps are omitted, so two runs against identical
+// inputs produce byte-identical output.
+func WithDeterministic(deterministic bool) Option {
+	return func(c *Config) {
+		c.deterministic = deterministic
+	}
+}
+
+// WithCertificateIdentityRegexp overrides the default identity pinning pattern
+// for binary attestation verification during bundle creation. The pattern must
+// contain "github.com/NVIDIA/aicr/". This is intended for testing with binaries
+// attested by non-release workflows (e.g., build-attested.yaml).
+func WithCertificateIdentityRegexp(pattern string) Option {
+	return func(c *Config) {
+		c.certificateIdentityRegexp = pattern
+	}
+}
+
+// WithEstimatedNodeCount sets the estimated number of GPU nodes. 0 means unset. Negative values are clamped to 0 for defense-in-depth.
+func WithEstimatedNodeCount(n int) Option {
+	return func(c *Config) {
+		if n < 0 {
+			n = 0
+		}
+		c.estimatedNodeCount = n
+	}
+}
+
+// WithDynamicValues sets the dynamic value declarations for the bundler.
+// Dynamic values are paths that should be provided at install time rather than bundle time.
+func WithDynamicValues(dynamicValues map[string][]string) Option {
+	return func(c *Config) {
+		if dynamicValues == nil {
+			return
+		}
+		for component, paths := range dynamicValues {
+			c.dynamicValues[component] = append(c.dynamicValues[component], paths...)
+		}
+	}
+}
+
+// WithStorageClass sets the Kubernetes StorageClass name to inject into components at bundle time.
+// When non-empty, it is written to all registry-declared storageClassPaths for each component.
+func WithStorageClass(storageClass string) Option {
+	return func(c *Config) {
+		c.storageClass = storageClass
+	}
+}
+
+// WithSharedStorageClass sets the Kubernetes StorageClass name to inject into
+// registry-declared sharedStorageClassPaths at bundle time.
+func WithSharedStorageClass(storageClass string) Option {
+	return func(c *Config) {
+		c.sharedStorageClass = storageClass
+	}
+}
+
+// WithDRAEvictionNodeLabel sets the node label used to coordinate DRA
+// kubelet-plugin eviction with GPU Operator driver upgrades.
+func WithDRAEvictionNodeLabel(label NodeLabel) Option {
+	return func(c *Config) {
+		if label == (NodeLabel{}) {
+			return
+		}
+		c.draEvictionNodeLabel = label
+	}
+}
+
+// WithVendorCharts enables bundle-time vendoring of upstream Helm chart
+// bytes. When set, every Helm component becomes a local chart inside the
+// generated bundle and the resulting artifact is fully air-gap
+// deployable. Trades the CVE-yank fail-loud signal of registry-referencing
+// bundles for offline deployability; vendored bundles silently install a
+// frozen chart version even after upstream yank.
+func WithVendorCharts(enabled bool) Option {
+	return func(c *Config) {
+		c.vendorCharts = enabled
+	}
+}
+
+// WithOCISourceName sets the outer OCIRepository name for Flux
+// ArtifactGenerator mode. When non-empty, local-chart HelmReleases
+// use ArtifactGenerator + ExternalArtifact instead of GitRepository.
+func WithOCISourceName(name string) Option {
+	return func(c *Config) {
+		c.ociSourceName = name
+	}
+}
+
+// FluxNamespace returns the Kubernetes namespace where Flux CRs are deployed.
+// Returns DefaultFluxNamespace when not explicitly set.
+func (c *Config) FluxNamespace() string {
+	if c.fluxNamespace == "" {
+		return DefaultFluxNamespace
+	}
+	return c.fluxNamespace
+}
+
+// WithFluxNamespace sets the namespace for generated Flux CRs. Must match
+// the namespace of the Flux installation in the target cluster.
+func WithFluxNamespace(ns string) Option {
+	return func(c *Config) {
+		c.fluxNamespace = ns
+	}
+}
+
+// FleetNamespace returns the Fleet workspace the generated GitRepo or HelmOps
+// are applied to.
+// Returns DefaultFleetNamespace when not explicitly set.
+func (c *Config) FleetNamespace() string {
+	if c.fleetNamespace == "" {
+		return DefaultFleetNamespace
+	}
+	return c.fleetNamespace
+}
+
+// WithFleetNamespace sets the Fleet workspace for the generated GitRepo or
+// HelmOps.
+func WithFleetNamespace(ns string) Option {
+	return func(c *Config) {
+		c.fleetNamespace = ns
+	}
+}
+
+// FleetMode returns the Fleet deployer output shape; empty means the default.
+func (c *Config) FleetMode() string {
+	return c.fleetMode
+}
+
+// WithFleetMode sets the Fleet deployer output shape ("gitrepo" or "helmop").
+func WithFleetMode(mode string) Option {
+	return func(c *Config) {
+		c.fleetMode = mode
+	}
+}
+
+// WithBundleChartName sets the Helm chart name written into the argocd-helm
+// bundle's Chart.yaml (and used as `source.chart` in the generated parent
+// Argo Application). Empty leaves the deployer's default in place. The CLI
+// derives this from the OCI `--output` reference's last path segment so
+// the parent App's `repoURL/chart:targetRevision` triple resolves against
+// the actual published artifact. See #1019.
+func WithBundleChartName(name string) Option {
+	return func(c *Config) {
+		c.bundleChartName = name
+	}
+}
+
+// WithBundleChartVersion sets the semantic Helm version written into the
+// argocd-helm bundle's Chart.yaml. It does not accept or normalize a raw OCI
+// Distribution tag; callers must pass the already-decoded SemVer form.
+func WithBundleChartVersion(version string) Option {
+	return func(c *Config) {
+		c.bundleChartVersion = version
+	}
+}
+
+// WithOCIParentNamespace sets the OCI parent namespace (registry + repo path
+// without the chart segment) baked into the argocd-helm bundle's values.yaml
+// as the default repoURL. Empty keeps repoURL as "" (local output). See #1342.
+func WithOCIParentNamespace(ns string) Option {
+	return func(c *Config) {
+		c.ociParentNamespace = ns
+	}
+}
+
+// WithAppName sets the parent Argo Application's `metadata.name` for the
+// argocd-helm and argocd deployers, and the GitRepo name and bundle/HelmOp
+// name prefix for fleet (a DNS-1123 label; see ValidateFleetName). Empty
+// leaves the deployer's default in place. Required by operators deploying multiple non-overlapping
+// AICR bundles to the same Argo CD namespace; without distinct names the
+// parent Applications silently overwrite each other and orphan the
+// previous bundle's children. See #1011.
+func WithAppName(name string) Option {
+	return func(c *Config) {
+		c.appName = name
+	}
+}
+
+// WithArgoCDSettings sets the dedicated Argo CD bundle settings for the
+// argocd and argocd-helm deployers. Bundling with any other deployer rejects
+// a non-zero value. Validation runs at bundle time, together with any
+// deprecated deployer:<key> value overrides.
+func WithArgoCDSettings(s ArgoCDSettings) Option {
+	return func(c *Config) {
+		c.argoCD = s.Clone()
+	}
+}
+
+// WithReadinessHooks enables emission of per-component readiness gate charts
+// for components that ship a recipes/components/<name>/readiness.yaml. Off by
+// default; when enabled, each such component gets a standalone
+// NNN-<name>-readiness/ chart that runs the gate CLI as a post-component Job.
+// See #904.
+func WithReadinessHooks(enabled bool) Option {
+	return func(c *Config) {
+		c.readinessHooks = enabled
+	}
+}
+
+// WithSerial forces deployers to sequence components strictly one at a time in
+// deployment order, disabling the per-tier / declared-dependency concurrency
+// the argocd, argocd-helm, flux, helmfile, and terraform deployers emit by
+// default. Off
+// by default; opt-in via --serial. A rollback / debugging escape hatch.
+func WithSerial(enabled bool) Option {
+	return func(c *Config) {
+		c.serial = enabled
+	}
+}
+
+// WithTerraformClusterRollover enables the cluster-rollover containment shim
+// in a --deployer terraform bundle. Off by default; opt-in via
+// --terraform-cluster-rollover.
+func WithTerraformClusterRollover(enabled bool) Option {
+	return func(c *Config) {
+		c.terraformClusterRollover = enabled
+	}
+}
+
+// WithTerraformChildModule emits a --deployer terraform bundle as a child
+// module instead of a root module. Off by default; opt-in via
+// --terraform-child-module.
+func WithTerraformChildModule(enabled bool) Option {
+	return func(c *Config) {
+		c.terraformChildModule = enabled
+	}
+}
+
+// WithBundlers sets the positive component-name filter: only recipe
+// components named here are bundled; every other enabled component is
+// skipped exactly like a disabled one, so its dependency edges are pruned
+// as satisfied externally. Empty (or nil) means all enabled components.
+// Names that the recipe does not declare, or that are disabled by the
+// recipe or --set, are rejected with ErrCodeInvalidRequest at bundle time
+// rather than silently ignored. See #1531.
+func WithBundlers(names []string) Option {
+	return func(c *Config) {
+		if len(names) == 0 {
+			return
+		}
+		c.bundlers = make([]string, len(names))
+		copy(c.bundlers, names)
+	}
+}
+
+// WithSplit renders the bundle as a class-partitioned set (ADR-018): one
+// directory per class with enabled components, under a set root carrying
+// recipe.yaml, split.yaml, bundle-info.yaml, checksums.txt and, with
+// Attest, the attestation. Off by
+// default. Validate rejects it with any deployer other than helm, with
+// checksums disabled, or together with WithBundlers.
+func WithSplit(enabled bool) Option {
+	return func(c *Config) {
+		c.split = enabled
+	}
+}
+
+// NewConfig returns a Config with default values.
+func NewConfig(options ...Option) *Config {
+	c := &Config{
+		deployer:            DeployerHelm,
+		includeChecksums:    true,
+		includeReadme:       true,
+		valueOverrides:      make(map[string]map[string]string),
+		valueOverridesTyped: make(map[string]map[string]any),
+		dynamicValues:       make(map[string][]string),
+		verbose:             false,
+		version:             "dev",
+	}
+	for _, opt := range options {
+		opt(c)
+	}
+	return c
+}
+
+// ParseValueOverrides parses value override strings in format "bundler:path.to.field=value".
+// Returns a slice of ComponentPath where every entry has Value != nil.
+// This function is used by both CLI and API handlers to parse --set flags and query parameters.
+// Pass the result to WithComponentPaths to apply the overrides to a Config.
+func ParseValueOverrides(overrides []string) ([]ComponentPath, error) {
+	result := make([]ComponentPath, 0, len(overrides))
+	for _, override := range overrides {
+		var cp ComponentPath
+		if err := cp.Parse(override); err != nil {
+			return nil, err
+		}
+		if cp.Value == nil {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("invalid format %q: --set requires 'bundler:path=value'", override))
+		}
+		result = append(result, cp)
+	}
+	return result, nil
+}
+
+// ParseDynamicValues parses dynamic value declarations in format "component:path.to.field".
+// Returns a slice of ComponentPath where every entry has Value == nil.
+// This function is used by both CLI and API handlers to parse --dynamic flags.
+// Pass the result to WithComponentPaths to apply the declarations to a Config.
+func ParseDynamicValues(inputs []string) ([]ComponentPath, error) {
+	result := make([]ComponentPath, 0, len(inputs))
+	for _, input := range inputs {
+		var cp ComponentPath
+		if err := cp.Parse(input); err != nil {
+			return nil, err
+		}
+		if cp.Value != nil {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("invalid format %q: dynamic declaration does not accept '=value'", input))
+		}
+		result = append(result, cp)
+	}
+	return result, nil
+}

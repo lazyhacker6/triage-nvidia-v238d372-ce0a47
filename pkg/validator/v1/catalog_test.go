@@ -1,0 +1,376 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package v1
+
+import (
+	"testing"
+)
+
+func TestFilterEntriesByValidation_NilValidation(t *testing.T) {
+	entries := []ValidatorEntry{
+		{Name: "v1", Phase: "deployment"},
+		{Name: "v2", Phase: "deployment"},
+	}
+	got := FilterEntriesByValidation(entries, PhaseDeployment, nil)
+	if len(got) != 0 {
+		t.Errorf("FilterEntriesByValidation(nil validation) returned %d entries, want 0", len(got))
+	}
+}
+
+func TestFilterEntriesByValidation_NilPhaseConfig(t *testing.T) {
+	entries := []ValidatorEntry{
+		{Name: "v1", Phase: "deployment"},
+	}
+	validationInput := &ValidationInput{
+		Config: ValidationConfig{
+			Deployment: nil, // No deployment config
+		},
+	}
+	got := FilterEntriesByValidation(entries, PhaseDeployment, validationInput)
+	if len(got) != 0 {
+		t.Errorf("FilterEntriesByValidation(nil phase config) returned %d entries, want 0", len(got))
+	}
+}
+
+func TestFilterEntriesByValidation_EmptyChecks(t *testing.T) {
+	entries := []ValidatorEntry{
+		{Name: "v1", Phase: "deployment"},
+	}
+	validationInput := &ValidationInput{
+		Config: ValidationConfig{
+			Deployment: &ValidationPhase{
+				Checks: []string{}, // Empty checks list
+			},
+		},
+	}
+	got := FilterEntriesByValidation(entries, PhaseDeployment, validationInput)
+	if len(got) != 0 {
+		t.Errorf("FilterEntriesByValidation(empty checks) returned %d entries, want 0", len(got))
+	}
+}
+
+func TestFilterEntriesByValidation_SingleCheck(t *testing.T) {
+	entries := []ValidatorEntry{
+		{Name: "operator-health", Phase: "deployment"},
+		{Name: "expected-resources", Phase: "deployment"},
+		{Name: "gpu-operator-version", Phase: "deployment"},
+	}
+	validationInput := &ValidationInput{
+		Config: ValidationConfig{
+			Deployment: &ValidationPhase{
+				Checks: []string{"operator-health"},
+			},
+		},
+	}
+	got := FilterEntriesByValidation(entries, PhaseDeployment, validationInput)
+	if len(got) != 1 {
+		t.Errorf("FilterEntriesByValidation() returned %d entries, want 1", len(got))
+	}
+	if len(got) > 0 && got[0].Name != "operator-health" {
+		t.Errorf("FilterEntriesByValidation() returned %q, want %q", got[0].Name, "operator-health")
+	}
+}
+
+func TestFilterEntriesByValidation_MultipleChecks(t *testing.T) {
+	entries := []ValidatorEntry{
+		{Name: "operator-health", Phase: "deployment"},
+		{Name: "expected-resources", Phase: "deployment"},
+		{Name: "gpu-operator-version", Phase: "deployment"},
+		{Name: "check-nvidia-smi", Phase: "deployment"},
+	}
+	validationInput := &ValidationInput{
+		Config: ValidationConfig{
+			Deployment: &ValidationPhase{
+				Checks: []string{"operator-health", "expected-resources"},
+			},
+		},
+	}
+	got := FilterEntriesByValidation(entries, PhaseDeployment, validationInput)
+	if len(got) != 2 {
+		t.Errorf("FilterEntriesByValidation() returned %d entries, want 2", len(got))
+	}
+	names := make(map[string]bool)
+	for _, entry := range got {
+		names[entry.Name] = true
+	}
+	if !names["operator-health"] || !names["expected-resources"] {
+		t.Errorf("FilterEntriesByValidation() missing expected entries")
+	}
+}
+
+func TestFilterEntriesByValidation_AllPhases(t *testing.T) {
+	tests := []struct {
+		name            string
+		phase           Phase
+		entries         []ValidatorEntry
+		validationInput *ValidationInput
+		expected        int
+		names           []string
+	}{
+		{
+			name:  "deployment phase filters correctly",
+			phase: PhaseDeployment,
+			entries: []ValidatorEntry{
+				{Name: "operator-health", Phase: "deployment"},
+				{Name: "expected-resources", Phase: "deployment"},
+			},
+			validationInput: &ValidationInput{
+				Config: ValidationConfig{
+					Deployment: &ValidationPhase{
+						Checks: []string{"operator-health"},
+					},
+				},
+			},
+			expected: 1,
+			names:    []string{"operator-health"},
+		},
+		{
+			name:  "performance phase filters correctly",
+			phase: PhasePerformance,
+			entries: []ValidatorEntry{
+				{Name: "nccl-all-reduce-bw", Phase: "performance"},
+				{Name: "inference-perf", Phase: "performance"},
+			},
+			validationInput: &ValidationInput{
+				Config: ValidationConfig{
+					Performance: &ValidationPhase{
+						Checks: []string{"nccl-all-reduce-bw"},
+					},
+				},
+			},
+			expected: 1,
+			names:    []string{"nccl-all-reduce-bw"},
+		},
+		{
+			name:  "conformance phase filters correctly",
+			phase: PhaseConformance,
+			entries: []ValidatorEntry{
+				{Name: "dra-support", Phase: "conformance"},
+				{Name: "gang-scheduling", Phase: "conformance"},
+			},
+			validationInput: &ValidationInput{
+				Config: ValidationConfig{
+					Conformance: &ValidationPhase{
+						Checks: []string{"dra-support"},
+					},
+				},
+			},
+			expected: 1,
+			names:    []string{"dra-support"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FilterEntriesByValidation(tt.entries, tt.phase, tt.validationInput)
+			if len(got) != tt.expected {
+				t.Errorf("FilterEntriesByValidation() returned %d entries, want %d", len(got), tt.expected)
+			}
+			if tt.names != nil {
+				for i, name := range tt.names {
+					if i >= len(got) {
+						t.Errorf("FilterEntriesByValidation() missing entry[%d], want %q (got only %d entries)", i, name, len(got))
+					} else if got[i].Name != name {
+						t.Errorf("FilterEntriesByValidation() entry[%d] = %q, want %q", i, got[i].Name, name)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestFilterEntriesByValidation_NonExistentCheck(t *testing.T) {
+	entries := []ValidatorEntry{
+		{Name: "operator-health", Phase: "deployment"},
+		{Name: "expected-resources", Phase: "deployment"},
+	}
+	validationInput := &ValidationInput{
+		Config: ValidationConfig{
+			Deployment: &ValidationPhase{
+				Checks: []string{"non-existent-check"},
+			},
+		},
+	}
+	got := FilterEntriesByValidation(entries, PhaseDeployment, validationInput)
+	if len(got) != 0 {
+		t.Errorf("FilterEntriesByValidation(non-existent check) returned %d entries, want 0", len(got))
+	}
+}
+
+func TestUnmatchedChecks(t *testing.T) {
+	catalog := &ValidatorCatalog{
+		Validators: []ValidatorEntry{
+			{Name: "operator-health", Phase: "deployment"},
+			{Name: "expected-resources", Phase: "deployment"},
+			{Name: "nccl-all-reduce-bw", Phase: "performance"},
+		},
+	}
+
+	tests := []struct {
+		name           string
+		phase          Phase
+		checks         []string
+		wantNames      []string
+		wantOtherPhase map[string]Phase
+	}{
+		{
+			name:      "all matched",
+			phase:     PhaseDeployment,
+			checks:    []string{"operator-health", "expected-resources"},
+			wantNames: nil,
+		},
+		{
+			name:      "typo unmatched anywhere",
+			phase:     PhaseDeployment,
+			checks:    []string{"operator-health", "expected-resource"},
+			wantNames: []string{"expected-resource"},
+			wantOtherPhase: map[string]Phase{
+				"expected-resource": "",
+			},
+		},
+		{
+			name:      "declared under wrong phase",
+			phase:     PhaseDeployment,
+			checks:    []string{"nccl-all-reduce-bw"},
+			wantNames: []string{"nccl-all-reduce-bw"},
+			wantOtherPhase: map[string]Phase{
+				"nccl-all-reduce-bw": PhasePerformance,
+			},
+		},
+		{
+			name:      "duplicate unmatched deduped",
+			phase:     PhaseDeployment,
+			checks:    []string{"bogus", "bogus"},
+			wantNames: []string{"bogus"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vi := &ValidationInput{
+				Config: ValidationConfig{
+					Deployment: &ValidationPhase{Checks: nil},
+				},
+			}
+			switch tt.phase {
+			case PhaseDeployment:
+				vi.Config.Deployment = &ValidationPhase{Checks: tt.checks}
+			case PhasePerformance:
+				vi.Config.Performance = &ValidationPhase{Checks: tt.checks}
+			case PhaseConformance:
+				vi.Config.Conformance = &ValidationPhase{Checks: tt.checks}
+			}
+
+			got := catalog.UnmatchedChecks(tt.phase, vi)
+			if len(got) != len(tt.wantNames) {
+				t.Fatalf("UnmatchedChecks() returned %d entries (%v), want %d (%v)",
+					len(got), got, len(tt.wantNames), tt.wantNames)
+			}
+			for i, u := range got {
+				if u.Name != tt.wantNames[i] {
+					t.Errorf("UnmatchedChecks()[%d].Name = %q, want %q", i, u.Name, tt.wantNames[i])
+				}
+				if u.Phase != tt.phase {
+					t.Errorf("UnmatchedChecks()[%d].Phase = %q, want %q", i, u.Phase, tt.phase)
+				}
+				if want, ok := tt.wantOtherPhase[u.Name]; ok && u.OtherPhase != want {
+					t.Errorf("UnmatchedChecks()[%d].OtherPhase = %q, want %q", i, u.OtherPhase, want)
+				}
+			}
+		})
+	}
+}
+
+func TestDuplicateChecks(t *testing.T) {
+	tests := []struct {
+		name   string
+		phase  Phase
+		checks []string
+		want   []string
+	}{
+		{
+			name:   "no duplicates",
+			phase:  PhaseDeployment,
+			checks: []string{"operator-health", "expected-resources"},
+			want:   nil,
+		},
+		{
+			name:   "single duplicate reported once",
+			phase:  PhaseDeployment,
+			checks: []string{"operator-health", "operator-health"},
+			want:   []string{"operator-health"},
+		},
+		{
+			name:   "triple occurrence reported once",
+			phase:  PhasePerformance,
+			checks: []string{"nccl", "nccl", "nccl"},
+			want:   []string{"nccl"},
+		},
+		{
+			name:   "multiple distinct duplicates in declaration order",
+			phase:  PhaseConformance,
+			checks: []string{"a", "b", "a", "c", "b"},
+			want:   []string{"a", "b"},
+		},
+		{
+			name:   "empty checks",
+			phase:  PhaseDeployment,
+			checks: nil,
+			want:   nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vi := &ValidationInput{}
+			switch tt.phase {
+			case PhaseDeployment:
+				vi.Config.Deployment = &ValidationPhase{Checks: tt.checks}
+			case PhasePerformance:
+				vi.Config.Performance = &ValidationPhase{Checks: tt.checks}
+			case PhaseConformance:
+				vi.Config.Conformance = &ValidationPhase{Checks: tt.checks}
+			}
+
+			got := DuplicateChecks(tt.phase, vi)
+			if len(got) != len(tt.want) {
+				t.Fatalf("DuplicateChecks() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("DuplicateChecks()[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestDuplicateChecks_NilValidationInput(t *testing.T) {
+	if got := DuplicateChecks(PhaseDeployment, nil); got != nil {
+		t.Errorf("DuplicateChecks(nil) = %v, want nil", got)
+	}
+}
+
+func TestUnmatchedChecks_NilReceiverAndNoChecks(t *testing.T) {
+	var nilCat *ValidatorCatalog
+	if got := nilCat.UnmatchedChecks(PhaseDeployment, &ValidationInput{}); got != nil {
+		t.Errorf("UnmatchedChecks(nil receiver) = %v, want nil", got)
+	}
+
+	cat := &ValidatorCatalog{Validators: []ValidatorEntry{{Name: "v1", Phase: "deployment"}}}
+	if got := cat.UnmatchedChecks(PhaseDeployment, nil); got != nil {
+		t.Errorf("UnmatchedChecks(nil validationInput) = %v, want nil", got)
+	}
+}

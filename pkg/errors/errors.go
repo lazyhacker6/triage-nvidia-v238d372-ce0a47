@@ -1,0 +1,196 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package errors
+
+import (
+	"context"
+	stderrors "errors"
+	"fmt"
+)
+
+// ErrorCode represents a structured error classification.
+type ErrorCode string
+
+const (
+	// ErrCodeNotFound indicates a requested resource was not found.
+	ErrCodeNotFound ErrorCode = "NOT_FOUND"
+	// ErrCodeUnauthorized indicates authentication or authorization failure.
+	ErrCodeUnauthorized ErrorCode = "UNAUTHORIZED"
+	// ErrCodeTimeout indicates an operation exceeded its time limit.
+	ErrCodeTimeout ErrorCode = "TIMEOUT"
+	// ErrCodeInternal indicates an internal system error.
+	ErrCodeInternal ErrorCode = "INTERNAL"
+	// ErrCodeInvalidRequest indicates malformed or invalid input.
+	ErrCodeInvalidRequest ErrorCode = "INVALID_REQUEST"
+	// ErrCodeRateLimitExceeded indicates the client exceeded an enforced request limit.
+	ErrCodeRateLimitExceeded ErrorCode = "RATE_LIMIT_EXCEEDED"
+	// ErrCodeMethodNotAllowed indicates the HTTP method is not allowed for the resource.
+	ErrCodeMethodNotAllowed ErrorCode = "METHOD_NOT_ALLOWED"
+	// ErrCodeUnavailable indicates a service or resource is temporarily unavailable.
+	//
+	// Note: this value is aligned with the public API error contract.
+	ErrCodeUnavailable ErrorCode = "SERVICE_UNAVAILABLE"
+	// ErrCodeConflict indicates a resource state conflict (e.g., already exists,
+	// version mismatch). Distinct from ErrCodeInvalidRequest because the request
+	// itself is well-formed; the conflict is with current resource state.
+	ErrCodeConflict ErrorCode = "CONFLICT"
+	// ErrCodeCanceled indicates the operator deliberately aborted the operation
+	// (SIGINT/SIGTERM propagated through the command context). Distinct from
+	// ErrCodeTimeout because a timeout is an environmental fault worth retrying
+	// and a cancellation is an instruction to stop: IsTransient reports false
+	// for this code, so a Ctrl-C never re-enters a retry loop or gets reported
+	// as a transient infrastructure failure.
+	ErrCodeCanceled ErrorCode = "CANCELED"
+)
+
+// StructuredError provides structured error information for better observability.
+// It includes an error code for programmatic handling, a human-readable message,
+// the underlying cause, and optional context for debugging.
+type StructuredError struct {
+	Code    ErrorCode
+	Message string
+	Cause   error
+	Context map[string]any
+}
+
+// Error implements the error interface.
+func (e *StructuredError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("[%s] %s: %v", e.Code, e.Message, e.Cause)
+	}
+	return fmt.Sprintf("[%s] %s", e.Code, e.Message)
+}
+
+// Unwrap returns the underlying cause for errors.Is and errors.As support.
+func (e *StructuredError) Unwrap() error {
+	return e.Cause
+}
+
+// Is reports whether target is a *StructuredError with the same Code, enabling
+// idiomatic code-based matching via errors.Is. The Message and Cause are not
+// compared; callers wanting cause-chain matching should rely on Unwrap.
+//
+// A zero-value Code is treated as non-matching — two errors constructed
+// without going through New/Wrap (e.g., literal &StructuredError{}) must not
+// match each other on an empty sentinel, which would otherwise produce
+// surprising false positives in errors.Is chains.
+func (e *StructuredError) Is(target error) bool {
+	t, ok := target.(*StructuredError)
+	if !ok {
+		return false
+	}
+	if e.Code == "" || t.Code == "" {
+		return false
+	}
+	return e.Code == t.Code
+}
+
+// New creates a new StructuredError with the given code and message.
+func New(code ErrorCode, message string) *StructuredError {
+	return &StructuredError{
+		Code:    code,
+		Message: message,
+	}
+}
+
+// NewWithContext creates a new StructuredError with context information.
+func NewWithContext(code ErrorCode, message string, context map[string]any) *StructuredError {
+	return &StructuredError{
+		Code:    code,
+		Message: message,
+		Context: context,
+	}
+}
+
+// Wrap wraps an existing error with additional context.
+func Wrap(code ErrorCode, message string, cause error) *StructuredError {
+	return &StructuredError{
+		Code:    code,
+		Message: message,
+		Cause:   cause,
+	}
+}
+
+// WrapWithContext wraps an error with additional context information.
+func WrapWithContext(code ErrorCode, message string, cause error, context map[string]any) *StructuredError {
+	return &StructuredError{
+		Code:    code,
+		Message: message,
+		Cause:   cause,
+		Context: context,
+	}
+}
+
+// IsTransient reports whether err represents a transient (retryable) failure:
+// a context cancellation/deadline, or a StructuredError carrying
+// ErrCodeTimeout anywhere in its Unwrap chain. Deterministic codes
+// (Internal, InvalidRequest, NotFound, ...) are NOT transient — callers that
+// bucket errors as retryable-vs-fail should treat anything this returns false
+// for as deterministic and fail closed. Returns false for nil.
+func IsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	// An explicit operator abort outranks anything else in the chain: a
+	// canceled command must never re-enter a retry loop, even when the
+	// underlying context.Canceled is still visible below it.
+	if stderrors.Is(err, New(ErrCodeCanceled, "")) {
+		return false
+	}
+	return stderrors.Is(err, context.DeadlineExceeded) ||
+		stderrors.Is(err, context.Canceled) ||
+		stderrors.Is(err, New(ErrCodeTimeout, ""))
+}
+
+// PropagateOrWrap returns err as-is when it already carries a *StructuredError
+// in its Unwrap chain (preserving the inner Code), otherwise wraps it with the
+// supplied fallback code and message. Use this when the called function may
+// return a coded error you want to preserve, but its non-coded errors still
+// need classification at this layer.
+func PropagateOrWrap(err error, fallbackCode ErrorCode, message string) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := stderrors.AsType[*StructuredError](err); ok {
+		return err
+	}
+	return Wrap(fallbackCode, message, err)
+}
+
+// WrapCtxErr wraps a dead context's error (typically ctx.Err()) as a
+// StructuredError, distinguishing operator cancellation from deadline
+// expiration: cause chaining context.Canceled maps to ErrCodeCanceled (the
+// caller asked to stop, not a fault worth retrying); anything else — a bare
+// context.DeadlineExceeded, or a cause chaining it — falls back to
+// fallbackCode, which callers pass as ErrCodeTimeout at nearly every call
+// site. Cancellation outranks the fallback even when cause also chains a
+// DeadlineExceeded, mirroring IsTransient's precedence. cause is preserved as
+// the returned error's Unwrap chain, so stderrors.Is(err, context.Canceled)
+// and stderrors.Is(err, context.DeadlineExceeded) keep working upstream.
+// Callers should have already confirmed cause != nil.
+func WrapCtxErr(cause error, fallbackCode ErrorCode, message string) *StructuredError {
+	if stderrors.Is(cause, context.Canceled) {
+		return Wrap(ErrCodeCanceled, message, cause)
+	}
+	return Wrap(fallbackCode, message, cause)
+}
+
+// WrapCtxErrWithContext is WrapCtxErr with an attached debugging context map,
+// mirroring the New/NewWithContext and Wrap/WrapWithContext pairing.
+func WrapCtxErrWithContext(cause error, fallbackCode ErrorCode, message string, context map[string]any) *StructuredError {
+	err := WrapCtxErr(cause, fallbackCode, message)
+	err.Context = context
+	return err
+}

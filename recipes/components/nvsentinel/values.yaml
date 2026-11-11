@@ -1,0 +1,129 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# NVSentinel Helm values
+# Base configuration for all deployments
+
+# Override release name prefix to avoid aicr-stack- prefix in resource names
+fullnameOverride: nvsentinel
+
+global:
+  # Tolerate all taints so GPU-node daemonsets (platform-connectors,
+  # gpu-health-monitor, syslog-health-monitor, metadata-collector) can
+  # schedule on nodes with NoSchedule/NoExecute taints set by ASG.
+  # Matches internal platform template behavior.
+  # TODO: remove once upstream NVSentinel chart defaults to this
+  # (see https://github.com/NVIDIA/NVSentinel/pull/1004)
+  tolerations:
+    - operator: Exists
+
+  # The chart default is docker.io/bitnamilegacy/os-shell:12-debian-12-r30,
+  # which no bump can fix: bitnamilegacy is Bitnami's frozen archive, and
+  # every nvsentinel release through v1.28.0 pins that same tag. It carries
+  # 13 critical / 109 high fixable findings and will never receive a patch.
+  #
+  # Nothing about the image is load-bearing. It runs one command --
+  # `chown`/`chmod` on a mounted path -- under runAsUser 0 with every
+  # capability dropped but CHOWN, readOnlyRootFilesystem and seccomp
+  # RuntimeDefault. Upstream's own chart unit test substitutes busybox for
+  # it (charts/nic-health-monitor/tests/pc_auth_strictness_test.yaml), so
+  # the image is interchangeable by upstream's own reckoning.
+  #
+  # The digest is the one AICR already ships in the network-operator and
+  # gpu-operator manifests, so the repo carries a single busybox identity to
+  # bump. Tag-plus-digest is the same form those manifests use; the digest
+  # is what resolves, the tag is there to read.
+  #
+  # Reaches two init containers, both mixin-gated: fix-state-permissions in
+  # the nic-health-monitor DaemonSet (nvsentinel-nic-health-monitor mixin,
+  # composed by the aks and oke-ol overlays) and fix-audit-log-permissions
+  # in platform-connectors / labeler (nvsentinel-observability mixin).
+  initContainerImage:
+    repository: docker.io/library/busybox
+    tag: "1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4"
+
+networkPolicy:
+  enabled: false
+
+platformConnector:
+
+  resources:
+    limits:
+      cpu: 200m
+      memory: 512Mi
+    requests:
+      cpu: 200m
+      memory: 512Mi
+
+  updateStrategy: RollingUpdate
+  maxUnavailable: 1
+
+# Use the generic (privileged-Job) reboot provider so users don't need
+# cloud IAM permissions. When janitor is enabled, janitor-provider spawns a
+# privileged Job that runs `chroot /host reboot` on the target node
+# (NVSentinel design 028).
+janitor-provider:
+  csp:
+    provider: generic
+
+# Layer 3 of NIC fault detection: mlx5_core driver faults from the
+# kernel log. Unconditional -- the DaemonSet already runs everywhere and
+# these patterns only match nodes with a Mellanox driver loaded.
+syslog-health-monitor:
+  # Replaces the chart default wholesale (Helm does not merge lists). The
+  # three GPU checks are carried forward; SysLogsNICDriverError is the
+  # addition.
+  enabledChecks:
+    - SysLogsXIDError
+    - SysLogsSXIDError
+    - SysLogsGPUFallenOff
+    - SysLogsNICDriverError
+  # All 11 chart-supported patterns, each STORE_ONLY so they override the
+  # chart-wide processingStrategy: EXECUTE_REMEDIATION without touching the
+  # XID/SXID/GPUFallenOff checks that keep it.
+  nicDriverDetection:
+    patterns:
+      - name: cmd_exec_timeout
+        enabled: true
+        processingStrategy: STORE_ONLY
+      - name: health_poll_failed
+        enabled: true
+        processingStrategy: STORE_ONLY
+      - name: unrecoverable_err
+        enabled: true
+        processingStrategy: STORE_ONLY
+      - name: netdev_watchdog
+        enabled: true
+        processingStrategy: STORE_ONLY
+      - name: pci_power_insufficient
+        enabled: true
+        processingStrategy: STORE_ONLY
+      - name: port_module_high_temp
+        enabled: true
+        processingStrategy: STORE_ONLY
+      - name: access_reg_failed
+        enabled: true
+        processingStrategy: STORE_ONLY
+      - name: module_unplugged
+        enabled: true
+        processingStrategy: STORE_ONLY
+      - name: mlx5_tx_timeout_detected
+        enabled: true
+        processingStrategy: STORE_ONLY
+      - name: mlx5_rx_timeout_detected
+        enabled: true
+        processingStrategy: STORE_ONLY
+      - name: mlx5_napi_soft_lockup
+        enabled: true
+        processingStrategy: STORE_ONLY

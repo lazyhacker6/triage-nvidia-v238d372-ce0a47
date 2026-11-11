@@ -1,0 +1,300 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This workflow posts coverage comments on PRs after the main workflow completes.
+# Uses workflow_run with guarded checkout to avoid executing untrusted code.
+# See: https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
+
+name: Post PR Comment
+
+on:
+  workflow_run:
+    workflows: ["Merge Gate"]
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  # COUPLING: This workflow depends on "Merge Gate" producing these artifacts (via qualification.yaml):
+  #   - coverage-pr (coverage.out from PR build)
+  #   - coverage-comment-data (JSON: coverage, threshold, pass, color, pr_number)
+  #   - coverage-baseline (coverage.out from last successful main build)
+  # Renaming the workflow or these artifacts will silently break PR comments.
+
+  post-coverage-comment:
+    name: Post Coverage Comment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Run for PRs regardless of conclusion - coverage might exist even if other steps failed
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.head_repository.fork == false
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout for go.mod version
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          sparse-checkout: go.mod
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install go-coverage-report
+        run: go install github.com/fgrosse/go-coverage-report/cmd/go-coverage-report@v1.2.0
+
+      - name: Download PR Coverage
+        id: download-pr
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        continue-on-error: true
+        with:
+          name: coverage-pr
+          path: /tmp/pr-coverage
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Download Coverage Metadata
+        id: download-meta
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        continue-on-error: true
+        with:
+          name: coverage-comment-data
+          path: /tmp/coverage-comment-data
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Download Baseline Coverage
+        id: download-baseline
+        if: steps.download-pr.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mkdir -p /tmp/baseline-coverage
+
+          # Find last successful main run
+          LAST_RUN=$(gh run list \
+            --repo ${{ github.repository }} \
+            --workflow "On Push Qualification" \
+            --branch main \
+            --status success \
+            --event push \
+            --json databaseId \
+            --limit 1 \
+            -q '.[0].databaseId' 2>/dev/null || echo "")
+
+          if [[ -n "$LAST_RUN" ]]; then
+            echo "Found baseline run: $LAST_RUN"
+            if gh run download "$LAST_RUN" \
+              --repo ${{ github.repository }} \
+              --name coverage-baseline \
+              --dir /tmp/baseline-coverage 2>/dev/null; then
+              echo "baseline_found=true" >> "$GITHUB_OUTPUT"
+              echo "✅ Baseline coverage downloaded"
+            else
+              echo "baseline_found=false" >> "$GITHUB_OUTPUT"
+              echo "⚠️ Failed to download baseline (first run?)"
+              # Create empty baseline
+              echo "mode: set" > /tmp/baseline-coverage/coverage.out
+            fi
+          else
+            echo "baseline_found=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ No successful baseline run found"
+            echo "mode: set" > /tmp/baseline-coverage/coverage.out
+          fi
+
+      - name: Get Changed Files
+        id: changed-files
+        if: steps.download-pr.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .github/outputs
+
+          PR_URL="${{ github.event.workflow_run.pull_requests[0].url }}"
+          if [[ -z "$PR_URL" || "$PR_URL" == "null" ]]; then
+            echo "No PR URL found in workflow_run payload. Skipping changed files." >&2
+            echo "any_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          FILES_JSON=$(curl -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$PR_URL/files?per_page=300")
+
+          echo "$FILES_JSON" | jq -c '
+            [.[] |
+              select(.filename | endswith(".go")) |
+              select(.filename | test("^vendor/") | not) |
+              select(.filename | test("_test\\.go$") | not) |
+              .filename
+            ]' > .github/outputs/all_modified_files.json
+
+          if [[ "$(cat .github/outputs/all_modified_files.json)" == "[]" ]]; then
+            echo "any_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "any_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate Coverage Delta Report
+        id: delta
+        if: steps.download-pr.outcome == 'success' && steps.changed-files.outputs.any_changed == 'true' && steps.download-baseline.outputs.baseline_found == 'true'
+        run: |
+          set -e
+
+          # Generate delta report
+          if go-coverage-report \
+            -root=github.com/NVIDIA/aicr \
+            /tmp/baseline-coverage/coverage.out \
+            /tmp/pr-coverage/coverage.out \
+            .github/outputs/all_modified_files.json > delta-report.md 2> delta-error.log; then
+            echo "delta_generated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "delta_generated=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Delta generation failed:"
+            cat delta-error.log || true
+          fi
+
+          # Check if report shows no change (to reduce noise)
+          if grep -q "will \*\*not change\*\* overall coverage" delta-report.md 2>/dev/null; then
+            echo "no_change=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no_change=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post PR Comment
+        if: steps.download-pr.outcome == 'success' && steps.download-meta.outcome == 'success'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const data = JSON.parse(fs.readFileSync('/tmp/coverage-comment-data/coverage-data.json', 'utf8'));
+
+            const coverage = data.coverage;
+            const threshold = data.threshold;
+            const pass = data.pass === 'true';
+            const color = data.color;
+            const prNumber = parseInt(data.pr_number, 10);
+
+            const status = pass ? '✅' : '❌';
+            const statusText = pass ? 'Pass' : 'Fail';
+
+            // Check if we have a delta report
+            let deltaSection = '';
+            const deltaGenerated = '${{ steps.delta.outputs.delta_generated }}' === 'true';
+            const noChange = '${{ steps.delta.outputs.no_change }}' === 'true';
+            const anyChanged = '${{ steps.changed-files.outputs.any_changed }}' === 'true';
+            const baselineFound = '${{ steps.download-baseline.outputs.baseline_found }}' === 'true';
+
+            if (deltaGenerated && !noChange) {
+              try {
+                const deltaReport = fs.readFileSync('delta-report.md', 'utf8');
+                deltaSection = `\n\n${deltaReport}`;
+              } catch (e) {
+                console.log('No delta report found');
+              }
+            } else if (!anyChanged) {
+              deltaSection = '\n\n*No Go source files changed in this PR.*';
+            } else if (noChange) {
+              deltaSection = '\n\n*Coverage unchanged by this PR.*';
+            } else if (!baselineFound) {
+              deltaSection = '\n\n*No baseline coverage available yet. Delta reporting will be available after the next main branch build.*';
+            }
+
+            const body = `## Coverage Report ${status}
+
+            | Metric | Value |
+            |--------|-------|
+            | Coverage | **${coverage}%** |
+            | Threshold | ${threshold}% |
+            | Status | ${statusText} |
+
+            <details>
+            <summary>Coverage Badge</summary>
+
+            \`\`\`
+            ![Coverage](https://img.shields.io/badge/coverage-${coverage}%25-${color})
+            \`\`\`
+            </details>${deltaSection}`;
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('## Coverage Report')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+              console.log(`Updated existing comment ${botComment.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: body
+              });
+              console.log(`Created new comment on PR #${prNumber}`);
+            }
+
+      - name: Post unavailable notice
+        if: steps.download-pr.outcome != 'success' || steps.download-meta.outcome != 'success'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            // Get PR number from workflow_run payload
+            const prs = context.payload.workflow_run.pull_requests;
+            if (!prs || prs.length === 0) return;
+            const prNumber = prs[0].number;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('## Coverage Report')
+            );
+
+            // Only post if there's no existing coverage comment
+            if (!botComment) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: '## Coverage Report\n\nCoverage data unavailable for this run. This can happen if the qualification workflow was cancelled or failed before generating coverage artifacts.',
+              });
+            }

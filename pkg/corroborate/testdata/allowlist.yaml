@@ -1,0 +1,28 @@
+---
+# Test fixture mirroring the canonical recipes/evidence/allowlist.yaml schema
+# (GP1-owned, parsed by the shared pkg/evidence/allowlist loader).
+# First-party CI signers pin an anchored identityPattern (wildcard only in
+# the ref, right of the OIDC subject's '@'); community/partner entries are
+# keyed by the one-way source slug — first 32 hex of
+# sha256(issuer + "\n" + identity) — never a cleartext identity.
+schemaVersion: "1.0.0"
+
+firstParty:
+  - label: aicr-uat-aws
+    issuer: https://token.actions.githubusercontent.com
+    identityPattern: '^https://github\.com/NVIDIA/aicr/\.github/workflows/uat-aws\.yaml@refs/heads/.+$'
+  - label: aicr-uat-gcp
+    issuer: https://token.actions.githubusercontent.com
+    identityPattern: '^https://github\.com/NVIDIA/aicr/\.github/workflows/uat-gcp\.yaml@refs/heads/.+$'
+
+community:
+  # slug of https://github.com/acme-gpu/aicr-attest/.github/workflows/attest.yaml@refs/heads/main
+  - label: acme-gpu
+    issuer: https://token.actions.githubusercontent.com
+    source: f1f1cf33e7d868f95ea0f5b7542e6662
+
+partner:
+  # slug of https://oidc.coreweave-lab.example/attest
+  - label: coreweave-lab
+    issuer: https://oidc.coreweave-lab.example
+    source: dbdbbe0e022faf8e9820537fa63164eb

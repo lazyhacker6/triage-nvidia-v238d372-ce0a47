@@ -1,0 +1,340 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package logging
+
+import (
+	"bytes"
+	"log/slog"
+	"os"
+	"strings"
+	"testing"
+)
+
+func Test_newCLILogger(t *testing.T) {
+	tests := []struct {
+		name  string
+		level string
+	}{
+		{"debug level", "debug"},
+		{"info level", "info"},
+		{"warn level", "warn"},
+		{"error level", "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := newCLILogger(tt.level)
+			if logger == nil {
+				t.Fatal("newCLILogger returned nil")
+			}
+
+			// Verify logger is usable
+			logger.Info("test message")
+		})
+	}
+}
+
+func TestCLIHandler_InfoMessage(t *testing.T) {
+	var buf bytes.Buffer
+	handler := newCLIHandler(&buf, slog.LevelInfo)
+	logger := slog.New(handler)
+
+	logger.Info("test info message")
+
+	output := buf.String()
+
+	// Should contain just the message, no color codes
+	if !strings.Contains(output, "test info message") {
+		t.Errorf("output should contain message, got: %q", output)
+	}
+
+	// Should not contain color codes for info messages
+	if strings.Contains(output, colorRed) {
+		t.Errorf("info message should not be colored, got: %q", output)
+	}
+}
+
+func TestCLIHandler_ErrorMessage(t *testing.T) {
+	var buf bytes.Buffer
+	handler := newCLIHandler(&buf, slog.LevelInfo)
+	// Force color on for this test even though the writer is a buffer.
+	handler.color = true
+	logger := slog.New(handler)
+
+	logger.Error("test error message")
+
+	output := buf.String()
+
+	// Should contain the message
+	if !strings.Contains(output, "test error message") {
+		t.Errorf("output should contain message, got: %q", output)
+	}
+
+	// Should contain red color code for error messages
+	if !strings.Contains(output, colorRed) {
+		t.Errorf("error message should be colored red, got: %q", output)
+	}
+
+	// Should contain reset code
+	if !strings.Contains(output, colorReset) {
+		t.Errorf("error message should reset color, got: %q", output)
+	}
+}
+
+func TestCLIHandler_FailureStatusColoredRed(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  string
+		wantRed bool
+	}{
+		{"failed status at info level is red", "failed", true},
+		{"error status at info level is red", "error", true},
+		{"passed status at info level is green", "passed", false},
+		{"skipped status at info level is green", "skipped", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			handler := newCLIHandler(&buf, slog.LevelInfo)
+			handler.color = true // force color even though the writer is a buffer
+			logger := slog.New(handler)
+
+			logger.Info("validator completed", "name", "deployment", "status", tt.status)
+
+			output := buf.String()
+			gotRed := strings.Contains(output, colorRed)
+			if gotRed != tt.wantRed {
+				t.Errorf("status=%q colored red = %v, want %v (output: %q)", tt.status, gotRed, tt.wantRed, output)
+			}
+			// A non-red line must still be colored green (not left uncolored).
+			if !tt.wantRed && !strings.Contains(output, colorGreen) {
+				t.Errorf("status=%q should be green, got: %q", tt.status, output)
+			}
+		})
+	}
+
+	// A handler-bound status attr (logger.With) must also trigger red, since
+	// hasFailureStatus inspects h.attrs in addition to the record attrs.
+	t.Run("handler-bound failed status at info level is red", func(t *testing.T) {
+		var buf bytes.Buffer
+		handler := newCLIHandler(&buf, slog.LevelInfo)
+		handler.color = true
+		logger := slog.New(handler).With("status", "failed")
+
+		logger.Info("validator completed", "name", "deployment")
+
+		if output := buf.String(); !strings.Contains(output, colorRed) {
+			t.Errorf("handler-bound status=failed should be red, got: %q", output)
+		}
+	})
+}
+
+func TestCLIHandler_NoColorWhenNotTTY(t *testing.T) {
+	var buf bytes.Buffer
+	handler := newCLIHandler(&buf, slog.LevelInfo)
+	logger := slog.New(handler)
+
+	logger.Error("test error message")
+	logger.Info("test info message")
+
+	output := buf.String()
+	if strings.Contains(output, colorRed) || strings.Contains(output, colorGreen) {
+		t.Errorf("non-TTY writer should not produce color codes, got: %q", output)
+	}
+}
+
+func TestShouldUseColor_NoColorEnv(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	if shouldUseColor(os.Stderr) {
+		t.Error("NO_COLOR set should disable color")
+	}
+}
+
+func TestCLIHandler_LevelFiltering(t *testing.T) {
+	tests := []struct {
+		name         string
+		handlerLevel slog.Level
+		logLevel     slog.Level
+		logFunc      func(*slog.Logger)
+		shouldLog    bool
+	}{
+		{
+			name:         "info handler logs info",
+			handlerLevel: slog.LevelInfo,
+			logLevel:     slog.LevelInfo,
+			logFunc:      func(l *slog.Logger) { l.Info("test") },
+			shouldLog:    true,
+		},
+		{
+			name:         "info handler filters debug",
+			handlerLevel: slog.LevelInfo,
+			logLevel:     slog.LevelDebug,
+			logFunc:      func(l *slog.Logger) { l.Debug("test") },
+			shouldLog:    false,
+		},
+		{
+			name:         "debug handler logs debug",
+			handlerLevel: slog.LevelDebug,
+			logLevel:     slog.LevelDebug,
+			logFunc:      func(l *slog.Logger) { l.Debug("test") },
+			shouldLog:    true,
+		},
+		{
+			name:         "error handler logs error",
+			handlerLevel: slog.LevelError,
+			logLevel:     slog.LevelError,
+			logFunc:      func(l *slog.Logger) { l.Error("test") },
+			shouldLog:    true,
+		},
+		{
+			name:         "error handler filters info",
+			handlerLevel: slog.LevelError,
+			logLevel:     slog.LevelInfo,
+			logFunc:      func(l *slog.Logger) { l.Info("test") },
+			shouldLog:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			handler := newCLIHandler(&buf, tt.handlerLevel)
+			logger := slog.New(handler)
+
+			tt.logFunc(logger)
+
+			output := buf.String()
+			hasOutput := len(output) > 0
+
+			if hasOutput != tt.shouldLog {
+				t.Errorf("shouldLog=%v but hasOutput=%v, output: %q", tt.shouldLog, hasOutput, output)
+			}
+		})
+	}
+}
+
+func TestCLIHandler_IncludesAttributes(t *testing.T) {
+	var buf bytes.Buffer
+	handler := newCLIHandler(&buf, slog.LevelInfo)
+	logger := slog.New(handler)
+
+	// Log with attributes
+	logger.Info("test message", "key1", "value1", "key2", "value2")
+
+	output := buf.String()
+
+	// Should contain the message
+	if !strings.Contains(output, "test message") {
+		t.Errorf("output should contain message, got: %q", output)
+	}
+
+	// Should contain attributes as key=value pairs
+	if !strings.Contains(output, "key1=value1") {
+		t.Errorf("output should contain key1=value1, got: %q", output)
+	}
+	if !strings.Contains(output, "key2=value2") {
+		t.Errorf("output should contain key2=value2, got: %q", output)
+	}
+}
+
+func TestGetLogPrefix(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		t.Setenv(logPrefixEnvVar, "")
+		if got := getLogPrefix(); got != "cli" {
+			t.Errorf("getLogPrefix() = %q, want cli", got)
+		}
+	})
+
+	t.Run("custom", func(t *testing.T) {
+		t.Setenv(logPrefixEnvVar, "test-prefix")
+		if got := getLogPrefix(); got != "test-prefix" {
+			t.Errorf("getLogPrefix() = %q, want test-prefix", got)
+		}
+	})
+}
+
+func TestCLIHandler_WithAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	base := newCLIHandler(&buf, slog.LevelInfo)
+
+	// nil/empty attrs → same handler (no-op fast path).
+	if got := base.WithAttrs(nil); got != base {
+		t.Error("WithAttrs(nil) should return the same handler")
+	}
+
+	// Non-empty attrs return a distinct handler that emits the bound attrs.
+	derived := base.WithAttrs([]slog.Attr{slog.String("requestID", "abc")})
+	if derived == base {
+		t.Fatal("WithAttrs(non-empty) should return a distinct handler")
+	}
+	logger := slog.New(derived)
+	logger.Info("hello")
+	out := buf.String()
+	if !strings.Contains(out, "requestID=abc") {
+		t.Errorf("expected bound attr in output, got: %q", out)
+	}
+}
+
+func TestCLIHandler_WithGroup(t *testing.T) {
+	var buf bytes.Buffer
+	base := newCLIHandler(&buf, slog.LevelInfo)
+
+	// Empty name → same handler.
+	if got := base.WithGroup(""); got != base {
+		t.Error("WithGroup(\"\") should return the same handler")
+	}
+
+	// Non-empty group → distinct handler that prefixes attribute keys.
+	derived := base.WithGroup("req")
+	if derived == base {
+		t.Fatal("WithGroup(non-empty) should return a distinct handler")
+	}
+	logger := slog.New(derived)
+	logger.Info("hello", "id", "abc")
+	out := buf.String()
+	if !strings.Contains(out, "req.id=abc") {
+		t.Errorf("expected group-prefixed attr in output, got: %q", out)
+	}
+}
+
+func TestSetDefaultCLILogger(t *testing.T) {
+	// Save original default logger
+	originalLogger := slog.Default()
+	defer slog.SetDefault(originalLogger)
+
+	tests := []struct {
+		name  string
+		level string
+	}{
+		{"set with debug level", "debug"},
+		{"set with info level", "info"},
+		{"set with error level", "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			SetDefaultCLILogger(tt.level)
+
+			// Verify we can use the default logger
+			defaultLogger := slog.Default()
+			if defaultLogger == nil {
+				t.Fatal("Default logger is nil after SetDefaultCLILogger")
+			}
+
+			// Verify the logger is usable
+			defaultLogger.Info("test message from default CLI logger")
+		})
+	}
+}

@@ -1,0 +1,374 @@
+# Publishing Recipe Evidence
+
+Recipe evidence is a signed bundle that records a recipe's validator results
+and binds them to a signer's identity (it attests the recorded result, not that
+a specific cluster existed). Producing it has two legs:
+
+1. **Validate + push (network-light).** Runs where the cluster lives —
+   often a corporate VPN. Captures a snapshot, runs the validators, builds
+   the bundle, and pushes it to an OCI registry.
+2. **Sign (Fulcio-bound).** Signs the pushed bundle with keyless OIDC
+   (Sigstore Fulcio + Rekor) and records the signature in the committed
+   pointer.
+
+The two legs need different network access, and the signing leg is the one
+contributors most often can't complete locally.
+
+## Validator image provenance
+
+**On a release or merged-`main` build, pass no `AICR_VALIDATOR_IMAGE_TAG`.**
+The binary already resolves an immutable validator tag on its own — `:vX.Y.Z`
+for a release build, `:sha-<commit>` for a `main`-tip build — and the override
+replaces it unconditionally, including over a release tag.
+
+That matters more here than in an ordinary validate run, because the predicate
+identifies the validators that ran by *tag alone*: `validatorImages[].digest`
+is deliberately empty (resolving it would cost a registry round-trip per
+image), so a moving tag leaves the attestation with nothing to fall back on.
+Once `:edge` advances, the bundle's claim about which validator code produced
+its results is no longer true, and nothing in the bundle records that. This is
+not hypothetical — `:edge` has been observed moving to a commit with a breaking
+rename about 75 minutes after a run it was recorded in, and moving twice within
+a single working session ([#2873](https://github.com/NVIDIA/aicr/issues/2873)).
+
+`aicr validate --emit-attestation` therefore **fails closed** on a mutable
+validator tag:
+
+```text
+[INVALID_REQUEST] refusing to emit evidence naming validator images that are not
+immutably pinned: ghcr.io/nvidia/aicr-validators/performance:edge: validator
+image tag can be repointed after the run, leaving the attestation unverifiable
+```
+
+(One line in the terminal; wrapped here.)
+
+A reference qualifies two ways, and only two:
+
+1. **It is digest-pinned** (`name@sha256:…`), from any registry. A digest is
+   self-verifying, so no promise about the publisher is needed.
+2. **It carries a tag AICR's CI freezes _and_ lives under
+   `ghcr.io/nvidia/aicr-validators/`** — `:vX.Y.Z` and its pre-releases
+   (`on-tag.yaml`), `:sha-<full-40-char-commit>` (`on-push.yaml`), or
+   `:uat-<run-id>` (the UAT lanes).
+
+The second half of that is the part worth internalizing: **tag syntax is not
+proof of immutability.** `example.com/validators/performance:v1.0.0` looks
+exactly like a release pin and means nothing — no workflow in this repository
+governs how that registry moves its tags, and it may repoint `:v1.0.0`
+whenever it likes. The same applies to a mirror of NVIDIA's own images reached
+via `AICR_VALIDATOR_IMAGE_REGISTRY`, and to any validator supplied by an
+external catalog. Those must be pinned by digest to vouch for provenance.
+
+Everything else is mutable: `:edge`, `:latest`, a bare `:1.0.0` with no `v`, a
+leading-zero `:v01.0.0`, a short `:sha-` prefix, an untagged ref, and any tag
+or registry the allowlist does not recognize. It is an allowlist precisely so
+a shape nobody anticipated fails closed rather than slipping through.
+
+Use `:edge` only when `:sha-<commit>` is genuinely unpublished (a
+feature-branch build, or right after a docs-only merge to `main`, which
+publishes no image). Check before assuming it is:
+
+```shell
+crane digest ghcr.io/nvidia/aicr-validators/performance:sha-$(git rev-parse origin/main)
+```
+
+If it resolves, drop the override and re-run — that is all the correction
+takes. When you genuinely must publish with a moving tag, pass
+`--allow-mutable-validator-tags` and **say so in the PR body**, naming which
+tag and why no immutable one was available. A reviewer cannot otherwise tell a
+deliberate exception from an override left over from a previous command.
+
+On the CLI the opt-out is a flag only — no environment variable, no
+config-file key. That is deliberate: an override exported once for a throwaway
+run is exactly how `:edge` reached committed evidence in the first place, and a
+guard that can be switched off by an inherited variable is not a guard. (Go
+callers set `EvidenceOptions.AllowMutableValidatorTags` explicitly, which is
+the same deliberate per-call act — see the
+[Go library guide](../integrator/go-library.md#what-evidenceattestationoptions-does-and-does-not-carry).)
+
+## The Fulcio connectivity problem
+
+Keyless signing reaches `fulcio.sigstore.dev` and `rekor.sigstore.dev`.
+**Corporate VPNs and some home networks block TLS to these hosts** — the
+connection is rejected at the IP level upstream, not by AICR. The symptom
+is a hang or a TLS/connection-reset error during the sign step, even though
+`aicr validate` and the registry push succeed.
+
+This is not an AICR bug and AICR cannot work around it; the block is on the
+path to Sigstore's public-good infrastructure. Contributors have reported
+needing a phone hotspot to sign from a laptop.
+
+## Recommended path: split the legs, sign in CI
+
+The fix is to keep the network-light leg local and move only the
+Fulcio-bound leg to GitHub Actions, where Sigstore is reachable. The signer
+identity becomes your fork's GitHub Actions OIDC identity rather than a
+personal one.
+
+### 1. Validate and push an unsigned bundle (local, on VPN)
+
+```shell
+SLUG="h100-eks-ubuntu-training"  # replace with the target overlay's file name, without .yaml
+OWNER="my-github-user"           # replace with your fork's GitHub owner
+aicr snapshot -o snapshot.yaml
+aicr validate \
+  -r "recipes/overlays/${SLUG}.yaml" \
+  -s snapshot.yaml \
+  --emit-attestation ./out \
+  --push "ghcr.io/${OWNER}/aicr-evidence" \
+  --no-sign
+RECIPE="h100-eks-ubuntu-training"  # replace with the recipe: field of ./out/pointer.yaml
+cp ./out/pointer.yaml "recipes/evidence/${RECIPE}.yaml"
+```
+
+**Profiled families (the AKS and GKE `gpuStack` recipes)** need two
+adjustments, because validating the raw overlay resolves only the
+declaration default and `aicr validate` has no `--profile` flag:
+
+```shell
+RESOURCE_GROUP="my-resource-group"  # AKS only: replace with your cluster's resource group
+CLUSTER="my-cluster"                # replace with your AKS or GKE cluster name
+INTENT="training"                   # replace with training or inference, from the target overlay's criteria
+GPU_STACK="azure-managed"           # replace with the profile to attest: azure-managed or operator-managed (AKS), gke-default, bundle-installer, or dra (GKE)
+# AKS only: capture the pool projection first.
+az aks nodepool list -g "${RESOURCE_GROUP}" --cluster-name "${CLUSTER}" -o json > pools.json
+aicr snapshot --aks-gpu-pools pools.json -o snapshot.yaml
+# GKE gke-default: a plain `aicr snapshot -o snapshot.yaml` suffices.
+# GKE bundle-installer and dra: also capture the pool projection.
+#   gcloud container node-pools list --cluster "${CLUSTER}" --format=json > pools.json
+#   aicr snapshot --gke-gpu-pools pools.json -o snapshot.yaml
+aicr recipe -s snapshot.yaml \
+  --intent "${INTENT}" \
+  --profile "gpuStack=${GPU_STACK}" \
+  -o recipe.yaml
+# Add --platform <kubeflow|dynamo|slurm> ONLY when the target leaf's
+# criteria pin one (e.g. h100-gke-cos-training is platformless — no flag).
+aicr validate -r recipe.yaml -s snapshot.yaml ... # rest as above
+```
+
+On AKS, capture the snapshot with the pool projection (resolution fails
+closed without the `K8s.aks-gpu-pools.gpu-driver` reading); on GKE the
+plain snapshot already carries the node labels `gke-default`'s constraint
+reads, but `bundle-installer` and `dra` also need the `--gke-gpu-pools`
+projection
+(resolution fails closed without the `K8s.gke-gpu-pools.gpu-driver-installation`
+reading). Then hydrate the recipe with the target leaf's criteria AND the
+profile selection, and validate that recipe. A v2 pointer records its
+selection in a `profile:` field — replay it verbatim. Legacy v1 pointers
+(`schemaVersion: 1.0.0`, e.g. the pre-profile `h100-gke-cos-training`
+pointers) predate profiles and carry no such field: converting one to
+profiled evidence selects the value from the **target cluster** — the
+profile the refreshed evidence is meant to attest — not from anything in
+the legacy pointer. This hydrated-recipe path is the only way to regenerate
+`bundle-installer` or `dra` evidence (on GKE, validating the raw overlay
+selects the `gke-default` default, whose
+`!gke-no-default-nvidia-gpu-device-plugin` constraint fails against those
+values' labeled pools).
+State `--intent` (and `--platform` when the leaf pins one — omit it
+otherwise) explicitly: the snapshot fingerprint supplies service,
+accelerator, and OS, but intent and platform are author-selected and
+default to `any`, so omitting them hydrates a different recipe identity
+than the slug you mean to refresh. Read them off the target overlay's
+`criteria:` block (or the pointer's recipe slug).
+
+`--no-sign` skips all OIDC/Fulcio/Rekor work, so this runs even where
+Sigstore egress is blocked. It pushes the content-addressed bundle and
+writes a pointer with an empty `signer` block.
+
+Commit it **flat** at `recipes/evidence/<recipe>.yaml` (where `<recipe>` is
+the pointer's `recipe:` field). This is the *only* committable location for
+an unsigned pointer: the nested per-source path
+`recipes/evidence/<recipe>/<src>/<digest>.yaml` includes a `<src>`
+segment derived from the **signer**, which a `--no-sign` pointer does not yet
+have. The signing leg below relocates the pointer to that nested path once it
+is signed. See
+[`aicr validate`](../user/cli-reference.md#aicr-validate) and
+[`aicr evidence publish`](../user/cli-reference.md#aicr-evidence-publish)
+(which also accepts `--no-sign` if you push as a separate step).
+
+> **Make the registry package public.** The signing step (and the
+> repository's evidence gate) pull the bundle back to sign and verify it.
+> If your fork's `aicr-evidence` package is private, the pull fails with an
+> HTTP **403** and the gate reports `registry-forbidden`. On GHCR, set the
+> `aicr-evidence` package visibility to **public** under your account's
+> *Packages* settings. Any OCI-1.1 registry works; it just has to be
+> readable.
+
+> **Grant the fork's Actions write access to the package.** Signing in CI
+> *attaches* the signature as an OCI referrer — a registry **write**, separate
+> from the public-read above. Two GHCR prerequisites the signing leg needs:
+> 1. The package's **Actions access** must include your fork repo with the
+>    **Write** role (GHCR package → *Settings* → *Manage Actions access* → add
+>    your fork). Without it the attach fails with HTTP **403** even though
+>    `packages: write` is granted in the workflow.
+> 2. A package first pushed from a local `aicr validate --push` may be linked
+>    to **NVIDIA/aicr** (the chart/repo it was built against) rather than your
+>    fork. Re-link it to your fork (GHCR package → *Settings* → *Change
+>    repository*) so your fork's Actions token is authorized. The first push
+>    from the fork's own CI links it correctly.
+
+### 2. Commit the unsigned pointer and push your branch
+
+```shell
+RECIPE="h100-eks-ubuntu-training"  # replace with the pointer's recipe: field
+git add "recipes/evidence/${RECIPE}.yaml"
+# Every commit from every contributor must be both signed off (-s, DCO) and
+# cryptographically signed (-S). See CONTRIBUTING.md.
+git commit -s -S -m "evidence: ${RECIPE} (unsigned; sign in CI)"
+git push
+```
+
+`aicr evidence verify` reports an unsigned pointer as a non-failing
+**pending signature** state, so an in-flight PR is not flagged as broken.
+
+### 3. Sign in your fork via GitHub Actions
+
+The **Recipe Evidence: Sign** workflow (`.github/workflows/evidence-publish.yaml`)
+runs two ways in your fork:
+
+- **Automatically** when you push a change under `recipes/evidence/**` to any
+  branch other than your default — so step 2's push usually triggers it for you.
+- **Manually** from your fork's *Actions* tab (`workflow_dispatch`, no inputs) —
+  use this to re-run after making the registry package public, or if the auto-run
+  didn't fire.
+
+The auto-trigger is fork-only (it never runs on the canonical repo) and skips its
+own signing commit, so it can't loop. The workflow:
+
+- discovers every flat pointer in `recipes/evidence/*.yaml` with an empty
+  `signer` (i.e. unsigned),
+- signs the bundle each one already references using the runner's ambient
+  OIDC token and **relocates** the now-signed pointer to its canonical
+  per-source path `recipes/evidence/<recipe>/<src>/<digest>.yaml`
+  ([`aicr evidence sign --relocate`](../user/cli-reference.md#aicr-evidence-sign)),
+- commits the move back to the branch.
+
+It is a clean no-op when there are no flat pointers, and it fails with a
+clear message if it cannot pull a bundle (the public-package requirement
+above). Pull the commit it pushes (`git pull`) — your PR now carries a
+**signed, nested** pointer (the flat pending file is gone). The *bundle* is
+signed; the commit-back is created through GitHub's `createCommitOnBranch`
+API, so GitHub applies its web-flow signature and it shows **Verified** (the
+DCO sign-off is preserved). The evidence trust anchor remains the Sigstore
+bundle signature, verified by `aicr evidence verify` — independent of the
+git commit's signature status.
+
+> **Run this leg before merge.** The blocking per-source contract gate
+> requires a **signed, nested** pointer; it rejects a flat pending pointer
+> still sitting at the evidence root. That is deliberate — an unsigned pointer
+> must not merge to `main`, where the fork-only sign workflow would never run
+> to complete it. So a PR whose pointer is still flat stays red until this leg
+> signs and relocates it (and you `git pull` the commit-back). Local tooling
+> can validate the transient flat state with
+> `evidence-pointercheck --allow-pending`, but the merge gate does not set it.
+
+> The workflow declares `id-token: write` in its own `permissions:` block —
+> it is not a default. Your fork must have GitHub Actions enabled and not
+> restrict workflow OIDC token issuance (the default fork setting allows it).
+>
+> Avoid pushing other commits to the branch while the workflow runs: it
+> commits the patched pointers back, and a concurrent push would cause a
+> non-fast-forward — re-dispatch after `git pull` if that happens.
+
+### 4. Add your signer to the allowlist
+
+A signed, nested pointer is **not** sufficient on its own. The contract gate
+also requires the pointer's claimed signer to be listed in
+[`recipes/evidence/allowlist.yaml`](https://github.com/NVIDIA/aicr/blob/main/recipes/evidence/allowlist.yaml) as a
+`community` or `partner` entry; an unlisted signer is rejected (it would only
+ever count as "reported", never corroborating). Your fork's GitHub Actions OIDC
+identity is a **new signer** that the existing entries do not cover, so you must
+add it in the same PR.
+
+The entry is keyed by the one-way `source` slug — the exact `<src>` directory
+the signing leg just created under `recipes/evidence/<recipe>/<src>/`. Add it
+under the `community` class (no cleartext identity; an optional `label` may
+carry a non-PII handle):
+
+```yaml
+# recipes/evidence/allowlist.yaml
+community:
+  - issuer: https://token.actions.githubusercontent.com  # required
+    source: <src>          # the <src> directory segment from step 3
+    label: <your-gh-handle> # optional, non-PII
+```
+
+See the header of `recipes/evidence/allowlist.yaml` and
+[artifact verification](../user/artifact-verification.md) for the anti-sybil
+rules; maintainer review of this entry is the trust gate.
+
+> **Regenerate the embedded pointer index.** The binary embeds pointer
+> presence in `pkg/evidence/index/pointers.yaml` (recipe id, source slug,
+> signer class). `TestPointersYAMLMatchesTree` fails when a new recipe
+> directory or signer slug lands under `recipes/evidence/` and that file was
+> not updated. The sign workflow does not regenerate it. After the signed
+> pointer and the allowlist entry are both on the branch:
+>
+> ```shell
+> AICR_UPDATE_EVIDENCE_INDEX=1 go test ./pkg/evidence/index/ -run TestPointersYAMLMatchesTree -count=1
+> go test ./pkg/evidence/index/ -run TestPointersYAMLMatchesTree -count=1
+> ```
+>
+> The first command rewrites `pointers.yaml` and fails on purpose, so the
+> next run embeds the new file. Commit `pointers.yaml` with the evidence
+> change.
+
+Only keyless signers count. Evidence signed with a KMS key
+(`--signing-key`) records `signer.issuer: key`, and the contract gate rejects
+it however the allowlist reads, because the allowlist pins OIDC identities and
+has no way to say which public key a contribution must carry. Key-signed
+evidence is for private verification with
+[`aicr evidence verify --key`](../user/artifact-verification.md#key-signed-evidence).
+
+## Fallback: split the legs locally
+
+If you have a host with Sigstore egress (a jump box, CI runner, or
+hotspot), you can run the signing leg there instead of in Actions:
+
+```shell
+SLUG="h100-eks-ubuntu-training"  # replace with the target overlay's file name, without .yaml
+OWNER="my-github-user"           # replace with your fork's GitHub owner
+# On VPN, where the cluster is: produce an unsigned bundle.
+aicr validate -r "recipes/overlays/${SLUG}.yaml" -s snapshot.yaml --emit-attestation ./out
+# Profiled families (AKS/GKE gpuStack): validate the hydrated recipe
+# instead, built from an --aks-gpu-pools snapshot (AKS; a plain snapshot
+# on GKE) with the target leaf's criteria and the pointer's recorded
+# --profile selection (see above):
+#   aicr recipe -s snapshot.yaml --intent <intent> [--platform <platform>] \
+#     --profile gpuStack=<value> -o recipe.yaml
+#   aicr validate -r recipe.yaml -s snapshot.yaml --emit-attestation ./out
+# The h100 GKE kubeflow training leaf ships torch-distributed-tcpxo, which
+# requires the ordered GPU-NIC interface mapping — overlay-direct validate/
+# bundle/evidence-digest fails closed on it (auto-hydration supplies none).
+# Hydrate first and add --gke-tcpxo-interfaces eth1=<net>,...,eth8=<net>:
+#   aicr recipe -s snapshot.yaml --intent training --platform kubeflow \
+#     --profile gpuStack=<value> --gke-tcpxo-interfaces eth1=<net>,...,eth8=<net> -o recipe.yaml
+
+# Off VPN, where Sigstore is reachable: sign, push, and write the pointer.
+aicr evidence publish ./out --push "ghcr.io/${OWNER}/aicr-evidence"
+```
+
+`aicr evidence publish` signs the pointer, so commit it directly at its
+**canonical per-source path**, not flat. The command logs the exact
+destination (`copyTo=…`) — copy the pointer there:
+
+```shell
+# The path is recipes/evidence/<recipe>/<src>/<digest>.yaml; <src> is
+# derived from your signer identity. Use the copyTo path the command printed.
+DEST="recipes/evidence/h100-eks-ubuntu-training/0123456789abcdef0123456789abcdef/sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.yaml"  # replace with the printed copyTo path
+mkdir -p "$(dirname "${DEST}")"
+cp ./out/pointer.yaml "${DEST}"
+```
+
+The flat commit-then-CI-sign flow above is only for the unsigned case: a
+signed pointer already has the signer the `<src>` segment derives from, so
+it goes straight to its nested path and needs no relocation. The *bundle* is
+content-addressed, so its bytes (and `bundle.digest`) are identical regardless
+of which host ran which leg — but the committed *pointer path* still depends on
+the signer: `<src>` is derived from your signing identity, so a different
+signer lands the pointer under a different `<src>` directory.
+
+## See also
+
+- [ADR-007: Verifiable Recipe Test Evidence](https://github.com/NVIDIA/aicr/blob/main/docs/design/007-recipe-evidence.md) — trust model and bundle format.
+- [`aicr evidence` CLI reference](../user/cli-reference.md#aicr-evidence-sign) — `sign`, `publish`, `verify`.

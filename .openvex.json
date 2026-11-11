@@ -1,0 +1,10 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/NVIDIA/aicr/.openvex.json",
+  "author": "NVIDIA AICR maintainers",
+  "role": "document creator",
+  "timestamp": "2026-10-29T20:35:00Z",
+  "version": 25,
+  "tooling": "manual curation (.agents/skills/aicr-managing-openvex)",
+  "statements": []
+}

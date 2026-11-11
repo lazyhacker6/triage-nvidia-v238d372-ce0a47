@@ -1,0 +1,247 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package recipe
+
+import (
+	"context"
+	"time"
+
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+)
+
+// ConstraintEvalResult represents the result of evaluating a single constraint.
+// This mirrors the result from pkg/validator to avoid circular imports.
+type ConstraintEvalResult struct {
+	// Passed indicates if the constraint was satisfied.
+	Passed bool
+
+	// Actual is the actual value extracted from the snapshot.
+	Actual string
+
+	// Error contains the error if evaluation failed (e.g., value not found).
+	Error error
+}
+
+// ConstraintEvaluatorFunc is a function type for evaluating constraints.
+// It takes a constraint and returns the evaluation result.
+// This function type allows the recipe package to use constraint evaluation
+// from the validator package without creating a circular dependency.
+type ConstraintEvaluatorFunc func(constraint Constraint) ConstraintEvalResult
+
+// Option is a functional option for configuring Builder instances.
+type Option func(*Builder)
+
+// WithVersion returns an Option that sets the Builder version string.
+// The version is included in recipe metadata for tracking purposes.
+func WithVersion(version string) Option {
+	return func(b *Builder) {
+		b.Version = version
+	}
+}
+
+// WithAllowLists returns an Option that sets criteria allowlists for the Builder.
+// When allowlists are configured, the Builder will reject criteria values that
+// are not in the allowed list. This is used by the API server to restrict
+// which criteria values can be requested.
+func WithAllowLists(al *AllowLists) Option {
+	return func(b *Builder) {
+		b.AllowLists = al
+	}
+}
+
+// WithDataProvider binds the Builder to a specific DataProvider, isolating
+// its metadata store and component registry from the shared embedded-catalog
+// caches.
+//
+// Use this from any caller that constructs more than one Builder per process.
+// When unset, the Builder falls back to the embedded catalog
+// (defaultEmbeddedProvider) — preserving the CLI and API server behavior.
+func WithDataProvider(dp DataProvider) Option {
+	return func(b *Builder) {
+		b.dp = dp
+	}
+}
+
+// NewBuilder creates a new Builder instance with the provided functional options.
+func NewBuilder(opts ...Option) *Builder {
+	b := &Builder{}
+
+	for _, opt := range opts {
+		opt(b)
+	}
+
+	return b
+}
+
+// Builder constructs RecipeResult payloads based on Criteria specifications.
+// It loads recipe metadata, applies matching overlays, and generates
+// tailored configuration recipes.
+type Builder struct {
+	Version    string
+	AllowLists *AllowLists
+	dp         DataProvider // nil ⇒ fall back to the embedded catalog
+}
+
+// DataProvider returns the Builder's bound provider, or nil if none is set
+// and the embedded catalog (defaultEmbeddedProvider) will be used.
+func (b *Builder) DataProvider() DataProvider {
+	if b == nil {
+		return nil
+	}
+	return b.dp
+}
+
+// BuildFromCriteria creates a RecipeResult payload for the provided criteria.
+// It loads the metadata store, applies matching overlays, and returns
+// a RecipeResult with merged components and computed deployment order.
+func (b *Builder) BuildFromCriteria(
+	ctx context.Context,
+	c *Criteria,
+	opts ...BuildOption,
+) (*RecipeResult, error) {
+
+	return b.BuildFromCriteriaWithProfile(ctx, c, "", opts...)
+}
+
+// BuildFromCriteriaWithProfile creates a RecipeResult using an explicit
+// name=value profile selection, or the declaration's default when profile is
+// empty.
+func (b *Builder) BuildFromCriteriaWithProfile(
+	ctx context.Context,
+	c *Criteria,
+	profile string,
+	opts ...BuildOption,
+) (*RecipeResult, error) {
+
+	return b.buildWithStore(ctx, c, opts, func(store *MetadataStore, buildCtx context.Context) (*RecipeResult, error) {
+		return store.BuildRecipeResultWithProfile(buildCtx, c, profile)
+	})
+}
+
+// BuildFromCriteriaWithEvaluator creates a RecipeResult payload for the provided criteria,
+// filtering overlays based on constraint evaluation against snapshot data.
+//
+// When an evaluator function is provided:
+//   - Overlays that match by criteria but fail constraint evaluation are excluded
+//   - Constraint warnings are included in the result metadata for visibility
+//   - Only overlays whose constraints pass (or have no constraints) are merged
+//
+// The evaluator function is typically created by wrapping
+// constraints.Evaluate, binding it to the snapshot data (see pkg/client/v1).
+//
+// Snapshot-driven Overrides live in the facade, not here. The builder
+// sees snapshot data only through the evaluator (used to include or
+// exclude overlays); any post-processing that mutates the resolved
+// recipe from measured state (e.g., the gpu-operator driver
+// auto-detect override in pkg/client/v1/gpu_driver_state.go) is
+// applied by the facade after this returns. A non-facade caller that
+// invokes BuildFromCriteriaWithEvaluator directly and wants those
+// measurement-driven overrides must apply them itself.
+func (b *Builder) BuildFromCriteriaWithEvaluator(
+	ctx context.Context,
+	c *Criteria,
+	evaluator ConstraintEvaluatorFunc,
+	opts ...BuildOption,
+) (*RecipeResult, error) {
+
+	return b.BuildFromCriteriaWithEvaluatorAndProfile(ctx, c, evaluator, "", opts...)
+}
+
+// BuildFromCriteriaWithEvaluatorAndProfile is the snapshot-filtered variant
+// with an explicit profile selection.
+func (b *Builder) BuildFromCriteriaWithEvaluatorAndProfile(
+	ctx context.Context,
+	c *Criteria,
+	evaluator ConstraintEvaluatorFunc,
+	profile string,
+	opts ...BuildOption,
+) (*RecipeResult, error) {
+
+	return b.buildWithStore(ctx, c, opts, func(store *MetadataStore, buildCtx context.Context) (*RecipeResult, error) {
+		return store.BuildRecipeResultWithEvaluatorAndProfile(buildCtx, c, evaluator, profile)
+	})
+}
+
+func (b *Builder) buildWithStore(ctx context.Context, c *Criteria, opts []BuildOption, buildFn func(*MetadataStore, context.Context) (*RecipeResult, error)) (*RecipeResult, error) {
+	if c == nil {
+		return nil, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "criteria cannot be nil")
+	}
+	buildCfg, err := resolveBuildConfig(c, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	buildCtx, cancel := context.WithTimeout(ctx, defaults.RecipeBuildTimeout)
+	defer cancel()
+
+	if ctxErr := buildCtx.Err(); ctxErr != nil {
+		return nil, aicrerrors.WrapWithContext(
+			aicrerrors.ErrCodeTimeout,
+			"recipe build context cancelled during initialization",
+			ctxErr,
+			map[string]any{
+				keyStage: stageInitialization,
+			},
+		)
+	}
+
+	start := time.Now()
+	defer func() {
+		recipeBuiltDuration.Observe(time.Since(start).Seconds())
+	}()
+
+	store, err := LoadMetadataStoreFor(buildCtx, b.dp)
+	if err != nil {
+		// PropagateOrWrap preserves an already-structured error
+		// (e.g., the ErrCodeTimeout buildMetadataStore returns when
+		// ctx is canceled mid-walk). Without this, a transient
+		// context cancellation surfaced as ErrCodeInternal — losing
+		// the timeout signal that callers (and the new transient-
+		// error-eviction in LoadMetadataStoreFor) rely on.
+		return nil, aicrerrors.PropagateOrWrap(err,
+			aicrerrors.ErrCodeInternal, "failed to load metadata store")
+	}
+
+	result, err := buildFn(store, buildCtx)
+	if err != nil {
+		return nil, err
+	}
+	// Metadata stores are cached and their ComponentRefs contain mutable maps
+	// and slices. Detach the build result before any option-driven mutation so
+	// sequential or concurrent builds cannot contaminate each other or the
+	// cached store.
+	for i := range result.ComponentRefs {
+		result.ComponentRefs[i] = cloneComponentRef(result.ComponentRefs[i])
+	}
+
+	if b.Version != "" {
+		result.Metadata.Version = b.Version
+	}
+	if err := applyBuildConfig(result, buildCfg); err != nil {
+		return nil, err
+	}
+	if err := result.ValidateCoherence(); err != nil {
+		return nil, err
+	}
+
+	// Stamp owner so cross-Builder result mixing is rejected at the
+	// consumption point (see RecipeResult.AssertOwnedBy). The Builder
+	// pointer identity is the token — zero-cost and unforgeable from
+	// outside the package because owner is unexported.
+	result.owner = b
+
+	return result, nil
+}

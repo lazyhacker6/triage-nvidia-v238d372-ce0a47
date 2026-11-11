@@ -1,0 +1,91 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Hand-curated illustration of RecipeResult structure; intentionally incomplete.
+# Components, metadata, and validation differ from actual generated output.
+# Generate a current recipe with `aicr recipe` before bundling or validation.
+# Shows selected training components; omits validation and resolved metadata.
+
+kind: RecipeResult
+apiVersion: aicr.run/v1
+metadata:
+  version: dev
+  appliedOverlays:
+    - base
+    - eks
+    - eks-training
+criteria:
+  service: eks
+  accelerator: any
+  intent: training
+  os: any
+constraints:
+  - name: K8s.server.version
+    value: '>= 1.30'
+componentRefs:
+  - name: cert-manager
+    namespace: cert-manager
+    chart: cert-manager
+    type: Helm
+    source: https://charts.jetstack.io
+    version: v1.20.2
+    valuesFile: components/cert-manager/values.yaml
+  - name: gpu-operator
+    namespace: gpu-operator
+    chart: gpu-operator
+    type: Helm
+    source: https://helm.ngc.nvidia.com/nvidia
+    version: v26.7.2
+    valuesFile: components/gpu-operator/values-eks-training.yaml
+    dependencyRefs:
+      - cert-manager
+  - name: nvsentinel
+    namespace: nvidia-system
+    chart: nvsentinel
+    type: Helm
+    source: oci://ghcr.io/nvidia
+    version: v1.9.0
+    valuesFile: components/nvsentinel/values.yaml
+    dependencyRefs:
+      - cert-manager
+  - name: nodewright-operator
+    namespace: nodewright
+    chart: nodewright
+    type: Helm
+    source: oci://ghcr.io/nvidia/nodewright/charts
+    version: v0.21.0
+    valuesFile: components/nodewright-operator/values.yaml
+  - name: prometheus-operator-crds
+    namespace: monitoring
+    chart: prometheus-operator-crds
+    type: Helm
+    source: https://prometheus-community.github.io/helm-charts
+    version: 28.0.1
+    valuesFile: components/prometheus-operator-crds/values.yaml
+  - name: kube-prometheus-stack
+    namespace: monitoring
+    chart: kube-prometheus-stack
+    type: Helm
+    source: https://prometheus-community.github.io/helm-charts
+    version: 84.4.0
+    valuesFile: components/kube-prometheus-stack/values.yaml
+    dependencyRefs:
+      - prometheus-operator-crds
+deploymentOrder:
+  - cert-manager
+  - prometheus-operator-crds
+  - kube-prometheus-stack
+  - gpu-operator
+  - nvsentinel
+  - nodewright-operator

@@ -1,0 +1,924 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package verifier
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	stderrors "errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"regexp"
+	"regexp/syntax"
+	"runtime"
+	"strings"
+	"sync"
+	"syscall"
+
+	"github.com/sigstore/sigstore-go/pkg/verify"
+
+	"github.com/NVIDIA/aicr/pkg/bundler/attestation"
+	"github.com/NVIDIA/aicr/pkg/bundler/checksum"
+	"github.com/NVIDIA/aicr/pkg/bundler/deployer"
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+)
+
+// readBoundedFile applies a bounded compatibility context to verifier inputs.
+func readBoundedFile(path string) ([]byte, error) {
+	return readBoundedFileContext(context.Background(), path)
+}
+
+// readBoundedFileContext opens verifier inputs without following links or
+// blocking on special files, validates the opened descriptor, streams at most
+// MaxSigstoreBundleSize bytes, and honors caller cancellation.
+func readBoundedFileContext(ctx context.Context, path string) ([]byte, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, errors.Wrap(errors.ErrCodeTimeout, "verifier file read canceled", ctxErr)
+	}
+	ctx, cancel := context.WithTimeout(ctx, defaults.FileReadTimeout)
+	defer cancel()
+
+	f, err := os.OpenFile( //nolint:gosec // verifier paths are bundle-local
+		path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if stderrors.Is(err, syscall.ELOOP) {
+			return nil, errors.Wrap(errors.ErrCodeInvalidRequest, "refusing to follow file symlink "+path, err)
+		}
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to open file "+path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to inspect opened file "+path, err)
+	}
+	if !opened.Mode().IsRegular() {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "file is not regular: "+path)
+	}
+	if opened.Size() > defaults.MaxSigstoreBundleSize {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("file %s exceeds maximum size (%d bytes)", path, defaults.MaxSigstoreBundleSize))
+	}
+	linked, err := os.Lstat(path)
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInvalidRequest, "file changed while opening: "+path, err)
+	}
+	if !linked.Mode().IsRegular() || !os.SameFile(opened, linked) {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "file changed while opening: "+path)
+	}
+
+	data := make([]byte, 0, opened.Size())
+	buffer := make([]byte, verifierFileReadBufferSize)
+	for {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, errors.Wrap(errors.ErrCodeTimeout, "verifier file read canceled", ctxErr)
+		}
+		read, readErr := f.Read(buffer)
+		if read > 0 {
+			if int64(len(data))+int64(read) > defaults.MaxSigstoreBundleSize {
+				return nil, errors.New(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("file %s exceeds maximum size (%d bytes)", path, defaults.MaxSigstoreBundleSize))
+			}
+			data = append(data, buffer[:read]...)
+		}
+		if readErr != nil {
+			if stderrors.Is(readErr, io.EOF) {
+				break
+			}
+			return nil, errors.Wrap(errors.ErrCodeInternal, "failed to read file "+path, readErr)
+		}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, errors.Wrap(errors.ErrCodeTimeout, "verifier file read canceled", ctxErr)
+	}
+	after, err := os.Lstat(path)
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInvalidRequest, "file changed while reading: "+path, err)
+	}
+	if !after.Mode().IsRegular() || !os.SameFile(opened, after) {
+		return nil, errors.New(errors.ErrCodeInvalidRequest, "file changed while reading: "+path)
+	}
+	return data, nil
+}
+
+// Identity pinning constants for NVIDIA CI.
+const (
+	verifierFileReadBufferSize = 32 * 1024
+
+	TrustedOIDCIssuer        = "https://token.actions.githubusercontent.com"
+	TrustedRepositoryPattern = `^https://github\.com/NVIDIA/aicr/\.github/workflows/on-tag\.yaml@refs/tags/.*`
+
+	// requiredRepoPrefix includes the scheme+domain to ensure github.com is the
+	// actual domain, not a path segment (e.g., "evil.com/github.com/NVIDIA/aicr/"
+	// would bypass a domain-less check). The escaped form handles regex patterns.
+	requiredRepoPrefix        = "://github.com/NVIDIA/aicr/"
+	requiredRepoPrefixEscaped = `://github\.com/NVIDIA/aicr/`
+
+	// requiredIdentityPrefix is the scheme-qualified form a pattern must START
+	// with. Anchoring on the full "https://" (rather than the "://" fragment
+	// above, which exists to keep github.com from being a path segment) is
+	// what lets ValidateIdentityPattern reason about the whole match instead
+	// of a substring hit somewhere inside it.
+	requiredIdentityPrefix        = "https" + requiredRepoPrefix
+	requiredIdentityPrefixEscaped = "https" + requiredRepoPrefixEscaped
+)
+
+// foreignIdentityCanaries are certificate identities that a correctly pinned
+// pattern MUST NOT match. ValidateIdentityPattern compiles the candidate and
+// tests it against every one of them, rejecting any pattern that matches.
+//
+// This behavioral check is the last of three layers, and exists because
+// requiring the repository prefix is necessary but NOT sufficient: a pattern
+// can begin with it and still match everything, most simply via alternation:
+//
+//	^https://github\.com/NVIDIA/aicr/.*|.*$
+//
+// That begins with the prefix and compiles cleanly, yet its second branch
+// matches any string. Since the identity matcher pins only the OIDC issuer
+// beyond this pattern, such a pattern silently reduces the gate to "any GitHub
+// Actions workflow in any repository".
+//
+// The prefix and top-level-alternation rules in ValidateIdentityPattern handle
+// the branch cases, including branches too narrow for any fixed canary set to
+// catch (a single attacker-controlled repository). These canaries cover the
+// widening that survives a structural read — an empty branch inside a group,
+// say, which leaves the root op unchanged while making the whole pattern match
+// anything. No layer subsumes another.
+//
+// Each entry is shaped like a real GitHub Actions SAN, because that is the
+// only identity form this pattern is ever matched against.
+var foreignIdentityCanaries = []string{
+	"https://github.com/evil/aicr/.github/workflows/on-tag.yaml@refs/tags/v1.0.0",
+	"https://github.com/NVIDIA/other-repo/.github/workflows/on-tag.yaml@refs/tags/v1.0.0",
+	"https://github.com/NVIDIA/aicr-lookalike/.github/workflows/on-tag.yaml@refs/tags/v1.0.0",
+	"https://github.com/attacker/repo/.github/workflows/pwn.yaml@refs/heads/main",
+	"https://gitlab.com/NVIDIA/aicr/.github/workflows/on-tag.yaml@refs/tags/v1.0.0",
+	"",
+}
+
+// VerifyOptions configures verification behavior.
+type VerifyOptions struct {
+	// CertificateIdentityRegexp overrides the default identity pinning pattern
+	// for binary attestation verification. Must BEGIN with
+	// "https://github.com/NVIDIA/aicr/" (a leading "^" is allowed) and must
+	// not use top-level alternation; see ValidateIdentityPattern.
+	// Defaults to TrustedRepositoryPattern if empty.
+	CertificateIdentityRegexp string
+
+	// Key selects public-key verification of the bundle attestation instead of
+	// keyless certificate-identity verification. A KMS key URI
+	// (awskms:// | gcpkms:// | azurekms:// | hashivault://) or a local PEM public-key file.
+	// Independent of CertificateIdentityRegexp, which pins the (separate) binary
+	// attestation; the two coexist (see #1152).
+	Key string
+
+	// TrustRoot is a path to a sigstore-go trusted_root.json for verifying the
+	// bundle attestation against a private Fulcio/Rekor. ADDITIVE: unioned with
+	// AICR's public-good root, so NVIDIA-signed and privately-signed bundles
+	// both verify. Counterpart to `bundle --fulcio-url`/`--rekor-url`.
+	// Composable with Key. Does NOT affect the binary attestation, which is
+	// always NVIDIA-public-CI-signed and stays pinned to the public-good root.
+	TrustRoot string
+
+	// IgnoreTLog enables offline/air-gapped verification of the key-signed
+	// bundle attestation: it skips the transparency-log (and observer-timestamp)
+	// requirement so a bundle produced by `bundle --signing-key ... --tlog-upload=false`
+	// (#409) verifies with no transparency-log network calls. Full offline
+	// operation additionally requires a local PEM Key: a KMS Key URI still makes a
+	// live GetPublicKey call via NewKeyVerificationIdentity to resolve the key.
+	// ONLY valid with Key set (the air-gapped path is key-based, not keyless);
+	// Verify rejects it otherwise. INSECURE relative to the default: without a
+	// tlog/timestamp there is no trusted proof of when the signature was made.
+	// Does NOT affect the keyless or binary-attestation paths, which always
+	// require a transparency log.
+	IgnoreTLog bool
+}
+
+// resolveBundleTrustRoot returns the TrustedRootSource for the bundle
+// attestation: the public-good root by default, or its union with the private
+// trusted_root.json named by opts.TrustRoot. The binary attestation is
+// unaffected and always uses the public-good root (see VerifyBinaryAttestation).
+func resolveBundleTrustRoot(opts *VerifyOptions) (attestation.TrustedRootSource, error) {
+	if opts.TrustRoot == "" {
+		return attestation.PublicGoodTrustedRoot, nil
+	}
+	return newUnionTrustedRoot(opts.TrustRoot)
+}
+
+// newUnionTrustedRoot unions the private trusted_root.json at path with AICR's
+// public-good root; see attestation.NewUnionTrustedRoot.
+func newUnionTrustedRoot(path string) (attestation.TrustedRootSource, error) {
+	return attestation.NewUnionTrustedRoot(path)
+}
+
+// ValidateIdentityPattern checks that a certificate identity pattern is
+// CONFINED to the NVIDIA/aicr GitHub repository, not merely that it mentions
+// it. Accepts both literal and regex-escaped forms of the domain (e.g.,
+// "github.com" or "github\.com").
+//
+// Confinement needs two rules together, because the identity matcher pins only
+// the OIDC issuer beyond this pattern: a widened pattern silently degrades the
+// gate to "any GitHub Actions workflow in any repository" rather than failing
+// visibly.
+//
+//  1. The pattern must BEGIN with the repository prefix (an optional leading
+//     "^" aside). Requiring it as a prefix rather than a substring is what
+//     makes the check sound: a pattern that starts with a literal, and whose
+//     root is not an alternation, can only match strings starting with that
+//     literal. A mere substring test admits alternations that reach the prefix
+//     down one branch while another branch matches something else entirely.
+//  2. The root must not be an alternation, since only one branch of an
+//     alternation has to match.
+//
+// Together these reject `(good|https://github.com/attacker/x/.*)` (does not
+// begin with the prefix) and `^https://github\.com/NVIDIA/aicr/.*|.*$` (root
+// alternation), while still accepting alternatives placed AFTER the prefix,
+// e.g. `.../aicr/\.github/workflows/(on-tag|release)\.yaml@.*`, where every
+// branch is already behind the pin.
+//
+// A leading "^" is optional rather than required so existing unanchored
+// patterns keep working. That is safe for the identity form this is matched
+// against: a GitHub Actions SAN cannot embed a second "://", because neither
+// repository names nor git refs may contain ":".
+func ValidateIdentityPattern(pattern string) error {
+	if pattern == "" {
+		return errors.New(errors.ErrCodeInvalidRequest, "certificate identity pattern cannot be empty")
+	}
+	// One optional leading anchor is stripped before the prefix test so both
+	// "^https://..." and "https://..." spellings are accepted.
+	body := strings.TrimPrefix(pattern, "^")
+	if !strings.HasPrefix(body, requiredIdentityPrefix) &&
+		!strings.HasPrefix(body, requiredIdentityPrefixEscaped) {
+
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("certificate identity pattern must begin with %q to pin to the NVIDIA repository "+
+				"(a leading \"^\" is allowed; put any alternatives after the prefix)", requiredIdentityPrefix))
+	}
+	// A pattern can begin with the required repository and still not be a
+	// valid regexp. Compile it here so callers that validate up-front report
+	// the failure against their own input (a CLI flag or a config field, with
+	// its spec path) rather than letting it surface later from the identity
+	// matcher.
+	compiled, err := regexp.Compile(pattern)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest,
+			"certificate identity pattern is not a valid regular expression", err)
+	}
+
+	// Reject top-level alternation. The substring check above proves the
+	// required repository appears SOMEWHERE in the pattern; it cannot prove
+	// every branch requires it. `a|b` only needs one branch to match, so a
+	// single unpinned branch defeats the whole gate — and the branch can be
+	// narrow (one attacker-controlled repository) rather than a broad `.*`,
+	// which is why the canary sweep below cannot be the only guard.
+	//
+	// A pattern pinning one repository never needs alternation at the top
+	// level: alternatives belong inside a group after the prefix, e.g.
+	// `.../aicr/\.github/workflows/(release|on-tag)\.yaml@.*`. Parsing rather
+	// than splitting on "|" keeps separators inside groups and character
+	// classes from being misread.
+	parsed, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest,
+			"certificate identity pattern could not be parsed", err)
+	}
+	if parsed.Op == syntax.OpAlternate {
+		// Name the required prefix here too, not only in the context map: the
+		// CLI surfaces the message alone, and a reader who has just been told
+		// "no top-level alternation" still needs to know what to anchor to.
+		return errors.NewWithContext(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("certificate identity pattern must not use top-level alternation: only one branch has to match, "+
+				"so an unpinned branch would defeat the pin to %q. Move the alternatives into a group after the prefix, "+
+				"e.g. %s\\.github/workflows/(on-tag|release)\\.yaml@.*", requiredIdentityPrefix, requiredIdentityPrefixEscaped),
+			map[string]any{
+				"pattern":          pattern,
+				"requiredRepoPath": requiredRepoPrefix,
+			})
+	}
+
+	// Carrying the repository prefix still does not mean the pattern is
+	// CONFINED to it — see foreignIdentityCanaries. Fail closed on any pattern
+	// that also admits an unrelated identity, which catches widening the
+	// structural rule above cannot see (an empty branch inside a group, for
+	// instance).
+	for _, canary := range foreignIdentityCanaries {
+		if compiled.MatchString(canary) {
+			return errors.NewWithContext(errors.ErrCodeInvalidRequest,
+				"certificate identity pattern is not confined to the NVIDIA repository: it also matches an unrelated identity",
+				map[string]any{
+					"pattern":          pattern,
+					"alsoMatches":      canary,
+					"requiredRepoPath": requiredRepoPrefix,
+				})
+		}
+	}
+	return nil
+}
+
+type verifierDependencies struct {
+	stageVerifiedBundle func(
+		context.Context,
+		string,
+		checksum.InventoryOptions,
+	) (string, *checksum.Inventory, func() error, error)
+	afterSnapshot func() error
+	warn          func(string, ...any)
+}
+
+func defaultVerifierDependencies() verifierDependencies {
+	return verifierDependencies{
+		stageVerifiedBundle: checksum.StageVerifiedBundle,
+		afterSnapshot:       func() error { return nil },
+		warn:                slog.Warn,
+	}
+}
+
+func normalizeVerifierDependencies(deps verifierDependencies) verifierDependencies {
+	defaults := defaultVerifierDependencies()
+	if deps.stageVerifiedBundle == nil {
+		deps.stageVerifiedBundle = defaults.stageVerifiedBundle
+	}
+	if deps.afterSnapshot == nil {
+		deps.afterSnapshot = defaults.afterSnapshot
+	}
+	if deps.warn == nil {
+		deps.warn = defaults.warn
+	}
+	return deps
+}
+
+// Verify performs full verification of a bundle directory.
+// Returns a VerifyResult describing the trust level and verification details.
+// Any returned staged-snapshot cleanup failure clears an otherwise successful
+// result and is reported as an internal error.
+func Verify(
+	ctx context.Context,
+	bundleDir string,
+	opts *VerifyOptions,
+) (result *VerifyResult, err error) {
+
+	return verifyWithDependencies(ctx, bundleDir, opts, defaultVerifierDependencies())
+}
+
+func verifyWithDependencies(
+	ctx context.Context,
+	bundleDir string,
+	opts *VerifyOptions,
+	deps verifierDependencies,
+) (result *VerifyResult, retErr error) {
+
+	deps = normalizeVerifierDependencies(deps)
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeTimeout, "context cancelled before verification", err)
+	}
+
+	// Resolve and validate options before touching the filesystem so a malformed
+	// request (e.g. IgnoreTLog without Key) fails with InvalidRequest regardless
+	// of whether the bundle directory exists, rather than being masked by a
+	// NotFound from the os.Stat below.
+	if opts == nil {
+		opts = &VerifyOptions{}
+	}
+	// Offline/air-gapped verification is key-based only: rejecting the transparency
+	// log without a public key would leave the keyless path with no trusted
+	// timestamp and nothing to bind the signature to. Fail closed here (not just
+	// in the CLI) so library callers get the same guarantee.
+	if opts.IgnoreTLog && opts.Key == "" {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			"IgnoreTLog (offline verification) requires Key: the air-gapped path is key-based")
+	}
+
+	if _, err := os.Stat(bundleDir); err != nil {
+		if os.IsNotExist(err) {
+			return nil, errors.New(errors.ErrCodeNotFound, "bundle directory not found: "+bundleDir)
+		}
+		return nil, errors.Wrap(errors.ErrCodeInternal, "cannot access bundle directory", err)
+	}
+
+	identityPattern := opts.CertificateIdentityRegexp
+	if identityPattern == "" {
+		identityPattern = TrustedRepositoryPattern
+	}
+	// Validate the identity pattern to make sure it good and has not been tampered with
+	if err := ValidateIdentityPattern(identityPattern); err != nil {
+		return nil, err
+	}
+
+	// Resolve the trust anchors for the bundle attestation up front, so a bad
+	// --trust-root file fails fast with its ErrCodeInvalidRequest instead of
+	// being folded into a verification-failure result downstream.
+	bundleSource, srcErr := resolveBundleTrustRoot(opts)
+	if srcErr != nil {
+		return nil, srcErr
+	}
+
+	result = &VerifyResult{}
+
+	// Step 1: verify the caller-controlled bundle, then carry only a private
+	// staged snapshot through every subsequent trust decision.
+	snapshot, done, checksumErr := verifyChecksumStepWithDependencies(ctx, bundleDir, result, deps)
+	if snapshot != nil {
+		defer func() {
+			cleanupErr := snapshot.cleanup()
+			if cleanupErr == nil {
+				return
+			}
+			if retErr != nil {
+				deps.warn("failed to clean verification snapshot after verification failure",
+					"error", cleanupErr, "primaryError", retErr)
+				return
+			}
+			result = nil
+			retErr = errors.Wrap(
+				errors.ErrCodeInternal, "failed to clean verification snapshot", cleanupErr)
+		}()
+		if err := deps.afterSnapshot(); err != nil {
+			return nil, err
+		}
+	}
+	if checksumErr != nil {
+		return nil, checksumErr
+	}
+	if done {
+		return result, nil
+	}
+	return verifyStagedSnapshot(
+		ctx, snapshot, result, opts, bundleSource, identityPattern)
+}
+
+func verifyStagedSnapshot(
+	ctx context.Context,
+	snapshot *verificationSnapshot,
+	result *VerifyResult,
+	opts *VerifyOptions,
+	bundleSource attestation.TrustedRootSource,
+	identityPattern string,
+) (*VerifyResult, error) {
+
+	verifiedDir := snapshot.stagedDir
+	checksumDigest := snapshot.checksumDigest[:]
+
+	slog.Debug("checksums verified", "files", result.ChecksumFiles)
+
+	// Step 2: Check for bundle attestation
+	bundleAttestPath, joinErr := deployer.SafeJoin(verifiedDir, attestation.BundleAttestationFile)
+	if joinErr != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "unsafe bundle attestation path", joinErr)
+	}
+	if _, statErr := os.Stat(bundleAttestPath); os.IsNotExist(statErr) {
+		// No attestation — checksums valid but unverified
+		result.setTrust(TrustUnverified, "checksums valid but no attestation files found (bundle created without --attest)")
+		return result, nil
+	}
+
+	// Step 3: Verify bundle attestation with sigstore-go, binding to the
+	// checksums.txt digest from the staged inventory.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, errors.Wrap(errors.ErrCodeTimeout, "context cancelled during verification", ctxErr)
+	}
+
+	var (
+		bundleCreator string
+		err           error
+	)
+	if opts.Key != "" {
+		bundleCreator, err = verifyKeySignedBundle(ctx, bundleAttestPath, checksumDigest, opts.Key, bundleSource, opts.IgnoreTLog)
+	} else {
+		bundleCreator, err = verifySigstoreBundle(ctx, bundleAttestPath, checksumDigest, bundleSource)
+	}
+	if err != nil {
+		if stderrors.Is(err, errors.New(errors.ErrCodeTimeout, "")) {
+			return nil, err
+		}
+		result.Errors = append(result.Errors, fmt.Sprintf("bundle attestation verification failed: %v", err))
+		result.setTrust(TrustUnknown, "bundle attestation verification failed")
+		return result, nil
+	}
+	result.BundleAttested = true
+	result.BundleCreator = bundleCreator
+	toolVersion, toolVersionErr := extractToolVersionContext(ctx, bundleAttestPath)
+	if toolVersionErr != nil {
+		return nil, toolVersionErr
+	}
+	result.ToolVersion = toolVersion
+
+	slog.Debug("bundle attestation verified", "creator", bundleCreator, "toolVersion", result.ToolVersion)
+
+	// Steps 4-5: Check for and verify the binary attestation.
+	done, stepErr := verifyBinaryStep(ctx, verifiedDir, bundleAttestPath, identityPattern, result)
+	if stepErr != nil {
+		return nil, stepErr
+	}
+	if done {
+		return result, nil
+	}
+
+	// Full chain verified — check if external data caps trust at attested
+	dataDir, joinErr := deployer.SafeJoin(verifiedDir, "data")
+	if joinErr != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "unsafe data directory path", joinErr)
+	}
+	if _, dataDirErr := os.Stat(dataDir); dataDirErr == nil {
+		result.HasExternalData = true
+		result.setTrust(TrustAttested, "external --data files included; verified requires only embedded recipe data")
+		return result, nil
+	}
+
+	result.setTrust(TrustVerified, "full chain verified: checksums, bundle attestation, binary attestation with NVIDIA CI identity")
+	return result, nil
+}
+
+// verifyBinaryStep runs steps 4-5 of Verify: locate and verify the binary
+// attestation, binding it to the binary digest recorded in the (already
+// verified) bundle attestation at bundleAttestPath. Trust semantics (#1550):
+//
+//   - binary attestation file MISSING → TrustAttested (incomplete chain: the
+//     bundle attestation itself verified, nothing claims more);
+//   - binary attestation PRESENT but its digest cannot be extracted or its
+//     verification FAILS → TrustUnknown (a claim exists and could not be
+//     substantiated — a hard failure, not a degraded success).
+//
+// Returns done=true when Verify should return the populated result as-is
+// (verification outcome, nil error); a non-nil error is a hard fault
+// (unsafe path), for which Verify returns no result.
+func verifyBinaryStep(ctx context.Context, bundleDir, bundleAttestPath, identityPattern string, result *VerifyResult) (bool, error) {
+	binaryAttestPath, joinErr := deployer.SafeJoin(bundleDir, attestation.BinaryAttestationFile)
+	if joinErr != nil {
+		return false, errors.Wrap(errors.ErrCodeInternal, "unsafe binary attestation path", joinErr)
+	}
+	if _, statErr := os.Stat(binaryAttestPath); os.IsNotExist(statErr) {
+		// Bundle attested but no binary attestation — chain incomplete
+		result.setTrust(TrustAttested, "bundle attested but binary attestation not found (incomplete chain)")
+		return true, nil
+	}
+
+	// Verify binary attestation with identity pinning. Extract the binary
+	// digest from the bundle attestation's resolvedDependencies rather than
+	// hashing the running binary — the verifying binary may be a different
+	// version than the one that created the bundle.
+	binaryDigest, err := extractBinaryDigestContext(ctx, bundleAttestPath)
+	if err != nil {
+		if stderrors.Is(err, errors.New(errors.ErrCodeTimeout, "")) {
+			return false, err
+		}
+		result.Errors = append(result.Errors, fmt.Sprintf("could not extract binary digest from bundle attestation: %v", err))
+		result.setTrust(TrustUnknown, "binary attestation present but binary digest could not be extracted from bundle attestation")
+		return true, nil
+	}
+
+	binaryBuilder, err := VerifyBinaryAttestation(ctx, binaryAttestPath, identityPattern, binaryDigest)
+	if err != nil {
+		if stderrors.Is(err, errors.New(errors.ErrCodeTimeout, "")) {
+			return false, err
+		}
+		result.Errors = append(result.Errors, fmt.Sprintf("binary attestation verification failed: %v", err))
+		result.setTrust(TrustUnknown, "binary attestation present but failed verification")
+		return true, nil
+	}
+	result.BinaryAttested = true
+	result.IdentityPinned = true
+	result.BinaryBuilder = binaryBuilder
+
+	slog.Debug("binary attestation verified", "builder", binaryBuilder)
+	return false, nil
+}
+
+type verificationSnapshot struct {
+	stagedDir      string
+	checksumDigest [sha256.Size]byte
+	remove         func() error
+	cleanupOnce    sync.Once
+	cleanupErr     error
+}
+
+func (s *verificationSnapshot) cleanup() error {
+	if s == nil {
+		return nil
+	}
+	s.cleanupOnce.Do(func() {
+		if s.remove != nil {
+			s.cleanupErr = s.remove()
+		}
+	})
+	return s.cleanupErr
+}
+
+// verifyChecksumStep verifies the caller-controlled bundle into a fresh,
+// private stage and reuses the manifest metadata from that final staged-tree
+// verification. All later trust evaluation must use only the returned snapshot.
+func verifyChecksumStep(ctx context.Context, bundleDir string, result *VerifyResult) (*verificationSnapshot, bool, error) {
+	return verifyChecksumStepWithDependencies(
+		ctx, bundleDir, result, defaultVerifierDependencies())
+}
+
+func verifyChecksumStepWithDependencies(
+	ctx context.Context,
+	bundleDir string,
+	result *VerifyResult,
+	deps verifierDependencies,
+) (*verificationSnapshot, bool, error) {
+
+	deps = normalizeVerifierDependencies(deps)
+	verifyOpts := checksum.InventoryOptions{AllowedMetadataPaths: attestation.BundleMetadataPaths()}
+	stagedDir, staged, cleanup, err := deps.stageVerifiedBundle(ctx, bundleDir, verifyOpts)
+	if err != nil {
+		return checksumStepFailure(err, result)
+	}
+	if cleanup == nil {
+		return nil, false, errors.New(
+			errors.ErrCodeInternal, "verified bundle stage returned no cleanup owner")
+	}
+	if staged == nil {
+		primaryErr := errors.New(
+			errors.ErrCodeInternal, "verified bundle stage returned no inventory")
+		cleanupErr := cleanup()
+		if cleanupErr != nil {
+			deps.warn("failed to clean verification snapshot after checksum failure",
+				"error", cleanupErr, "primaryError", primaryErr)
+		}
+		return nil, false, primaryErr
+	}
+	snapshot := &verificationSnapshot{
+		stagedDir:      stagedDir,
+		checksumDigest: staged.ChecksumDigest(),
+		remove:         cleanup,
+	}
+	result.ChecksumsPassed = true
+	result.ChecksumFiles = staged.ManifestLen()
+	return snapshot, false, nil
+}
+
+func checksumStepFailure(err error, result *VerifyResult) (*verificationSnapshot, bool, error) {
+	if stderrors.Is(err, errors.New(errors.ErrCodeTimeout, "")) {
+		return nil, false, err
+	}
+	if stderrors.Is(err, errors.New(errors.ErrCodeInternal, "")) {
+		return nil, false, err
+	}
+	if !stderrors.Is(err, errors.New(errors.ErrCodeInvalidRequest, "")) {
+		return nil, false, err
+	}
+	if stderrors.Is(err, checksum.ErrChecksumManifestMissing) {
+		result.setTrust(TrustUnknown, "checksums.txt not found")
+		result.Errors = append(result.Errors, "checksums.txt not found")
+		return nil, true, nil
+	}
+	result.Errors = append(result.Errors, err.Error())
+	result.setTrust(TrustUnknown, "checksum inventory verification failed")
+	return nil, true, nil
+}
+
+// resolveExecutablePath returns the best path for reading the running binary.
+// On Linux, /proc/self/exe refers to the original inode even if the binary
+// has been replaced on disk, preventing TOCTOU races. On other platforms,
+// falls back to os.Executable().
+func resolveExecutablePath() string {
+	if runtime.GOOS == "linux" {
+		return "/proc/self/exe"
+	}
+	path, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
+// parseDSSEPayload extracts and decodes the base64 DSSE payload from a
+// sigstore bundle JSON file. Returns the decoded in-toto statement JSON.
+func parseDSSEPayload(bundlePath string) ([]byte, error) {
+	return parseDSSEPayloadContext(context.Background(), bundlePath)
+}
+
+func parseDSSEPayloadContext(ctx context.Context, bundlePath string) ([]byte, error) {
+	data, err := readBoundedFileContext(ctx, bundlePath)
+	if err != nil {
+		return nil, err // already coded by readBoundedFileContext
+	}
+
+	var raw map[string]json.RawMessage
+	if err = json.Unmarshal(data, &raw); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to unmarshal bundle", err)
+	}
+
+	envelopeJSON, ok := raw["dsseEnvelope"]
+	if !ok {
+		return nil, errors.New(errors.ErrCodeInternal, "missing dsseEnvelope")
+	}
+
+	var envelope struct {
+		Payload string `json:"payload"`
+	}
+	if err = json.Unmarshal(envelopeJSON, &envelope); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to unmarshal dsseEnvelope", err)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to decode DSSE payload", err)
+	}
+	return decoded, nil
+}
+
+// extractToolVersion reads a sigstore bundle file and extracts the tool version
+// from the SLSA predicate's internalParameters.toolVersion field.
+// Returns empty string if extraction fails (best-effort, non-fatal).
+func extractToolVersion(bundlePath string) string {
+	version, _ := extractToolVersionContext(context.Background(), bundlePath)
+	return version
+}
+
+func extractToolVersionContext(ctx context.Context, bundlePath string) (string, error) {
+	stmtJSON, err := parseDSSEPayloadContext(ctx, bundlePath)
+	if err != nil {
+		if stderrors.Is(err, errors.New(errors.ErrCodeTimeout, "")) {
+			return "", err
+		}
+		return "", nil
+	}
+
+	var stmt struct {
+		Predicate struct {
+			BuildDefinition struct {
+				InternalParameters struct {
+					ToolVersion string `json:"toolVersion"`
+				} `json:"internalParameters"`
+			} `json:"buildDefinition"`
+		} `json:"predicate"`
+	}
+	if err := json.Unmarshal(stmtJSON, &stmt); err != nil {
+		return "", nil
+	}
+
+	return stmt.Predicate.BuildDefinition.InternalParameters.ToolVersion, nil
+}
+
+// extractBinaryDigest reads the bundle attestation and returns the binary
+// digest from resolvedDependencies. This is the digest of the binary that
+// created the bundle, not the currently running binary.
+func extractBinaryDigest(bundlePath string) ([]byte, error) {
+	return extractBinaryDigestContext(context.Background(), bundlePath)
+}
+
+func extractBinaryDigestContext(ctx context.Context, bundlePath string) ([]byte, error) {
+	stmtJSON, err := parseDSSEPayloadContext(ctx, bundlePath)
+	if err != nil {
+		return nil, errors.PropagateOrWrap(
+			err, errors.ErrCodeInternal, "failed to parse bundle attestation payload")
+	}
+
+	var stmt struct {
+		Predicate struct {
+			BuildDefinition struct {
+				ResolvedDependencies []struct {
+					Digest map[string]string `json:"digest"`
+				} `json:"resolvedDependencies"`
+			} `json:"buildDefinition"`
+		} `json:"predicate"`
+	}
+	if err := json.Unmarshal(stmtJSON, &stmt); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to parse bundle attestation statement", err)
+	}
+
+	for _, dep := range stmt.Predicate.BuildDefinition.ResolvedDependencies {
+		if hexDigest, ok := dep.Digest["sha256"]; ok && hexDigest != "" {
+			digest, decErr := hex.DecodeString(hexDigest)
+			if decErr != nil {
+				continue
+			}
+			return digest, nil
+		}
+	}
+
+	return nil, errors.New(errors.ErrCodeNotFound, "no binary digest found in bundle attestation resolvedDependencies")
+}
+
+// verifySigstoreBundle verifies a Sigstore bundle (.sigstore.json) against the
+// public-good trusted root, binding the attestation to the given artifact digest.
+// Requires a valid OIDC-issued certificate from any issuer (bundle attestation
+// proves someone signed it, not necessarily NVIDIA — identity pinning to NVIDIA
+// is enforced separately on the binary attestation).
+// Returns the signer identity on success.
+func verifySigstoreBundle(ctx context.Context, bundlePath string, artifactDigest []byte, src attestation.TrustedRootSource) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", errors.Wrap(errors.ErrCodeTimeout, "context cancelled before bundle attestation verification", err)
+	}
+
+	data, err := readBoundedFileContext(ctx, bundlePath)
+	if err != nil {
+		return "", err // already coded by readBoundedFileContext
+	}
+
+	// Require any valid OIDC-issued certificate — confirms a real identity signed this
+	identity, err := verify.NewShortCertificateIdentity("", ".+", "", ".+")
+	if err != nil {
+		return "", errors.Wrap(errors.ErrCodeInternal, "failed to create bundle identity matcher", err)
+	}
+
+	return attestation.VerifyStatementWith(ctx, data,
+		attestation.NewKeylessVerificationIdentity(identity, src),
+		attestation.NewRequireTLogPolicy(), artifactDigest)
+}
+
+// verifyKeySignedBundle verifies a public-key-signed bundle attestation (#407
+// KMS signing or a local PEM) against the key named by keyRef, binding it to
+// artifactDigest. Returns the key identity (KMS URI or pem:<fp>) as the bundle
+// creator, since a key-signed bundle has no certificate SAN. When ignoreTLog is
+// true (offline/air-gapped, #1154), the transparency-log requirement is relaxed
+// so a bundle signed with `bundle --signing-key ... --tlog-upload=false` (#409)
+// verifies with no transparency-log network calls (a local PEM keyRef is then
+// fully offline; a KMS URI keyRef still resolves the key remotely).
+func verifyKeySignedBundle(ctx context.Context, bundlePath string, artifactDigest []byte, keyRef string, src attestation.TrustedRootSource, ignoreTLog bool) (string, error) {
+	id, err := attestation.NewKeyVerificationIdentity(ctx, keyRef, src)
+	if err != nil {
+		return "", err // already classified (ErrCodeInvalidRequest / ErrCodeUnavailable)
+	}
+	data, err := readBoundedFileContext(ctx, bundlePath)
+	if err != nil {
+		return "", err // already coded by readBoundedFileContext
+	}
+	tlogPolicy := attestation.NewRequireTLogPolicy()
+	if ignoreTLog {
+		tlogPolicy = attestation.NewNoTLogVerifyPolicy()
+	}
+	signer, err := attestation.VerifyStatementWith(ctx, data, id, tlogPolicy, artifactDigest)
+	if err != nil {
+		return "", err
+	}
+	if signer == "" {
+		// Key-signed bundles carry no cert SAN; fall back to the key identity.
+		if ki, ok := id.(interface{ Identity() string }); ok {
+			return ki.Identity(), nil
+		}
+	}
+	return signer, nil
+}
+
+// VerifyBinaryAttestation verifies the binary attestation with identity pinning
+// to the given OIDC issuer and repository pattern, binding the attestation to
+// the given artifact digest. Returns the signer identity on success.
+func VerifyBinaryAttestation(ctx context.Context, bundlePath string, identityPattern string, artifactDigest []byte) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", errors.Wrap(errors.ErrCodeTimeout, "context cancelled before binary attestation verification", err)
+	}
+
+	data, err := readBoundedFileContext(ctx, bundlePath)
+	if err != nil {
+		return "", err // already coded by readBoundedFileContext
+	}
+	return VerifyBinaryAttestationData(ctx, data, identityPattern, artifactDigest)
+}
+
+// ReadBinaryAttestation reads a binary attestation file once. It refuses a
+// symlink as the final path component, does not block on special files, and is
+// size-bounded and cancellable. Verify the returned bytes with
+// VerifyBinaryAttestationData and copy those same bytes, so what is written is
+// what was verified.
+func ReadBinaryAttestation(ctx context.Context, path string) ([]byte, error) {
+	return readBoundedFileContext(ctx, path)
+}
+
+// VerifyBinaryAttestationData verifies an already-read binary attestation
+// (Sigstore bundle bytes) against the NVIDIA-CI identity pattern and the
+// artifact digest. VerifyBinaryAttestation reads a file then delegates here;
+// callers that already hold the bytes (e.g. the aicrd server, which caches and
+// embeds them) call this directly to verify the exact content they will use,
+// avoiding a verify-then-reread window.
+func VerifyBinaryAttestationData(ctx context.Context, data []byte, identityPattern string, artifactDigest []byte) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", errors.Wrap(errors.ErrCodeTimeout, "context cancelled before binary attestation verification", err)
+	}
+
+	// Pin identity to NVIDIA CI using the provided pattern
+	identity, err := verify.NewShortCertificateIdentity(
+		TrustedOIDCIssuer, "",
+		"", identityPattern,
+	)
+	if err != nil {
+		return "", errors.Wrap(errors.ErrCodeInternal, "failed to create identity matcher", err)
+	}
+
+	// Binary attestation is always signed by NVIDIA's public GitHub-OIDC CI, so
+	// it verifies against the public-good root only (nil source) regardless of
+	// any --trust-root for the bundle attestation.
+	return attestation.VerifyStatementWith(ctx, data,
+		attestation.NewKeylessVerificationIdentity(identity, nil),
+		attestation.NewRequireTLogPolicy(), artifactDigest)
+}

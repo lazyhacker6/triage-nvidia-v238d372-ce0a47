@@ -1,0 +1,521 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cli
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/urfave/cli/v3"
+
+	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+	"github.com/NVIDIA/aicr/pkg/serializer"
+)
+
+func recipeCmdFlags() []cli.Flag {
+	// Help text + shell completions draw from AllCriteria*Types so values
+	// introduced by --data overlays are discoverable. Before --data is
+	// processed the registry is empty, so the listed values match the
+	// embedded OSS set; once a data provider is initialized later in the
+	// Action the registry is populated, but flag Usage strings have
+	// already been formatted by then — discoverability in --help is on
+	// a best-effort basis when --data is co-resident on disk for an
+	// interactive `aicr recipe --data X --help`. The registry-aware
+	// validation still works regardless.
+	return []cli.Flag{
+		withCompletions(&cli.StringFlag{
+			Name:     flagService,
+			Usage:    fmt.Sprintf("Kubernetes service type (e.g. %s)", strings.Join(recipe.GetCriteriaServiceTypes(), ", ")),
+			Category: catQueryParameters,
+		}, recipe.GetCriteriaServiceTypes),
+		withCompletions(&cli.StringFlag{
+			Name:     flagAccelerator,
+			Aliases:  []string{"gpu"},
+			Usage:    fmt.Sprintf("Accelerator/GPU type (e.g. %s)", strings.Join(recipe.GetCriteriaAcceleratorTypes(), ", ")),
+			Category: catQueryParameters,
+		}, recipe.GetCriteriaAcceleratorTypes),
+		withCompletions(&cli.StringFlag{
+			Name:     flagIntent,
+			Usage:    fmt.Sprintf("Workload intent (e.g. %s)", strings.Join(recipe.GetCriteriaIntentTypes(), ", ")),
+			Category: catQueryParameters,
+		}, recipe.GetCriteriaIntentTypes),
+		withCompletions(&cli.StringFlag{
+			Name:     flagOS,
+			Usage:    fmt.Sprintf("Operating system type of the GPU node (e.g. %s)", strings.Join(recipe.GetCriteriaOSTypes(), ", ")),
+			Category: catQueryParameters,
+		}, recipe.GetCriteriaOSTypes),
+		withCompletions(&cli.StringFlag{
+			Name:     flagPlatform,
+			Usage:    fmt.Sprintf("Platform/framework type to include in the runtime (e.g. %s)", strings.Join(recipe.GetCriteriaPlatformTypes(), ", ")),
+			Category: catQueryParameters,
+		}, recipe.GetCriteriaPlatformTypes),
+		&cli.StringFlag{
+			Name:     flagProfile,
+			Usage:    "Configuration profile selection in name=value form",
+			Category: catQueryParameters,
+		},
+		withCompletions(&cli.StringFlag{
+			Name:     flagSlurmAccountingMode,
+			Usage:    fmt.Sprintf("Slurm accounting ownership mode (%s)", strings.Join(recipe.AccountingModes(), ", ")),
+			Category: catQueryParameters,
+		}, recipe.AccountingModes),
+		withCompletions(&cli.StringFlag{
+			Name: flagRuntimeInventory,
+			Usage: fmt.Sprintf(
+				"Runtime AI inventory (k8s-aibom) selection (%s). Recorded in the generated recipe; "+
+					"disabling removes the component and its health check",
+				strings.Join(recipe.RuntimeInventoryModes(), ", ")),
+			Category: catQueryParameters,
+		}, recipe.RuntimeInventoryModes),
+		&cli.StringFlag{
+			Name: flagGKETCPXOInterfaces,
+			Usage: "Ordered GKE GPU-NIC interface mapping for the torch-distributed-tcpxo runtime, " +
+				"as eth1=<network>,...,eth8=<network>. Required when the resolved recipe ships that " +
+				"runtime (h100 GKE kubeflow training); recorded in the generated recipe",
+			Category: catQueryParameters,
+		},
+		&cli.IntFlag{
+			Name:     "nodes",
+			Usage:    "Number of worker/GPU nodes in the cluster",
+			Category: catQueryParameters,
+		},
+		&cli.BoolFlag{
+			Name: "criteria-strict",
+			Usage: `Reject criteria values not in the embedded OSS catalog (ignore --data contributions).
+	Use in CI gates so the upstream catalog cannot accidentally depend on internal-only values.
+	Also honored via AICR_CRITERIA_STRICT=1.`,
+			Category: catQueryParameters,
+		},
+		&cli.BoolFlag{
+			Name: flagRequireEvidence,
+			Usage: `Fail when the resolved recipe has no committed evidence pointer.
+	The check is offline presence for the resolved recipe id, including the selected profile value. It does not verify a signature or fetch a bundle.
+	A pointer on a base id does not cover a profiled resolve. Resolving with external data (--data or spec.recipe.data) fails, even when the leaf overlay is still the embedded one.
+	Also honored via AICR_REQUIRE_EVIDENCE=1 or spec.recipe.requireEvidence: true in --config.`,
+			Category: catQueryParameters,
+		},
+		&cli.StringFlag{
+			Name: flagInheritFrom,
+			Usage: `Path to a prior recipe file, or to a bundle directory, whose resolved namespace, chart, source, path, manifest files and pre-manifest files this recipe keeps.
+	A bundle directory also supplies the fullnameOverride/nameOverride object names it installed with.
+	Use on an AICR upgrade so a component already running is not relocated, replaced or renamed by a moved default.
+	Use --inherit=namespace to keep only namespaces and take other settings from the new release.`,
+			Category: catInput,
+		},
+		&cli.StringFlag{
+			Name:     flagInherit,
+			Value:    "all",
+			Usage:    "Fields to keep from --inherit-from: all or namespace (requires --inherit-from)",
+			Category: catInput,
+		},
+		&cli.StringFlag{
+			Name:    cmdNameSnapshot,
+			Aliases: []string{"s"},
+			Usage: `Path/URI to previously generated configuration snapshot.
+	Supports: file paths, HTTP/HTTPS URLs, or ConfigMap URIs (cm://namespace/name).
+	If provided, criteria are extracted from the snapshot.`,
+			Category: catInput,
+		},
+		configFlag(),
+		dataFlag(),
+		outputFlag(),
+		formatFlag(),
+		kubeconfigFlag(),
+	}
+}
+
+func recipeCmd() *cli.Command {
+	return &cli.Command{
+		Name:     cmdNameRecipe,
+		Category: functionalCategoryName,
+		Usage:    "Create optimized recipe for given intent and environment parameters.",
+		// Value lists are derived from the canonical criteria registry (the
+		// same source the --service/--accelerator/--intent/--os flag usage
+		// strings use) so a new criteria value cannot silently leave this
+		// help text advertising a supported coordinate as unsupported.
+		Description: fmt.Sprintf(`Generate configuration recipe based on specified environment parameters including:
+  - Kubernetes service type (e.g. %s)
+  - Accelerator type (e.g. %s)
+  - Workload intent (e.g. %s)
+  - GPU node operating system (e.g. %s)
+  - Number of GPU nodes in the cluster
+
+The recipe returns a list of components with deployment order based on dependencies.
+Output can be in JSON or YAML format.
+
+Examples:
+
+Generate recipe from explicit criteria:
+  aicr recipe --service eks --accelerator h100 --os ubuntu --intent training
+
+Generate recipe from a config file:
+  aicr recipe --config config.yaml
+
+Generate recipe from a snapshot file:
+  aicr recipe --snapshot snapshot.yaml
+
+Generate recipe from a ConfigMap snapshot:
+  aicr recipe --snapshot cm://gpu-operator/aicr-snapshot
+
+Save recipe to a file:
+  aicr recipe --snapshot cm://gpu-operator/aicr-snapshot -o recipe.yaml
+
+Override config file values with flags:
+  aicr recipe --config config.yaml --service gke
+
+Override snapshot-detected criteria:
+  aicr recipe --snapshot cm://gpu-operator/aicr-snapshot --service gke`,
+			strings.Join(recipe.GetCriteriaServiceTypes(), ", "),
+			strings.Join(recipe.GetCriteriaAcceleratorTypes(), ", "),
+			strings.Join(recipe.GetCriteriaIntentTypes(), ", "),
+			strings.Join(recipe.GetCriteriaOSTypes(), ", "),
+		),
+		Commands: []*cli.Command{
+			recipeListCmd(),
+			recipeValidateCmd(),
+			recipeSignCatalogCmd(),
+			recipeVerifyCatalogCmd(),
+		},
+		Flags: recipeCmdFlags(),
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if err := validateSingleValueFlags(cmd, flagService, flagAccelerator, flagIntent, flagOS,
+				flagPlatform, flagProfile, flagSlurmAccountingMode, flagRuntimeInventory, flagGKETCPXOInterfaces,
+				flagInheritFrom, flagInherit, "snapshot", "config", flagOutput,
+				flagFormat); err != nil {
+				return err
+			}
+
+			cfg, err := loadFacadeConfig(ctx, cmd)
+			if err != nil {
+				return err
+			}
+
+			// Mode banner: recipe generation reads inputs (criteria, embedded
+			// data, an optional snapshot) and never deploys to or modifies a
+			// live cluster, so make that explicit up front (issue #1383).
+			slog.Info("generating recipe offline — reads inputs only; does not deploy to or modify any cluster")
+
+			// Build a per-command Client bound to the resolved data source
+			// (--data / spec.recipe.data, else embedded). The Client owns its
+			// own DataProvider and per-provider criteria registry, replacing
+			// the old process-global data provider.
+			client, err := recipeClientFromCmd(ctx, cmd, cfg)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = client.Close() }()
+
+			// Eagerly load THIS Client's catalog so its criteria registry is
+			// seeded before any criteria parse. The metadata store cache is
+			// otherwise lazy and the first parse would run against an empty
+			// registry. LoadCatalog preserves the inner error code so YAML
+			// parse failures surface as ErrCodeInvalidRequest.
+			if err = client.LoadCatalog(ctx); err != nil {
+				return err
+			}
+
+			applyClientCriteriaStrictMode(cmd, cfg, client)
+
+			outFormat, err := parseRecipeOutputFormat(cmd, cfg)
+			if err != nil {
+				return err
+			}
+
+			kubeconfig := cmd.String("kubeconfig")
+
+			result, err := buildRecipeFromCmdWithConfig(ctx, cmd, cfg, client)
+			if err != nil {
+				return errors.PropagateOrWrap(err, errors.ErrCodeInternal, "error building recipe")
+			}
+			if err = requirePublishedEvidence(ctx, cmd, cfg, client, result); err != nil {
+				return err
+			}
+
+			// Operate on the upstream pkg/recipe.RecipeResult for the remainder
+			// of this command — the facade RecipeResult exposes only the
+			// stable projection, but the CLI emits the full YAML and reports
+			// metadata that lives on the upstream shape.
+			resolved := result.Resolved()
+
+			// Log constraint warnings for visibility
+			if resolved != nil && len(resolved.Metadata.ConstraintWarnings) > 0 {
+				for _, w := range resolved.Metadata.ConstraintWarnings {
+					slog.Warn("overlay excluded due to constraint failure",
+						"overlay", w.Overlay,
+						"constraint", w.Constraint,
+						"expected", w.Expected,
+						"actual", w.Actual,
+						"reason", w.Reason)
+				}
+			}
+
+			output := recipeOutputPath(cmd, cfg)
+			ser, err := serializer.NewFileWriterOrStdoutWithKubeconfig(outFormat, output, kubeconfig)
+			if err != nil {
+				return errors.Wrap(errors.ErrCodeInternal, "failed to create output writer", err)
+			}
+			defer func() {
+				if closer, ok := ser.(interface{ Close() error }); ok {
+					if err := closer.Close(); err != nil {
+						slog.Warn("failed to close serializer", "error", err)
+					}
+				}
+			}()
+
+			if err := ser.Serialize(ctx, resolved); err != nil {
+				return errors.Wrap(errors.ErrCodeInternal, "failed to serialize recipe", err)
+			}
+
+			componentNames := make([]string, len(resolved.ComponentRefs))
+			for i, ref := range resolved.ComponentRefs {
+				componentNames[i] = ref.Name
+			}
+
+			slog.Info("recipe generation completed",
+				"output", output,
+				"components", len(resolved.ComponentRefs),
+				"componentNames", strings.Join(componentNames, ", "),
+				"overlays", len(resolved.Metadata.AppliedOverlays))
+
+			return nil
+		},
+	}
+}
+
+// applyClientCriteriaStrictMode applies command and config strictness only
+// after LoadCatalog has seeded the Client's registry. Strict mode then hides
+// external-origin criteria values from every subsequent parse. The
+// AICR_CRITERIA_STRICT environment variable is already honored when the
+// registry is constructed, so only the flag and config need handling here.
+// Keep recipe and query on this shared path so both commands enforce the same
+// criteria policy for external filesystem and OCI catalogs.
+func applyClientCriteriaStrictMode(cmd *cli.Command, cfg *aicr.Config, client *aicr.Client) {
+	if cmd.Bool("criteria-strict") || cfg.IsCriteriaStrict() {
+		client.CriteriaRegistry().SetStrict(true)
+	}
+}
+
+// recipeOutputPath returns the recipe output destination, with the CLI flag
+// overriding spec.recipe.output.path.
+func recipeOutputPath(cmd *cli.Command, cfg *aicr.Config) string {
+	return stringFlagOrConfig(cmd, "output", cfg.RecipeOutputOptions().Path)
+}
+
+// parseRecipeOutputFormat reads --format with precedence
+// CLI > spec.recipe.output.format > flag default ("yaml"), and validates
+// the result. stringFlagOrConfig handles all three sources: it prefers a
+// non-empty config value over the flag's Value: default, and falls
+// through to cmd.String(flag) (which surfaces the Value: default) only
+// when both CLI and config are empty.
+func parseRecipeOutputFormat(cmd *cli.Command, cfg *aicr.Config) (serializer.Format, error) {
+	raw := stringFlagOrConfig(cmd, "format", cfg.RecipeOutputOptions().Format)
+	out := serializer.Format(raw)
+	if out.IsUnknown() {
+		return "", errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("unknown output format: %q, valid formats are: yaml, json, table", raw))
+	}
+	return out, nil
+}
+
+// applyCriteriaFromConfig merges spec.recipe.criteria values into an existing
+// Criteria. Config values override snapshot-extracted values when both are
+// present and differ; when criteria is empty (no snapshot), config simply
+// populates it. CLI flags subsequently override both via applyCriteriaOverrides,
+// yielding precedence: CLI > config > snapshot.
+//
+// Conversion (string→typed enum) happens in
+// (*config.RecipeSpec).ResolveCriteriaWithRegistry against the per-provider
+// registry threaded in by the caller — this function only handles the
+// merge-and-log concern.
+//
+// Override events are logged at INFO so the resolved value is auditable.
+//
+// touched records which of the 5 coverage dimensions (service, accelerator,
+// intent, os, platform) this call set from config — i.e. explicitly
+// user-stated rather than snapshot-derived. Callers not tracking that
+// distinction (e.g. the no-snapshot criteria path) may pass nil; marks are
+// then no-ops.
+func applyCriteriaFromConfig(criteria *recipe.Criteria, cfg *aicr.Config, reg *recipe.CriteriaRegistry, touched map[aicr.CriteriaDimension]bool) error {
+	derived, err := cfg.RecipeCriteria(reg)
+	if err != nil {
+		return err
+	}
+	// Back to the internal shape: the merge below assigns into a
+	// *recipe.Criteria whose fields are enum types, not strings.
+	resolved := aicr.ToInternalCriteria(derived)
+	if resolved.Service != "" {
+		logCriteriaOverride(flagService, string(criteria.Service), string(resolved.Service))
+		criteria.Service = resolved.Service
+		markCriteriaTouched(touched, aicr.DimensionService)
+	}
+	if resolved.Accelerator != "" {
+		logCriteriaOverride(flagAccelerator, string(criteria.Accelerator), string(resolved.Accelerator))
+		criteria.Accelerator = resolved.Accelerator
+		markCriteriaTouched(touched, aicr.DimensionAccelerator)
+	}
+	if resolved.Intent != "" {
+		logCriteriaOverride(flagIntent, string(criteria.Intent), string(resolved.Intent))
+		criteria.Intent = resolved.Intent
+		markCriteriaTouched(touched, aicr.DimensionIntent)
+	}
+	if resolved.OS != "" {
+		logCriteriaOverride(flagOS, string(criteria.OS), string(resolved.OS))
+		criteria.OS = resolved.OS
+		markCriteriaTouched(touched, aicr.DimensionOS)
+	}
+	if resolved.Platform != "" {
+		logCriteriaOverride(flagPlatform, string(criteria.Platform), string(resolved.Platform))
+		criteria.Platform = resolved.Platform
+		markCriteriaTouched(touched, aicr.DimensionPlatform)
+	}
+	if resolved.Nodes > 0 {
+		if criteria.Nodes > 0 && criteria.Nodes != resolved.Nodes {
+			slog.Info("config overriding snapshot-detected value",
+				"field", "nodes", "snapshot", criteria.Nodes, "config", resolved.Nodes)
+		}
+		criteria.Nodes = resolved.Nodes
+	}
+	return nil
+}
+
+// markCriteriaTouched records that dim was explicitly set by config or a CLI
+// flag (as opposed to snapshot/fingerprint derivation). touched may be nil
+// for callers that don't need the distinction (e.g. the no-snapshot criteria
+// path); marking is then a no-op.
+func markCriteriaTouched(touched map[aicr.CriteriaDimension]bool, dim aicr.CriteriaDimension) {
+	if touched != nil {
+		touched[dim] = true
+	}
+}
+
+// logCriteriaOverride logs an INFO line when config replaces a non-default
+// snapshot-extracted value with a different one. Empty/wildcard prior values
+// are not interesting (the field was effectively unset).
+func logCriteriaOverride(field, prior, override string) {
+	if prior == "" || prior == criteriaAny || prior == override {
+		return
+	}
+	slog.Info("config overriding snapshot-detected value",
+		"field", field, "snapshot", prior, "config", override)
+}
+
+// mergeCriteriaFromCmdAndConfig builds a Criteria starting from spec.recipe.criteria
+// (when cfg is non-nil) and overlays CLI flag values on top. Every enum value
+// — config-sourced and flag-sourced alike — is resolved against the supplied
+// per-provider registry so a `--data` overlay's non-OSS values validate.
+func mergeCriteriaFromCmdAndConfig(cmd *cli.Command, cfg *aicr.Config, reg *recipe.CriteriaRegistry) (*recipe.Criteria, error) {
+	criteria := recipe.NewCriteria()
+	if err := applyCriteriaFromConfig(criteria, cfg, reg, nil); err != nil {
+		return nil, err
+	}
+	if err := applyCriteriaOverrides(cmd, criteria, reg, nil); err != nil {
+		return nil, err
+	}
+	return criteria, nil
+}
+
+// applyCriteriaOverrides applies CLI flag overrides to criteria, resolving each
+// enum value against the supplied per-provider registry. Logs a warning when a
+// flag overrides a value detected from the snapshot.
+//
+// touched records which of the 5 coverage dimensions this call set from a CLI
+// flag — see applyCriteriaFromConfig. Callers not tracking that distinction
+// may pass nil.
+func applyCriteriaOverrides(cmd *cli.Command, criteria *recipe.Criteria, reg *recipe.CriteriaRegistry, touched map[aicr.CriteriaDimension]bool) error {
+	if s := cmd.String(flagService); s != "" {
+		parsed, err := reg.ParseService(s)
+		if err != nil {
+			return err
+		}
+		if criteria.Service != "" && criteria.Service != parsed {
+			slog.Info("CLI flag overriding snapshot-detected value",
+				"field", flagService,
+				"detected", criteria.Service,
+				"override", parsed)
+		}
+		criteria.Service = parsed
+		markCriteriaTouched(touched, aicr.DimensionService)
+	}
+	if s := cmd.String(flagAccelerator); s != "" {
+		parsed, err := reg.ParseAccelerator(s)
+		if err != nil {
+			return err
+		}
+		if criteria.Accelerator != "" && criteria.Accelerator != parsed {
+			slog.Info("CLI flag overriding snapshot-detected value",
+				"field", flagAccelerator,
+				"detected", criteria.Accelerator,
+				"override", parsed)
+		}
+		criteria.Accelerator = parsed
+		markCriteriaTouched(touched, aicr.DimensionAccelerator)
+	}
+	if s := cmd.String(flagIntent); s != "" {
+		parsed, err := reg.ParseIntent(s)
+		if err != nil {
+			return err
+		}
+		if criteria.Intent != "" && criteria.Intent != parsed {
+			slog.Info("CLI flag overriding snapshot-detected value",
+				"field", flagIntent,
+				"detected", criteria.Intent,
+				"override", parsed)
+		}
+		criteria.Intent = parsed
+		markCriteriaTouched(touched, aicr.DimensionIntent)
+	}
+	if s := cmd.String(flagOS); s != "" {
+		parsed, err := reg.ParseOS(s)
+		if err != nil {
+			return err
+		}
+		if criteria.OS != "" && criteria.OS != parsed {
+			slog.Info("CLI flag overriding snapshot-detected value",
+				"field", flagOS,
+				"detected", criteria.OS,
+				"override", parsed)
+		}
+		criteria.OS = parsed
+		markCriteriaTouched(touched, aicr.DimensionOS)
+	}
+	if s := cmd.String(flagPlatform); s != "" {
+		parsed, err := reg.ParsePlatform(s)
+		if err != nil {
+			return err
+		}
+		if criteria.Platform != "" && criteria.Platform != parsed {
+			slog.Info("CLI flag overriding snapshot-detected value",
+				"field", flagPlatform,
+				"detected", criteria.Platform,
+				"override", parsed)
+		}
+		criteria.Platform = parsed
+		markCriteriaTouched(touched, aicr.DimensionPlatform)
+	}
+	if n := cmd.Int("nodes"); n > 0 {
+		if criteria.Nodes > 0 && criteria.Nodes != n {
+			slog.Info("CLI flag overriding snapshot-detected value",
+				"field", "nodes",
+				"detected", criteria.Nodes,
+				"override", n)
+		}
+		criteria.Nodes = n
+	}
+	return nil
+}

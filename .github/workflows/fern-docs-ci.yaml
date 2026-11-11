@@ -1,0 +1,63 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Validates Fern docs configuration on pull requests that touch docs or fern/.
+#
+# NOTE: `fern check` validates docs.yml/nav configuration — it does NOT parse
+# MDX, so it cannot catch a construct that aborts `fern generate --docs` at
+# publish time. Parser-level MDX validation is the `docs-mdx` job in
+# merge-gate.yaml, which is the blocking check (see docs/contributor/tests.md
+# "Docs MDX Gate"). This workflow is advisory nav/link validation.
+
+name: Fern Docs CI
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'fern/**'
+      - '.github/workflows/fern-docs-ci.yaml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  fern-check:
+    name: Fern Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '20'
+
+      - name: Install Fern CLI
+        run: npm install -g fern-api@$(jq -r .version fern/fern.config.json)
+
+      - name: Check MDX safety
+        run: ./tools/check-docs-mdx
+
+      - name: Fern check
+        run: fern check
+
+      - name: Check links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --offline --no-progress 'docs/**/*.md'
+          fail: true

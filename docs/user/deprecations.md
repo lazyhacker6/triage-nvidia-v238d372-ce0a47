@@ -1,0 +1,285 @@
+# Deprecations
+
+Every active AICR deprecation, the replacement, and the release that removes it.
+An entry stays on this page until the removal ships, then moves to
+[Removed](#removed) for one further release so an operator upgrading across
+several versions can still find out what happened.
+
+The policy behind this page — what counts as a breaking change on each surface,
+and the notice a removal owes — is in
+[`RELEASE.md`](https://github.com/NVIDIA/aicr/blob/main/RELEASE.md#deprecation-policy).
+
+## How you will find out
+
+You do not have to read this page to be warned. Every deprecation is announced
+on the affected surface through that surface's own channel — which is not always
+a runtime warning, because the most useful moment to be told differs by surface:
+
+| Surface | What you see | When |
+|---|---|---|
+| CLI | A warning on stderr naming the replacement and the removal release | At run time |
+| REST | A `Deprecation` header ([RFC 9745](https://www.rfc-editor.org/rfc/rfc9745.html)) with the deprecation date, a `Sunset` header ([RFC 8594](https://www.rfc-editor.org/rfc/rfc8594.html)) with the removal date, a `Link` with `rel="deprecation"`, and `deprecated: true` on the operation in the OpenAPI spec | On every response |
+| REST, one parameter value | A `Link` with `rel="deprecation"` pointing at the entry on this page; `Deprecation` and `Sunset` once their dates are set. The operation and parameter stay undeprecated in the OpenAPI spec, whose parameter description names the deprecated value. See [RELEASE.md](https://github.com/NVIDIA/aicr/blob/main/RELEASE.md#a-deprecated-parameter-value-not-a-deprecated-operation) | On responses to requests that use the value |
+| Go SDK | A `// Deprecated:` godoc marker, which `staticcheck` reports as `SA1019` | At **build** time |
+| Bundles and artifacts | A loader warning naming the file and the release that stops reading it | When the artifact is read |
+
+The Go SDK is deliberately build-time rather than run-time: the compiler and
+your linter can tell you before you ship, which beats a log line from
+production.
+
+That announcement is the contract. If something was removed without one, that is
+a bug worth [filing](https://github.com/NVIDIA/aicr/issues/new/choose).
+
+## Active
+
+### Bundle-time GPU allocation-policy overrides
+
+**Surface:** bundle value overrides ·
+**Deprecated in:** v0.17 · **Removed in:** not scheduled
+
+A static bundle-time override (`--set`, `--set-json`, `--set-file`, or a config
+file) of a key that selects the GPU allocation policy still applies, but warns.
+The keys are `devicePlugin.enabled` on `gpu-operator`(`-ocp`),
+`resources.gpus.enabled` and `gpuResourcesEnabledOverride` on
+`nvidia-dra-driver-gpu`(`-ocp`), and the `enabled` toggle of those components.
+Validators verify the allocation policy resolved from the recipe, so a
+bundle-time change is reported as recipe/cluster drift. `--dynamic` on these
+keys is already rejected. See
+[Configured GPU allocation policy](validation.md#configured-gpu-allocation-policy).
+
+No removal release is set yet, so the warning does not name one.
+
+**What to do.** Set the allocation mode in a recipe overlay instead of at
+bundle time.
+
+### Bundle-time `slinky-slurm:accounting.enabled` on legacy Slurm recipes
+
+**Surface:** bundle value overrides ·
+**Deprecated in:** v0.19 · **Removed in:** not scheduled
+
+A Slurm recipe that records no accounting mode (no
+`configuration.slurm.accounting`) predates `--slurm-accounting-mode`. Bundling
+one with a `slinky-slurm:accounting.enabled` override still works, but warns:
+the override selects only customer-managed accounting, and it is not recorded
+in recipe evidence. On a recipe that records a mode, the same override is
+rejected; see [Slurm Accounting](slinky-slurm-accounting.md).
+
+No removal release is set yet, so the warning does not name one.
+
+**What to do.** Regenerate the recipe with `--slurm-accounting-mode` (for
+example `customer-managed`) and drop the override.
+
+### Argo CD options as `deployer:` value overrides
+
+**Surface:** CLI, REST, config file, Go SDK ·
+**Deprecated in:** v1.2 · **Removed in:** v2.0.0
+
+The four Argo CD bundle options were set with a reserved `deployer` prefix on
+the value-override flag: `--set deployer:<key>=<value>`, `set=deployer:<key>=<value>`
+on `POST /v1/bundle`, or a `deployer:<key>=<value>` entry in
+`spec.bundle.deployment.set`. Each now has a dedicated setting:
+
+| Deprecated | CLI flag | Config field (`spec.bundle.deployment.argocd`) | REST parameter |
+|---|---|---|---|
+| `deployer:namePrefix` | `--argocd-name-prefix` | `namePrefix` | `argocd-name-prefix` |
+| `deployer:destinationServer` | `--argocd-destination-server` | `destinationServer` | `argocd-destination-server` |
+| `deployer:project` | `--argocd-project` | `project` | `argocd-project` |
+| `deployer:cascadeDelete` | `--argocd-cascade-delete` | `cascadeDelete` | `argocd-cascade-delete` |
+
+The `deployer:` spelling still works and produces the same bundle. Bundling
+warns once per key, whether the entry came from the CLI, a config file or the
+Go SDK, and a REST request that uses it gets a
+`Link` response header with `rel="deprecation"` pointing here. Only the
+`deployer:` spelling is deprecated: the bundle operation and the `set`
+parameter are not. Giving the same setting both ways in one source is
+rejected. A Go SDK caller passing `deployer:` entries in
+`BundleOptions.ValueOverrides` gets the same warning; use
+`BundleOptions.ArgoCD` instead.
+
+The argocd-helm install-time values are unaffected:
+`helm install --set deployer.namePrefix=...` (a dot, not a colon) is a chart
+value, not this bundle-time option.
+
+The spelling is on frozen v1 surfaces, so it keeps working through v1.x and
+is removed in v2.0.0, per the
+[deprecation policy](https://github.com/NVIDIA/aicr/blob/main/RELEASE.md#deprecation-policy).
+
+**What to do.** Replace each `deployer:<key>` entry with the setting in the
+table, then confirm the bundle is unchanged.
+
+### The `--feature` flag and `evidence.cncf.features` key
+
+**Surface:** CLI, config file, Go SDK ·
+**Deprecated in:** the release that follows v1.2.0 · **Removed in:** the same release (entry moves to Removed when its tag lands)
+
+The `validate` command's `--feature` (`-f`) scoped the sections of the bash evidence
+collector that `--cncf-submission` ran. The collector was deleted when
+`aicr validate --phase conformance` became the only runner for CNCF AI
+conformance ([#3602](https://github.com/NVIDIA/aicr/issues/3602), ADR-007
+amendment): every conformance check the recipe declares runs, so there is no
+section list to scope: the recipe's `validation.conformance.checks` decides
+what runs, `--skip-check` already scopes a CI run by name, and a submission
+run refuses `--skip-check` on purpose. The flag is removed outright (the CLI
+reports it as an unknown flag), a config document that sets
+`spec.validate.evidence.cncf.features` does not load, and the Go SDK refuses a
+non-empty `CNCFCollectOptions.Features` with `INVALID_REQUEST`. The frozen v1
+surface owes notice before a removal; the removal shipped with the collector
+because the behavior the flag selected no longer exists, and it is recorded
+here for that reason.
+
+**What to do.** Drop the flag or key. To write the submission directory, pass
+`--cncf-submission --evidence-dir <dir>` with `spec.validate.evidence.cncf.vendor`
+in `--config`; see
+[CNCF submission evidence](validation.md#cncf-submission-evidence).
+
+### `--evidence-dir` without `--cncf-submission`
+
+**Surface:** CLI, config file ·
+**Deprecated in:** the release that follows v1.2.0 · **Removed in:** the same release (entry moves to Removed when its tag lands)
+
+`--evidence-dir` alone rendered the CNCF evidence pages from a conformance run
+that was not a submission. The ADR-007 amendment makes the two flags require
+each other (evidence is written only for a submission run), so `--evidence-dir`
+without `--cncf-submission`, and `spec.validate.evidence.cncf.dir` without
+`cncfSubmission: true`, are refused with `INVALID_REQUEST`
+([#3602](https://github.com/NVIDIA/aicr/issues/3602)).
+
+**What to do.** Add `--cncf-submission` (or `cncfSubmission: true`). The same
+checks run with the same verdicts; the run additionally adds the requirement
+aggregation to its exit status, see
+[Exit status of a submission run](validation.md#exit-status-of-a-submission-run).
+
+### `--cncf-submission` without `--recipe` or without the conformance phase
+
+**Surface:** CLI, config file ·
+**Deprecated in:** the release that follows v1.2.0 · **Removed in:** the same release (entry moves to Removed when its tag lands)
+
+A submission run used to accept no recipe: the collector detected the
+cluster's capabilities itself. The single runner selects the conformance
+checks from the recipe, so `--cncf-submission` without `--recipe` (or
+`spec.validate.input.recipe`) is refused with `INVALID_REQUEST`, as every
+other validate run already was. It is also refused when the `--phase`
+selection leaves the conformance phase out, since the evidence is rendered
+from that phase's checks and every requirement would otherwise read not
+tested ([#3602](https://github.com/NVIDIA/aicr/issues/3602)).
+
+**What to do.** Pass `--recipe <recipe.yaml>` (the deployed bundle's
+`bundle/recipe.yaml` is the usual input) and `--phase conformance` or
+`--phase all`.
+
+### `Client.CollectCNCFEvidence` argument contract
+
+**Surface:** Go SDK ·
+**Deprecated in:** the release that follows v1.2.0 · **Removed in:** the same release (entry moves to Removed when its tag lands)
+
+The signature is unchanged, and three documented semantics changed with the
+collector's removal ([#3602](https://github.com/NVIDIA/aicr/issues/3602)):
+
+- A nil `*RecipeResult`, documented as optional (the collector then detected
+  the cluster's capabilities), is refused with `ErrCodeInvalidRequest`: the
+  run selects its conformance checks from the recipe.
+- `CNCFCollectOptions.NoCluster`, documented as a test mode that reported
+  every section skipped, is refused with `ErrCodeInvalidRequest`: submission
+  evidence comes from checks that ran on a live cluster. The field is marked
+  `Deprecated`.
+- `CNCFEvidenceFeatures()` returns an empty slice instead of the nine feature
+  names, and is marked `Deprecated` together with
+  `CNCFCollectOptions.Features`, which is refused when non-empty (see the
+  entry above).
+
+The method is now the submission run itself: snapshot, the conformance phase
+the recipe declares, render, and the exit rule of
+`CNCFRequirementAggregate.Outcome`. Its cluster footprint is the CLI's, not
+the kubectl collector's: the snapshot agent runs privileged (hostPID,
+hostNetwork and host mounts for the GPU, SystemD and OS collectors) in
+`CNCFCollectOptions.Namespace` (default `aicr-validation`), and
+`ValidateState` creates per-run RBAC for the validator Jobs, a cluster-admin
+binding by default. A caller that needs a restricted agent or its own
+validator ServiceAccount composes `CollectSnapshot`, `ValidateState`,
+`MergeReports` and `RenderCNCFEvidenceWithResult` (or `WriteCNCFSubmission`)
+directly. `staticcheck`
+reports the deprecated members as `SA1019` at build time.
+
+**What to do.** Pass the recipe from `LoadRecipe` or `ResolveRecipe`; for an
+offline dry-run call `ValidateState` with `WithValidationNoCluster(true)`
+instead; drop `Features` and any use of `CNCFEvidenceFeatures()`. See
+[Go library](../integrator/go-library.md#cncf-ai-conformance-evidence).
+
+
+## Removed
+
+### Alpha artifact `apiVersion` values
+
+**Surface:** bundle and artifact schemas ·
+**Deprecated in:** v0.22 · **Removed in:** v1.0.0
+
+Every artifact AICR generates carried an alpha `apiVersion` — `aicr.run/v1alpha2`
+for most kinds, `aicr.run/v1alpha3` for profile-bearing recipes. Those values were
+replaced by maturity-appropriate targets, per
+[ADR-022](https://github.com/NVIDIA/aicr/blob/main/docs/design/022-artifact-maturity-and-deprecation.md).
+
+| Kind | Retired | Replacement |
+|---|---|---|
+| `Snapshot`, default `RecipeResult`, `RecipeCriteria`, `BundleProvenance` | `aicr.run/v1alpha2` | `aicr.run/v1` |
+| `AICRConfig`, catalog `RecipeMetadata`, `RecipeMixin`, `ComponentRegistry` | `aicr.run/v1alpha2` | `aicr.run/v1beta1` |
+| Profile-bearing `RecipeMetadata` and `RecipeResult` | `aicr.run/v1alpha3` | `aicr.run/v1beta2` |
+
+**What to do.** Generated artifacts — snapshots, resolved recipes, bundle
+provenance — are recaptured or regenerated by re-running the command that
+produced them. Files you authored — `AICRConfig`, and any external
+`RecipeMetadata`, `RecipeMixin`, or `ComponentRegistry` in a `--data` catalog —
+are edited by hand. AICR has no conversion layer and does not rewrite your
+catalog.
+
+**The window was v0.22 only, and it has closed.** v0.21 and v0.22 read both the
+alpha and the target values; v1.0.0 reads only the target, and rejects an alpha or
+absent `apiVersion` with a message naming the value, the expected value, and the
+release that withdrew it. An archived artifact whose source cannot be recaptured
+stays readable only with a retained v0.21 or v0.22 binary. See
+[catalog and binary compatibility](../integrator/data-extension.md#catalog-and-binary-compatibility)
+for the release-by-release table.
+
+**Go importers.** The retirement also removed the exported `pkg/header`
+identifiers that named the alpha values. `pkg/header` sits outside the
+`pkg/client/v1` SDK surface the API compatibility gate covers, so this reaches
+you as a compile error rather than a recorded API break.
+
+| Removed | Replace with |
+|---|---|
+| `APIVersionV1Alpha2` | the bare segment for your track — `APIVersionV1`, `APIVersionV1Beta1`, or `APIVersionV1Beta2` |
+| `APIVersionV1Alpha3` | `APIVersionV1Beta2`; it only ever named the profile-bearing track |
+| `GroupVersion` | the full group/version for your track — `GroupVersionV1`, `GroupVersionV1Beta1`, or `GroupVersionV1Beta2` |
+| `RecipeResultGroupVersion` | `GroupVersionV1Beta2`, for the same reason |
+| `WarnDeprecatedAPIVersion` | nothing — a retired value is rejected now, not warned about. `RetirementNote` supplies the `(… was retired in v1.0.0)` clause for the rejection message |
+| `ResetAPIVersionRecorderForTest` | nothing — the warning recorder it reset is gone |
+
+The two constant families are not interchangeable: an `APIVersion*` constant is
+a bare segment (`v1beta1`), while a `GroupVersion*` constant carries the group
+as well (`aicr.run/v1beta1`). Use the Kind table above to pick your track, and
+alias the constant rather than the string it happens to equal — the tracks hold
+distinct values now, so a collapsed alias shows up as a wrong value rather than
+a latent one.
+
+### Empty `apiVersion` on artifacts
+
+**Surface:** bundle and artifact schemas ·
+**Deprecated in:** v0.22 ·
+**Removed in:** v1.0.0 for `Snapshot`, `RecipeCriteria`, and `RecipeResult`
+inputs; v0.21 for `RecipeMetadata` overlays
+
+Artifacts predating the `apiVersion` field loaded with the field absent or
+empty. That tolerance retired alongside the alpha values — except for
+`RecipeMetadata`, which lost it a release early and without a warning window;
+see below.
+
+One narrowing landed earlier than the rest: as of v0.21, a `RecipeMetadata`
+overlay passed directly (`aicr bundle -r overlay.yaml`,
+`aicr validate -r overlay.yaml`) must carry an `apiVersion`, because the catalog
+scanner already required one and the two paths disagreed on the same bytes
+([#2421](https://github.com/NVIDIA/aicr/issues/2421)). `Snapshot`,
+`RecipeCriteria`, and hydrated `RecipeResult` inputs kept the tolerance until
+v1.0.0.
+
+**What to do.** Add an `apiVersion` header to any artifact you author or retain.
+Use the target value from the table above; v1.0.0 and later accept only the
+target.

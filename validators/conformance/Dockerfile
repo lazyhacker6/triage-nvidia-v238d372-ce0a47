@@ -1,0 +1,27 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+FROM nvcr.io/nvidia/distroless/static:v4.1.3@sha256:e6eb65cecc405fabfdfd69f95d4e090baa696c97ab3759151f4160c97aa8ecb7
+
+# Go dependencies are resolved before the image build. BuildKit cannot receive
+# the authenticated release proxy credential without exposing it in build
+# metadata, so this stage only packages the binary for its target platform.
+ARG TARGETARCH
+COPY dist/validator/${TARGETARCH}/conformance /conformance
+COPY validators/conformance/testdata /app/testdata
+
+WORKDIR /app
+# nvs (UID 1000) is the sole nonroot user in the NVIDIA distroless static base.
+USER nvs
+ENTRYPOINT ["/conformance"]

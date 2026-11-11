@@ -1,0 +1,247 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cli-bundle-ocp
+spec:
+  description: |
+    Validates that aicr recipe + bundle CLI commands produce correct output
+    for OCP (OpenShift Container Platform) recipes. Verifies:
+      - Numbered folder layout (six OCP components)
+      - Rendered manifest content (Subscription, OperatorGroup, CRs)
+      - Readiness gate folders emitted with --readiness-hooks
+    No cluster needed -- purely CLI output validation.
+    Run with: AICR_BIN=$(pwd)/dist/e2e/aicr chainsaw test --no-cluster --test-dir tests/chainsaw/cli/bundle-ocp
+  timeouts:
+    exec: 60s
+  steps:
+    - name: generate-recipe
+      description: Generate an OCP inference recipe.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-ocp"
+              rm -rf "${WORK}" && mkdir -p "${WORK}"
+              ${AICR_BIN} recipe \
+                --service ocp \
+                --intent inference \
+                --output "${WORK}/recipe.yaml"
+
+    - name: assert-recipe
+      description: Verify recipe has correct criteria and OCP components.
+      try:
+        - script:
+            content: |
+              chainsaw assert \
+                --resource /tmp/chainsaw-bundle-ocp/recipe.yaml \
+                --file ./assert-recipe.yaml \
+                --no-color --timeout 5s
+
+    - name: generate-bundle
+      description: Generate a Helm bundle with readiness hooks.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-ocp"
+              ${AICR_BIN} bundle \
+                --recipe "${WORK}/recipe.yaml" \
+                --output "${WORK}/bundle" \
+                --readiness-hooks
+
+    - name: assert-folder-structure
+      description: Verify bundle scaffold files exist and at least one component folder is emitted.
+      try:
+        - script:
+            content: |
+              # Each check below carries its own `|| { …; exit 1; }`, which is
+              # what makes it fail closed — `set -e` does not apply to the left
+              # side of `||`. set -eu is defence in depth for anything added
+              # later without that guard: a bare `test -f` returns 1 without
+              # terminating, and Chainsaw reads only the script's final exit
+              # status, so an unguarded check would pass silently.
+              set -eu
+              WORK="/tmp/chainsaw-bundle-ocp"
+              for f in deploy.sh README.md recipe.yaml; do
+                test -f "${WORK}/bundle/${f}" \
+                  || { echo "missing scaffold file: ${f}" >&2; exit 1; }
+              done
+              ls "${WORK}"/bundle/[0-9][0-9][0-9]-*/ >/dev/null 2>&1 \
+                || { echo "no numbered component folders found" >&2; exit 1; }
+            check:
+              ($error == null): true
+
+    - name: assert-rendered-manifests
+      description: Verify bundle contains at least one OLM component with Subscription and OperatorGroup.
+      try:
+        - script:
+            content: |
+              WORK="/tmp/chainsaw-bundle-ocp"
+              ls -d "${WORK}"/bundle/[0-9][0-9][0-9]-*-olm/ >/dev/null 2>&1 \
+                || { echo "no OLM component folders found" >&2; exit 1; }
+              for kind in Subscription OperatorGroup; do
+                found=false
+                for f in "${WORK}"/bundle/*/templates/*.yaml; do
+                  [ -f "$f" ] || continue
+                  grep -q "kind: ${kind}" "$f" 2>/dev/null && { found=true; break; }
+                done
+                [ "${found}" = "true" ] \
+                  || { echo "kind ${kind} not found in bundle" >&2; exit 1; }
+              done
+            check:
+              ($error == null): true
+
+    - name: assert-olm-has-readiness-gate
+      description: Verify every OLM folder has a readiness gate folder immediately after it.
+      try:
+        - script:
+            content: |
+              WORK="/tmp/chainsaw-bundle-ocp"
+              for olm_dir in "${WORK}"/bundle/[0-9][0-9][0-9]-*-olm/; do
+                [ -d "${olm_dir}" ] || continue
+                basename "${olm_dir}" | grep -q "\-readiness/$" && continue
+                olm_name=$(basename "${olm_dir}" | sed 's/^[0-9]*-//')
+                olm_seq=$(basename "${olm_dir}" | grep -o '^[0-9]*')
+                rdns_dir=$(ls -d "${WORK}"/bundle/[0-9][0-9][0-9]-${olm_name}-readiness 2>/dev/null | head -1)
+                [ -n "${rdns_dir}" ] \
+                  || { echo "readiness folder for ${olm_name} not found" >&2; exit 1; }
+                rdns_seq=$(basename "${rdns_dir}" | grep -o '^[0-9]*')
+                [ "${olm_seq}" -lt "${rdns_seq}" ] \
+                  || { echo "${olm_name} (${olm_seq}) must precede its readiness gate (${rdns_seq})" >&2; exit 1; }
+              done
+            check:
+              ($error == null): true
+
+    - name: assert-cr-follows-olm-readiness-gate
+      description: Verify every operator CR folder follows its OLM readiness gate.
+      try:
+        - script:
+            content: |
+              WORK="/tmp/chainsaw-bundle-ocp"
+              for rdns_dir in "${WORK}"/bundle/[0-9][0-9][0-9]-*-olm-readiness/; do
+                [ -d "${rdns_dir}" ] || continue
+                rdns_seq=$(basename "${rdns_dir}" | grep -o '^[0-9]*')
+                cr_name=$(basename "${rdns_dir}" | sed 's/^[0-9]*-//; s/-readiness$//' | sed 's/-olm$//')
+                cr_dir=$(ls -d "${WORK}"/bundle/[0-9][0-9][0-9]-${cr_name} 2>/dev/null | head -1)
+                [ -n "${cr_dir}" ] \
+                  || { echo "CR folder for ${cr_name} not found" >&2; exit 1; }
+                cr_seq=$(basename "${cr_dir}" | grep -o '^[0-9]*')
+                [ "${rdns_seq}" -lt "${cr_seq}" ] \
+                  || { echo "readiness gate (${rdns_seq}) must precede CR ${cr_name} (${cr_seq})" >&2; exit 1; }
+              done
+            check:
+              ($error == null): true
+
+    - name: assert-network-readiness-barrier-precedes-gpu-policy
+      description: >-
+        Verify the NicClusterPolicy readiness gate blocks the peermem-enabled
+        GPU ClusterPolicy until Network Operator reports DOCA/OFED ready.
+      try:
+        - script:
+            content: |
+              set -eu
+              WORK="/tmp/chainsaw-bundle-ocp"
+              network_dir=$(ls -d "${WORK}"/bundle/[0-9][0-9][0-9]-network-operator-ocp 2>/dev/null | head -1)
+              network_readiness_dir=$(ls -d "${WORK}"/bundle/[0-9][0-9][0-9]-network-operator-ocp-readiness 2>/dev/null | head -1)
+              gpu_dir=$(ls -d "${WORK}"/bundle/[0-9][0-9][0-9]-gpu-operator-ocp 2>/dev/null | head -1)
+              [ -n "${network_dir}" ] && [ -n "${network_readiness_dir}" ] && [ -n "${gpu_dir}" ] \
+                || { echo "missing OCP network/GPU ordering folder" >&2; exit 1; }
+
+              network_seq=$(basename "${network_dir}" | grep -o '^[0-9]*')
+              network_readiness_seq=$(basename "${network_readiness_dir}" | grep -o '^[0-9]*')
+              gpu_seq=$(basename "${gpu_dir}" | grep -o '^[0-9]*')
+              [ "${network_seq}" -lt "${network_readiness_seq}" ] \
+                || { echo "network-operator-ocp (${network_seq}) must precede its readiness gate (${network_readiness_seq})" >&2; exit 1; }
+              [ "${network_readiness_seq}" -lt "${gpu_seq}" ] \
+                || { echo "network readiness gate (${network_readiness_seq}) must precede gpu-operator-ocp (${gpu_seq})" >&2; exit 1; }
+
+              grep -R -q 'kind: NicClusterPolicy' "${network_readiness_dir}/templates" \
+                || { echo "network readiness gate does not assert NicClusterPolicy" >&2; exit 1; }
+              grep -R -q 'state: ready' "${network_readiness_dir}/templates" \
+                || { echo "network readiness gate does not assert state=ready" >&2; exit 1; }
+              grep -R -q 'nicclusterpolicies' "${network_readiness_dir}/templates" \
+                || { echo "network readiness gate lacks NicClusterPolicy RBAC" >&2; exit 1; }
+            check:
+              ($error == null): true
+
+    - name: generate-argocd-helm-bundle
+      description: >-
+        Bundle the same OCP recipe with --deployer argocd-helm. Most OCP
+        components are local charts (OLM installer + CR pairs), but
+        prometheus-adapter-ocp and nvidia-dra-driver-gpu-ocp reuse their
+        upstream Helm chart (no certified OCP operator exists for them),
+        so static/ is expected to contain exactly those two values files.
+        See issue #1942 for the original all-local-chart empty-directory
+        bug this step guards against.
+      try:
+        - script:
+            content: |
+              AICR_BIN="${AICR_BIN:?Set AICR_BIN to the path of the aicr binary}"
+              WORK="/tmp/chainsaw-bundle-ocp"
+              ${AICR_BIN} bundle \
+                --recipe "${WORK}/recipe.yaml" \
+                --output "${WORK}/bundle-argocd-helm" \
+                --deployer argocd-helm
+            check:
+              ($error == null): true
+
+    - name: assert-argocd-helm-static-has-helm-reuse-components-only
+      description: >-
+        static/ must contain exactly the two Helm-reuse OCP components'
+        values files (prometheus-adapter-ocp, nvidia-dra-driver-gpu-ocp)
+        and must NOT contain their non-OCP base equivalents (which aren't
+        part of this OCP recipe) or an empty/missing directory.
+      try:
+        - script:
+            content: |
+              # The explicit `|| { …; exit 1; }` on each check is the
+              # safeguard, and set -eu covers anything added later without
+              # one.
+              set -eu
+              WORK="/tmp/chainsaw-bundle-ocp"
+              BUNDLE="${WORK}/bundle-argocd-helm"
+              for f in Chart.yaml values.yaml; do
+                test -f "${BUNDLE}/${f}" \
+                  || { echo "missing scaffold file: ${f}" >&2; exit 1; }
+              done
+              ls "${BUNDLE}"/[0-9][0-9][0-9]-*/ >/dev/null 2>&1 \
+                || { echo "no numbered component folders found" >&2; exit 1; }
+              # static/ must exist (two upstream-Helm-reuse OCP components
+              # contribute values files) and contain exactly the expected
+              # pair — no more, no less.
+              test -d "${BUNDLE}/static" \
+                || { echo "static/ missing; expected values files for prometheus-adapter-ocp and nvidia-dra-driver-gpu-ocp" >&2; exit 1; }
+              for f in prometheus-adapter-ocp.yaml nvidia-dra-driver-gpu-ocp.yaml; do
+                test -f "${BUNDLE}/static/${f}" \
+                  || { echo "missing expected static/ file: ${f}" >&2; ls -la "${BUNDLE}/static" >&2; exit 1; }
+              done
+              for f in prometheus-adapter.yaml nvidia-dra-driver-gpu.yaml; do
+                if [ -e "${BUNDLE}/static/${f}" ]; then
+                  echo "unexpected non-OCP base component file in static/: ${f} (not part of this OCP recipe)" >&2
+                  exit 1
+                fi
+              done
+              actual_count=$(ls "${BUNDLE}/static" | wc -l)
+              [ "${actual_count}" -eq 2 ] \
+                || { echo "static/ has ${actual_count} files, expected exactly 2" >&2; ls -la "${BUNDLE}/static" >&2; exit 1; }
+            check:
+              ($error == null): true
+      cleanup:
+        - script:
+            content: |
+              rm -rf /tmp/chainsaw-bundle-ocp

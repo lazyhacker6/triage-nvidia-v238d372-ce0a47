@@ -1,0 +1,482 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package attestation
+
+import (
+	"context"
+	stderrors "errors"
+	"log/slog"
+	"sort"
+	"strings"
+
+	bundleattest "github.com/NVIDIA/aicr/pkg/bundler/attestation"
+	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/evidence/redact"
+	"github.com/NVIDIA/aicr/pkg/oci"
+	"github.com/NVIDIA/aicr/pkg/recipe"
+	"github.com/NVIDIA/aicr/pkg/serializer"
+	"github.com/NVIDIA/aicr/pkg/snapshotter"
+	"github.com/NVIDIA/aicr/pkg/validator"
+	"github.com/NVIDIA/aicr/pkg/validator/catalog"
+)
+
+// EmitOptions controls a single Emit run. The same options struct is used
+// by `aicr validate --emit-attestation` and by the (forthcoming) API
+// surface so the orchestration stays callable from both pkg/cli and
+// pkg/server with no business-logic duplication.
+type EmitOptions struct {
+	// OutDir receives pointer.yaml and the summary-bundle/ tree.
+	OutDir string
+
+	// BOMPath is the path to a pre-built CycloneDX BOM. When empty Emit
+	// auto-generates a recipe-bound BOM via BuildAutoBOM.
+	BOMPath string
+
+	// Push is the optional OCI reference (oci://… or registry path) the
+	// summary bundle is pushed to. When empty Emit produces an unsigned,
+	// local-only bundle.
+	Push        string
+	PlainHTTP   bool
+	InsecureTLS bool
+
+	// NoSign pushes the bundle unsigned and writes a pointer with an empty
+	// signer block. Consulted only when Push is set; with Push empty the
+	// bundle is already local-only and unsigned. Lets the network-light push
+	// run where the cluster lives and defers Fulcio/Rekor signing to the
+	// fork-based CI workflow.
+	NoSign bool
+
+	// Full disables minimization. By default (Full=false) the bundle ships a
+	// redacted snapshot and CTRF reports with stdout/message omitted, and the
+	// predicate records the redaction policy. Full=true ships the raw
+	// payloads (pre-feature behavior) and leaves the predicate's redaction
+	// field unset.
+	Full bool
+
+	Recipe       *recipe.RecipeResult
+	Snapshot     *snapshotter.Snapshot
+	PhaseResults []*validator.PhaseResult
+
+	// Catalog is the validator catalog snapshot used for the auto-BOM and
+	// the predicate's validatorImages list. Pass nil when no catalog was
+	// loaded — the predicate's validatorImages will be omitted.
+	Catalog *catalog.ValidatorCatalog
+
+	// AllowMutableValidatorTags emits the bundle even when a validator image
+	// resolves to a moving tag. Emit otherwise fails closed, because the
+	// predicate records validator images by tag alone (ValidatorImages'
+	// Digest is empty by design) and a moving tag leaves the attestation's
+	// claim about which validators ran unverifiable once the tag advances.
+	//
+	// Set it only where the ref is known-disposable and the evidence is not:
+	// the kind UAT smoke lane runs side-loaded ko.local images, and the
+	// evidence demo publishes to a 72h ttl.sh repo. A real conformance run
+	// drops AICR_VALIDATOR_IMAGE_TAG instead. See #2873.
+	AllowMutableValidatorTags bool
+
+	// AICRVersion is stamped into the predicate and into the auto BOM's
+	// metadata.tools entry.
+	AICRVersion string
+
+	// AICRCommit is the build commit stamped into the predicate. A value
+	// that is not a commit SHA (e.g. the unstamped "unknown") is omitted.
+	AICRCommit string
+
+	// OIDCResolve is consulted only when Push is set. A SigningKey selects
+	// KMS signing and no token is resolved; otherwise resolution is
+	// deferred until adjacent to SignStatement so Fulcio's nonce-binding
+	// window is respected — a long Helm-render-and-push phase between
+	// resolve and sign otherwise invalidates the token.
+	OIDCResolve bundleattest.ResolveOptions
+}
+
+// EmitResult describes the artifacts a successful Emit run produced.
+// Sign and PushSummary are nil when --push is absent; Bundle and
+// PointerPath are always populated on success.
+type EmitResult struct {
+	Bundle      *Bundle
+	PointerPath string
+	Sign        *bundleattest.SignedAttestation
+	PushSummary *PushResult
+}
+
+// errMutableValidatorTag is the cause carried by the provenance failure. The
+// predicate identifies validators by tag alone, so a moving tag is a defect in
+// the evidence, not in the run that produced it — the validations themselves
+// succeeded.
+var errMutableValidatorTag = stderrors.New(
+	"validator image tag can be repointed after the run, leaving the attestation unverifiable")
+
+// checkValidatorTagProvenance fails closed when any validator image the
+// predicate will record resolves to a moving tag, naming every offending ref
+// so the operator can see which override to drop. With allow set the emit
+// proceeds and the refs are logged instead — the bundle still records what
+// actually ran, it just cannot be independently re-resolved later.
+func checkValidatorTagProvenance(images []ValidatorImage, allow bool) error {
+	mutable := MutableValidatorImages(images)
+	if len(mutable) == 0 {
+		return nil
+	}
+	if allow {
+		slog.Warn("emitting evidence with mutable validator image tags",
+			"images", mutable,
+			"impact", "the attestation names refs that can later resolve to different validator code")
+		return nil
+	}
+	return errors.WrapWithContext(errors.ErrCodeInvalidRequest,
+		"refusing to emit evidence naming validator images that are not immutably pinned: "+strings.Join(mutable, ", "),
+		errMutableValidatorTag,
+		map[string]any{
+			"images": mutable,
+			// Every cause is named because the override is only the most
+			// common one. An unstamped `go build` (commit "unknown") resolves
+			// nothing and leaves the catalog's own :latest in place, and an
+			// image outside the trusted publisher prefix fails on any tag —
+			// in both cases telling the operator to unset a variable they
+			// never set would be a dead end.
+			"hint": "unset AICR_VALIDATOR_IMAGE_TAG if set, or build with a stamped commit " +
+				"(make build) so an immutable tag resolves (:vX.Y.Z or :sha-<commit>); " +
+				"an image outside " + catalog.TrustedValidatorRepoPrefix +
+				" must be pinned by digest (name@sha256:...), because no AICR workflow " +
+				"governs how another registry moves its tags; or pass " +
+				"--allow-mutable-validator-tags to override",
+		})
+}
+
+// Emit builds, optionally signs, and optionally pushes a recipe-evidence
+// bundle (predicateType v3, unconditionally), then writes the pointer file. The
+// pointer is written last, only when every earlier stage succeeds — a
+// push-ref validation, build, sign, or push error returns before any
+// pointer is written. When Push is absent the pointer is still written
+// (with empty bundle fields) on a successful build.
+//
+// A validator image resolving to a mutable tag fails the emit before any work
+// is done, unless AllowMutableValidatorTags is set.
+//
+// Behavior matrix:
+//
+//	Push absent           → unsigned bundle on disk; pointer carries empty bundle.{oci,digest}.
+//	Push set, no OIDC     → error: keyless signing requires an OIDC token.
+//	Push set, OIDC        → sign with cosign keyless, push summary to OCI, populate pointer.
+func Emit(ctx context.Context, opts EmitOptions) (*EmitResult, error) {
+	// Validate --push up front so a malformed ref doesn't waste a Fulcio
+	// cert + Rekor inclusion proof on a sign the push would reject anyway.
+	if opts.Push != "" {
+		if _, err := oci.ParseOutputTarget(opts.Push); err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInvalidRequest, "invalid push reference", err)
+		}
+	}
+
+	// Gate the validator provenance before any work, for the same reason the
+	// push ref is parsed above: a bundle that must not be published should
+	// cost nothing to reject, and must leave nothing half-written on disk.
+	validatorImages := ValidatorImagesForPredicate(opts.Catalog)
+	if err := checkValidatorTagProvenance(validatorImages, opts.AllowMutableValidatorTags); err != nil {
+		return nil, err
+	}
+
+	bomBody, err := LoadOrGenerateBOMContext(ctx, opts.BOMPath, opts.Recipe, opts.Snapshot, opts.Catalog, opts.AICRVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	// Use the deterministic marshaller: snapshot.yaml is written into the
+	// bundle as-is and its hash feeds the signed manifest digest, so
+	// yaml.v3's randomized map iteration would otherwise produce a
+	// different manifest digest on every run for the same inputs. The
+	// recipe is canonicalized further down by Build, but using the same
+	// helper here keeps the contract uniform across both fields.
+	recipeYAML, err := serializer.MarshalYAMLDeterministic(opts.Recipe)
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to marshal recipe for evidence", err)
+	}
+
+	// Minimize the backing content unless the operator opted into a full
+	// bundle. The predicate's Fingerprint/CriteriaMatch are still computed
+	// by Build from the raw opts.Snapshot, so the conformance signal is
+	// preserved; only the shipped snapshot/CTRF bytes are reduced.
+	snapshotForBundle, phaseResults, redaction := applyRedaction(opts)
+
+	snapshotYAML, err := serializer.MarshalYAMLDeterministic(snapshotForBundle)
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to marshal snapshot for evidence", err)
+	}
+
+	buildCtx, buildCancel := context.WithTimeout(ctx, defaults.EvidenceBundleBuildTimeout)
+	defer buildCancel()
+
+	bundle, err := Build(buildCtx, BuildOptions{
+		OutputDir:               opts.OutDir,
+		Recipe:                  opts.Recipe,
+		RecipeYAML:              recipeYAML,
+		Snapshot:                opts.Snapshot,
+		SnapshotYAML:            snapshotYAML,
+		BOM:                     BOMInputs{Body: bomBody, CycloneDXVersion: DefaultCycloneDXVersion},
+		PhaseResults:            phaseResults,
+		AICRVersion:             opts.AICRVersion,
+		AICRCommit:              opts.AICRCommit,
+		ValidatorCatalogVersion: CatalogVersion(opts.Catalog),
+		ValidatorImages:         validatorImages,
+		Redaction:               redaction,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	slog.Info("evidence bundle built",
+		"summaryDir", bundle.SummaryDir,
+		"recipe", bundle.RecipeName,
+		"subjectDigest", bundle.SubjectDigest)
+
+	out, err := signAndPush(ctx, bundle, signPushOptions{
+		Push:        opts.Push,
+		PlainHTTP:   opts.PlainHTTP,
+		InsecureTLS: opts.InsecureTLS,
+		AICRVersion: opts.AICRVersion,
+		OIDCResolve: opts.OIDCResolve,
+		NoSign:      opts.NoSign,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	pointer, err := BuildPointer(buildPointerInputsFromOutcome(bundle, out))
+	if err != nil {
+		return nil, err
+	}
+	pointerPath, err := WritePointer(opts.OutDir, pointer)
+	if err != nil {
+		return nil, err
+	}
+
+	slog.Info("evidence pointer written",
+		"path", pointerPath,
+		"copyTo", PointerCopyToHint(pointer))
+
+	if out.PushSummary != nil {
+		slog.Info("evidence bundle pushed",
+			"reference", out.PushSummary.Reference,
+			"digest", out.PushSummary.Digest)
+	}
+
+	return &EmitResult{
+		Bundle:      bundle,
+		PointerPath: pointerPath,
+		Sign:        out.Sign,
+		PushSummary: out.PushSummary,
+	}, nil
+}
+
+// applyRedaction returns the snapshot and phase results to write into the
+// bundle, plus the redaction provenance to record in the predicate.
+//
+// Full bundles pass the raw inputs through unchanged with nil provenance.
+// Minimal bundles ship a redacted snapshot and CTRF reports with
+// stdout/message omitted; the applied-rule list is the sorted union of the
+// snapshot and CTRF rules. Phase results without a report pass through
+// untouched (their slot stays nil), preserving Build's nil-report skip.
+func applyRedaction(opts EmitOptions) (*snapshotter.Snapshot, []*validator.PhaseResult, *RedactionInfo) {
+	if opts.Full {
+		return opts.Snapshot, opts.PhaseResults, nil
+	}
+
+	redactedSnap, snapRules := redact.Snapshot(opts.Snapshot)
+
+	results := make([]*validator.PhaseResult, len(opts.PhaseResults))
+	var ctrfRules []string
+	for i, pr := range opts.PhaseResults {
+		if pr == nil || pr.Report == nil {
+			results[i] = pr
+			continue
+		}
+		redactedReport, rules := redact.CTRF(pr.Report)
+		ctrfRules = rules
+		clone := *pr
+		clone.Report = redactedReport
+		results[i] = &clone
+	}
+
+	// snapRules and ctrfRules are disjoint static sets; concatenate and sort
+	// for a stable, readable order in the recorded provenance.
+	applied := append(append([]string(nil), snapRules...), ctrfRules...)
+	sort.Strings(applied)
+
+	return redactedSnap, results, &RedactionInfo{
+		Policy:  redact.PolicyName,
+		Version: redact.PolicyVersion,
+		Applied: applied,
+	}
+}
+
+// emitOutcome carries the artifacts the pointer file needs from the
+// optional sign+push leg. All fields are nil when Push is absent.
+type emitOutcome struct {
+	Sign        *bundleattest.SignedAttestation
+	PushSummary *PushResult
+}
+
+// signPushOptions is the subset of EmitOptions the sign+push leg
+// consumes. Pulling it out of EmitOptions lets both Emit (which builds
+// the bundle in-memory) and Publish (which loads a pre-built bundle from
+// disk) drive the identical pipeline without sharing the build-only
+// fields (Recipe, Snapshot, PhaseResults, …).
+type signPushOptions struct {
+	Push        string
+	PlainHTTP   bool
+	InsecureTLS bool
+	AICRVersion string
+	OIDCResolve bundleattest.ResolveOptions
+
+	// NoSign pushes the bundle but skips the Fulcio/Rekor signing and the
+	// Sigstore-referrer attach. The resulting pointer carries
+	// bundle.oci/digest with an empty signer block, to be signed later by
+	// the fork-based CI workflow. Decouples the network-light push leg from
+	// the Fulcio-bound signing leg.
+	NoSign bool
+}
+
+// signAndPush handles the optional sign+push pipeline. Returns a
+// zero-valued outcome when Push is absent.
+//
+// Sequence (Push set):
+//  1. Push the bundle directory as an OCI artifact → artifactDigest.
+//  2. Build an artifact-subject Statement (subject.digest = artifactDigest)
+//     carrying the same predicate body.
+//  3. Sign the Statement → Sigstore Bundle JSON, with the KMS key or a
+//     keyless OIDC token resolved only now (see signEvidenceStatement).
+//  4. Write the signed bundle beside the local evidence for inspection.
+//  5. Attach the Sigstore Bundle as an OCI Referrer so cosign's
+//     /v2/<name>/referrers/<digest> discovery finds the signature.
+func signAndPush(ctx context.Context, bundle *Bundle, opts signPushOptions) (emitOutcome, error) {
+	if opts.Push == "" {
+		return emitOutcome{}, nil
+	}
+	if !opts.NoSign {
+		if err := validateEvidenceSigningMode(opts.OIDCResolve); err != nil {
+			return emitOutcome{}, err
+		}
+	}
+
+	// Resolve the push target. When the operator omits a tag, derive a
+	// per-recipe one from the bundle rather than defaulting to a shared
+	// constant, so distinct attestations never collide on one tag.
+	pushRef, err := effectiveEvidenceRef(opts.Push, bundle)
+	if err != nil {
+		return emitOutcome{}, err
+	}
+
+	pushCtx, pushCancel := context.WithTimeout(ctx, defaults.EvidenceBundlePushTimeout)
+	defer pushCancel()
+	summary, err := Push(pushCtx, PushOptions{
+		SourceDir:     bundle.SummaryDir,
+		Reference:     pushRef,
+		AICRVersion:   opts.AICRVersion,
+		PredicateType: bundle.PredicateType,
+		PlainHTTP:     opts.PlainHTTP,
+		InsecureTLS:   opts.InsecureTLS,
+	})
+	if err != nil {
+		return emitOutcome{}, err
+	}
+
+	// Push-without-sign: stop after the content-addressed push. The pointer
+	// built from this outcome carries bundle.oci/digest with a nil Signer,
+	// signaling "pending signature" to verifiers and the gate.
+	if opts.NoSign {
+		slog.Info("evidence bundle pushed unsigned (--no-sign); sign later via the fork-based CI workflow",
+			"reference", summary.Reference,
+			"digest", summary.Digest)
+		return emitOutcome{PushSummary: summary}, nil
+	}
+
+	artifactDigestHex := strings.TrimPrefix(summary.Digest, "sha256:")
+	artifactStmt, err := BuildArtifactStatement(
+		oci.TrimScheme(summary.Reference),
+		artifactDigestHex,
+		bundle.PredicateType,
+		bundle.Predicate,
+	)
+	if err != nil {
+		return emitOutcome{}, err
+	}
+
+	signRes, err := signEvidenceStatement(ctx, artifactStmt, opts.OIDCResolve)
+	if err != nil {
+		return emitOutcome{}, err
+	}
+
+	// Write signed bytes locally for inspection; the pushed artifact
+	// itself doesn't carry them — the canonical signature reference is
+	// the OCI Referrer attached below.
+	if err := WriteSignedAttestation(bundle, signRes.BundleJSON); err != nil {
+		return emitOutcome{}, err
+	}
+
+	attachCtx, attachCancel := context.WithTimeout(ctx, defaults.EvidenceBundlePushTimeout)
+	defer attachCancel()
+	referrer, attachErr := AttachSigstoreBundleAsReferrer(attachCtx, AttachReferrerOptions{
+		Reference:  pushRef,
+		BundleJSON: signRes.BundleJSON,
+		ExcludedRoots: []string{
+			bundle.SummaryDir,
+		},
+		MainArtifact: MainArtifactDescriptor{
+			Digest:    summary.Digest,
+			MediaType: summary.MediaType,
+			Size:      summary.Size,
+		},
+		PlainHTTP:   opts.PlainHTTP,
+		InsecureTLS: opts.InsecureTLS,
+	})
+	if attachErr != nil {
+		return emitOutcome{}, attachErr
+	}
+	slog.Info("Sigstore Bundle attached as OCI Referrer",
+		"referrerDigest", referrer.Digest,
+		"mainArtifactDigest", summary.Digest)
+
+	return emitOutcome{Sign: signRes, PushSummary: summary}, nil
+}
+
+// logOIDCResolveMode emits a single info-or-debug line describing which
+// OIDC source the resolver is about to consult. Interactive flows log at
+// Info (the user may be about to be prompted); non-interactive sources
+// log at Debug to keep build logs quiet.
+func logOIDCResolveMode(opts bundleattest.ResolveOptions) {
+	switch {
+	case opts.IdentityToken != "":
+		slog.Debug("resolving OIDC token", "mode", "identity-token")
+	case opts.AmbientURL != "" && opts.AmbientToken != "":
+		slog.Debug("resolving OIDC token", "mode", "ambient-github-actions")
+	case opts.DeviceFlow:
+		slog.Info("resolving OIDC token via device-code flow (will print a code to enter at the URL shown)")
+	default:
+		slog.Info("resolving OIDC token via browser flow (will open a local browser)")
+	}
+}
+
+func buildPointerInputsFromOutcome(bundle *Bundle, out emitOutcome) PointerInputs {
+	in := PointerInputs{Bundle: bundle}
+	if out.PushSummary != nil {
+		in.BundleOCI = oci.TrimScheme(out.PushSummary.Reference)
+		in.BundleHash = out.PushSummary.Digest
+	}
+	// PointerSignerFromSignature applies the zero-Rekor rule: a
+	// SignedAttestation.RekorLogIndex of 0 is the "no Rekor entry" sentinel
+	// (e.g. --tlog-upload=false) and maps to a nil index. nil when out.Sign is nil.
+	in.Signer = PointerSignerFromSignature(out.Sign)
+	return in
+}

@@ -1,0 +1,121 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Agentgateway Health Check
+#
+# Validates that agentgateway is running and healthy in the agentgateway-system
+# namespace. Checks that the agentgateway deployment has at least one available
+# replica, that no pods in the namespace are stuck in Pending, Failed, or
+# Unknown phases, and that the recipe's Gateway (applied by the separate
+# agentgateway-post step) exists and is Accepted and Programmed.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: agentgateway-health-check
+spec:
+  timeouts:
+    assert: 5m
+  steps:
+    - name: validate-deployment-exists
+      try:
+        # Guard against vacuous pass on empty namespace: verify the
+        # agentgateway deployment exists and has at least one ready replica.
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: agentgateway
+                namespace: agentgateway-system
+              status:
+                (availableReplicas > `0`): true
+    - name: validate-inference-gateway-programmed
+      try:
+        # The Gateway is not part of the agentgateway chart: the bundler
+        # applies recipes/components/agentgateway/manifests/inference-gateway.yaml
+        # as the separate agentgateway-post step, so a healthy controller
+        # says nothing about whether that step ran (#3714). Accepted=True
+        # means the controller claimed the Gateway for its GatewayClass;
+        # Programmed=True means it generated the proxy Deployment and
+        # Service. Each condition is selected by type with a JMESPath
+        # projection rather than matched by position in the list.
+        - assert:
+            resource:
+              apiVersion: gateway.networking.k8s.io/v1
+              kind: Gateway
+              metadata:
+                name: inference-gateway
+                namespace: agentgateway-system
+              status:
+                (conditions[?type == 'Accepted']):
+                  - status: "True"
+                (conditions[?type == 'Programmed']):
+                  - status: "True"
+    - name: validate-all-pods-healthy
+      try:
+        # Assert no pods are in unhealthy phases (Pending / Failed /
+        # Unknown) or stuck in Running phase with a known-bad
+        # container-waiting reason (CrashLoopBackOff,
+        # ImagePullBackOff, ErrImagePull, CreateContainerConfigError).
+        # Phase-only filtering misses CrashLoopBackOff because such
+        # pods typically remain in Running phase with an unhealthy
+        # container.
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: agentgateway-system
+              status:
+                phase: Pending
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: agentgateway-system
+              status:
+                phase: Failed
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: agentgateway-system
+              status:
+                phase: Unknown
+        # JMESPath projection (not single-element match): kyverno-json's
+        # sliceNode.Assert gates on exact slice length before per-element
+        # comparison, so a `containerStatuses: - state: ...` shape only
+        # matches single-container pods and silently passes sidecars. Use
+        # `containerStatuses[?...] | length(@) > 0` to fire on any
+        # container at any index. Parallel initContainerStatuses block
+        # below catches init-container failures (invisible to
+        # containerStatuses). Per PR #1245 review (@ArangoGutierrez).
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: agentgateway-system
+              status:
+                ((containerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: agentgateway-system
+              status:
+                ((initContainerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true

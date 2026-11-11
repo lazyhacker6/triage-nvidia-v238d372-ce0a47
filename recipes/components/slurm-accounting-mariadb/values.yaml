@@ -1,0 +1,63 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# AICR deployment gate; consumed before Helm rendering.
+install: false
+
+fullnameOverride: mariadb
+namespaceOverride: slurm
+
+mariadb:
+  # Engine pinned explicitly. mariadb-operator 26.10.0 changed its default
+  # server image to mariadb:12.3.3; without a pin, a fresh slurm_acct_db
+  # cluster would silently come up on a new MariaDB major version while
+  # existing clusters kept 11.8.8, and slurmdbd's supported MariaDB matrix
+  # has not been checked against 12.3. Pinning also puts the server image
+  # into the rendered CR, where the BOM can see it: the operator's own
+  # default lives in its runtime config block and is invisible to a
+  # render-based BOM. Moving to 12.3 is its own change, with its own UAT.
+  #
+  # Tag plus index digest, per ADR-006: the digest is what resolves, so a
+  # rebuild of the 11.8.9 tag cannot change the server under an unchanged
+  # pin. Keep the tag: the operator picks the server's entrypoint script by
+  # the version in the tag, and a digest-only reference falls back to its
+  # default version, 12.3.
+  image: mariadb:11.8.9@sha256:c4124d1afa875e47f2892edf26b482fa54f796e2f342d3717a04ca091a22a9bd
+  rootPasswordSecretKeyRef:
+    name: mariadb-root-password
+    key: root
+    generate: true
+  username: slurm
+  database: slurm_acct_db
+  passwordSecretKeyRef:
+    name: mariadb-password
+    key: password
+    generate: true
+  cleanupPolicy: Skip
+  storage:
+    size: 20Gi
+  replicas: 1
+  galera:
+    enabled: false
+  myCnf: |
+    [mariadb]
+    innodb_buffer_pool_size=4096M
+    innodb_log_file_size=1024M
+    innodb_lock_wait_timeout=900
+    max_allowed_packet=16M
+  resources:
+    requests:
+      cpu: 1
+      memory: 6Gi
+    limits:
+      cpu: 2
+      memory: 8Gi
+
+users: []
+databases: []
+grants: []

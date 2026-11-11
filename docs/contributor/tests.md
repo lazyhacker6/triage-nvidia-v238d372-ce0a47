@@ -1,0 +1,823 @@
+# Testing AICR
+
+AICR's test pyramid has five layers. Unit tests are the broad base —
+table-driven, hermetic, `--no-cluster`. Above them sit integration
+tests against a real Kubernetes API (Kind), Chainsaw post-deploy
+health checks, KWOK matrix tests that exercise scheduling shape and
+deployer output without GPU hardware, and E2E tests that drive the
+built `aicr` binary through hermetic Chainsaw CLI suites
+(`--no-cluster`). Testing on real GPU clusters is [UAT](uat.md),
+outside this pyramid.
+
+> **What to use when.** If the code path can be exercised without
+> the Kubernetes API, write a unit test. If it cannot, prefer KWOK
+> or Chainsaw over Kind, and Kind over a UAT run on real hardware.
+
+The pre-push gate is **`make qualify`**. It runs tests with the race
+detector and coverage threshold, lints (golangci-lint + yamllint),
+e2e, vulnerability scan, and license check. CI runs the equivalent plus a few
+CI-only checks (see [The `make qualify` Gate](#the-make-qualify-gate)).
+
+## Test Surfaces
+
+| Surface | When to use | Lives in | Run locally | Gated by |
+|---|---|---|---|---|
+| **Unit tests (Go)** | Logic exercisable without K8s API | `*_test.go` next to source | `make test` | `make qualify`, push CI |
+| **Integration tests (Go)** | Logic touching the K8s API | `*_test.go` with envtest / fake client | `make test` (Kind for live cases) | `make qualify`, push CI |
+| **Chainsaw health checks** | Component-level post-deploy health | `recipes/checks/<name>/health-check.yaml` | `make check-health COMPONENT=<name>` | UAT readiness gate (`aicr validate --phase deployment`), registry-linked checks only; statically by `TestValidateTestReadOnly_AllCheckFiles` under `make test`, which covers opt-in checks too |
+| **KWOK matrix tests** | Recipe scheduling shape + deployer output without GPUs | `kwok/scripts/*`, `recipes/overlays/*` | `make kwok-test-deployer RECIPE=… DEPLOYER=…` | `kwok-recipes.yaml` workflow |
+| **E2E tests** | CLI behavior through the built binary, no cluster | `tools/e2e`, `tests/chainsaw/{cli,signing,bundle-templates}/` | `unset GITLAB_TOKEN && ./tools/e2e` | `make qualify`, `CLI E2E` job in `qualification.yaml` |
+
+The rest of this page covers each surface in the order a typical
+change touches them — unit, integration, chainsaw, KWOK, E2E — plus
+the `make qualify` gate and common gotchas.
+
+## Unit Tests
+
+Unit tests are the default. Required patterns from
+[CLAUDE.md](https://github.com/NVIDIA/aicr/blob/main/.claude/CLAUDE.md):
+table-driven cases, race detector enabled, no live cluster access.
+
+**Table-driven** (mandatory for multiple cases):
+
+```go
+func TestParseCriteria(t *testing.T) {
+    tests := []struct {
+        name    string
+        input   string
+        want    string
+        wantErr bool
+    }{
+        {"valid h100", "h100", "h100", false},
+        {"empty rejected", "", "", true},
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            got, err := Parse(tt.input)
+            if (err != nil) != tt.wantErr {
+                t.Fatalf("err=%v wantErr=%v", err, tt.wantErr)
+            }
+            if got != tt.want {
+                t.Errorf("got=%q want=%q", got, tt.want)
+            }
+        })
+    }
+}
+```
+
+**Race detector** is always on:
+
+```bash
+go test -race ./...                          # full module
+go test -race -v ./pkg/recipe/...            # single package
+go test -race -v ./pkg/recipe -run TestX     # single test
+```
+
+**CLI tests capture `cmd.Writer`**, not stdout. CLI commands write
+through `cmd.Root().Writer` so tests can intercept output:
+
+```go
+buf := &bytes.Buffer{}
+cmd := recipeCmd()
+cmd.Writer = buf
+args := []string{"recipe", "--service", "eks", "--accelerator", "h100"}
+if err := cmd.Run(context.Background(), args); err != nil {
+    t.Fatalf("run: %v", err)
+}
+```
+
+(The CLI is built on `urfave/cli/v3`: a command exposes a `Writer`
+field and is invoked with `cmd.Run(ctx, args)` where `args[0]` is the
+command name — there is no Cobra-style `SetOut`/`SetArgs`/`Execute`.)
+
+Direct `fmt.Println` / `fmt.Printf` to stdout in `pkg/cli` breaks
+this pattern and is a review-blocker.
+
+**Coverage floor: 83%** (from `.settings.yaml`
+`quality.coverage_threshold`; excludes `validators/`, see #1752). `make test-coverage` enforces it.
+Per-package decreases > 0.5% are flagged for justification.
+
+## Test Isolation (`--no-cluster`)
+
+Any test that touches the validator or a collector **must** run with
+`--no-cluster` set. Two reasons:
+
+1. **Hermeticity.** A test that happens to have a kubeconfig pointed
+   at a real cluster will connect to it and create resources. CI
+   runners and laptops both fail this way silently otherwise.
+2. **Speed.** No RBAC creation, no Job deployment, no waiting on pods.
+
+**How to set it:**
+
+```go
+// Go unit/integration tests
+v := validator.New(
+    validator.WithNoCluster(true),
+    validator.WithVersion(version),
+)
+```
+
+```bash
+# CLI invocations in tests, scripts, and chainsaw
+aicr validate --recipe recipe.yaml --snapshot snapshot.yaml --no-cluster
+```
+
+```yaml
+# Chainsaw scripts: always include --no-cluster on aicr invocations
+- script:
+    content: |
+      ${AICR_BIN} validate -r recipe.yaml -s snapshot.yaml --no-cluster
+```
+
+**Behavior with `NoCluster=true`:** the validator skips ServiceAccount /
+Role / ClusterRole creation, skips Job deployment for container-per-validator
+checks, and reports each check as `"skipped — no-cluster mode (test
+mode)"`. **Constraints are still evaluated inline**, because constraint
+evaluation reads the snapshot rather than the API server. A test that
+asserts on validator output must therefore assert on the constraint
+results, not on check results.
+
+The option lives in [`pkg/validator/options.go`](https://github.com/NVIDIA/aicr/blob/main/pkg/validator/options.go)
+(`WithNoCluster`). Adding a new validator entry point that talks to
+the API must respect this flag — the anti-patterns table treats live
+cluster access in tests as a review-blocker.
+
+## Coverage Gate Workflow
+
+Before pushing a Go change, verify the per-package coverage delta on
+the narrowest directory root your change touches. `$pkg/...` includes
+descendants — pick the narrowest root that covers the diff.
+
+```bash
+# 1. Profile the working tree (changes must be committed first).
+go test -coverprofile=cover.out ./pkg/recipe/...
+
+# 2. Profile origin/main from a clean worktree, outside the source tree.
+git worktree add $TMPDIR/baseline origin/main \
+  && (cd $TMPDIR/baseline && go test \
+        -coverprofile=$TMPDIR/base.out ./pkg/recipe/...); \
+  rc=$?; git worktree remove --force $TMPDIR/baseline; \
+  (exit $rc)
+
+# 3. Compare totals.
+go tool cover -func=$TMPDIR/base.out | tail -1
+go tool cover -func=cover.out          | tail -1
+```
+
+Writing the baseline profile to `$TMPDIR/base.out` is deliberate: a
+profile inside the worktree disappears with `worktree remove --force`.
+
+**Gates:**
+
+- **Block** if `make test-coverage` fails (project-wide 83% floor).
+- **Block** if any new exported function or method has 0% coverage
+  in the diff — add tests before pushing.
+- **Flag** any per-package decrease > 0.5% and explain in the PR.
+
+Report the delta in the PR Testing section, e.g., `pkg/recipe:
+90.4% → 90.3% (-0.1%)`. CI also posts per-package deltas via
+`go-coverage-report` after push, but the local gate catches
+regressions before push.
+
+## Integration Tests (Kind)
+
+When a test needs a real Kubernetes API — controller logic, RBAC
+behavior, watch semantics — use Kind. `make dev-env` spins up a Kind
+cluster and starts Tilt; `make dev-env-clean` tears it down. Prefer
+`controller-runtime`'s `envtest` (local apiserver/etcd, no Kind) for
+unit-scope controller tests; reserve Kind for cross-package or
+deployer-output flows that need a full cluster.
+
+```bash
+make dev-env                    # Kind + Tilt running
+make dev-env-clean              # delete cluster, stop Tilt
+```
+
+Live-cluster tests still set `--no-cluster` when the call path
+includes the validator — the flag suppresses validator RBAC and Job
+deployment; cluster-touching code under test is unaffected.
+
+## Chainsaw Health Checks
+
+Each component in the registry can carry an optional Chainsaw assert
+YAML that runs after the bundle deploys to confirm the component is
+healthy: pods Ready, services resolve, CRDs `Established`, custom
+resources reach a known phase. The asserts live alongside the
+component:
+
+```text
+recipes/checks/<component>/health-check.yaml
+```
+
+Discover them and run locally against a Kind cluster:
+
+```bash
+make check-health COMPONENT=gpu-operator       # single component
+make check-health-all                           # registry-linked components
+# opt-in-only checks (e.g. nvsentinel-observability,
+# nvsentinel-preflight) aren't in that sweep -- run them directly:
+make check-health COMPONENT=nvsentinel-observability
+make check-health COMPONENT=nvsentinel-preflight
+make validate-local RECIPE=recipe.yaml          # full pipeline
+```
+
+**When to add one:** the contributor wants to verify, after deploy,
+that the component's pods reach Ready, its CRDs are `Established`,
+its operator deploys its custom resources, or its services resolve.
+Anything subtler than "is it alive" belongs in a container-per-validator
+check (see [validator.md](validator.md)) so the assertion runs as part
+of a tracked validation phase rather than a one-shot Chainsaw step.
+
+**Always include `--no-cluster` on `aicr` invocations inside the
+chainsaw script.** A chainsaw test that runs `aicr validate` without
+the flag will attempt to install RBAC into the test cluster, which
+diverges from the assertion's intent (the validator job is the unit
+under test elsewhere).
+
+Components with an assert file today include `gpu-operator`,
+`network-operator`, `nfd`, `cert-manager`, `nvsentinel`, `kueue`,
+`kubeflow-trainer`, `slinky-slurm`, and more — browse
+[`recipes/checks/`](https://github.com/NVIDIA/aicr/tree/main/recipes/checks)
+for the full list.
+
+## KWOK Matrix Testing
+
+KWOK (Kubernetes WithOut Kubelet) simulates a GPU cluster without
+real hardware. CI uses it to validate two things per recipe:
+
+1. **Scheduling shape.** Node selectors, tolerations, and resource
+   requests render correctly and land pods on the simulated nodes
+   the overlay expects.
+2. **Deployer output correctness.** The same recipe is re-rendered
+   through every output adapter — `helm`, `argocd-oci`,
+   `argocd-helm-oci`, `argocd-git`, `flux-oci`, `flux-git` — and each
+   renders to a working bundle the GitOps controllers can reconcile.
+
+KWOK nodes have no kubelet, so pods never actually run. KWOK testing
+**does not exercise** runtime validators (NCCL, inference-perf) or
+component health — for those, see [validator.md](validator.md). If a
+recipe's constraints reference dimensions the KWOK node profiles do
+not provide (e.g., a GPU model no profile registers), the bundle
+renders but pods stay Pending or land on the wrong nodes. Extend
+`kwok/profiles/` rather than relax the recipe — KWOK is the
+simulated reflection of production shape, not a relaxed substitute.
+
+KWOK results are advisory. The `KWOK Test Summary (advisory)` check turns red
+when a tier fails, but it does not block merges. The main branch ruleset
+requires `gate` (the aggregate job in the `Merge Gate` workflow,
+`merge-gate.yaml`) and `Check PR Title`. `gate` is the only required
+qualification aggregate.
+
+For the design rationale and the spike findings that justify the
+chart pin and Repository-secret shape, see
+[ADR-008](https://github.com/NVIDIA/aicr/blob/main/docs/design/008-kwok-deployer-matrix.md);
+for the Git-source lanes (in-cluster Gitea, `flux-git` and `argocd-git`),
+see [ADR-010](https://github.com/NVIDIA/aicr/blob/main/docs/design/010-kwok-git-source-lanes.md).
+For cluster-level KWOK setup (node profiles, recipe auto-discovery),
+see [kwok/README.md](https://github.com/NVIDIA/aicr/blob/main/kwok/README.md).
+
+### Deployer Coverage Matrix
+
+| Tier | Trigger | Deployers exercised |
+|------|---------|----------------------|
+| Tier 1 — generic overlays | every PR + push | `helm` on every generic overlay, plus each other deployer on one probe overlay (`eks-training`) |
+| Tier 2 — diff-aware accelerator overlays | PR only, conditional on changed files | `helm` only |
+| Tier 3 — full overlay set | push to `main` + nightly schedule | `helm`, `argocd-oci`, `argocd-helm-oci`, `argocd-git`, `flux-oci`, `flux-git` |
+
+| Lane | Pull artifact | Apply manifests | Reconcile to Ready |
+|---|---|---|---|
+| `helm` | n/a (filesystem) | `helm install` | pods scheduled |
+| `argocd-oci` | repo-server OCI pull | Argo CD sync | `Synced+Healthy` |
+| `argocd-helm-oci` | `helm pull` OCI | wrapper chart install | `Synced+Healthy` |
+| `argocd-git` | repo-server Git clone (in-cluster Gitea) | Argo CD sync | root App Git `repoURL` + `Synced+Healthy` |
+| `flux-oci` | source-controller OCI pull | kustomize-controller apply | all HelmReleases `Ready=True` + ArtifactGenerators Ready |
+| `flux-git` | source-controller Git clone (in-cluster Gitea) | kustomize-controller apply | GitRepositories Ready + all HelmReleases `Ready=True` |
+
+Tier 1 crosses the non-`helm` deployers with a single probe overlay to keep
+the PR matrix small. The probe is `eks-training`, which carries more
+components than the bare `eks` base, and falls back to the first generic
+overlay when it is absent. GitOps templating regressions specific to a component that the
+probe does not include are caught by Tier 3, which runs the full recipe x
+deployer cross-product after merge.
+
+Tier 2 stays `helm`-only because its job is to verify accelerator-specific
+overlays still render correctly when their inputs change. The deployer
+shape is orthogonal — re-running through Argo CD would only re-exercise
+template rendering, which Tier 1 and Tier 3 already cover on the generic
+overlays. The `flux-git` and `argocd-git` lanes cover the filesystem
+(Git-source) round-trip of
+[#963](https://github.com/NVIDIA/aicr/issues/963) for both GitOps
+controllers, sharing the same in-cluster Gitea infrastructure.
+
+### Inventory Read-Back
+
+Every matrix cell ends by reading the bundle it just deployed back out of
+the cluster and requiring the two answers to agree. `validate-scheduling.sh`
+step 7 runs `aicr upgrade-check` twice against the same target recipe, once
+with `--from cluster` and once with `--from <bundle-dir>`, and diffs the
+per-component rows of the two JSON reports.
+
+The bundle is the oracle. The `recipe.yaml` at its root lists exactly the
+releases the bundler emitted, at exactly the versions it pinned, so there is
+no golden to maintain and nothing to drift against: a per-component
+divergence is by construction a defect in the cluster read. That matters
+most for the deployers whose release naming is not the component's own name
+(Flux composes `<targetNamespace>-<name>` and Argo CD prepends a settable
+prefix), where a mapping that no longer matches reports an empty inventory
+and a confident "every component is new". This is ADR-021 acceptance
+criterion 4, and running it on the existing `{recipe, deployer}` matrix is
+what makes the criterion's per-deployer requirement free.
+
+Compared: the component name, the kind of change, the `from` and `to`
+versions, and the verdict with the reason that produced it, plus the summary
+counts. Excluded, because they differ by construction: the top-level `from`
+(the literal `cluster` on one side, a path on the other), the `source` block
+(a cluster read has one, an artifact comparison does not), and `atRisk` (the
+cluster read implies the scan, the artifact comparison does not perform it).
+The `source` block is asserted on separately, since a read that matched
+nothing produces the same table a broken artifact read would and two
+degenerate reads must not agree their way to a pass.
+
+One row is excused, on the Argo CD lanes only. The cluster read takes an
+Argo CD chart version from what a sync established, never from the pin, and
+on KWOK some Applications never establish one: their sync operation waits on
+a health state the simulator does not produce. Such a component reads as
+`unversioned` with no `from`. The lane lists the Applications before the
+read, and a component may take that row shape only when its Application is
+neither `Synced` nor has a completed sync in `status.history`, and only when
+it is on `READBACK_UNSETTLED_ALLOWLIST` in `upgrade-readback.sh`: components
+observed to stall on KWOK, kai-scheduler today. Any other unsettled
+Application fails, so a lane cannot pass having compared nothing. Every other
+difference for an allowlisted component still fails, each excused row is
+logged, and the list is kept as `excused-unsettled.txt` beside the reports.
+
+Both invocations pass `--fail-on-error=false`: the question is whether the
+two paths agree, not whether the upgrade is safe, so a verdict-driven
+non-zero exit must not stand in for the comparison. A non-zero exit with
+that flag set is a real failure of the command.
+
+On a mismatch the lane prints a unified diff of the two projections and
+leaves both reports under `/tmp/kwok-debug-artifacts/upgrade-check/<recipe>-<deployer>/`,
+which the composite action uploads. The comparison itself lives in
+`kwok/scripts/lib/upgrade-readback.sh` and is unit-tested against fixture
+reports by `upgrade-readback_test.sh`; the matrix-deployer to `--deployer`
+mapping (`argocd-git` → `argocd`, `argocd-helm-oci` → `argocd-helm`) lives
+once in `kwok/scripts/lib/deployer-map.sh`.
+
+Readiness is deliberately not a precondition, so KWOK never producing a
+Ready workload cannot affect it. The read needs release records to exist,
+which the deploy step has already established: Helm writes its storage
+record before any pod runs, the Argo CD gate asserts the root Application
+reached `operationState.phase==Succeeded` (so every child Application is
+materialized), and the Flux gate asserts every HelmRelease reached
+`deployed`.
+
+### Running KWOK Locally
+
+```bash
+unset GITLAB_TOKEN
+make build
+make kwok-cluster
+
+# Single recipe + single deployer
+make kwok-test-deployer RECIPE=eks-training DEPLOYER=argocd-oci
+```
+
+Valid `DEPLOYER` values: `helm`, `argocd-oci`, `argocd-helm-oci`,
+`argocd-git`, `flux-oci`, `flux-git`. The target invokes
+`kwok/scripts/run-all-recipes.sh --deployer <name> <recipe>`, which
+calls `install-infra.sh` once with `DEPLOYER` exported (in-cluster
+`registry:2` always; Argo CD for `argocd-*`; Flux 2 controllers for
+`flux-*`; Gitea additionally for the Git-source lanes `flux-git` and
+`argocd-git`), then runs `validate-scheduling.sh` for the recipe.
+
+**Registry host port.** The Kind cluster exposes the in-cluster
+`registry:2` Service on **host port 5500** (`kwok/kind-config.yaml`'s
+`extraPortMappings`). 5500 avoids Apple ControlCenter
+(AirPlay / Handoff) which listens on host port 5000 by default on
+macOS. Linux runners have 5500 free too. The in-cluster NodePort
+(`30500`) and Service `containerPort` (`5000`) are hardcoded and
+independent — Argo CD's repo-server reaches the registry via Service
+DNS (`registry.aicr-registry.svc.cluster.local:5000`) regardless.
+
+**Gitea host port (flux-git / argocd-git).** The same pattern exposes
+the in-cluster Gitea on **host port 3300** (NodePort `30300`) so the
+runner can `git push` the filesystem bundle; 3300 avoids Gitea's
+default 3000, commonly held by Grafana / local dev servers. The GitOps
+controller (Flux's source-controller or Argo CD's repo-server) clones
+via Service DNS (`gitea.aicr-registry.svc.cluster.local:3000`).
+Clusters created before the 3300 mapping existed must be recreated
+(`kind delete cluster --name aicr-kwok-test`) — `install-infra.sh`
+exit code 71 is the telltale.
+
+**Sweeping all deployers locally.** `make kwok-test-all` defaults to
+`helm`; there is no matrix-aware make target. Loop in shell:
+
+```bash
+for d in helm argocd-oci argocd-helm-oci argocd-git flux-oci flux-git; do
+  make kwok-test-deployer RECIPE=eks-training DEPLOYER="$d" || break
+done
+
+# Full recipe set under a single deployer:
+bash kwok/scripts/run-all-recipes.sh --deployer argocd-oci
+```
+
+### Failure Modes and Exit Codes
+
+The three scripts emit distinct exit codes so CI, the Make target,
+and local loops can branch on failure mode without parsing logs.
+
+| Script | Code | Meaning |
+|--------|------|---------|
+| `install-infra.sh` | 10 | `yq` missing or `.settings.yaml` field absent |
+| `install-infra.sh` | 20 | Registry Deployment not Ready within 120 s |
+| `install-infra.sh` | 21 | Registry not reachable on host port within 60 s |
+| `install-infra.sh` | 30 | Argo CD Helm install failed |
+| `install-infra.sh` | 31 | `applications.argoproj.io` CRD not Established within 120 s |
+| `install-infra.sh` | 32 | Patching `argocd-cm` with the CSIDriver diff customization failed |
+| `install-infra.sh` | 40 | Repository secret apply failed |
+| `install-infra.sh` | 60 | Flux install manifest apply failed |
+| `install-infra.sh` | 61 | Flux controller not Ready within 180 s |
+| `install-infra.sh` | 62 | Flux CRDs not Established within 60 s |
+| `install-infra.sh` | 70 | Gitea Deployment not Ready within 120 s |
+| `install-infra.sh` | 71 | Gitea not reachable on host port within 60 s (cluster likely predates the 3300 port mapping) |
+| `install-infra.sh` | 72 | Gitea admin user bootstrap failed |
+| `validate-scheduling.sh` | 50 | GitOps sync deadline hit |
+| `run-all-recipes.sh` | 50 | Three consecutive GitOps sync timeouts; ADR-008 3-strike rule tripped |
+
+Exit code 50 is distinct so the 3-strike rule in `run-all-recipes.sh`
+counts only sync-deadline strikes, not bundle-render or
+scheduling-shape failures.
+
+### Tuning the Sync Deadline
+
+Seven environment variables shape how long the GitOps lanes wait
+on a sync. Argo CD and Flux pairs are
+independent.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `KWOK_ARGOCD_SYNC_TIMEOUT` | `480` s | Deadline for all child Argo CD Applications to reach `Synced+Healthy` |
+| `KWOK_ARGOCD_ROOT_GRACE` | `30` s | Grace period for the root Application before deadline counting starts |
+| `KWOK_ARGOCD_READBACK_SETTLE_TIMEOUT` | `180` s | How long the inventory read-back waits for every installed Application outside the unsettled allowlist to finish its first sync, bounded by `KWOK_SYNC_DEADLINE_EPOCH`. One still syncing is read as unversioned and fails the read-back |
+| `KWOK_ARGOCD_READBACK_SETTLE_INTERVAL` | `5` s | Spacing between the read-back's re-checks |
+| `KWOK_FLUX_SYNC_TIMEOUT` | `500` s | Deadline for source fetch (OCIRepository or GitRepository) + Kustomization apply + HelmReleases `Ready=True` + ArtifactGenerators Ready |
+| `KWOK_FLUX_ROOT_GRACE` | `30` s | Grace period for the outer Kustomization before deadline counting starts |
+| `KWOK_SYNC_DEADLINE_EPOCH` | unset | Absolute epoch deadline for sync-gate work (CI only). When set, each gate budget becomes min(default, deadline − now); below a 120 s floor the gate fails fast with exit 50 so chainsaw's catch-block diagnostics always print before GitHub's job timeout |
+
+In CI, the `kwok-test` action derives `KWOK_SYNC_DEADLINE_EPOCH` in its
+first step — before toolchain setup and the `aicr` build, so the anchor
+sits within ~60 s of job start — from its `job_timeout_minutes` input
+(required, no default — every caller must wire its own value, which
+must equal that caller's `timeout-minutes`; currently `20` for the
+KWOK jobs) minus a 240 s margin reserved for chainsaw catch-block
+diagnostics, pod verification, and debug-artifact upload. The input
+must be a positive integer with no leading zeros, and must leave at
+least 120 s of usable budget after the 240 s margin (i.e. `>= 6`); the
+step fails fast otherwise. Local runs leave it unset and keep the
+fixed defaults above.
+
+The Git-source lanes (`flux-git`, `argocd-git`) additionally honor
+`KWOK_GITEA_HOST_PORT` (default `3300`), `KWOK_GITEA_USER` (default
+`aicr`), and `KWOK_GITEA_PASSWORD` (default `aicr-kwok-ci`) — shared
+between `install-infra.sh` (Gitea install + admin bootstrap) and
+`validate-scheduling.sh` (`git push`). The password is a CI-only
+credential for the ephemeral in-cluster Gitea, not a secret.
+`argocd-git` reuses the `KWOK_ARGOCD_SYNC_TIMEOUT` budget.
+
+On a clean local Kind cluster `Synced+Healthy` lands in ~30 s; the
+480-second default exists to absorb CI variance (the all-semantics gate
+waits for every Application, not just the first one, so it needs more
+budget than the old exists-semantics check did). If a local run trips
+code 50 but the cluster is otherwise healthy, raise the relevant
+timeout before assuming the recipe is broken — cold-cluster image
+pulls are the most common cause.
+
+### Debugging CI Failures
+
+When `kwok-test` fails, it uploads an artifact named
+`kwok-debug-<recipe>-<deployer>-<run_id>` containing:
+
+- `<cluster>-resources.txt`, `<cluster>-nodes.txt`, `<cluster>-pods.txt`, `<cluster>-events.txt`
+- `<cluster>-argo-apps.yaml` plus the repo-server and application-controller logs (argocd lanes)
+- `<cluster>-flux-resources.yaml` (OCIRepositories, GitRepositories, Kustomizations, HelmReleases, ArtifactGenerators, ExternalArtifacts) plus source-, kustomize-, and helm-controller logs (flux-* lanes)
+- `<cluster>-registry.log` — last 200 lines of the in-cluster `registry:2`
+- `<cluster>-gitea.log` — last 200 lines of the in-cluster Gitea (Git-source lanes: `flux-git`, `argocd-git`)
+
+Start with the repo-server log (Argo CD) or source-controller log
+(Flux) for OCI-pull failures. Application-controller / kustomize-controller
+logs show reconciliation decisions and prune behavior;
+helm-controller logs surface per-`HelmRelease` install outcomes.
+
+Independently of the outcome, every `kwok-test` job also uploads
+`kwok-results-<recipe>-<deployer>-<run_id>-<attempt>` containing `kwok-results.json`,
+a [CTRF](https://ctrf.io) report written by `run-all-recipes.sh` (via the
+shared `tools/ctrf` emitter) with one test per `(recipe, deployer)` cell:
+`kwok/<recipe>/<deployer>` with status `passed`, `failed` (the message
+distinguishes a GitOps sync timeout from a generic failure), or `skipped`
+(no KWOK profile in implicit batch mode). The file is also written on the
+3-strike bail, so a truncated matrix still reports the cells it ran, and when
+cluster or `install-infra.sh` setup fails before any cell runs it holds a
+single `kwok/setup/<deployer>` entry with status `other` and the setup
+failure in its message. The report is flushed after every cell, and a TERM
+or INT while a cell runs records that cell as `other` ("interrupted") before
+the runner exits with the usual 128+signal status, so an interrupted matrix
+still reports what it completed.
+Locally the same file lands at `/tmp/kwok-debug-artifacts/kwok-results.json`
+(override with `KWOK_RESULTS_FILE`).
+
+### Adding a New Deployer Value
+
+The deployer set is finite and matches what `pkg/bundler` emits. To
+add a new value:
+
+1. Add a `case` branch in `kwok/scripts/validate-scheduling.sh`'s
+   `resolve_argocd_root_app()` (or `resolve_flux_root_names()` for
+   Flux-reconciled lanes), plus branches in `generate_bundle` and
+   `deploy_bundle`. Reuse the existing `argocd-oci` / `argocd-git` /
+   `flux-oci` / `flux-git` branches as templates. For a Git-source lane,
+   `argocd-git` and `flux-git` are the closest models — they share the
+   `compute_gitea_urls()` / `push_bundle_to_gitea()` helpers (Gitea
+   dual-view URLs, push-to-create, branch `main`).
+2. Extend the `DEPLOYER` allowlist in
+   `kwok/scripts/run-all-recipes.sh` (`case "$DEPLOYER" in` in `main()`).
+3. Extend the `case "${DEPLOYER}"` branches in `install-infra.sh`'s
+   `main()` so the right controller stack is installed (a Git-source
+   lane composes its GitOps controller install with `install_gitea`,
+   as `argocd-git` and `flux-git` do).
+4. Extend the `deployer:` input description in
+   `.github/actions/kwok-test/action.yml`.
+5. Add the value to the `deployer:` matrix in Tier 1 and Tier 3 of
+   `.github/workflows/kwok-recipes.yaml`. Leave Tier 2 alone — the
+   orthogonality rationale above still applies.
+6. Add a row to the [Deployer Coverage Matrix](#deployer-coverage-matrix)
+   above so contributors can discover the new lane.
+
+If the new value requires changes to in-cluster infra (different
+registry, different Argo CD chart, additional CRDs), update
+`install-infra.sh` and pin any new versions in `.settings.yaml`. The
+exit-code taxonomy in [Failure Modes and Exit Codes](#failure-modes-and-exit-codes)
+is contiguous — pick the next free code if a new distinct failure
+mode appears.
+
+## E2E Tests
+
+`./tools/e2e` is the CLI integration runner. It builds the `aicr` binary
+with goreleaser, then runs the Chainsaw suites in `tests/chainsaw/cli/`,
+`tests/chainsaw/signing/`, and `tests/chainsaw/bundle-templates/` with
+`--no-cluster`. Each test invokes the binary and asserts on its exit code
+and output files; no cluster or cloud account is involved.
+
+```bash
+unset GITLAB_TOKEN
+./tools/e2e
+```
+
+`make qualify` invokes the e2e step (`make e2e`) as part of the pre-push
+gate. Locally, suites labelled `ci=true` (they need a CI-attested binary)
+are skipped, and suites labelled `requires=docker` are skipped when no
+Docker daemon or registry image is available. CI runs the CLI and signing
+suites in the `CLI E2E` job of `qualification.yaml`. Testing on real GPU
+clusters is covered by [UAT](uat.md).
+
+## The `make qualify` Gate
+
+`make qualify` is the canonical pre-push command. It runs:
+
+- `test-coverage` — `go test -race ./...` plus the 83% coverage floor.
+- `lint` — golangci-lint with `.golangci.yaml`, yamllint, and the docs checks
+  (filenames, MDX patterns, MDX parse, YAML fences, shell placeholders, and
+  links, described in [Docs MDX Gate](#docs-mdx-gate),
+  [Docs YAML Fence Gate](#docs-yaml-fence-gate),
+  [Docs Shell Placeholder Gate](#docs-shell-placeholder-gate), and
+  [Docs Link Gate](#docs-link-gate)).
+- `tuning-check` — node-tuning profile freshness.
+- `coverage-check` — the committed CUJ/CLI coverage matrix against the tree.
+- `e2e` — the Chainsaw CLI suites via `tools/e2e` (see [E2E Tests](#e2e-tests)).
+- `scan` — Grype vulnerability scan.
+- `license-check` — license header / dependency-license sweep.
+- bundle layout — `TestBundleLayoutMatchesManifest` renders the frozen fixture
+  recipe through every deployer and compares the tree to
+  `pkg/bundler/testdata/layout/manifests/`. A removed or renamed path fails; an
+  added one is additive. See
+  [Bundle layout](../user/bundling.md#bundle-layout).
+- artifact schemas — `tools/schemagen` tests gate freshness, real-artifact
+  validity, and breaking changes against `api/aicr/v1/schemas/baseline/`. See
+  [API server](api-server.md#artifact-schema-gate).
+- `openapi-diff` — the REST contract in `api/aicr/v1/server.yaml` against its
+  committed baseline, failing on unacknowledged breaking changes and on stale
+  acknowledgements. See [API server](api-server.md#rest-contract-gate).
+- `api-diff` — exported `pkg/client/v1` compatibility, including the scoped
+  repository-local type closure reachable through transparent aliases, against
+  the latest stable release.
+
+CI runs the equivalent, plus a few checks that exist only there — the lychee
+link check on `docs/**`, CodeQL, and the GPU test lanes — so a green local
+`make qualify` makes CI likely to pass, not certain.
+
+**Branch lint gate for Go changes.** If a PR changes any `.go` file,
+you must also run:
+
+```bash
+AFFECTED="recipe"  # replace with the changed package path under pkg/
+golangci-lint run -c .golangci.yaml "./pkg/${AFFECTED}/..."
+golangci-lint run -c .golangci.yaml ./...           # full sweep
+```
+
+This applies even to PRs labeled `area/docs` when they include
+incidental Go changes. Do not rely on CI to surface lint failures —
+the pre-push gate is local.
+
+## Docs MDX Gate
+
+Fern renders published docs through an MDX parser, so a construct that is valid
+CommonMark can still abort `fern generate --docs` at publish time. A bare `<=`
+in prose is the classic case — MDX reads the `<` as the start of a JSX tag and
+fails with `Unexpected character = (U+003D) before name`.
+
+**Which files are checked.** Both checks derive their file list from
+`docs/index.yml` via `tools/docs-published-files` — Fern's navigation manifest
+is the authoritative statement of what gets parsed. Globbing
+`docs/user`/`docs/integrator`/`docs/contributor` instead was a denylist in
+disguise: it missed `docs/README.md`, the published landing page, so a hazard
+there passed both gates and still broke the publish. Add a page to
+`docs/index.yml` and it is gated that day; a file that is not published is not
+gated at all.
+
+Two checks cover this, both run by `make lint`:
+
+| Check | What it is | Speed |
+|-------|-----------|-------|
+| `make check-docs-mdx` | Pattern-based bash approximation. Names the specific hazard, needs no dependencies. | Instant |
+| `make check-docs-mdx-parse` | The real MDX parser (`@mdx-js/mdx`, locked in `tools/mdx/package-lock.json`). Authoritative. | ~2 s + one `npm ci` |
+
+The parser is the source of truth. The bash rules are deliberately kept as a
+strict **subset** of what it rejects: a miss is caught by the parse gate, but a
+false positive would force you to mangle prose the publish step would have
+accepted. That is why `< 500` and `< 10 s` are fine (MDX only enters tag mode
+when a name-ish character follows `<` immediately) while `<= 2,000` and `<30 s`
+are not.
+
+Hazards only the parser sees: a stray closing tag (`</div>`), an unclosed
+fragment (`<>`), a placeholder sharing a line with well-formed JSX, unbalanced
+expression braces spanning lines, and any acorn-level syntax error.
+
+Well-formed JSX is fine in both — `<Component />` and `<span>text</span>` parse,
+and the Fern component set is authored that way. So is YAML frontmatter: Fern
+strips it before MDX, so a `title: gate <= 2,000` is valid, and both checks skip
+it by line number so later diagnostics still cite the true line.
+
+`check-docs-mdx-parse` needs Node 20+. Without it the script prints a warning
+and exits 0 locally, but **hard-fails under CI** — the `docs-mdx` job in
+`merge-gate.yaml` blocks on it, and that workflow's `gate` job is a
+required status check. This is the one place where a green local `make qualify` does not
+guarantee a green CI: if you have no Node, the MDX gate did not actually run.
+
+Fixing a violation is usually one of:
+
+```markdown
+gate <= 2,000   →  gate `<= 2,000`
+<30 s           →  `<30 s`        or  &lt;30 s
+<br>            →  <br />
+{template}      →  \{template\}
+```
+
+Note that `fern check` (the Fern Docs CI job) does **not** parse MDX, and the
+job that does — `fern generate --docs --preview` — runs as a `workflow_run`
+companion whose status never lands on the PR head SHA, so it cannot be a
+required check. `make check-docs-mdx-parse` exists to close that gap without a
+token or a dependency on Fern's service at merge time.
+
+## Docs YAML Fence Gate
+
+`make check-docs-yaml` checks every Markdown and MDX file under `docs/**`. Any
+fenced code block labelled `yaml` or `yml` must parse as YAML. This is a syntax
+check only: partial fragments are allowed and do not need to be complete
+Kubernetes resources.
+
+Inside a YAML fence, `...` is an explicit document-end marker. Content after it
+must start a new document with `---`; use `# ...` to show omitted content.
+Aliases must refer to an earlier anchor in the same YAML document. Empty
+fragments are valid, but malformed or incomplete YAML directives are rejected.
+Fences inside HTML or MDX comments are ignored.
+
+There is no `no-parse` bypass: `yaml no-parse` remains checked, and
+comma-suffixed labels such as `yaml,no-parse` are rejected. Relabel Helm or
+Go-template examples as `gotemplate`, and intentionally invalid examples as
+`text`. The checker needs Node 20+; without Node it warns and skips locally, but
+hard-fails in CI so the docs-only merge gate cannot pass without running it.
+
+## Docs Shell Placeholder Gate
+
+`make check-docs-shell` checks fenced code blocks labelled `bash`, `sh`, `shell`,
+or `zsh` in every Markdown and MDX file under `docs/**`, except the ADRs in
+`docs/design/`. It fails on any `<placeholder>` the shell would read as
+redirection. `kubectl delete namespace <namespace>` is a syntax error when
+pasted. `kubectl get pods <name> -n default` is valid syntax: it fails only
+because no file named `name` exists, and where one does, it runs
+`kubectl get pods default` and writes the output to a file named `-n`.
+
+Do not replace a placeholder with a bare `${VAR}`. An unset variable expands to
+nothing and the command runs with an argument missing, which is worse than a
+syntax error for `kubectl delete` or `helm uninstall`. Assign every variable in
+the same block before its first use, and quote every expansion:
+
+```bash
+NAMESPACE="my-namespace"  # replace with your namespace
+kubectl delete namespace "${NAMESPACE}"
+```
+
+Placeholders inside quotes, comments, or heredoc bodies are not read as
+redirection and pass. Command substitution is the exception: `$(...)` and
+backticks are parsed as commands inside double quotes and inside a heredoc
+whose delimiter is unquoted (`<<EOF`, not `<<'EOF'`), so
+`"$(kubectl get pods -n <ns>)"` still fails. Command synopses such as `aicr verify <bundle-dir> [flags]` and
+command output are not runnable, so label them `text`; `console` transcripts
+are not checked. The checker needs Node 20+ and has the same local-skip and
+CI-hard-fail behavior as the YAML fence gate.
+
+## Docs Link Gate
+
+`make check-docs-links` runs `tools/check-docs-links`, which parses every page
+that `docs/index.yml` publishes as GitHub-flavored Markdown and checks each
+Markdown link outside code. Two rules apply:
+
+- A relative link must resolve to another published page. Fern renders a link
+  to any other file as a site URL that serves a "Page Not Found" body with HTTP
+  200, so neither the file existing nor an online status check catches it. A
+  link to an ADR under `docs/design/`, a generated BOM page, or a file outside
+  `docs/` fails for that reason.
+- A `https://github.com/NVIDIA/aicr/blob/main/<path>` URL must name a path that
+  exists in the repository.
+
+To link a file Fern does not publish, use its `blob/main` URL. A root-relative
+link such as `/aicr/user-guide/cli-reference` fails because the site's URL
+layout cannot be resolved offline, so link the page's `.md` file by relative
+path instead. Fragments are not checked.
+
+The lychee run in Fern Docs CI separately checks that every relative target
+exists as a file, which catches a renamed or deleted page.
+
+## Common Gotchas
+
+- **`goreleaser` fails when both `GITLAB_TOKEN` and `GITHUB_TOKEN`
+  are set.** `make build`, `make qualify`, and `./tools/e2e` all
+  invoke goreleaser indirectly. Always `unset GITLAB_TOKEN` in the
+  shell first. This is one of the most common local-only CI-passes-fine
+  failure modes.
+- **Forgetting `make bom-docs`** after a `recipes/registry.yaml`,
+  component values, or chart-pin change. The BOM's **version column
+  and component set are now gated**: `TestCommittedBOMVersionsMatchRegistry`
+  (run by `make test` → `make qualify`, and by the `bom-freshness`
+  merge-gate job on docs-only PRs) fails CI if a pinned version drifts
+  or a component row is missing/orphaned. What is **not** gated at PR
+  time is *rendered-image drift* — a chart bumping an image inside its
+  own templates with no pin change on our side; `make bom-check` (a full
+  re-render comparison) is its **opt-in** blocking check, and the weekly
+  BOM-refresh workflow auto-detects it and opens a PR. So run
+  `make bom-docs` locally any time the change touches charts.
+- **Assuming `make notices` is needed** after a `go.mod` or `go.sum` change.
+  `THIRD_PARTY_NOTICES.md` is the union of every redistributed
+  dependency's license across the released OS/arch matrix
+  (linux+darwin × amd64+arm64), so a dependency-graph change can add or
+  drop entries. The file is not committed — `make release` regenerates it
+  from the tag being released and goreleaser uploads it — so there is
+  nothing to keep fresh and nothing to remember after a dependency bump.
+  The `notices-generator` merge-gate job runs the generator on dependency
+  changes and fails CI if it cannot complete, so a break surfaces on the
+  PR that causes it instead of blocking a release at tag time.
+- **Forgetting `make python-licenses`** after editing
+  `validators/performance/requirements.txt` or
+  `validators/performance/requirements-overrides.txt`. The notices file also covers
+  the Python closure installed into the `aiperf-bench` image, but that
+  closure is fetched from PyPI at image-build time and is not part of the
+  Go dependency graph, so `make notices` cannot regenerate it.
+  `make python-licenses`
+  (needs network) refreshes the committed fragment at
+  `validators/performance/licenses/python-notices.md`; `make notices`
+  then folds it in. The fragment records the sha256 of both files it came
+  from, and `make notices` fails closed when either no longer matches, so any edit without a refresh is caught by the same
+  `notices-generator` job rather than shipping stale attributions.
+  The generator sets a fixed platform matrix and `LC_ALL=C`, so
+  `make notices` produces byte-identical output on macOS and Linux.
+- **Coverage decrease > 0.5%** is flagged for justification (the project-wide
+  83% floor is what blocks). Add tests rather than
+  reaching for `// nolint` or `t.Skip` — both are review-blockers
+  under the no-skip-tests rule in CLAUDE.md.
+- **Live-cluster connections from unit tests.** A test that forgets
+  `--no-cluster` will attach to whichever kubeconfig is current and
+  create RBAC against it. Always pass `WithNoCluster(true)` (Go) or
+  `--no-cluster` (CLI / chainsaw) on the validator path.
+- **CLI tests asserting on stdout.** `pkg/cli` writes through
+  `cmd.Root().Writer`. A test that captures `os.Stdout` will see
+  nothing. Use `cmd.Writer = buf` and assert on `buf.String()`.
+
+## See Also
+
+- [contributor index](index.md) — package layout and the scope boundary
+- [recipe.md](recipe.md) — recipe-level constraints and merge tests
+- [validator.md](validator.md) — validator engine, chainsaw checks, container-per-validator pattern
+- [CLAUDE.md](https://github.com/NVIDIA/aicr/blob/main/.claude/CLAUDE.md) — coding rules and anti-patterns table
+- [ADR-008](https://github.com/NVIDIA/aicr/blob/main/docs/design/008-kwok-deployer-matrix.md) — KWOK deployer matrix rationale
+- [ADR-010](https://github.com/NVIDIA/aicr/blob/main/docs/design/010-kwok-git-source-lanes.md) — Git-source lanes (Gitea, flux-git, argocd-git)
+- [kwok/README.md](https://github.com/NVIDIA/aicr/blob/main/kwok/README.md) — KWOK cluster setup and node profiles

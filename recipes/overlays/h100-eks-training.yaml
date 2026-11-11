@@ -1,0 +1,120 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+kind: RecipeMetadata
+apiVersion: aicr.run/v1beta1
+metadata:
+  name: h100-eks-training
+
+spec:
+  # Inherits from eks-training recipe (EKS + training settings)
+  base: eks-training
+
+  # Machine type: qualified on p5.48xlarge (8x H100 SXM, 32x EFA). These
+  # criteria carry no machine-type axis, so they also match smaller H100 shapes
+  # (e.g. p5.4xlarge). Those deploy normally — unlike the GKE leaf, no component
+  # here pins node affinity to a shape — but the performance floors below are
+  # fixed absolute values calibrated on the full node, so a smaller shape can
+  # false-fail a healthy run. Normalizing them per GPU/fabric class was declined
+  # (#1256, #1254 — both closed not-planned); the floors are deliberately
+  # absolute, so the qualified shape is the supported way to pass them.
+  criteria:
+    service: eks
+    accelerator: h100
+    intent: training
+
+  # Specific constraints for H100 on EKS training workloads
+  # Constraint names use fully qualified measurement paths: {type}.{subtype}.{key}
+  constraints:
+    - name: K8s.server.version
+      value: ">= 1.32.4"
+
+  componentRefs:
+    # H100-specific GPU Operator overrides (inherits valuesFile from eks-training)
+    - name: gpu-operator
+      type: Helm
+      dependencyRefs:
+        - nfd
+        - cert-manager
+        - prometheus-operator-crds
+        - nodewright-customizations
+      overrides:
+        cdi:
+          enabled: true
+        gdrcopy:
+          enabled: true
+
+    - name: nodewright-customizations
+      type: Helm
+      manifestFiles:
+        - components/nodewright-customizations/manifests/tuning.yaml
+      overrides:
+        service: eks
+        accelerator: h100
+        intent: multiNodeTraining
+      dependencyRefs:
+        - nodewright-operator
+
+    - name: nfd
+      type: Helm
+      overrides:
+        topologyUpdater:
+          enable: true
+
+  # Validation checks for H100 on EKS training workloads.
+  # Defined at the intent layer (not OS-specific) so all OS variants inherit them.
+  validation:
+    deployment:
+      checks:
+        - operator-health
+        - expected-resources
+        - gpu-operator-version
+        - check-nvidia-smi
+      constraints:
+        - name: Deployment.gpu-operator.version
+          value: ">= v24.6.0"
+    performance:
+      checks:
+        - nccl-all-reduce-bw
+      # NOTE: this NCCL bus-bandwidth floor is a fixed absolute value calibrated
+      # on a full 8-GPU H100 NVLink/SXM node with multi-NIC transport. busbw is
+      # fabric-class dependent (not GPU-count scaled), so a smaller or
+      # different-fabric H100 SKU — e.g. a single-GPU-per-node shape, whose
+      # all-reduce is pure inter-node NIC with no intra-node NVLink — can
+      # false-fail. Making the gate fabric/transport-class aware is tracked in
+      # https://github.com/NVIDIA/aicr/issues/1256.
+      constraints:
+        # Fixed absolute floor calibrated on p5.48xlarge (8x H100 SXM,
+        # 32x EFA, NVLink/NVSwitch). This recipe is SKU-agnostic — it
+        # matches all EKS/H100 instance types, including small shapes
+        # (e.g. p5.4xlarge: 1 GPU, 1 EFA) whose pure inter-node NIC path
+        # measures tens of GB/s and cannot clear this floor. See #1256.
+        # The proper fix is either a weakest-in-scope liveness floor
+        # (option a) or a per-fabric criteria dimension (option b);
+        # both need measured numbers from the small SKUs that we don't
+        # have yet. Keeping the calibrated value here until then.
+        - name: nccl-all-reduce-bw
+          value: ">= 300"
+    conformance:
+      checks:
+        - platform-health
+        - gpu-operator-health
+        - dra-support
+        - accelerator-metrics
+        - ai-service-metrics
+        - gang-scheduling
+        - pod-autoscaling
+        - cluster-autoscaling
+        - secure-accelerator-access
+        - driver-runtime-management

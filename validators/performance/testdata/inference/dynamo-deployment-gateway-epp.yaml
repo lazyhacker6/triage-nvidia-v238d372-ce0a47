@@ -1,0 +1,162 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Dynamo inference workload for performance benchmarking through GAIE/EPP.
+# EPP performs KV-cache-aware endpoint selection and worker frontend sidecars
+# run in direct mode so they honor EPP's routing headers. Workers publish
+# KV-cache events over ZMQ directly to the KV router; no NATS relay in
+# the 1.4+ default path.
+#
+# Worker GPU wiring is MODE-DISPATCHED (capability-driven, issue #1327): DRA
+# ResourceClaimTemplate on nodes with usable full-GPU DRA, device-plugin
+# nvidia.com/gpu limits elsewhere.
+# Pod scheduling (nodeSelector / tolerations / GPU wiring) is injected
+# programmatically from Go (see applyInferenceWorkerScheduling in
+# inference_perf_constraint.go) so taint values with YAML-special characters
+# cannot break the template.
+#
+# Images are substituted by inferenceTemplateData, tagged with the recipe's
+# dynamo-platform chart version, and honor AICR_VALIDATOR_IMAGE_REGISTRY.
+
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: ${DEPLOYMENT_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  backendFramework: vllm
+  components:
+    - name: Epp
+      type: epp
+      replicas: 1
+      podTemplate:
+        spec:
+          containers:
+            - name: main
+              image: "${DYNAMO_FRONTEND_IMAGE}"
+              env:
+                - name: DYN_KV_CACHE_BLOCK_SIZE
+                  value: "128"
+                - name: DYN_MODEL_NAME
+                  # Quoted so a scalar-looking model ID parses as a string
+                  # after ${MODEL} substitution.
+                  value: "${MODEL}"
+                - name: DYN_ENFORCE_DISAGG
+                  value: "false"
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: aicr-hf-token
+                      key: token
+                      optional: true
+                - name: HUGGING_FACE_HUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: aicr-hf-token
+                      key: token
+                      optional: true
+      eppConfig:
+        config:
+          plugins:
+            - type: disagg-profile-handler
+            - name: decode-filter
+              type: label-filter
+              parameters:
+                label: nvidia.com/dynamo-component-type
+                validValues:
+                  - decode
+                allowsNoLabel: true
+            - name: picker
+              type: max-score-picker
+            - name: dyn-decode
+              type: dyn-decode-scorer
+          schedulingProfiles:
+            - name: decode
+              plugins:
+                - pluginRef: decode-filter
+                  weight: 1
+                - pluginRef: dyn-decode
+                  weight: 1
+                - pluginRef: picker
+                  weight: 1
+    - name: VllmDecodeWorker
+      type: decode
+      replicas: ${GPU_COUNT}
+      sharedMemorySize: 2Gi
+      frontendSidecar: sidecar-frontend
+      podTemplate:
+        spec:
+          containers:
+            - name: main
+              image: "${DYNAMO_VLLM_RUNTIME_IMAGE}"
+              workingDir: /workspace/examples/backends/vllm
+              # Shell wrapper appends GKE's managed-device-plugin driver-lib
+              # mount (/usr/local/nvidia/lib64) to LD_LIBRARY_PATH — the
+              # plugin injects the mount but not the env, and a pod-level env
+              # would clobber the image's own entries. No-op under the GPU
+              # Operator toolkit flow. See the comment on the same wrapper in
+              # dynamo-deployment.yaml for the full rationale (gke-default
+              # qualification: vLLM "Failed to infer device type").
+              command:
+                - /bin/bash
+                - -c
+                - export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}/usr/local/nvidia/lib64"; exec python3 -m dynamo.vllm "$@"
+                - dynamo.vllm
+              args:
+                - --model
+                - "${MODEL}"
+                - --served-model-name
+                - "${MODEL}"
+                - --enable-prefix-caching
+                - --block-size
+                - "128"
+                - --kv-events-config
+                - '{"enable_kv_cache_events":true}'
+              env:
+                - name: DYN_EVENT_PLANE
+                  value: zmq
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: aicr-hf-token
+                      key: token
+                      optional: true
+                - name: HUGGING_FACE_HUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: aicr-hf-token
+                      key: token
+                      optional: true
+            - name: sidecar-frontend
+              image: "${DYNAMO_VLLM_RUNTIME_IMAGE}"
+              args:
+                - -m
+                - dynamo.frontend
+                - --router-mode
+                - direct
+              env:
+                - name: DYN_EVENT_PLANE
+                  value: zmq
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: aicr-hf-token
+                      key: token
+                      optional: true
+                - name: HUGGING_FACE_HUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: aicr-hf-token
+                      key: token
+                      optional: true

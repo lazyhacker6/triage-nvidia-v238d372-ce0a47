@@ -1,0 +1,823 @@
+# AKS GPU Setup
+
+## Kubernetes Version Requirement
+
+AICR requires **Kubernetes 1.34 or later** on AKS. This is driven by DRA (Dynamic
+Resource Allocation), which is included in every AICR recipe.
+
+The core DRA APIs (`resource.k8s.io`) **graduated to GA (stable `v1`)** in
+Kubernetes 1.34. No AKS-specific feature flag is needed — DRA is enabled out of
+the box once you're on 1.34+.
+
+```shell
+RESOURCE_GROUP="my-resource-group"  # replace with your Azure resource group
+CLUSTER="my-cluster"                # replace with your AKS cluster name
+
+# Create a cluster on 1.34
+az aks create \
+  --resource-group "${RESOURCE_GROUP}" \
+  --name "${CLUSTER}" \
+  --kubernetes-version 1.34 \
+  --enable-oidc-issuer \
+  --enable-workload-identity \
+  --enable-managed-identity \
+  --generate-ssh-keys
+
+# Upgrade an existing cluster to 1.34
+az aks upgrade \
+  --resource-group "${RESOURCE_GROUP}" \
+  --name "${CLUSTER}" \
+  --kubernetes-version 1.34
+```
+
+You can verify DRA is available after the upgrade:
+
+```shell
+kubectl api-resources --api-group=resource.k8s.io
+```
+
+Expected output includes `deviceclasses`, `resourceclaims`, `resourceclaimtemplates`,
+and `resourceslices`.
+
+> **Note:** Kubernetes version skipping is not allowed. If your cluster is on 1.32,
+> you must upgrade to 1.33 first, then to 1.34.
+
+## Dynamic Resource Allocation (DRA)
+
+All AKS GPU recipes include the `nvidia-dra-driver-gpu` component, which exposes
+GPU resources via the Kubernetes DRA API. In the production default,
+whole-GPU allocation goes through the device plugin (`nvidia.com/gpu` limits),
+while DRA serves ComputeDomain/IMEX channels and other structured resources —
+claim-based allocation, structured device advertisement, and gang-scheduling
+integration.
+
+### Feature Gate Details
+
+| Kubernetes Version | DRA Status | Feature Gate |
+|--------------------|-----------|--------------|
+| 1.26–1.31 | Alpha | `DynamicResourceAllocation` — off by default |
+| 1.32–1.33 | Beta | `DynamicResourceAllocation` — off by default |
+| 1.34+ | **GA / Stable** | `resource.k8s.io/v1` — always enabled, no feature gate needed |
+
+On AKS 1.34, DRA is GA. You do not need to pass any custom API server flags or
+register an AKS preview feature.
+
+### Configuring the allocation mode
+
+The whole-GPU allocation mode is an **allocation policy** that validators
+resolve from the recipe's hydrated values and verify against the cluster,
+failing closed on mismatch
+([#1327](https://github.com/NVIDIA/aicr/issues/1327)) — so configure it in a
+recipe overlay, not at bundle time. Bundle-time `--set` / `--set-json` /
+`--set-file` overrides of the nested policy keys
+(`dradriver:resources.gpus.enabled`, `dradriver:gpuResourcesEnabledOverride`,
+`gpuoperator:devicePlugin.enabled`, and the same key on `gpu-operator-ocp`)
+still work but are **deprecated** and log a warning; the component-level
+`enabled` toggle of those components — disabling an advertiser changes the
+policy exactly like the nested keys — is honored only via scalar `--set`
+(the typed `--set-json`/`--set-file` path rejects `enabled` for every
+component) and likewise warns when used this way. In every case:
+validators verify the recipe-resolved policy, so a bundle-time change
+surfaces as recipe/cluster drift at validation time. `--dynamic` declarations
+on these keys are rejected outright — the value would be unknowable when the
+policy is resolved.
+
+### Device Plugin vs DRA
+
+Exactly **one whole-GPU advertiser per node** is required. Enabling both
+concurrently causes GPU over-admission — the two allocators keep independent
+ledgers, so dual advertisement can double-allocate or contend for the same
+physical GPU — and **recipe-backed validation rejects** a dual-advertised
+configuration with an invalid-request error at policy-resolution time
+(running `aicr validate` is what enforces this; recipe/bundle generation
+alone does not invoke the resolver, so skipping validation bypasses the
+check).
+
+**Device-plugin whole-GPU allocation is the production default** — stock
+recipes ship it out of the box (`resources.gpus.enabled: false` and
+`gpuResourcesEnabledOverride: false` in the `nvidia-dra-driver-gpu` component
+values, `devicePlugin.enabled: true` in the `gpu-operator` values), so no
+overlay or `--set` is needed. The DRA driver stays active for
+ComputeDomain/IMEX and other non-GPU resources; only its full-GPU
+advertisement is disabled.
+
+For DRA-only (experimental — the validators exercise ResourceClaims and
+discover DRA-only nodes from the allocation probe under this policy, but full
+`aicr validate` is not guaranteed until the
+[#1327](https://github.com/NVIDIA/aicr/issues/1327) graduation checklist
+passes; the stock demo/workload manifests request scalar `nvidia.com/gpu`
+and are likewise unschedulable there), the opt-in overlay must change all
+three values together — a partial flip is rejected at resolution time (dual
+advertisement, an inert waiver, or no advertiser at all):
+
+```yaml
+spec:
+  componentRefs:
+    - name: nvidia-dra-driver-gpu
+      overrides:
+        gpuResourcesEnabledOverride: true
+        resources:
+          gpus:
+            enabled: true
+    - name: gpu-operator
+      overrides:
+        devicePlugin:
+          enabled: false
+```
+
+### Label GPU nodes for the DRA kubelet plugin (opt-in only)
+
+DRA eviction coordination is opt-in and **does nothing on the default AKS
+profile**. Under `gpuStack=azure-managed` the node image installs the driver, so
+GPU Operator sets `driver.enabled=false`, deploys no driver pod and runs no
+Driver Manager — there is nothing to coordinate with, and no node label is
+needed. Bundles generated without `--dra-eviction-node-label` add no such
+selector, and the DRA kubelet plugin runs on every accelerated node.
+
+The label matters only if you both run an operator-managed driver (see the
+`gpuStack=operator-managed` procedure below) and generate the bundle with
+`aicr bundle --dra-eviction-node-label key=value`. The bundle then carries
+`dra-node-labeler`, which applies the label to every GPU node from GFD's
+`nvidia.com/gpu.present`, so no node pool change is needed. If you disable the
+labeler (`--set dra-node-labeler:enabled=false`), set the label **in the node
+pool definition**, with the other required node labels — an ad hoc
+`kubectl label node` does not survive node replacement, recycling, autoscaling,
+or a pool scaled from zero, so later nodes arrive unlabeled.
+
+When you have opted in, an unlabeled GPU node fails silently: it runs no kubelet
+plugin and publishes no `ResourceSlices`, and neither Helm nor the bundle's
+`deploy.sh` reports an error. With no labeled GPU node at all the DaemonSet sits
+at `DESIRED=0`; with only some labeled, those nodes work while the rest silently
+lack DRA.
+See [Prepare DRA nodes when opting in to eviction coordination](../user/bundling.md#prepare-dra-nodes-when-opting-in-to-eviction-coordination).
+
+## GPU Driver Setup
+
+AKS has two mutually exclusive GPU **ownership modes**. Each is a complete
+provisioning profile — the nodepool creation flags and the GPU Operator values
+must come from the *same* mode. Mixing them (for example, a `--gpu-driver none`
+pool with `toolkit.enabled=false`) leaves containerd without a working `nvidia`
+runtime handler: every GPU Operator operand fails with
+`FailedCreatePodSandBox: no runtime for "nvidia" is configured` and GPU nodes
+advertise zero `nvidia.com/gpu`.
+
+| Mode | Nodepool | GPU Operator values |
+|------|----------|---------------------|
+| AKS azure-managed (default) | AKS "Driver only" install profile (`--enable-managed-gpu=false`, the AKS default) | `driver.enabled=false`, `toolkit.enabled=false`, `operator.runtimeClass=nvidia-container-runtime` (recipe defaults) |
+| GPU Operator-managed | `--gpu-driver none` (AKS "None/BYO" install profile) | `driver.enabled=true`, `toolkit.enabled=true`, `operator.runtimeClass=nvidia`, plus `dradriver:nvidiaDriverRoot=/run/nvidia/driver` (all together) |
+
+AICR's default follows the CSP default: an `az aks nodepool add` without GPU
+driver flags preinstalls the NVIDIA driver and container toolkit from the AKS
+node image, and the AKS recipes ship the matching GPU Operator values.
+
+Both modes use an *unmanaged* GPU node pool. Do not combine AICR with
+AKS-managed GPU node pools (`--enable-managed-gpu=true`, preview —
+`gpuProfile.nvidia.managementMode: Managed`): that profile makes AKS install
+its own device plugin, DCGM exporter, and GPU health tooling, which duplicate
+and conflict with the GPU Operator operands AICR deploys. See
+[AKS install profiles](https://learn.microsoft.com/en-us/azure/aks/aks-managed-gpu-nodes#install-profiles).
+
+**Recording the pool mode in snapshots.** The ownership mode lives in the
+Azure control plane (AgentPool `gpuProfile.driver`), not in any Kubernetes
+API object, so a snapshot cannot observe it from inside the cluster. To
+record it, dump the node pools and pass the file to `aicr snapshot`:
+
+```shell
+RESOURCE_GROUP="my-resource-group"  # replace with your Azure resource group
+CLUSTER="my-cluster"                # replace with your AKS cluster name
+
+az aks nodepool list \
+  --cluster-name "${CLUSTER}" \
+  --resource-group "${RESOURCE_GROUP}" \
+  -o json > pools.json
+
+aicr snapshot --aks-gpu-pools pools.json -o snapshot.yaml
+```
+
+The GPU pools' driver modes are projected into the snapshot's
+`K8s.aks-gpu-pools.gpu-driver` reading (`Install` for azure-managed pools,
+`None` for `--gpu-driver none` pools; disagreeing or AKS-managed pools
+project a value that fails recipe qualification closed). `aicr validate`
+accepts the same `--aks-gpu-pools` flag when it captures a live snapshot.
+The projection runs on the machine invoking the CLI — the file never
+enters the cluster — and a malformed or missing file fails the command
+before any cluster work.
+
+**End-to-end flow.** Three steps; the pool dump is consumed only at step 2
+(the snapshot carries the reading from then on — recipe takes the snapshot,
+bundle takes the recipe):
+
+```shell
+RESOURCE_GROUP="my-resource-group"  # replace with your Azure resource group
+CLUSTER="my-cluster"                # replace with your AKS cluster name
+
+# 1. Dump the node pools (the mode lives in the Azure control plane).
+az aks nodepool list -g "${RESOURCE_GROUP}" --cluster-name "${CLUSTER}" -o json > pools.json
+
+# 2. Snapshot with the projection (agent Job or local mode).
+aicr snapshot --aks-gpu-pools pools.json -o snapshot.yaml
+
+# 3. Generate the recipe with the profile value your pools call for,
+#    then bundle. Selection is explicit; the reading VERIFIES it.
+aicr recipe --service aks --accelerator h100 --os ubuntu --intent training \
+  --snapshot snapshot.yaml -o recipe.yaml                 # azure-managed default
+#   ... or, for --gpu-driver none pools:
+#   --profile gpuStack=operator-managed
+# The keyed toleration is required on AKS under either profile value.
+# NVSentinel needs no overrides: the gpuStack profile configures it.
+# See "NVSentinel is configured by the profile" below.
+aicr bundle -r recipe.yaml \
+  --accelerated-node-toleration nvidia.com/gpu:NoSchedule \
+  -o ./bundles
+```
+
+The reading qualifies the selection — it does not choose for you. Every
+combination is deterministic:
+
+| Pools read | Default (`azure-managed`) | `--profile gpuStack=operator-managed` |
+|---|---|---|
+| `Install` (AKS installs the driver) | ✅ resolves | ❌ fails closed: constraint expects `None` |
+| `None` (`--gpu-driver none`) | ❌ fails closed: constraint expects `Install` | ✅ resolves |
+| `Mixed` / `Managed` | ❌ fails closed naming the observed state | ❌ fails closed |
+| no reading (snapshot captured without `--aks-gpu-pools`) | ❌ fails closed: reading **unavailable** — recapture the snapshot with the pool dump | ❌ same |
+
+A wrong selection can never silently produce a mismatched recipe — the
+error names the observed pool state, and fixing it means changing the
+selection, the pools, or recapturing, never overriding the values by hand.
+
+**Selection and verification are independent axes.** `--profile` (or its
+absence) decides the selection; `--snapshot` (or its absence) decides
+whether the selection is verified now or later. The selection is NEVER
+derived from the snapshot, and the check is NEVER skipped when a snapshot
+is present:
+
+| Invocation | Selected value | Pool-mode check |
+|---|---|---|
+| no `--profile`, no `--snapshot` | declaration default (`azure-managed`) | none possible (no cluster data) — the constraint is still recorded in the recipe and enforced at `aicr validate` readiness |
+| `--profile gpuStack=operator-managed`, no `--snapshot` | `operator-managed` | same — deferred to validate |
+| no `--profile`, `--snapshot` | default (`azure-managed`) | checked at generation: pools must read `Install`, else generation fails closed naming the observed state |
+| `--profile gpuStack=operator-managed`, `--snapshot` | `operator-managed` | checked at generation: pools must read `None`, else fails closed |
+
+A snapshot without the pool reading (captured without `--aks-gpu-pools`)
+fails closed for either selection — never a silent skip. If you need an
+unverified recipe deliberately, generate criteria-only (drop
+`--snapshot`): the artifact is honest about being unqualified, and
+validate re-checks when a snapshot exists.
+
+### Default: Use the AKS Azure-Managed Profile
+
+Create nodepools with the AKS **Driver only** install profile — the AKS
+default, so simply omit `--gpu-driver none`:
+
+```shell
+RESOURCE_GROUP="my-resource-group"  # replace with your Azure resource group
+CLUSTER="my-cluster"                # replace with your AKS cluster name
+
+az aks nodepool add \
+  --cluster-name "${CLUSTER}" \
+  --resource-group "${RESOURCE_GROUP}" \
+  --name gpupool \
+  --node-vm-size Standard_ND96isr_H100_v5 \
+  --node-count 1
+```
+
+No changes to AICR recipes are needed — this is the AKS family's `gpuStack`
+configuration profile at its default value, `azure-managed` (the resolved
+recipe records `metadata.selectedProfile: gpuStack=azure-managed`).
+The AKS node image preinstalls the NVIDIA driver and container toolkit and
+preconfigures containerd, so the recipe defaults (`driver.enabled=false`,
+`toolkit.enabled=false`, `operator.runtimeClass=nvidia-container-runtime`)
+leave driver and container-runtime ownership with AKS. AICR's GPU Operator
+still deploys and owns the rest of the GPU stack: device plugin, DCGM
+exporter, GPU Feature Discovery, and the validator.
+
+Driver lifecycle and compatibility stay with Microsoft's node-image QA —
+driver versions follow the AKS node-image release cadence rather than the
+AICR recipe's pins. `operator.runtimeClass` must match the runtime handler
+preconfigured on the AKS node image; NVIDIA's AKS example uses
+`nvidia-container-runtime` (see
+[GPU Operator on Microsoft AKS](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/microsoft-aks.html)).
+
+`driver.rdma.useHostMofed` remains `false` in this mode — it is inert while
+`driver.enabled=false`, but keeping it correct prevents a later ownership-mode
+change from reviving the `nvidia_peermem` symbol-mismatch bug (see the comment
+in `recipes/components/gpu-operator/values-aks.yaml`).
+
+**GPUDirect RDMA (`nvidia-peermem`) under the azure-managed profile.** With
+`driver.enabled=false` there is no GPU Operator driver DaemonSet to load the
+`nvidia-peermem` kernel module (`driver.rdma.enabled` is inert), and the
+AKS-managed driver install does not load it automatically. Azure's RDMA
+guidance requires a dedicated reloader in this mode, so the AKS recipes ship
+Azure's `nvidia-peermem-reloader` DaemonSet as a `network-operator` manifest
+(`recipes/components/network-operator/manifests/nvidia-peermem-reloader.yaml`):
+a retry loop keeps re-asserting `modprobe nvidia-peermem` (via the node's own
+kmod) until the driver and the OFED `ib_core` stack are both present, and
+re-loads it if a driver update unloads it. The pod deliberately reports Ready
+immediately — deployers helm-wait on the network-operator manifests before
+gpu-operator installs, so a modprobe-gated readiness probe would deadlock the
+GPU-Operator-managed alternative profile below, where the driver only appears
+after gpu-operator deploys (and where the operator's driver pod loads
+`nvidia-peermem` itself, making the reloader a harmless no-op). It targets
+IB-capable nodes (the same `pci-15b3.present` label as the
+NicClusterPolicy, set by the nfd-worker rule in
+`components/nfd/values-nvidia-nics-aks.yaml` and, for one release, by the
+`nfd-network-rule` manifest) and is removed together with the RDMA stack by
+the documented opt-out (`--set networkoperator:enabled=false
+--set-json 'nfd:worker.config.sources.custom=[]'`; the second flag stops
+nfd-worker labeling nodes for a network-operator that is not installed). See
+[Azure's GPU driver guidance](https://azure.github.io/aks-rdma-infiniband/configurations/gpu-drivers).
+
+**Stub `nvidia-peermem` builds and the DMA-BUF path.** The reloader
+re-asserts the module where the module is loadable — it cannot make an
+unloadable module load. On some AKS node images (observed on
+`AKSUbuntu-2404gen2containerd-202606.19.0`, kernel `6.8.0-1059-azure`,
+preinstalled driver 580.126.09) the preinstalled
+`/lib/modules/<kernel>/updates/dkms/nvidia-peermem.ko` is a stub DKMS build:
+`modprobe nvidia-peermem` fails with `Invalid argument` and no dmesg trace —
+the signature of NVIDIA's conftest finding no OFED-style headers at image
+bake and compiling the peer-memory support out — even though the running
+kernel exports `ib_register_peer_memory_client` and the IB stack (`ib_core`,
+`mlx5_ib`) is loaded after nodewright host prep. On such images the
+reloader's retry loop is the expected steady state ("not loadable yet",
+indefinitely), and GPUDirect RDMA is carried by the kernel's DMA-BUF path
+instead (driver 580 + kernel 6.8 + mlx5 + a DMA-BUF-capable NCCL) — that
+path delivered the validated NCCL bandwidth below. Only when neither path is
+available — no loadable `nvidia-peermem` and no DMA-BUF support — is
+GPUDirect RDMA lost; NCCL then falls back to host-memory staging and the
+calibrated all-reduce gate will regress or fail.
+
+**Validation status.** This profile is validated end-to-end on AKS H100
+(2x `Standard_ND96isr_H100_v5`, node image
+`AKSUbuntu-2404gen2containerd-202606.19.0`, preinstalled driver 580.126.09)
+for both intents: the deployment phase passes all four checks
+(operator-health, expected-resources, gpu-operator-version,
+check-nvidia-smi) for training and inference, and the training performance
+phase passes the calibrated NCCL all-reduce gate at 157.29 GB/s (16 GiB
+message size across 2 nodes, gate >= 150). The Dynamo inference counterpart
+(`h100-aks-ubuntu-inference-dynamo`) passes `inference-perf` at
+148,004 tok/s throughput (gate `>= 50,000`) with 579.70 ms TTFT p99
+(gate `<= 2,000`) — Qwen/Qwen3-8B at 256 concurrency per GPU via
+dynamo-router on a single ND96isr node. Other SKUs and node images have
+not been exercised — run `aicr validate` after deployment and report gaps.
+
+**Inference-perf model-cache cold load on the default StorageClass.** The
+`inference-perf` check stages the model checkpoint on a model-cache PVC; on
+AKS the cluster-default Azure disk StorageClass can be slow enough that a
+cold load — several decode workers reading the checkpoint shards
+concurrently from one RWO PVC — exceeds the check's default 10-minute
+workload-ready window. The check then fails with
+`DynamoGraphDeployment not ready: TIMEOUT` while the workers are healthily
+loading (not a performance failure — the run above passed once the window
+was raised). Two remedies: override the catalog entry via `--data` (see
+[Validator Extension](validator-extension.md)) setting the
+`AICR_INFERENCE_PERF_WORKLOAD_READY_TIMEOUT` and
+`AICR_INFERENCE_PERF_HEALTH_TIMEOUT` envs and raising the entry `timeout`
+in tandem, or point `AICR_INFERENCE_PERF_MODEL_CACHE_STORAGE_CLASS` at a
+faster class (for example premium SSD v2).
+
+**Device-isolation hardening under the azure-managed profile.** The AKS node
+image preinstalls the NVIDIA container toolkit with the upstream permissive
+defaults in `/etc/nvidia-container-runtime/config.toml`
+(`accept-nvidia-visible-devices-envvar-when-unprivileged = true`,
+`accept-nvidia-visible-devices-as-volume-mounts = false`). Because
+containerd's default runtime on GPU nodes is `nvidia-container-runtime`, every
+container passes through the toolkit, so an unprivileged pod whose image sets
+`NVIDIA_VISIBLE_DEVICES=all` (the default in most CUDA base images) would be
+handed all host GPUs with no Kubernetes allocation — breaking container-level
+GPU isolation and failing the `secure-accelerator-access` conformance check.
+With `driver.enabled=false` and `toolkit.enabled=false` there is no operator
+toolkit DaemonSet to harden the config, so every AKS recipe applies the
+nodewright `nvidia-setup` package with the `aks-any` combination (the
+`toolkit-hardening` NodeWright CR in the `nodewright-customizations`
+component). It sets
+`accept-nvidia-visible-devices-envvar-when-unprivileged = false` and
+`accept-nvidia-visible-devices-as-volume-mounts = true` via `nvidia-ctk config
+--in-place` on every node labeled `kubernetes.azure.com/accelerator=nvidia`,
+tolerating every taint. The toolkit re-reads its config at every container
+start, so the package declares no interrupt: no cordon, drain, reboot, or
+containerd restart, and running pods are unaffected. The CR is
+`runtimeRequired` with `autoTaintNewNodes`, so a new GPU node carries the
+runtime-required taint until the keys are set. The operator applies that taint
+shortly after the node joins, which leaves a brief window
+([nodewright#901](https://github.com/NVIDIA/nodewright/issues/901)); creating
+the GPU node pool with `--node-taints
+nodewright.nvidia.com=runtime-required:NoSchedule` closes it. The AKS accelerator recipes (H100, A100) also
+set the same keys from their `nvidia-setup` `aks-h100` host prep; the two
+write identical values, and the step skips a node whose keys are already set.
+
+Under the GPU-Operator-managed profile (`--gpu-driver none` +
+`toolkit.enabled=true`) the operator owns the toolkit, and the AKS values set
+the same hardened keys via `gpu-operator.toolkit.env`
+(`ACCEPT_NVIDIA_VISIBLE_DEVICES_ENVVAR_WHEN_UNPRIVILEGED=false`,
+`ACCEPT_NVIDIA_VISIBLE_DEVICES_AS_VOLUME_MOUNTS=true`), which the toolkit
+installer writes into its config. The `aks-any` package also runs there; it
+sets the same keys wherever the node carries a host toolkit config and
+`nvidia-ctk`, and otherwise completes without changes.
+
+Disabling `nodewright-customizations` (`--set
+nodewrightcustomizations:enabled=false`) removes the `toolkit-hardening` CR
+along with every other nodewright customization. Under azure-managed that
+removes the hardening and `secure-accelerator-access` fails; under
+operator-managed the GPU Operator's toolkit keeps the keys.
+
+**Scope of the hardening.** Setting the env-var key to `false` closes the
+`NVIDIA_VISIBLE_DEVICES` env-var path — the path `secure-accelerator-access`
+exercises. Setting `accept-nvidia-visible-devices-as-volume-mounts = true` is
+required so the device plugin's volume-mounts allocation strategy still works
+for legitimately allocated pods, but it leaves the **volume-mounts
+device-request path open** (a pod that declares a `/dev/null`-backed mount whose
+destination is under `/var/run/nvidia-container-devices` can still select
+devices — the pinned toolkit v1.20.0 accepts the volume-mount device request
+only when the mount *source* is `/dev/null`). This is the same posture as
+GPU-Operator-managed mode — not a regression — but it means full multi-tenant
+isolation additionally requires an admission policy restricting a
+`/dev/null`-backed mount whose destination is under
+`/var/run/nvidia-container-devices`. A
+green `secure-accelerator-access` result confirms the env-var path is closed,
+not that isolation is complete.
+
+**Upgrading a cluster that runs the `nvidia-toolkit-hardening` DaemonSet.**
+Earlier AICR releases set these keys with a DaemonSet in the
+`gpu-operator-post` release, which current bundles no longer contain. Flux
+prunes it; the Helm, Helmfile and Argo CD deployers leave the DaemonSet
+running. It writes the same keys, so it is harmless, but nothing manages it any
+more. Remove it after the upgrade (with Helm or Helmfile,
+`helm uninstall gpu-operator-post -n gpu-operator` instead):
+
+```shell
+kubectl delete daemonset -n gpu-operator nvidia-toolkit-hardening
+```
+
+**GPU-Operator-managed override tuple.** The documented fallback override set
+(`driver.enabled=true`, `toolkit.enabled=true`, `operator.runtimeClass=nvidia`,
+`dradriver:nvidiaDriverRoot=/run/nvidia/driver`) does not need an explicit
+`gpuoperator:hostPaths.driverInstallDir` — the base `values.yaml` already pins
+`hostPaths.driverInstallDir=/run/nvidia/driver`, so it stays in lockstep with
+the DRA driver root.
+
+**Migration note for pre-existing AKS recipes:** a recipe file references the
+catalog's values files by path, so an AKS recipe generated *before* this
+default flip resolves the new `driver.enabled=false` / `toolkit.enabled=false`
+values on its next `aicr bundle` while retaining its old baked overrides —
+in particular, the DRA driver root stays at the operator container path and
+the resulting bundle is incoherent. **Regenerate pre-flip AKS recipes**
+(`aicr recipe ...`) before bundling with this AICR version — for GPU pools
+created with `--gpu-driver none`, regenerate with
+`--profile gpuStack=operator-managed`. (A legacy pre-profile artifact may instead
+supply the complete GPU Operator-managed override set:
+`--set gpuoperator:driver.enabled=true --set gpuoperator:toolkit.enabled=true
+--set gpuoperator:operator.runtimeClass=nvidia
+--set dradriver:nvidiaDriverRoot=/run/nvidia/driver` — rejected on profiled
+recipes when it diverges from the selected value; the ownership lock
+accepts only identical values.) `aicr bundle` now fails closed on this combination:
+the `CheckDriverOwnershipCoherence` validation detects the incoherent
+driver root (`driver.enabled=false` with the DRA driver root still at the
+operator container path) on the final effective values and blocks the
+bundle until the recipe is regenerated (profiled recipes select the other
+`gpuStack` value; legacy pre-profile artifacts may instead supply the full
+override set) ([#1757](https://github.com/NVIDIA/aicr/issues/1757)).
+
+**Driver-absent mismatch (profiled recipes):** resolving an AKS recipe from
+a snapshot now takes one of two fail-closed paths, neither of which is a
+bundle-time `--set` flip:
+
+- Pools reading `None` under the azure-managed default: the constraint
+  rejects the recipe at resolution, before any driver-state recording —
+  but `None` **qualifies** `--profile gpuStack=operator-managed`, so simply rerun
+  with that selection against the same snapshot (no pool change or
+  recapture needed). `Mixed`, `Managed`, or a missing reading reject
+  either selection; fix the pools (or capture with `--aks-gpu-pools`) and
+  recapture.
+- Pools reading `Install` while the sampled node has no loaded driver
+  (failed AKS driver install, mid-reimage): the constraint passes — pool
+  mode is the ownership contract, not live state — and resolution records
+  `metadata.gpuDriverState: absent`; `aicr bundle` then fails closed
+  (`CheckDriverOwnershipCoherence`). Repair the AKS-managed install and
+  recapture, or switch the pools to `--gpu-driver none`, recapture, and
+  regenerate with `--profile gpuStack=operator-managed`. The driver-ownership paths
+  are profile-owned, so the pre-profile per-path `--set` tuple is rejected.
+
+Legacy pre-profile AKS artifacts (no `metadata.selectedProfile`) keep the
+old behavior: warn at resolution, record `absent`, and unblock at bundle
+time with the complete legacy override set (`--set gpuoperator:driver.enabled=true
+--set gpuoperator:toolkit.enabled=true --set gpuoperator:operator.runtimeClass=nvidia
+--set dradriver:nvidiaDriverRoot=/run/nvidia/driver` — accepted only on
+legacy artifacts; on profiled recipes these paths are owned and flags
+diverging from the selected value are rejected). Criteria-only resolves
+(`aicr recipe --service aks ...`) have no cluster signal and record no state —
+the conformance-phase `gpu-operator-health` validation is the backstop.
+
+`Standard_ND96isr_H100_v5` is the 8-GPU ND H100 v5 SKU. The AKS Dynamo
+inference throughput gate (`inference-throughput`) is a fixed absolute
+**full-node** floor calibrated on an 8-GPU H100 node, so this SKU is the
+supported happy path for that gate. The same applies to the AKS H100 training
+NCCL gate (`nccl-all-reduce-bw >= 150`): its floor is calibrated on full
+ND96isr nodes using the Network Operator's RDMA shared device pool
+(`rdma/hca_shared_devices_a`) over the SKU's multi-HCA InfiniBand fabric.
+Smaller NCads H100 SKUs (`Standard_NC80adis_H100_v5` = 2 GPUs,
+`Standard_NC40ads_H100_v5` = 1 GPU) run fine for deployment but will
+false-fail both full-node floors — they lack the GPU count and IB fabric the
+calibrations assume; gate on `inference-ttft-p99` only on those until the
+per-GPU normalization in
+[#1254](https://github.com/NVIDIA/aicr/issues/1254) lands.
+
+The NCCL gate's benchmark pods pull the `nccl-tests` image from
+`public.ecr.aws` (AWS's public registry) — a cross-cloud pull when running on
+Azure. Private or egress-restricted AKS clusters must allow registry egress to
+`public.ecr.aws` or mirror the image into an Azure-reachable registry (e.g.
+ACR) before running the performance phase; otherwise the benchmark workers
+fail at image pull and the check fails without measuring anything.
+
+**GDRCopy in the azure-managed profile.** The AKS recipes set
+`gdrcopy.enabled: false` because the operator deploys GDRCopy as a sidecar
+container in the operator-managed driver pod; with `driver.enabled=false` that
+pod is never created, so the setting is inert against the preinstalled driver.
+Note that using GDRCopy requires both the `gdrdrv` kernel module on the node
+and the userspace library in the workload image; whether the Azure-managed
+node image ships `gdrdrv` remains unverified. To get operator-deployed
+GDRCopy, switch to the GPU-Operator-managed profile below (regenerate with
+`--profile gpuStack=operator-managed`) and add `--set gpuoperator:gdrcopy.enabled=true`
+at bundle time — `gdrcopy.enabled` is not a profile-owned path, so the
+override is accepted.
+
+**NVSentinel is configured by the profile.** Two silent NVSentinel
+misconfigurations are specific to `azure-managed`. The `gpuStack` profile now
+sets them itself ([#2181](https://github.com/NVIDIA/aicr/issues/2181)), along
+with the values janitor's GPU reset Job needs, so no bundle-time override is
+needed under either profile value:
+
+| Path | `azure-managed` (default) | `operator-managed` |
+|---|---|---|
+| `nvsentinel.labeler.assumeDriverInstalled` | `true` | `false` |
+| `nvsentinel.metadata-collector.runtimeClassName` | `nvidia-container-runtime` | `nvidia` |
+| `nvsentinel.janitor.config.controllers.gpuReset.resetJob.runtimeClassName` | `nvidia-container-runtime` | `nvidia` |
+| `nvsentinel.janitor.config.controllers.gpuReset.resetJob.hostDriverRootPath` | `/` | `/run/nvidia/driver` |
+
+The last two rows matter only with the
+[`nvsentinel-remediation`](../user/component-catalog.md#graded-remediation)
+mixin, which deploys janitor. Its GPU reset Job requests the same RuntimeClass,
+and would otherwise be rejected at admission the same way, and it runs
+`nvidia-smi` by chrooting into the driver root: the host root where the node
+image installs the driver, the operator's install path where the operator does.
+
+Because these are profile-owned paths, a bundle-time `--set` diverging from the
+selected value is **rejected** rather than silently applied. The two gates
+below remain as defense in depth.
+
+The two failure signatures look similar but are distinct, and both must be
+fixed for `metadata-collector` to become ready:
+
+| Symptom | DaemonSets | Cause |
+|---|---|---|
+| **0 DESIRED** pods — pods never scheduled, no error, no event | `metadata-collector`, `syslog-health-monitor-regular`, `syslog-health-monitor-kata` | driver label never applied ([#2175](https://github.com/NVIDIA/aicr/issues/2175)) |
+| **N desired / 0 CREATED** — `FailedCreate` at admission, no pod object exists | `metadata-collector` | RuntimeClass name mismatch ([#2176](https://github.com/NVIDIA/aicr/issues/2176)) |
+
+**Driver label (`labeler.assumeDriverInstalled`).** With
+`driver.enabled=false` there is no GPU Operator driver pod, and the NVSentinel
+labeler decides the node label `nvsentinel.dgxc.nvidia.com/driver.installed` by
+watching for one. Left unset the label is never applied, and the three
+DaemonSets that select on it come up with **0 desired pods**. This is easy to
+miss: a DaemonSet matching no node is not unhealthy, so it reports no error
+and emits no event, and `gpu-health-monitor` keeps running because it selects
+on the DCGM label instead. The stack presents as fully rolled out.
+
+The value renders the labeler's `--assume-driver-installed` argument — the
+chart-level automation of the Manual Labeling Procedure in NVSentinel design
+018 — and, per the upstream decision in
+[NVIDIA/NVSentinel#1583](https://github.com/NVIDIA/NVSentinel/issues/1583),
+the recommended, permanent mechanism for host-installed drivers (no automatic
+detection fallback will be added). Under `azure-managed` a recipe that reaches
+bundle generation without it is a **blocking error**
+(`CheckNVSentinelDriverLabelDetectable`), so the silent half-rollout cannot
+ship. Under `operator-managed` the profile sets it to an explicit `false` and
+the gate does not fire at all: the operator's driver pod is the evidence there,
+and skipping detection would keep the label applied across an unloaded driver.
+
+**Runtime class (`metadata-collector.runtimeClassName`).** The
+metadata-collector DaemonSet requests a RuntimeClass by name, and the GPU
+Operator's ClusterPolicy controller names its primary RuntimeClass after
+`operator.runtimeClass`. Under `azure-managed` that is
+`nvidia-container-runtime` (matching the handler preconfigured on the AKS node
+image), so a collector left on its chart default `nvidia` finds no such
+RuntimeClass and the API server rejects every pod at admission:
+
+```text
+Warning  FailedCreate  daemonset/metadata-collector
+Error creating: pods "metadata-collector-" is forbidden:
+pod rejected: RuntimeClass "nvidia" not found
+```
+
+No pod object is ever created, so there is nothing to `kubectl describe`; the
+`FailedCreate` event on the DaemonSet is the only signal.
+
+The same profile value owns `gpu-operator.operator.runtimeClass`,
+`nvsentinel.metadata-collector.runtimeClassName` and the GPU reset Job's
+`runtimeClassName` and driver root, so they are consistent by construction
+under either value. `CheckNVSentinelRuntimeClassCoherence` still compares the
+operator and metadata-collector names as a **blocking error** if they ever
+diverge, and `CheckNVSentinelRemediationPipelineCoherent` does the same for the
+reset Job.
+
+**Labeling the nodes by hand does not persist.** Applying the label manually:
+
+```shell
+NODE="my-gpu-node"  # replace with the GPU node name
+kubectl label node "${NODE}" nvsentinel.dgxc.nvidia.com/driver.installed=true
+```
+
+takes effect immediately and then silently reverts — with no driver pod to
+observe, the labeler computes an empty desired value and removes the label on
+its next reconcile. Design 018 documents manual labeling as the procedure for
+this case, so an operator following it will see it work and later find the
+DaemonSets back at 0 desired.
+
+### Alternative: Let GPU Operator Manage the Driver
+
+If you prefer the GPU Operator to install the driver (e.g., to pin the driver
+version through the AICR recipe rather than follow the AKS node-image
+cadence), create nodepools with `--gpu-driver none` so AKS skips its driver
+installation:
+
+```shell
+RESOURCE_GROUP="my-resource-group"  # replace with your Azure resource group
+CLUSTER="my-cluster"                # replace with your AKS cluster name
+
+az aks nodepool add \
+  --cluster-name "${CLUSTER}" \
+  --resource-group "${RESOURCE_GROUP}" \
+  --name gpupool \
+  --node-vm-size Standard_ND96isr_H100_v5 \
+  --gpu-driver none \
+  --node-count 1
+```
+
+Add the eviction label to this pool only if you opt in at bundle time **and**
+disable the bundled labeler (`--set dra-node-labeler:enabled=false`). With the
+labeler in the bundle, `dra-node-labeler` applies the label itself and the pool
+needs nothing. When you do provision it, the node label and the flag value must
+be the **same `key=value` pair** — the flag selects the convention, and AICR
+renders exactly what you pass:
+
+`az aks nodepool update --labels` **replaces** the pool's entire user-label map
+rather than merging, so repeat every label the pool already carries or they are
+dropped — including the accelerated-node selector the bundle relies on:
+
+```shell
+RESOURCE_GROUP="my-resource-group"  # replace with your Azure resource group
+CLUSTER="my-cluster"                # replace with your AKS cluster name
+
+az aks nodepool update \
+  --cluster-name "${CLUSTER}" --resource-group "${RESOURCE_GROUP}" --name gpupool \
+  --labels nodeGroup=gpu-worker nvidia.com/dra-kubelet-plugin=true
+```
+
+Prefer setting both at pool creation time (`az aks nodepool add --labels ...`)
+so there is no map to preserve.
+
+Then pass the same pair to `aicr bundle` in the generation step below. See
+[Label GPU nodes for the DRA kubelet plugin (opt-in only)](#label-gpu-nodes-for-the-dra-kubelet-plugin-opt-in-only).
+
+Then select the mode at recipe generation time with the `gpuStack`
+configuration profile — one flag flips every ownership path together:
+
+```shell
+aicr recipe --service aks --accelerator h100 --os ubuntu --intent training \
+  --profile gpuStack=operator-managed -o recipe.yaml
+# AKS requires a keyed accelerated-node toleration.
+# --dra-eviction-node-label opts in; dra-node-labeler labels the GPU nodes.
+aicr bundle -r recipe.yaml -o ./bundles \
+  --accelerated-node-toleration nvidia.com/gpu:NoSchedule \
+  --dra-eviction-node-label nvidia.com/dra-kubelet-plugin=true
+```
+
+The `operator-managed` value sets `driver.enabled=true`, `toolkit.enabled=true`,
+`operator.runtimeClass=nvidia`, and retargets `nvidia-dra-driver-gpu`'s
+`nvidiaDriverRoot` from the AKS default (`/`, the host-installed driver
+location) to the GPU Operator driver container's install root
+(`/run/nvidia/driver`) — nothing installs a driver at the host root in this
+mode. A partial configuration is impossible by construction: the profile
+owns all four paths, so per-path `--set` overrides that diverge from the
+selected value are rejected at bundle time (identical values are accepted;
+legacy pre-profile recipes without `metadata.selectedProfile` still take
+the old four-flag `--set` tuple).
+
+When generating from a snapshot, capture the pool mode first (see
+"Recording the pool mode in snapshots" above): the `operator-managed` value's
+recorded constraint requires the pools to read `gpu-driver: None`, so
+resolution fails closed if the pools were not actually created with
+`--gpu-driver none`.
+
+This gives the GPU Operator ownership of the full stack: it installs the
+driver and configures the containerd `nvidia` runtime handler through its
+container-toolkit DaemonSet. `--gpu-driver none` shifts driver lifecycle and
+compatibility responsibility from Microsoft's node-image QA to the GPU
+Operator (and the AICR recipe's pinned versions), and node bring-up now
+includes driver installation time. See
+[Skip GPU driver installation](https://learn.microsoft.com/en-us/azure/aks/use-nvidia-gpu#skip-gpu-driver-install).
+
+`driver.rdma.useHostMofed` remains `false` in this mode too — the recipe
+supplies MOFED through the Network Operator's OFED container, not a
+host-preinstalled MOFED (see the comment in
+`recipes/components/gpu-operator/values-aks.yaml`).
+
+## InfiniBand RDMA Host Setup (nodewright)
+
+AKS recipes deliver the InfiniBand RDMA host configuration (persistent
+`ib_umad`/`rdma_ucm` module loading, `LimitMEMLOCK=infinity` for containerd and
+kubelet) through nodewright: the `nodewright-customizations` component applies
+`nvidia-setup` packages to GPU nodes, with reboots handled as nodewright
+interrupts. This replaces the earlier privileged `ib-node-config` DaemonSet.
+
+**The `nvidia-tuned` package is disabled by default on AKS.** Under the
+Azure-managed driver profile the AKS overlays set
+`nodewright-customizations` `tuningEnabled: false`, which omits `nvidia-tuned`
+from the Skyhook packages (no tuning-triggered node reboot) and chains
+`nvidia-setup-full` directly off `nvidia-setup-kernel`. The RDMA host prep
+above still runs — it lives in `nvidia-setup`, not `nvidia-tuned`. An A/B
+comparison on an AKS H100 cluster also measured the tuned inference profile
+(isolcpus/hugepages) regressing inference TTFT from ~550 ms to ~6 s, so
+untuned is the better default today. To re-enable the tuning profile:
+
+```shell
+aicr bundle -r recipe.yaml \
+  --set nodewrightcustomizations:tuningEnabled=true \
+  -o ./bundles
+```
+
+**Upgrading in place does not revert previously applied tuning.** The
+`tuningEnabled: false` gate only controls whether `nvidia-tuned` renders into
+the Skyhook CR — nodewright package uninstall defaults off and the tuning
+customization declares no uninstall block, so a cluster that already applied
+`nvidia-tuned` keeps its host state (isolcpus, hugepages, GRUB changes) after
+upgrading to a `tuningEnabled: false` bundle. That state remains until the
+nodes are reimaged or recreated; recreating the GPU node pool is the clean
+path. Automated remediation is tracked in
+[#1820](https://github.com/NVIDIA/aicr/issues/1820).
+
+**Pass a keyed toleration on AKS.** AKS admission collapses a pod's toleration
+list to just the wildcard (`operator: Exists`, no key) when one is present,
+which defeats the nodewright operator's drain exemption for its own package
+pods and deadlocks packages that declare interrupts on first install
+([nodewright#296](https://github.com/NVIDIA/nodewright/issues/296)). Recovering
+from that deadlock requires manually cordoning and rebooting the node. Because
+`aicr bundle` injects a wildcard toleration by default when
+`--accelerated-node-toleration` is not set, always bundle the AKS accelerator
+recipes (which wire the interrupt-declaring `tuning.yaml` packages) with a
+keyed toleration matching your GPU node taint:
+
+```shell
+aicr bundle -r recipe.yaml \
+  --accelerated-node-toleration nvidia.com/gpu:NoSchedule \
+  -o ./bundles
+```
+
+Bundling an AKS accelerator recipe without a keyed toleration is a **blocking
+error** (`CheckWildcardAcceleratedToleration`): the bundle is not produced until
+you supply one, so the deadlock cannot ship silently. AKS recipes without an
+accelerator carry only the toolkit-hardening package, which declares no
+interrupt, so they bundle with the default toleration.
+
+To opt out of the RDMA stack entirely (e.g., on non-InfiniBand SKUs), select
+`nvidia-setup`'s accelerator-agnostic AKS profile with
+`accelerator=generic`. In place of the `aks-h100` host prep (IB modules, memlock
+limits, toolkit hardening) the `tuning` CR then applies `aks-any` (the toolkit
+hardening only). The `tuning` CR keeps its interrupts, so the keyed toleration
+is still required:
+
+```shell
+aicr bundle -r recipe.yaml \
+  --accelerated-node-toleration nvidia.com/gpu:NoSchedule \
+  --set networkoperator:enabled=false \
+  --set-json 'nfd:worker.config.sources.custom=[]' \
+  --set gpuoperator:driver.rdma.useHostMofed=false \
+  --set nodewrightcustomizations:accelerator=generic \
+  -o ./bundles
+```
+
+`generic` is AICR's value for "no accelerator-specific nodewright profile"; the
+bundle passes it to `nvidia-setup` as that package's `any`. Use `generic`, not
+`any`: with `tuningEnabled=true`, `generic` also moves `nvidia-tuned` to its
+`nvidia-generic` profile, and `nvidia-tuned` ships no `any` profile.
+
+**Opting out of nodewright customizations removes the hardening CR.** The
+`toolkit-hardening` CR ships `nvidia-setup` through `nodewright-customizations`,
+so excluding that component (`--set nodewrightcustomizations:enabled=false`, a
+recipe override, or the bundlers filter) removes it under either gpuStack
+profile. Under azure-managed (the default) that removes the toolkit hardening,
+and `aicr bundle` warns; under operator-managed the GPU Operator's toolkit keeps
+the same keys through `gpu-operator.toolkit.env`. If you used
+`--set nodewrightcustomizations:enabled=false` to skip RDMA, switch to
+`accelerator=generic` above to keep the hardening. On a cluster that was
+bundled with `enabled=false`, that switch deploys the `tuning` CR, whose
+`nvidia-setup-full` package drains and reboots each GPU node once, one node at a
+time (`interruptionBudget.count: 1`). Pass `--workload-selector` with a label
+your training pods carry so nodewright does not evict running jobs.
+
+## References
+
+- [GPU Operator on AKS](https://learn.microsoft.com/en-us/azure/aks/nvidia-gpu-operator)
+- [AKS GPU Node Pools](https://learn.microsoft.com/en-us/azure/aks/gpu-cluster)
+- [Kubernetes DRA Documentation](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)
+- [NVIDIA DRA Driver](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu)
+- [AKS Supported Kubernetes Versions](https://learn.microsoft.com/en-us/azure/aks/supported-kubernetes-versions)
+- [Kubernetes 1.34 DRA Updates (blog)](https://kubernetes.io/blog/2025/09/01/kubernetes-v1-34-dra-updates/)

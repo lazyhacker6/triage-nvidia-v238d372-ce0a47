@@ -1,0 +1,543 @@
+# GitHub Actions Architecture
+
+This directory contains a modular, reusable GitHub Actions architecture optimized for separation of concerns and composability.
+
+## Composite Actions
+
+### Script Conventions
+
+Composite action helper scripts in this directory are intentionally portable
+across checkout modes: keep them mode `0644` and invoke them as
+`bash path/to/script.sh` from workflows or `action.yml` files. Do not rely on
+executable bits or `./script.sh` invocation.
+
+### Core CI/CD Actions
+
+#### `go-test/`
+
+**Purpose**: Set up Go and Helm, verify the module manifests are tidy, and run unit tests with race detection and coverage
+**When to use**: Go CI workflows that use the repository's `make test` target
+**Inputs**:
+- `go_version` (required): Go version to install
+- `coverage_report` (optional): Whether to generate a coverage report (default: "false")
+- `coverage_threshold` (optional): Minimum coverage percentage (default: empty)
+- `helm_version` (required): Helm version from `load-versions`
+- `setup_envtest_version` (required): setup-envtest version from `load-versions`
+- `setup_envtest_sha256` (**required**): pinned linux/amd64 SHA256 for the setup-envtest release binary, from `load-versions`. controller-runtime publishes no `checksums.txt` beside it, so this pin is the only integrity check on the download
+- `apidiff_version` (optional): apidiff version from `load-versions`, which reads it from the `go.mod` require line; when set, builds apidiff and runs `make api-diff` (default: empty, which skips both steps). The input gates whether the check runs; the version built comes from that same `go.mod` entry
+- `oasdiff_version` (**required**): oasdiff version from `load-versions`; installs oasdiff before `make test` and runs `make openapi-diff` after. Not optional, because `make test` runs `tools/openapi-diff_test.sh`, which fails in CI when oasdiff is absent rather than skipping — the REST contract gate cannot be silently unverified
+- `oasdiff_sha256` (**required**): pinned linux/amd64 SHA256 for the oasdiff release archive, from `load-versions`. The install fails closed when it is missing or malformed rather than falling back to the release's own `checksums.txt`
+- `privileged_ci` (optional): whether the checked-out ref is trusted (default: `"true"`). Only trusted runs save the Go cache; restore is unconditional. `ok-to-test` passes `false` because it runs an untrusted PR head inside the default branch's cache scope
+
+`go-lint`, `e2e`, and `install-e2e-tools` take a `privileged_ci` input too, but
+each gates a different cache, so the name alone does not tell you what stops:
+`go-lint` gates only golangci-lint's own `~/.cache/golangci-lint` entry,
+`install-e2e-tools` gates its `/usr/local/bin` tool cache, and `e2e` only
+forwards the value. None of the three writes the Go module or build cache —
+they restore `go-test`'s entry and never save it. In all four, the input
+suppresses the writes an ordinary fork run makes by default; on the `ok-to-test`
+path these action files are themselves checked out from the fork, so the gate is
+not a boundary against a crafted PR. Job-level skipping in `qualification.yaml`
+(`cli-e2e`, `security-scan`) is the control that holds there.
+
+That residual exposure is accepted rather than closed ([#2681](https://github.com/NVIDIA/aicr/issues/2681)):
+the fixes that would make it an invariant either stop running lint/test/e2e on
+fork PRs, or move untrusted code onto a base-repo branch where fork-authored
+workflow files reach the private GPU runners. Since the maintainer's vouch is
+the real control, `/ok-to-test` refuses its bare form on a PR that touches
+`.github/**`, or has too many changed files for that to be checked, and
+requires `/ok-to-test confirm-ci`, so the CI diff cannot be waved through
+without being shown.
+
+Callers that set `apidiff_version` must check out full history with
+`fetch-depth: 0` so `make api-diff` can resolve a reachable stable release tag.
+
+#### `security-scan/`
+**Purpose**: Anchore/Grype vulnerability scanning with SARIF upload
+**When to use**: Security validation in CI/CD pipelines
+**Inputs**:
+- `path` (optional): Filesystem path to scan (default: ".")
+- `image` (optional): Container image to scan
+- `severity-cutoff` (optional): Minimum severity (default: "high")
+- `output_file` (optional): SARIF file name (default: "scan-results.sarif")
+- `category` (optional): GitHub Security category (default: "anchore")
+
+**Example**:
+```yaml
+- uses: ./.github/actions/security-scan
+  with:
+    severity-cutoff: 'medium'
+    category: 'anchore-fs'
+```
+
+### Development Environment Actions
+
+#### `install-e2e-tools/`
+**Purpose**: Install development and E2E testing tools using the shared `tools/setup-tools` script
+**When to use**: E2E test workflows that need development tools (kubectl, kind, tilt, etc.)
+**Key Features**:
+- Uses `tools/setup-tools` for consistency with local development
+- Caches tools based on `.settings.yaml` hash
+- Same tools, same versions as local dev - no "works on my machine" issues
+
+**Example**:
+```yaml
+- uses: ./.github/actions/install-e2e-tools
+```
+
+This action runs `tools/setup-tools --skip-go --skip-docker` in auto mode, which:
+- Reads versions from `.settings.yaml` (single source of truth)
+- Installs: helm, kubectl, kind, ctlptl, tilt, ko, grype, yamllint, golangci-lint
+- Skips Go (handled by `actions/setup-go`) and Docker (pre-installed on runners)
+- Uses the same installation logic as local development
+
+#### `install-go-licenses/`
+**Purpose**: Build the pinned `go-licenses` from this module with `GOFLAGS` pinned
+**When to use**: Any job running `make license-check`, `make notices`, or `make release`
+**Inputs**:
+- `version` (required): go-licenses version from `load-versions`, which reads it from the `go.mod` require line. Validated for presence only — the version built comes from that same entry
+
+`go-licenses` publishes no binary release, so it cannot come from
+`setup-build-tools` (which installs from binary releases). It is instead a `tool`
+directive in `go.mod` and is built with `go build` from the main module, so its
+transitive dependencies are covered by the committed `go.sum` and the install
+never contacts `sum.golang.org` — the checksum database is consulted only when a
+module is being *added*. `go install pkg@version` resolves outside the module,
+where nothing is in `go.sum`, so it authenticated every dependency against the
+live checksum database and an outage there failed the gate (#2667).
+
+Pinning `GOFLAGS` to `-mod=readonly` is a correctness requirement rather than a
+preference, and applies to `go build` exactly as it did to `go install`:
+`-trimpath` strips the binary's baked-in `GOROOT`, which makes `go-licenses`
+classify every package as standard library and report an empty dependency graph
+while still exiting `0`. Measured on a `-trimpath` build of v2.0.1,
+`go-licenses csv` emits zero rows. `-mod=readonly` rather than an empty
+`GOFLAGS` so CI still cannot rewrite the manifest it is validating. The build is
+centralized here so no caller can silently drop either contract.
+
+**Example**:
+```yaml
+- uses: ./.github/actions/install-go-licenses
+  with:
+    version: ${{ steps.versions.outputs.go_licenses }}
+```
+
+#### `load-versions/`
+**Purpose**: Load tool versions from `.settings.yaml` as workflow outputs
+**When to use**: When you need version values in workflow steps
+**Outputs**: the Go version (from `.go-version`), plus one output per exposed
+`.settings.yaml` pin (tool versions, chart versions, image references, and
+quality thresholds; not every settings key is exposed), and the Docker Hub
+pull-through mirror from `build.dockerhub_mirror` as both `dockerhub_mirror`
+(URL) and `dockerhub_mirror_host` — see
+[`load-versions/action.yml`](load-versions/action.yml) for the authoritative set.
+**Failure**: fails the calling job when `build.dockerhub_mirror` is missing or is
+not an `https://` host URL without a path, rather than letting mirror consumers
+fall back to anonymous Docker Hub pulls.
+
+**Example**:
+```yaml
+- uses: ./.github/actions/load-versions
+  id: versions
+- uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5  # v6.2.0
+  with:
+    go-version: ${{ steps.versions.outputs.go }}
+```
+
+### Build & Release Actions
+
+#### `setup-build-tools/`
+**Purpose**: Install pinned, checksum-verified tool binaries (ko, syft, crane, oras, oasdiff, setup-envtest, addlicense, goreleaser)  
+**When to use**: When you need specific build tools without full build pipeline  
+**Inputs**:
+- `install_ko` (optional): Install ko (default: "false")
+- `install_syft` (optional): Install syft (default: "false")
+- `install_crane` (optional): Install crane (default: "false")
+- `crane_version` (optional): crane version (default: "v0.21.0")
+- `install_oras` (optional): Install oras (default: "false")
+- `oras_version` (required when `install_oras: "true"`): oras version from `load-versions`, without the leading `v`
+- `oras_sha256` (required when `install_oras: "true"`): oras linux/amd64 SHA256 from `load-versions`
+- `install_oasdiff` (optional): Install oasdiff (default: "false")
+- `oasdiff_version` (required when `install_oasdiff: "true"`): oasdiff version from `load-versions`
+- `oasdiff_sha256` (required when `install_oasdiff: "true"`): oasdiff linux/amd64 SHA256 from `load-versions`
+- `install_setup_envtest` (optional): Install setup-envtest (default: "false")
+- `setup_envtest_version` (required when `install_setup_envtest: "true"`): setup-envtest version from `load-versions`, matching a controller-runtime release tag
+- `setup_envtest_sha256` (required when `install_setup_envtest: "true"`): setup-envtest linux/amd64 SHA256 from `load-versions`. controller-runtime publishes no `checksums.txt` for this asset, so the pin is the only integrity check on it
+- `install_addlicense` (optional): Install addlicense (default: "false")
+- `addlicense_version` (required when `install_addlicense: "true"`): addlicense version from `load-versions`
+- `addlicense_sha256` (required when `install_addlicense: "true"`): addlicense linux/amd64 SHA256 from `load-versions`
+- `install_goreleaser` (optional): Install goreleaser (default: "false")
+- `goreleaser_version` (required when `install_goreleaser: "true"`): GoReleaser version from `load-versions`
+
+**Example**:
+```yaml
+- uses: ./.github/actions/setup-build-tools
+  with:
+    install_ko: 'true'
+    install_crane: 'true'
+    crane_version: 'v0.21.0'
+```
+
+#### `go-build-release/`
+**Purpose**: Validate the exact-tag release target, then run the complete build
+and release pipeline (tools + auth + make release)
+**When to use**: Release workflows that build and publish artifacts
+**Inputs**:
+- `registry` (optional): Container registry (default: "ghcr.io")
+- `ko_version` (optional): Ko version (default: "v0.18.0")
+- `goreleaser_version` (required): GoReleaser version from `load-versions`
+- `go_licenses_version` (required): go-licenses version from `load-versions`
+- `candidate_tag` (required): Validated `candidate-<run-id>-<run-attempt>` image tag
+
+**Outputs**:
+- `release_outcome`: Release step outcome (success/failure)
+
+**Note**: A partial draft is reused only when its name and tag both equal the
+release tag, its pre-release state matches, and its existing assets are a safe
+subset of the fixed release asset set. Unexpected draft assets and
+already-public releases are rejected before GoReleaser runs, and reused draft
+notes are replaced with notes generated from the current tag. Image repository
+paths are fully specified in `.goreleaser.yaml` under `kos.repositories`.
+
+**Example**:
+```yaml
+- uses: ./.github/actions/load-versions
+  id: versions
+- uses: ./.github/actions/go-build-release
+  id: release
+  with:
+    ko_version: ${{ steps.versions.outputs.ko }}
+    goreleaser_version: ${{ steps.versions.outputs.goreleaser }}
+    go_licenses_version: ${{ steps.versions.outputs.go_licenses }}
+    candidate_tag: ${{ needs.detect.outputs.candidate_tag }}
+- if: steps.release.outputs.release_outcome == 'success'
+  run: echo "Release succeeded"
+```
+
+### Attestation Actions
+
+#### `ghcr-login/`
+**Purpose**: Authenticate to GitHub Container Registry  
+**When to use**: Before any GHCR operations (shared authentication)  
+**Inputs**:
+- `registry` (optional): Registry URL (default: "ghcr.io")
+- `username` (optional): Username (default: github.actor)
+
+**Example**:
+```yaml
+- uses: ./.github/actions/ghcr-login
+```
+
+#### `attest-image-from-tag/`
+**Purpose**: Bind a fixed AICR candidate image to an authoritative digest,
+resolve its per-platform manifest digests, and generate SBOM + VEX + provenance
+**When to use**: Attesting candidate images in the AICR release workflow
+**Inputs**:
+- `image_name` (required): One of the fixed release image names: the seven AICR images, `aicr-operator` and `aicr-registry` (`release-input-validation.sh`)
+- `candidate_tag` (required): Validated `candidate-<run-id>-<run-attempt>` tag
+- `expected_digest` (required): Authoritative `sha256:<64 lowercase hex>` digest
+- `crane_version` (optional): crane version (default: "v0.20.6")
+
+**Outputs**:
+- `image_digest`: Resolved sha256 digest
+
+**Example**:
+```yaml
+- uses: ./.github/actions/attest-image-from-tag
+  with:
+    image_name: ghcr.io/nvidia/aicrd
+    candidate_tag: candidate-${{ github.run_id }}-${{ github.run_attempt }}
+    expected_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+```
+
+#### `sbom-and-attest/`
+
+**Purpose**: Generate the CycloneDX SBOM, OpenVEX and SLSA provenance
+attestations for an image whose digests are already known
+**When to use**: When you already have the digests (e.g., from build output)
+**Inputs**:
+- `image_name` (required): One of the fixed release image names: the seven AICR images, `aicr-operator` and `aicr-registry` (`release-input-validation.sh`)
+- `image_digest` (required): Multi-platform index digest; subject for the index provenance attestation
+- `amd64_digest` (required): `linux/amd64` manifest digest; subject for the amd64 SBOM, VEX and provenance
+- `arm64_digest` (required): `linux/arm64` manifest digest; subject for the arm64 SBOM, VEX and provenance
+
+Cosign is pinned from `.settings.yaml` via `load-versions`, and every
+`cosign attest` call sets `--new-bundle-format=true` explicitly so the
+attestations land through the OCI referrers path by our decision rather than by
+an installer default. Provenance is attested once per subject — the index and
+each platform manifest — through `actions/attest-build-provenance`, so every
+call mints the in-toto subject it publishes under rather than re-pushing one
+document to subjects its own statement does not name. The SBOM and the VEX share
+a per-platform subject and are deliberately in different formats so a referrers
+listing can tell them apart;
+`tools/openvex-bind` rewrites `.openvex.json` product identifiers to the
+platform manifest digest before the VEX is signed, and replaces the
+document-level `tooling` field with an identifier of itself so committed prose
+cannot reach a signature. Both the committed source and
+every generated projection are validated by `openvex-guard.sh`, which holds the
+rules and the pinned v0.2.0 `@context` once so the two checks cannot drift; the
+only rule that differs is that a projection may carry an empty `statements`
+array. The action's header comment explains the full subject policy.
+
+**Example**:
+
+```yaml
+- uses: ./.github/actions/sbom-and-attest
+  with:
+    image_name: ghcr.io/nvidia/aicrd
+    image_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    amd64_digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+    arm64_digest: sha256:2222222222222222222222222222222222222222222222222222222222222222
+```
+
+### KWOK Testing Actions
+
+#### `kwok-test/`
+**Purpose**: Test recipes using KWOK simulated nodes in a shared Kind cluster
+**When to use**: KWOK recipe validation in CI or manual workflow dispatch
+**Requires**: An earlier job that uploads the `aicr` binary under `dist/` as the `kwok-aicr-bin` artifact. The action downloads it and does not build `aicr`.
+**Inputs**:
+- `recipe` (required): Recipe name to test
+- `deployer` (optional): `helm`, `argocd-oci`, `argocd-helm-oci`, `argocd-git`, `flux-oci`, or `flux-git` (default: "helm")
+- `kind_version` (optional): Kind version (default: "0.31.0")
+- `helm_version` (optional): Helm version (default: "v4.1.1")
+- `kwok_version` (optional): KWOK version (default: "v0.7.0")
+- `kubectl_version` (optional): kubectl version (default: "v1.35.0")
+- `flux_version` (optional): Flux CLI version, required for the `flux-*` deployers
+- `chainsaw_version` (required): Chainsaw version used by the sync gate
+- `chainsaw_sha256` (required): Chainsaw SHA256 checksum for linux/amd64
+- `kind_node_image` (optional): Kind node image
+- `job_timeout_minutes` (required): The calling job's `timeout-minutes`, used to derive the sync-gate deadline
+
+**Key Design**: Calls `run-all-recipes.sh` — the same script used by `make kwok-test-all` locally. This ensures CI and local testing use identical code paths with a single shared cluster.
+
+**Example**:
+```yaml
+- uses: ./.github/actions/kwok-test
+  with:
+    recipe: eks-training
+    deployer: helm
+    kind_version: ${{ steps.versions.outputs.kind }}
+    helm_version: ${{ steps.versions.outputs.helm }}
+    chainsaw_version: ${{ steps.versions.outputs.chainsaw }}
+    chainsaw_sha256: ${{ steps.versions.outputs.chainsaw_sha256_linux_amd64 }}
+    job_timeout_minutes: '20'
+```
+
+## Workflows
+
+### `on-push.yaml`
+**Trigger**: Push to main (Markdown-, `docs/**`- and `LICENSE`-only pushes are skipped), manual dispatch
+**Purpose**: Qualify each merged commit and publish validator images from main
+**Jobs**:
+1. **Qualification** (`tests`): Calls the reusable `qualification.yaml` (test, lint, CLI E2E, E2E, security scan)
+2. **Validator Images** (`build-docker`): After qualification, builds each validator image for amd64 and arm64
+3. **Docker Manifest** (`docker-manifest`): Publishes the multi-arch `sha-<commit>` and `edge` tags
+
+Pull requests run the same `qualification.yaml` through `merge-gate.yaml`.
+
+### `on-tag.yaml`
+**Trigger**: Semantic version tags (v*.*.*)
+**Purpose**: Build, release, attest
+**Jobs**:
+1. **Qualification**: Reusable test, lint, E2E, and source-security gates
+2. **Candidate Builds**: Draft release artifacts and all seven images under one
+   run-unique candidate tag
+3. **Digest Resolution**: One authoritative seven-image digest map
+4. **Image Security**: Both platforms of every resolved digest are scanned
+5. **Attestation**: Platform SBOMs and reusable-workflow provenance for the same digests
+6. **Promotion**: Read-only preflight, all version aliases, then stable `latest`
+   aliases only after every version alias is verified
+7. **Publication**: Require the exact release asset set, then publish the
+   validated numeric GitHub release ID
+8. **Stable Distribution**: Publish Homebrew after publication
+
+### `kwok-recipes.yaml`
+**Trigger**: Push/PR to main (when `recipes/**` or `kwok/**` change), manual dispatch
+**Purpose**: KWOK simulated cluster validation of recipe scheduling
+**Jobs**:
+1. **Script Tests, Discover, Prime Images, Build aicr**: Run first. Build uploads the `aicr` binary once for every cell.
+2. **Tier 1, 2 and 3**: Each calls `kwok-test-run.yaml`, whose cells run the `kwok-test` action (`run-all-recipes.sh`, same as `make kwok-test-all`)
+3. **Summary**: Reports pass/fail (advisory, does not block merges)
+
+## Architecture Principles
+
+### Separation of Concerns
+- **Single Responsibility**: Each action does one thing well
+- **Composability**: Actions can be combined for complex workflows
+- **Testability**: Small actions are easier to test in isolation
+
+### Reusability Layers
+1. **Primitive Actions**: Low-level operations (ghcr-login, setup-build-tools)
+2. **Composed Actions**: Combine primitives (attest-image-from-tag = login + crane + sbom-and-attest)
+3. **Pipeline Actions**: Full workflows (go-build-release = tools + auth + release)
+
+### Authentication Strategy
+- GHCR authentication centralized in `ghcr-login` action
+- All actions requiring registry access use this shared action
+- Eliminates redundant login steps (was happening 3x in on-tag workflow)
+
+### Tool Installation Strategy
+- **Development tools**: Use `install-e2e-tools` which delegates to `tools/setup-tools`
+  - Same script used locally and in CI - guaranteed consistency
+  - Versions managed in `.settings.yaml` (single source of truth)
+  - `make tools-check` works identically in both environments
+- **Build tools**: Use `setup-build-tools` for selective installation of ko, syft, crane, goreleaser
+- Version pinning ensures reproducibility across all environments
+
+## Migration from Previous Architecture
+
+### Removed Redundancies
+- **Before**: 3 separate GHCR logins (attest-image-from-tag, sbom-and-attest, workflow)
+- **After**: Single `ghcr-login` action reused everywhere
+
+- **Before**: 4 separate tool installations in workflow (ko, syft, crane, goreleaser)
+- **After**: Single `go-build-release` or selective `setup-build-tools`
+
+### Benefits
+- **Less Code**: ~40% reduction in workflow YAML
+- **Better Reuse**: Actions portable to other repos/workflows
+- **Clearer Intent**: Pipeline steps self-document through action names
+- **Easier Testing**: Individual actions can be tested independently
+- **Version Management**: Tool versions centralized in action defaults
+
+## Adding New Workflows
+
+### For a simple CI workflow
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: ./.github/actions/go-test
+        with:
+          go_version: ${{ steps.versions.outputs.go }}
+          helm_version: ${{ steps.versions.outputs.helm }}
+          setup_envtest_version: ${{ steps.versions.outputs.setup_envtest }}
+          setup_envtest_sha256: ${{ steps.versions.outputs.setup_envtest_sha256_linux_amd64 }}
+          apidiff_version: ${{ steps.versions.outputs.apidiff }}
+          oasdiff_version: ${{ steps.versions.outputs.oasdiff }}
+          oasdiff_sha256: ${{ steps.versions.outputs.oasdiff_sha256_linux_amd64 }}
+          coverage_report: 'true'
+      - uses: ./.github/actions/go-lint
+        with:
+          go_version: ${{ steps.versions.outputs.go }}
+          golangci_lint_version: ${{ steps.versions.outputs.golangci_lint }}
+          addlicense_version: ${{ steps.versions.outputs.addlicense }}
+          addlicense_sha256: ${{ steps.versions.outputs.addlicense_sha256_linux_amd64 }}
+      - uses: ./.github/actions/security-scan
+```
+
+### For a release workflow with attestations
+```yaml
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: ./.github/actions/go-test
+        with:
+          go_version: ${{ steps.versions.outputs.go }}
+          helm_version: ${{ steps.versions.outputs.helm }}
+          setup_envtest_version: ${{ steps.versions.outputs.setup_envtest }}
+          setup_envtest_sha256: ${{ steps.versions.outputs.setup_envtest_sha256_linux_amd64 }}
+          apidiff_version: ${{ steps.versions.outputs.apidiff }}
+          oasdiff_version: ${{ steps.versions.outputs.oasdiff }}
+          oasdiff_sha256: ${{ steps.versions.outputs.oasdiff_sha256_linux_amd64 }}
+      - uses: ./.github/actions/go-build-release
+        id: release
+        with:
+          ko_version: ${{ steps.versions.outputs.ko }}
+          goreleaser_version: ${{ steps.versions.outputs.goreleaser }}
+          go_licenses_version: ${{ steps.versions.outputs.go_licenses }}
+          candidate_tag: candidate-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: ./.github/actions/attest-image-from-tag
+        with:
+          image_name: ghcr.io/nvidia/aicrd
+          candidate_tag: candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          expected_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          crane_version: ${{ steps.versions.outputs.crane }}
+```
+
+### For custom tool combinations
+```yaml
+steps:
+  - uses: ./.github/actions/setup-build-tools
+    with:
+      install_crane: 'true'
+      install_ko: 'true'
+  - run: |
+      ko build ./cmd/my-app
+      crane digest ghcr.io/org/my-app:latest
+```
+
+## Local/CI Consistency
+
+The `install-e2e-tools` action ensures that CI uses the exact same tool installation logic as local development:
+
+```
+┌─────────────────────┐     ┌─────────────────────┐
+│   Local Dev         │     │   GitHub Actions    │
+│                     │     │                     │
+│ make tools-setup    │     │ install-e2e-tools   │
+│        │            │     │        │            │
+│        ▼            │     │        ▼            │
+│ tools/setup-tools   │◄───►│ tools/setup-tools   │
+│        │            │     │        │            │
+│        ▼            │     │        ▼            │
+│  .settings.yaml     │◄───►│  .settings.yaml     │
+└─────────────────────┘     └─────────────────────┘
+         │                           │
+         └───────────────────────────┘
+                Same versions, same tools
+```
+
+This eliminates "works on my machine" issues by ensuring:
+- Same tool versions (from `.settings.yaml`)
+- Same installation logic (`tools/setup-tools`)
+- Same verification (`make tools-check`)
+
+## Future Enhancements
+
+### Potential Improvements
+1. **Matrix Attestation Action**: Accept arrays of images to attest N images in one step
+2. **Reusable Workflow**: For full "CI → release → attest → deploy" as a callable workflow
+3. **Multi-Registry Support**: Extend ghcr-login to support DockerHub, ECR, GAR, etc.
+4. **Parallel Attestations**: Run attestations concurrently for faster builds
+5. **Notification Action**: Slack/Discord/PagerDuty notifications for workflow events
+
+### Cross-Repo Reusability
+To use these actions in other repositories:
+```yaml
+- uses: NVIDIA/aicr/.github/actions/go-test@main
+  with:
+    go_version: '...'             # .go-version
+    helm_version: '...'           # .settings.yaml testing_tools.helm
+    setup_envtest_version: '...'  # .settings.yaml testing_tools.setup_envtest
+    setup_envtest_sha256: '...'   # .settings.yaml testing_tools.setup_envtest_sha256_linux_amd64
+    oasdiff_version: '...'        # .settings.yaml linting.oasdiff
+    oasdiff_sha256: '...'         # .settings.yaml linting.oasdiff_sha256_linux_amd64
+    coverage_report: 'true'
+```
+
+The cross-repository example intentionally omits `apidiff_version`. Repositories
+without AICR's `make api-diff` target retain the original test behavior because
+an empty `apidiff_version` skips the API compatibility steps.
+
+Everything else shown is required and has no such escape hatch:
+`setup_envtest_version`, `setup_envtest_sha256` and `oasdiff_sha256` are each
+checked at the top of their install step and fail the job when empty or
+malformed, so omitting one produces a failure at run time rather than a skipped
+step. A cross-repo caller has no `load-versions` to read `.settings.yaml`, so it
+passes literal values: copy each from the file and key named in its comment
+rather than from this page, and note that each `*_sha256` must be the digest for
+the version beside it.

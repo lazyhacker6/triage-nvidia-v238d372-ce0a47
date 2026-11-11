@@ -1,0 +1,148 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: github.com/mchmarny/cluster/v1alpha1
+kind: Cluster
+
+deployment:
+  id: aicr-uat
+  provider: gke
+  tenancy: eidosx
+  location: us-central1
+  state: tenancy
+  destroy: false
+  tags:
+    env: demo
+
+cluster:
+  gke:
+    version: "1.35"
+    controlPlane:
+      authorizedNetworks:
+        - cidr: 216.228.127.128/30
+          name: hq
+        - cidr: 52.41.222.58/32
+          name: nw1
+        - cidr: 54.68.11.139/32
+          name: nw2
+        - cidr: 128.77.49.32/30
+          name: nw3
+        - cidr: 35.236.84.119/32
+          name: nvs
+
+network:
+  gke:
+    subnets:
+      nodes:
+        - name: system-subnet
+          cidr: "10.0.0.0/22"
+        - name: worker-subnet
+          cidr: "10.0.128.0/17"
+    gpuNets:
+      count: 8
+      mtu: 8244
+      cidrBase: "192.168.0.0/16"
+      # No gvnicCidr: an extra gVNIC additional network on an a3-megagpu-8g GPU
+      # pool has no free PCI slot, so it takes a GPU-NIC slot (0000:06:00.0) and
+      # displaces gpu-nic-7 onto a virtio slot. RxDM then detects only 7/8 GPU
+      # NICs in the PCI tree, exits 1, and never binds its UDS, so NCCL fails
+      # with "connect() 111: Connection refused" on NET/FasTrak. Nothing here
+      # consumes the gVNIC network. See docs/integrator/gke-tcpxo-networking.md.
+    firewallRules:
+      # Allows all intra-VPC TCP/UDP/ICMP from 10.0.0.0/8, which covers node
+      # subnets and the GKE pod secondary ranges — including Dynamo's TCP
+      # request plane and its fixed ZMQ KV-event port (5557), so no
+      # per-service rule is needed.
+      - name: nccl-internal
+        direction: INGRESS
+        priority: 900
+        sourceRanges:
+          - "10.0.0.0/8"
+        allowed:
+          - protocol: tcp
+          - protocol: udp
+          - protocol: icmp
+
+compute:
+  gke:
+    nodePools:
+      system:
+        machineType: e2-standard-4
+        autoscaling:
+          enabled: true
+          minNodes: 3
+          maxNodes: 3
+        nodeConfig:
+          labels:
+            nodeGroup: system-worker
+            dedicated: system-workload
+
+      workers:
+        # No general-purpose CPU pool. Nothing in the GCP UAT lane selects one:
+        # system components go to nodeGroup=system-worker and every accelerated
+        # workload to nodeGroup=gpu-worker, while the validator's orchestrator
+        # Jobs only *prefer* non-GPU nodes, so the untainted system pool serves
+        # them. A pool pinned to the GPU zone to satisfy nothing cost a run:
+        # `minNodes: 1` in us-central1-c hit ZONE_RESOURCE_POOL_EXHAUSTED for 35m
+        # and failed Bringup *after* the H100s were reserved, so the teardown
+        # discarded them (#2764). Re-adding one is not a matter of unpinning:
+        # GKE applies node counts PER ZONE, so a zone-less pool on this regional
+        # cluster provisions one node in each of us-central1-b/c/f. A
+        # stockout-tolerant pool needs region-wide counts, and those need an
+        # actuator change first: v0.5.17 passes `totalMinNodes`/`totalMaxNodes`
+        # through, but emits `min_node_count`/`max_node_count` unconditionally
+        # (defaulting to 1 and 3), and the provider rejects per-zone and total
+        # limits together. The gpu-worker pin below must stay regardless — the
+        # reservation is zonal.
+        - name: gpu-worker
+          machineType: a3-megagpu-8g
+          diskType: pd-ssd
+          diskSizeGb: 200
+          zones:
+            - us-central1-c
+          autoscaling:
+            # Two GPU nodes: activates the multi-node NCCL East-West fabric
+            # check (nccl-all-reduce-bw, which skips on a single GPU node) and
+            # lets the TrainJob (numNodes: 2) span both nodes. Drawn from the
+            # 384-node general-pool reservation below, so no capacity gate.
+            enabled: true
+            minNodes: 2
+            maxNodes: 2
+          guestAccelerator:
+            type: nvidia-h100-mega-80gb
+            count: 8
+            gpuDriverInstallation:
+              gpuDriverVersion: DEFAULT
+          nodeConfig:
+            gvnic: true
+            capacityReservations:
+              - projects/nv-dgxcloudprod-20240108/reservations/h100-a3-mega-phase-1-general-pool-384-us-c1-reservation
+            taints:
+              - key: dedicated
+                value: gpu-workload
+                effect: NO_SCHEDULE
+            labels:
+              nodeGroup: gpu-worker
+              dedicated: user-workload
+              # NO gke-no-default-nvidia-gpu-device-plugin label: on GKE the
+              # managed driver install (gpu-driver-version=DEFAULT) is
+              # finalized by an init container of the SAME DaemonSet the
+              # opt-out label disables, so a labeled fresh pool comes up
+              # driverless (staged installer, no kernel module — run
+              # 30930940652). The pool matches the gpuStack profile's
+              # gke-default default (#1761 PR 3), whose constraint requires
+              # the label ABSENT on every GPU node; the label belongs only
+              # to the bundle-installer value, paired with a label-surviving
+              # driver path (gpu-driver-version=disabled + the bundle's
+              # gcp-driver-installer DaemonSet).

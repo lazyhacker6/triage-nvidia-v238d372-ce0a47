@@ -1,0 +1,260 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cli
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/urfave/cli/v3"
+
+	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
+	"github.com/NVIDIA/aicr/pkg/errors"
+)
+
+const (
+	evidenceVerifyFormatText = "text"
+	evidenceVerifyFormatJSON = "json"
+)
+
+// evidenceVerifyCmd implements `aicr evidence verify <input>`.
+// Accepts three input forms (auto-detected): directory, pointer file,
+// or OCI reference. When the bundle is signed (attestation.intoto.jsonl
+// present), the signature is verified against the Sigstore trusted
+// root and the predicate body is extracted from the verified payload.
+func evidenceVerifyCmd() *cli.Command {
+	return &cli.Command{
+		Name:     "verify",
+		Category: functionalCategoryName,
+		Usage:    "Verify a recipe evidence bundle (offline).",
+		Description: `Verifies a recipe-evidence bundle's (v1 or v2) signature (when present)
+and manifest hash chain, then surfaces the predicate's fingerprint,
+phase counts, and BOM info.
+
+Input is auto-detected as one of:
+
+  pointer    recipes/evidence/<recipe>/<source>/<digest>.yaml — pulls the OCI artifact named inside.
+  oci        ghcr.io/owner/aicr-evidence@sha256:abc... or oci://...
+  directory  ./out/summary-bundle/ (or a parent containing it).
+
+The rendered output goes to stdout by default; -o writes it to a file
+instead. -t selects the format (text = Markdown, json = structured).
+
+Verdict codes (the "exit" field in --format json):
+
+  0   bundle valid; every check passed.
+  1   bundle valid; recorded validator results show failures (informational).
+  2   bundle invalid (signature, schema, or integrity failure).
+  3   verification did not complete, so no verdict was reached — either the
+      bundle was not readable (failureCause.class "transient": dead mount,
+      unreachable registry) or the run was aborted ("canceled").
+
+Process exit codes differ: verdicts 1 and 2 both exit 2; verdict 3 exits 5
+when transient and 9 when canceled. Branch on the JSON "exit" field to
+tell 1 from 2.
+`,
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:     flagOutput,
+				Aliases:  []string{"o"},
+				Usage:    "Write output to this file (default: stdout).",
+				Category: catOutput,
+			},
+			withCompletions(&cli.StringFlag{
+				Name:     flagFormat,
+				Aliases:  []string{"t"},
+				Value:    evidenceVerifyFormatText,
+				Usage:    "Output format: text (Markdown summary), json.",
+				Category: catOutput,
+			}, func() []string { return []string{evidenceVerifyFormatText, evidenceVerifyFormatJSON} }),
+			&cli.StringFlag{
+				Name:     "expected-issuer",
+				Usage:    "Pin the OIDC issuer URL on the signing certificate (empty = any issuer). Keyless only; not valid with --key.",
+				Category: catEvidence,
+			},
+			&cli.StringFlag{
+				Name:     "expected-identity-regexp",
+				Usage:    "Pin the signer's SubjectAlternativeName via regex (empty = any identity). Keyless only; not valid with --key.",
+				Category: catEvidence,
+			},
+			&cli.StringFlag{
+				Name: flagVerifyKey,
+				Usage: "Verify evidence signed with --signing-key against a KMS key URI (awskms:// | gcpkms:// | azurekms:// | " +
+					"hashivault://) or a local PEM public-key file. The key pins the signer: evidence signed by any other " +
+					"key, or keylessly, fails. A KMS URI makes a live GetPublicKey call to resolve the key.",
+				Category: catEvidence,
+			},
+			&cli.StringFlag{
+				Name: flagTrustRoot,
+				Usage: "Verify against a private Sigstore trusted root (a trusted_root.json from a self-hosted Fulcio/Rekor). " +
+					"Additive to AICR's built-in public-good root. Composes with --key. The verify counterpart to " +
+					"--fulcio-url / --rekor-url / --signing-config on the signing commands.",
+				Category: catEvidence,
+			},
+			&cli.BoolFlag{
+				Name: flagInsecureIgnoreTLog,
+				Usage: "Skip transparency-log verification for evidence signed with --signing-key ... --tlog-upload=false. " +
+					"Requires --key; a local PEM key verifies fully offline. \"insecure\" because, with no transparency " +
+					"log, there is no trusted timestamp proving when the signature was made.",
+				Category: catEvidence,
+			},
+			&cli.StringFlag{
+				Name:     "bundle",
+				Usage:    "OCI reference override when the pointer carries no bundle.oci.",
+				Category: catEvidence,
+			},
+			&cli.BoolFlag{
+				Name:     "registry-plain-http",
+				Usage:    "Use HTTP for registry traffic (local-registry tests only).",
+				Category: catEvidence,
+			},
+			&cli.BoolFlag{
+				Name:     "registry-insecure-tls",
+				Usage:    "Skip TLS verification for the registry (self-signed certificates).",
+				Category: catEvidence,
+			},
+			&cli.BoolFlag{
+				Name:     "allow-unpinned-tag",
+				Usage:    "Accept tag-only OCI references (default: refuse). Tags are not content-addressable; opt in only for one-off debugging.",
+				Category: catEvidence,
+			},
+		},
+		Action: runEvidenceVerifyCmd,
+	}
+}
+
+func runEvidenceVerifyCmd(ctx context.Context, cmd *cli.Command) (err error) {
+	input := cmd.Args().First()
+	if input == "" {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"input is required: aicr evidence verify <pointer|oci-ref|directory>")
+	}
+	if flagErr := validateSingleValueFlags(cmd, flagVerifyKey, flagTrustRoot); flagErr != nil {
+		return flagErr
+	}
+	format := cmd.String(flagFormat)
+	if format != evidenceVerifyFormatText && format != evidenceVerifyFormatJSON {
+		return errors.New(errors.ErrCodeInvalidRequest, "invalid --format: must be text or json")
+	}
+
+	client, clientErr := embeddedClient(ctx)
+	if clientErr != nil {
+		return clientErr
+	}
+	defer func() { _ = client.Close() }()
+
+	result, verifyErr := client.VerifyEvidence(ctx, aicr.EvidenceVerifyOptions{
+		Input:                  input,
+		BundleRef:              cmd.String("bundle"),
+		ExpectedIssuer:         cmd.String("expected-issuer"),
+		ExpectedIdentityRegexp: cmd.String("expected-identity-regexp"),
+		Key:                    cmd.String(flagVerifyKey),
+		TrustRoot:              cmd.String(flagTrustRoot),
+		IgnoreTLog:             cmd.Bool(flagInsecureIgnoreTLog),
+		PlainHTTP:              cmd.Bool("registry-plain-http"),
+		InsecureTLS:            cmd.Bool("registry-insecure-tls"),
+		AllowUnpinnedTag:       cmd.Bool("allow-unpinned-tag"),
+	})
+	if verifyErr != nil {
+		return verifyErr
+	}
+
+	w, closeFn, openErr := openVerifyOutput(cmd.String(flagOutput), cmd.Root().Writer)
+	if openErr != nil {
+		return openErr
+	}
+	defer func() {
+		// Writable Close errors flush buffered data — capture so a partial
+		// write to --output is not reported as success.
+		if closeErr := closeFn(); closeErr != nil && err == nil {
+			err = errors.Wrap(errors.ErrCodeInternal, "failed to close --output file", closeErr)
+		}
+	}()
+	if writeErr := writeVerifyOutput(w, format, result); writeErr != nil {
+		return writeErr
+	}
+
+	return verdictError(result)
+}
+
+// verdictError maps a verifier verdict to the coded error whose exit code the
+// process returns. Extracted from the command so the full mapping — including
+// the two ways a run can end without a verdict — is directly testable.
+//
+// Verdicts 1 and 2 both land on process exit 2 (ErrCodeConflict and
+// ErrCodeInvalidRequest share it); consumers that need to tell them apart read
+// the JSON "exit" field. Verdict 3 gets its own codes precisely so a CI gate
+// can distinguish "we could not check this" from "we checked it and it failed".
+func verdictError(result *aicr.EvidenceVerification) error {
+	switch result.Exit {
+	case aicr.EvidenceExitValidPassed:
+		return nil
+	case aicr.EvidenceExitValidPhaseFailures:
+		return errors.New(errors.ErrCodeConflict,
+			"bundle valid; recorded validator results show failures")
+	case aicr.EvidenceExitIncomplete:
+		if result.FailureCause != nil && result.FailureCause.Class == aicr.EvidenceCauseCanceled {
+			return errors.New(errors.ErrCodeCanceled,
+				"bundle verification aborted before a verdict was reached")
+		}
+		// ErrCodeTimeout (exit 5) is the deliberate umbrella for every
+		// non-canceled transient cause, including registry 5xx/429 where
+		// ErrCodeUnavailable (exit 6) would be the literal match. The verdict
+		// contract is two-valued on purpose — 5 transient, 9 canceled — so a
+		// gate branches on two codes rather than tracking the full ErrCode
+		// taxonomy. Reading exit 5 back as "timeout" is the cost of that.
+		return errors.New(errors.ErrCodeTimeout,
+			"bundle verification could not complete; the bundle was not readable (storage or registry fault)")
+	default:
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"bundle verification failed; see the verifier output for details")
+	}
+}
+
+// openVerifyOutput resolves the --output flag. Empty path returns the
+// CLI's default writer (stdout) and a no-op closer; a path opens the file
+// for writing and returns a closer that flushes/closes it. The caller MUST
+// invoke the closer and propagate its error — closing a writable file can
+// surface buffered-write failures that would otherwise look like success.
+func openVerifyOutput(path string, stdout io.Writer) (io.Writer, func() error, error) {
+	if path == "" {
+		return stdout, func() error { return nil }, nil
+	}
+	f, err := os.Create(path) //nolint:gosec // operator-supplied destination
+	if err != nil {
+		return nil, nil, errors.Wrap(errors.ErrCodeInternal,
+			"failed to open --output file for writing", err)
+	}
+	return f, f.Close, nil
+}
+
+func writeVerifyOutput(w io.Writer, format string, r *aicr.EvidenceVerification) error {
+	if format == evidenceVerifyFormatJSON {
+		body, err := aicr.RenderEvidenceJSON(r)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(body); err != nil {
+			return errors.Wrap(errors.ErrCodeInternal, "failed to write JSON output", err)
+		}
+		return nil
+	}
+	if _, err := fmt.Fprint(w, aicr.RenderEvidenceMarkdown(r)); err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to write Markdown output", err)
+	}
+	return nil
+}

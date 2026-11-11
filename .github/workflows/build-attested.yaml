@@ -1,0 +1,105 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Build attested binaries on-demand without cutting a release tag.
+# Produces tar.gz archives with SLSA Build Provenance v1 attestation
+# as downloadable job artifacts.
+
+## NOTE: THIS WORKFLOW IS FOR TESTING PURPOSES ONLY.
+## if you need something attested by ci. This does not run tests or security scans.
+## The only complete/valid way to attest that passes all validation is via on-tag.yaml.
+## Validate attestations requires to pass the following certificate identity regexp:
+##  --certificate-identity-regexp 'https://github.com/NVIDIA/aicr/.github/workflows/on-tag\.yaml@refs/tags/.*'
+## so this attestation is not the same as a production release.
+
+name: Build Attested Binaries
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-attest:
+    name: Build and Attest Binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Load versions
+        id: versions
+        uses: ./.github/actions/load-versions
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532  # v4.1.3
+        with:
+          # Pin from .settings.yaml (>= v3.1.0) so cosign logs DSSE attestations
+          # to Rekor v2 as hashedrekord/PAE. The installer default (v3.0.6) writes
+          # the legacy dsse entry type, which sigstore-go cannot verify. See #1650.
+          cosign-release: ${{ steps.versions.outputs.cosign }}
+
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de  # v7.3.0
+        with:
+          version: ${{ steps.versions.outputs.goreleaser }}
+          install-only: true
+
+      - name: Generate SLSA predicate
+        uses: ./.github/actions/generate-slsa-predicate
+        with:
+          workflow_file: build-attested.yaml
+
+      - name: Build and attest
+        env:
+          AICR_CANDIDATE_TAG: candidate-attested-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          goreleaser release --snapshot --clean --skip=publish,ko,sbom --timeout 20m
+
+      - name: Verify archive contents
+        run: |
+          set -euo pipefail
+          echo "=== Archives ==="
+          ls -la dist/aicr_v*.tar.gz 2>/dev/null || echo "No archives found"
+          echo ""
+          for archive in dist/aicr_v*.tar.gz; do
+            [ -f "$archive" ] || continue
+            echo "--- $(basename "$archive") ---"
+            tar -tzf "$archive"
+            echo ""
+          done
+
+      - name: Upload archives
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: aicr-attested-binaries
+          path: dist/*.tar.gz
+          retention-days: 3

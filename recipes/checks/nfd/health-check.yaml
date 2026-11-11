@@ -1,0 +1,145 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Node Feature Discovery Health Check
+#
+# Validates the standalone NFD deployment by checking:
+# 1. NFD Master Deployment has at least one ready replica
+# 2. NFD Worker DaemonSet has fully rolled out and is current
+#    (desiredNumberScheduled > 0, numberReady/updatedNumberScheduled both
+#    match it, and observedGeneration matches metadata.generation, so
+#    neither a partial nor a stale rollout passes)
+# 3. NFD GC Deployment has at least one ready replica (gc.enable: true)
+#
+# Resource names: AICR deploys the kubernetes-sigs/node-feature-discovery
+# chart under release name "nfd" (matching the ComponentRef Name in
+# recipes/registry.yaml). The chart's fullname template prefixes the
+# release name to the chart name when they don't overlap, yielding
+# "nfd-node-feature-discovery-*" for the master Deployment, worker
+# DaemonSet, and gc Deployment. If a deployer ever switches the release
+# name to "node-feature-discovery", these asserts need updating in
+# lockstep.
+# 4. No pods in unhealthy phases (Pending, Failed, Unknown) or stuck in
+#    Running with a known-unhealthy container waiting reason
+#    (CrashLoopBackOff, ImagePullBackOff, ErrImagePull,
+#    CreateContainerConfigError)
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: nfd-health-check
+spec:
+  timeouts:
+    assert: 5m
+  steps:
+    - name: validate-master-deployment
+      try:
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: nfd-node-feature-discovery-master
+                namespace: node-feature-discovery
+              status:
+                (availableReplicas > `0`): true
+    - name: validate-worker-daemonset
+      try:
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: nfd-node-feature-discovery-worker
+                namespace: node-feature-discovery
+              # Guard against vacuous pass when 0 nodes match the
+              # DaemonSet: require at least one scheduled pod.
+              ((status.desiredNumberScheduled || `0`) > `0`): true
+              # Full rollout: every scheduled pod is ready. Combined with
+              # the guard above, this rejects partial failures. We assert on
+              # numberReady (always present in DaemonSetStatus) rather than
+              # numberUnavailable, which is `omitempty` and disappears from
+              # the status when zero — making `numberUnavailable == 0`
+              # evaluate `null == 0` (false) on a fully-healthy DaemonSet.
+              ((status.numberReady || `0`) == status.desiredNumberScheduled): true
+              # numberReady alone doesn't distinguish a node still on the
+              # previous revision (also Ready) from a fully current rollout;
+              # updatedNumberScheduled/observedGeneration close that gap.
+              ((status.updatedNumberScheduled || `0`) == status.desiredNumberScheduled): true
+              ((status.observedGeneration || `0`) == metadata.generation): true
+    - name: validate-gc-deployment
+      try:
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: nfd-node-feature-discovery-gc
+                namespace: node-feature-discovery
+              status:
+                (availableReplicas > `0`): true
+    - name: validate-all-pods-healthy
+      try:
+        # Phase-based errors: Pending/Failed/Unknown.
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: node-feature-discovery
+              status:
+                phase: Pending
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: node-feature-discovery
+              status:
+                phase: Failed
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: node-feature-discovery
+              status:
+                phase: Unknown
+        # Container-state errors: pods stuck in Running phase with a
+        # container in a known-bad waiting reason. Phase filtering alone
+        # misses CrashLoopBackOff/ImagePullBackOff because those pods
+        # typically remain in Running phase with unhealthy containers.
+        # JMESPath projection (not single-element match): kyverno-json's
+        # sliceNode.Assert gates on exact slice length before per-element
+        # comparison, so a `containerStatuses: - state: ...` shape only
+        # matches single-container pods and silently passes sidecars. Use
+        # `containerStatuses[?...] | length(@) > 0` to fire on any
+        # container at any index. Parallel initContainerStatuses block
+        # below catches init-container failures (invisible to
+        # containerStatuses). Per PR #1245 review (@ArangoGutierrez).
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: node-feature-discovery
+              status:
+                ((containerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: node-feature-discovery
+              status:
+                ((initContainerStatuses || `[]`)[?state.waiting.reason == 'CrashLoopBackOff' || state.waiting.reason == 'ImagePullBackOff' || state.waiting.reason == 'ErrImagePull' || state.waiting.reason == 'CreateContainerConfigError'] | length(@) > `0`): true

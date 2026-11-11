@@ -1,0 +1,197 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package cli implements the command-line interface for the AICR aicr tool.
+//
+// # Overview
+//
+// The aicr CLI provides commands for the four-stage workflow: capturing system snapshots,
+// generating configuration recipes, validating constraints, and creating deployment bundles.
+// It is designed for cluster administrators and SREs managing NVIDIA GPU infrastructure.
+//
+// # Commands
+//
+// The workflow commands and the skill utility are summarized below. The CLI also
+// provides query, verify, evidence, diff, upgrade-check, mirror, trust, and
+// completion; run "aicr --help" for the full list, and see
+// docs/user/cli-reference.md for every command and flag.
+//
+// snapshot - Capture system configuration (Step 1):
+//
+//	aicr snapshot [--output FILE] [--format yaml|json|table]
+//	aicr snapshot --output cm://namespace/configmap-name  # ConfigMap output
+//	aicr snapshot --namespace my-namespace                  # Custom namespace
+//
+// Captures a comprehensive snapshot of the current system including CPU/GPU settings,
+// kernel parameters, systemd services, Kubernetes configuration, Helm releases, and
+// Argo CD applications. Supports file, stdout, and Kubernetes ConfigMap output.
+//
+// recipe - Generate configuration recipes (Step 2):
+//
+//	aicr recipe --os ubuntu --service eks --gpu h100 --intent training
+//	aicr recipe --snapshot system.yaml --intent inference --output recipe.yaml
+//	aicr recipe -s cm://namespace/snapshot -o cm://namespace/recipe  # ConfigMap I/O
+//	aicr recipe --config config.yaml --output recipe.yaml  # Config file mode
+//
+// Generates optimized configuration recipes based on either:
+//   - Specified environment parameters (OS, service, GPU, intent)
+//   - Existing system snapshot (analyzes snapshot to extract parameters)
+//   - AICRConfig file (Kubernetes-style YAML/JSON with kind: AICRConfig)
+//
+// # Config File Mode
+//
+// The --config flag accepts a single AICRConfig document carrying defaults
+// for the recipe and/or bundle commands:
+//
+//	aicr recipe --config /path/to/config.yaml
+//
+// Config file format (YAML or JSON):
+//
+//	kind: AICRConfig
+//	apiVersion: aicr.run/v1beta1
+//	metadata:
+//	  name: my-deployment
+//	spec:
+//	  recipe:
+//	    criteria:
+//	      service: eks
+//	      accelerator: gb200
+//	      os: ubuntu
+//	      intent: training
+//	      nodes: 8
+//
+// Individual CLI flags override config file values:
+//
+//	aicr recipe --config config.yaml --service gke  # service=gke overrides file
+//
+// validate - Validate recipe constraints (Step 3):
+//
+//	aicr validate --recipe recipe.yaml --snapshot snapshot.yaml
+//	aicr validate -r recipe.yaml -s cm://default/aicr-snapshot
+//	aicr validate -r recipe.yaml -s cm://ns/snapshot --fail-on-error=false
+//
+// Validates recipe constraints against actual measurements from a snapshot.
+// Supports version comparisons (>=, <=, >, <), equality (==, !=), and exact match.
+// Failed checks exit non-zero by default (--fail-on-error is on); pass
+// --fail-on-error=false to report failures without failing the command.
+//
+// bundle - Create deployment bundles (Step 4):
+//
+//	aicr bundle --recipe recipe.yaml --output ./bundles
+//	aicr bundle -r recipe.yaml --deployer argocd -o ./bundles
+//	aicr bundle -r recipe.yaml --set gpuoperator:driver.version=580.86.16
+//
+// Generates deployment artifacts from recipes. By default creates a Helm
+// per-component bundle with individual values.yaml per component. Use
+// --deployer argocd for Argo CD Application manifests.
+//
+// skill - Generate AI agent skill file (Utility):
+//
+//	aicr skill --agent claude-code
+//	aicr skill --agent codex
+//	aicr skill --agent claude-code --force
+//	aicr skill --agent claude-code --stdout
+//
+// Generates a skill file that teaches a coding agent how to use the
+// AICR CLI. The file is written to the agent's standard configuration directory
+// (~/.claude/skills/aicr/SKILL.md for Claude Code, ~/.codex/skills/aicr/SKILL.md for Codex).
+// Use --stdout to print the content instead of writing to disk. If the target file
+// already exists, you will be prompted to confirm overwrite when stdin is a terminal;
+// pass --force to overwrite without prompting (e.g., in CI).
+//
+// # Global Flags
+//
+//	--debug        Enable debug logging
+//	--log-json     Output logs in JSON format
+//	--help, -h     Show command help
+//	--version, -v  Show version information
+//
+// Output destination and format (--output/-o, --format/-t) are per-command
+// flags; see each command's --help.
+//
+// # Output Formats
+//
+// YAML (default):
+//   - Human-readable, preserves structure
+//   - Suitable for version control
+//
+// JSON:
+//   - Machine-parseable, compact
+//   - Suitable for programmatic consumption
+//
+// Table:
+//   - Hierarchical text representation
+//   - Suitable for terminal viewing
+//
+// # Usage Examples
+//
+// Complete workflow:
+//
+//	aicr snapshot --output snapshot.yaml
+//	aicr recipe --snapshot snapshot.yaml --intent training --output recipe.yaml
+//	aicr validate --recipe recipe.yaml --snapshot snapshot.yaml
+//	aicr bundle --recipe recipe.yaml --output ./bundles
+//
+// ConfigMap-based workflow:
+//
+//	aicr snapshot -o cm://default/aicr-snapshot
+//	aicr recipe -s cm://default/aicr-snapshot -o cm://default/aicr-recipe
+//	aicr validate -r cm://default/aicr-recipe -s cm://default/aicr-snapshot
+//	aicr bundle -r cm://default/aicr-recipe -o ./bundles
+//
+// Generate recipe for Ubuntu on EKS with H100 GPUs:
+//
+//	aicr recipe --os ubuntu --service eks --gpu h100 --intent training
+//
+// Override bundle values at generation time:
+//
+//	aicr bundle -r recipe.yaml --set gpuoperator:gds.enabled=true -o ./bundles
+//
+// # Environment Variables
+//
+//	AICR_DEBUG             Same as --debug
+//	AICR_LOG_JSON          Same as --log-json
+//	AICR_LOG_PREFIX        Override the CLI log prefix (default: "cli")
+//	NO_COLOR               Suppress ANSI color codes in CLI logger output
+//	NODE_NAME              Override node name for Kubernetes collection
+//	KUBERNETES_NODE_NAME   Fallback node name if NODE_NAME not set
+//	HOSTNAME               Final fallback for node name
+//	KUBECONFIG             Path to kubeconfig file
+//
+// # Exit Codes
+//
+// The exit code is derived from the failure's error code (ExitCodeFromError in
+// pkg/errors): 0 on success, 1 for an unclassified error, and a distinct code
+// from 2 to 9 per error class (for example 2 for invalid input, 5 for a timeout,
+// 9 when the operator cancels). The full table is in the Exit Codes section of
+// docs/user/cli-reference.md.
+//
+// # Architecture
+//
+// The CLI uses the urfave/cli/v3 framework. Recipe and bundle commands
+// delegate through the pkg/client/v1 (aicr.Client) facade so the CLI and
+// the aicrd HTTP server share a single implementation path. Specialized
+// packages it routes to include:
+//   - pkg/client/v1 - aicr.Client facade (recipe + bundle entry points)
+//   - pkg/snapshotter - System snapshot collection
+//   - pkg/recipe - Recipe resolution and overlay merge
+//   - pkg/bundler - Bundle orchestration and generation
+//   - pkg/component - Shared bundler utilities used by the bundler
+//   - pkg/serializer - Output formatting (including ConfigMap)
+//   - pkg/logging - Structured logging
+//
+// Version information is embedded at build time using ldflags:
+//
+//	go build -ldflags="-X 'github.com/NVIDIA/aicr/pkg/cli.version=1.0.0'"
+package cli

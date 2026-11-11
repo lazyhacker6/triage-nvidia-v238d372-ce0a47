@@ -1,0 +1,139 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package recipe
+
+import (
+	"fmt"
+
+	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/header"
+	"github.com/NVIDIA/aicr/pkg/measurement"
+)
+
+// RequestInfo holds simplified request metadata for documentation purposes.
+// This replaces the old Query type with just the fields needed for bundle documentation.
+type RequestInfo struct {
+	Os        string `json:"os,omitempty" yaml:"os,omitempty"`
+	OsVersion string `json:"osVersion,omitempty" yaml:"osVersion,omitempty"`
+	Service   string `json:"service,omitempty" yaml:"service,omitempty"`
+	K8s       string `json:"k8s,omitempty" yaml:"k8s,omitempty"`
+	GPU       string `json:"gpu,omitempty" yaml:"gpu,omitempty"`
+	Intent    string `json:"intent,omitempty" yaml:"intent,omitempty"`
+}
+
+// Recipe represents the recipe response structure.
+type Recipe struct {
+	header.Header `json:",inline" yaml:",inline"`
+
+	Request      *RequestInfo               `json:"request,omitempty" yaml:"request,omitempty"`
+	MatchedRules []string                   `json:"matchedRules,omitempty" yaml:"matchedRules,omitempty"`
+	Measurements []*measurement.Measurement `json:"measurements" yaml:"measurements"`
+}
+
+// Validate validates a recipe against all registered bundlers that implement Validator.
+func (r *Recipe) Validate() error {
+	if r == nil {
+		return errors.New(errors.ErrCodeInvalidRequest, "recipe cannot be nil")
+	}
+
+	if len(r.Measurements) == 0 {
+		return errors.New(errors.ErrCodeInvalidRequest, "recipe has no measurements")
+	}
+
+	return nil
+}
+
+// ValidateStructure performs basic structural validation.
+func (r *Recipe) ValidateStructure() error {
+	if err := r.Validate(); err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest, "recipe structure validation failed", err)
+	}
+
+	// Validate each measurement
+	for i, m := range r.Measurements {
+		if m == nil {
+			return errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("measurement at index %d is nil", i))
+		}
+
+		if m.Type == "" {
+			return errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("measurement at index %d has empty type", i))
+		}
+
+		if len(m.Subtypes) == 0 {
+			return errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("measurement type %s has no subtypes", m.Type))
+		}
+
+		// Validate subtypes
+		for j, st := range m.Subtypes {
+			if st.Name == "" {
+				return errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("subtype at index %d in measurement %s has empty name", j, m.Type))
+			}
+
+			if st.Data == nil {
+				return errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf("subtype %s in measurement %s has nil data", st.Name, m.Type))
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateMeasurementExists checks if a specific measurement type exists.
+func (r *Recipe) validateMeasurementExists(measurementType measurement.Type) error {
+	if err := r.ValidateStructure(); err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest, "measurement existence check failed", err)
+	}
+
+	for _, m := range r.Measurements {
+		if m.Type == measurementType {
+			return nil
+		}
+	}
+	return errors.New(errors.ErrCodeNotFound, fmt.Sprintf("measurement type %s not found in recipe", measurementType))
+}
+
+// validateSubtypeExists checks if a specific subtype exists within a measurement.
+func (r *Recipe) validateSubtypeExists(measurementType measurement.Type, subtypeName string) error {
+	if err := r.validateMeasurementExists(measurementType); err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest, "subtype existence check failed", err)
+	}
+
+	for _, m := range r.Measurements {
+		if m.Type == measurementType {
+			for _, st := range m.Subtypes {
+				if st.Name == subtypeName {
+					return nil
+				}
+			}
+			return errors.New(errors.ErrCodeNotFound, fmt.Sprintf("subtype %s not found in measurement type %s", subtypeName, measurementType))
+		}
+	}
+	return errors.New(errors.ErrCodeNotFound, fmt.Sprintf("measurement type %s not found in recipe", measurementType))
+}
+
+// validateRequiredKeys checks if required keys exist in a subtype's data.
+func validateRequiredKeys(subtype *measurement.Subtype, requiredKeys []string) error {
+	if subtype == nil {
+		return errors.New(errors.ErrCodeInvalidRequest, "subtype is nil")
+	}
+
+	for _, key := range requiredKeys {
+		if _, exists := subtype.Data[key]; !exists {
+			return errors.New(errors.ErrCodeNotFound, fmt.Sprintf("required key %s not found in subtype %s", key, subtype.Name))
+		}
+	}
+
+	return nil
+}
